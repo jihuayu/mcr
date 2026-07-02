@@ -204,7 +204,10 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use super::{AddressWaitResult, wait_on_address_u32, wake_by_address_all_u32};
 
@@ -219,10 +222,19 @@ mod tests {
 
     #[test]
     fn wait_times_out_when_value_is_unchanged() {
-        let value = std::sync::atomic::AtomicU32::new(1);
+        let value = Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let waiter_value = Arc::clone(&value);
+        let (sender, receiver) = mpsc::channel();
 
-        let result =
-            wait_on_address_u32(&value, 1, Some(std::time::Duration::from_millis(1))).unwrap();
+        std::thread::spawn(move || {
+            let result = wait_on_address_u32(&waiter_value, 1, Some(Duration::from_millis(1)));
+            let _ = sender.send(result);
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed address wait must not block indefinitely")
+            .unwrap();
 
         assert_eq!(result, AddressWaitResult::TimedOut);
     }
