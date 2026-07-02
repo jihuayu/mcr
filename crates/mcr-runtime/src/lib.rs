@@ -1722,6 +1722,16 @@ impl Runtime {
         self.dispatcher.subsystems_mut().files.memory_mut()
     }
 
+    #[must_use]
+    pub fn vfs(&self) -> &VirtualFileSystem {
+        self.dispatcher.subsystems().files.vfs()
+    }
+
+    #[must_use]
+    pub fn vfs_mut(&mut self) -> &mut VirtualFileSystem {
+        self.dispatcher.subsystems_mut().files.vfs_mut()
+    }
+
     pub fn dispatch_syscall(&mut self, context: GuestContext) -> SyscallDispatchResult {
         self.dispatcher.dispatch(context)
     }
@@ -1775,6 +1785,16 @@ where
     #[must_use]
     pub const fn tracer_mut(&mut self) -> &mut T {
         self.dispatcher.tracer_mut()
+    }
+
+    #[must_use]
+    pub fn vfs(&self) -> &VirtualFileSystem {
+        self.dispatcher.subsystems().files.vfs()
+    }
+
+    #[must_use]
+    pub fn vfs_mut(&mut self) -> &mut VirtualFileSystem {
+        self.dispatcher.subsystems_mut().files.vfs_mut()
     }
 
     pub fn dispatch_syscall(&mut self, context: GuestContext) -> SyscallDispatchResult {

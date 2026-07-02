@@ -2,8 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mcr_sys::{GuestContext, LinuxErrno, Syscall, SyscallRegisters};
-use mcr_task::{INITIAL_GUEST_PID, INITIAL_GUEST_TID};
+use mcr_sys::LinuxErrno;
 use mcr_vfs::{
     AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, ProcSelfData, Rootfs, VirtualFileSystem,
 };
@@ -198,7 +197,8 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
     }
 
     let mut vfs = load_rootfs(&config.rootfs)?;
-    let program = RuntimeFileSystem::new(vfs.clone(), ())
+    let mut program_loader = RuntimeFileSystem::new(vfs.clone(), ());
+    let program = program_loader
         .load_guest_program(
             config.program.clone(),
             config.args.clone(),
@@ -215,40 +215,18 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         vfs.clone(),
         crate::RuntimeDiagnosticsTracer::new(),
     )?;
-    runtime.dispatch_syscall(GuestContext::new(
-        INITIAL_GUEST_PID,
-        INITIAL_GUEST_TID,
-        SyscallRegisters {
-            rax: Syscall::Getpid.number().raw(),
-            rip: runtime
-                .kernel()
-                .task(INITIAL_GUEST_TID)
-                .expect("initial task exists")
-                .regs()
-                .rip(),
-            ..SyscallRegisters::default()
-        },
-    ));
 
-    let output = dispatch_mvp_program(&mut vfs, &config.program, &config.args)?;
-    let status = output.status();
-    runtime.dispatch_syscall(GuestContext::new(
-        INITIAL_GUEST_PID,
-        INITIAL_GUEST_TID,
-        SyscallRegisters {
-            rax: Syscall::ExitGroup.number().raw(),
-            rdi: status as u64,
-            rip: runtime
-                .kernel()
-                .task(INITIAL_GUEST_TID)
-                .expect("initial task exists")
-                .regs()
-                .rip(),
-            ..SyscallRegisters::default()
-        },
-    ));
-
-    Ok(output)
+    match runtime.run_guest_until_exit() {
+        Ok(status) => Ok(RunRootfsOutput::new(
+            status,
+            runtime.vfs().stdout_snapshot(),
+            runtime.vfs().stderr_snapshot(),
+        )),
+        Err(error) if error.linux_errno() == LinuxErrno::ENOEXEC => {
+            dispatch_mvp_program(&mut vfs, &config.program, &config.args)
+        }
+        Err(error) => Err(run_rootfs_linux_errno(error.linux_errno())),
+    }
 }
 
 fn dispatch_mvp_program(
@@ -742,6 +720,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use mcr_sys::Syscall;
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::{RunRootfsConfig, run_rootfs};
@@ -874,6 +853,19 @@ mod tests {
     }
 
     #[test]
+    fn run_rootfs_executes_guest_syscalls_and_captures_stdio() {
+        let rootfs = TestRootfs::new("guest-syscalls");
+        rootfs.write_guest_syscall_elf("/bin/guest", b"hello from guest\n", 7);
+
+        let output =
+            run_rootfs(RunRootfsConfig::new(rootfs.path(), b"/bin/guest".to_vec())).unwrap();
+
+        assert_eq!(output.status(), 7);
+        assert_eq!(output.stdout(), b"hello from guest\n");
+        assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
     fn run_rootfs_executes_shell_echo_pipeline_smoke() {
         let rootfs = TestRootfs::new("shell-pipe");
         rootfs.write_static_elf("/bin/sh");
@@ -959,6 +951,40 @@ mod tests {
             self.write_file(guest_path, &elf);
         }
 
+        fn write_guest_syscall_elf(&self, guest_path: &str, stdout: &[u8], status: u32) {
+            let mut code = Vec::new();
+            push_mov_r32_imm32(&mut code, 0, Syscall::Write.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 1);
+            push_mov_r32_imm32(&mut code, 6, 0x402000);
+            push_mov_r32_imm32(&mut code, 2, stdout.len() as u32);
+            code.extend_from_slice(&[0x0f, 0x05]);
+            push_mov_r32_imm32(&mut code, 0, Syscall::ExitGroup.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, status);
+            code.extend_from_slice(&[0x0f, 0x05]);
+
+            let elf = Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x2000,
+                    0x402000,
+                    stdout.len() as u64,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x403000, 0x100, 0x100))
+                .data_at(0x1000, code)
+                .data_at(0x2000, stdout.to_vec())
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
         fn write_dynamic_elf(&self, guest_path: &str, interpreter: &str) {
             let mut interpreter_path = interpreter.as_bytes().to_vec();
             interpreter_path.push(0);
@@ -1007,5 +1033,11 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn push_mov_r32_imm32(code: &mut Vec<u8>, register: u8, value: u32) {
+        assert!(register < 8);
+        code.push(0xb8 + register);
+        code.extend_from_slice(&value.to_le_bytes());
     }
 }
