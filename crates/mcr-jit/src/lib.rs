@@ -714,6 +714,61 @@ where
             let value = read_reg32(registers, instruction.op1_register())?;
             write_memory_u32(memory, rip, address, value)?;
         }
+        Code::Movzx_r32_rm8 => {
+            let value = u32::from(read_operand_u8(registers, memory, &instruction, 1)?);
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movzx_r64_rm8 => {
+            let value = u64::from(read_operand_u8(registers, memory, &instruction, 1)?);
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movzx_r32_rm16 => {
+            let value = u32::from(read_operand_u16(registers, memory, &instruction, 1)?);
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movzx_r64_rm16 => {
+            let value = u64::from(read_operand_u16(registers, memory, &instruction, 1)?);
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movsx_r32_rm8 => {
+            let value = sign_extend_u64(
+                u64::from(read_operand_u8(registers, memory, &instruction, 1)?),
+                8,
+            ) as u32;
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movsx_r64_rm8 => {
+            let value = sign_extend_u64(
+                u64::from(read_operand_u8(registers, memory, &instruction, 1)?),
+                8,
+            );
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movsx_r32_rm16 => {
+            let value = sign_extend_u64(
+                u64::from(read_operand_u16(registers, memory, &instruction, 1)?),
+                16,
+            ) as u32;
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movsx_r64_rm16 => {
+            let value = sign_extend_u64(
+                u64::from(read_operand_u16(registers, memory, &instruction, 1)?),
+                16,
+            );
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Movsxd_r64_rm32 => {
+            let value = sign_extend_u64(
+                u64::from(read_operand_u32(registers, memory, &instruction, 1)?),
+                32,
+            );
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Cdqe => {
+            let value = sign_extend_u64(u64::from(read_reg32(registers, Register::EAX)?), 32);
+            write_reg64(registers, Register::RAX, value)?;
+        }
         Code::Push_r64 if instruction.op0_kind() == OpKind::Register => {
             let value = read_reg64(registers, instruction.op0_register())?;
             registers.rsp = registers.rsp.wrapping_sub(8);
@@ -946,6 +1001,11 @@ const fn sign_bit(bits: u32) -> u64 {
     1_u64 << (bits - 1)
 }
 
+fn sign_extend_u64(value: u64, bits: u32) -> u64 {
+    let shift = 64 - bits;
+    ((value << shift) as i64 >> shift) as u64
+}
+
 fn block_from_rip(block: GuestBlock<'_>, rip: u64) -> Result<GuestBlock<'_>, ExecutionError> {
     let offset = block_offset(block, rip)?;
     let bytes = block
@@ -1118,6 +1178,110 @@ fn effective_address(
         .wrapping_add(instruction.memory_displacement64()))
 }
 
+fn read_operand_u8<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u8, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => read_reg8(registers, instruction.op_register(operand)),
+        OpKind::Memory => read_memory_u8(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn read_operand_u16<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u16, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => read_reg16(registers, instruction.op_register(operand)),
+        OpKind::Memory => read_memory_u16(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn read_operand_u32<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u32, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => read_reg32(registers, instruction.op_register(operand)),
+        OpKind::Memory => read_memory_u32(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn read_memory_u8<M>(memory: &mut M, rip: u64, address: u64) -> Result<u8, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let mut bytes = [0; 1];
+    memory
+        .read_memory_operand(address, &mut bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Read,
+            error,
+        })?;
+    Ok(bytes[0])
+}
+
+fn read_memory_u16<M>(memory: &mut M, rip: u64, address: u64) -> Result<u16, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let mut bytes = [0; 2];
+    memory
+        .read_memory_operand(address, &mut bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Read,
+            error,
+        })?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
 fn read_memory_u32<M>(memory: &mut M, rip: u64, address: u64) -> Result<u32, ExecutionError>
 where
     M: GuestMemoryOperandAccess,
@@ -1218,6 +1382,64 @@ fn read_reg64(registers: &GuestRegisters, register: Register) -> Result<u64, Exe
         }
     };
     Ok(value)
+}
+
+fn read_reg8(registers: &GuestRegisters, register: Register) -> Result<u8, ExecutionError> {
+    let value = match register {
+        Register::AL => registers.rax as u8,
+        Register::CL => registers.rcx as u8,
+        Register::DL => registers.rdx as u8,
+        Register::BL => registers.rbx as u8,
+        Register::AH => (registers.rax >> 8) as u8,
+        Register::CH => (registers.rcx >> 8) as u8,
+        Register::DH => (registers.rdx >> 8) as u8,
+        Register::BH => (registers.rbx >> 8) as u8,
+        Register::SPL => registers.rsp as u8,
+        Register::BPL => registers.rbp as u8,
+        Register::SIL => registers.rsi as u8,
+        Register::DIL => registers.rdi as u8,
+        Register::R8L => registers.r8 as u8,
+        Register::R9L => registers.r9 as u8,
+        Register::R10L => registers.r10 as u8,
+        Register::R11L => registers.r11 as u8,
+        Register::R12L => registers.r12 as u8,
+        Register::R13L => registers.r13 as u8,
+        Register::R14L => registers.r14 as u8,
+        Register::R15L => registers.r15 as u8,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    };
+    Ok(value)
+}
+
+fn read_reg16(registers: &GuestRegisters, register: Register) -> Result<u16, ExecutionError> {
+    let value = match register {
+        Register::RAX | Register::EAX | Register::AX => registers.rax,
+        Register::RBX | Register::EBX | Register::BX => registers.rbx,
+        Register::RCX | Register::ECX | Register::CX => registers.rcx,
+        Register::RDX | Register::EDX | Register::DX => registers.rdx,
+        Register::RSI | Register::ESI | Register::SI => registers.rsi,
+        Register::RDI | Register::EDI | Register::DI => registers.rdi,
+        Register::RBP | Register::EBP | Register::BP => registers.rbp,
+        Register::RSP | Register::ESP | Register::SP => registers.rsp,
+        Register::R8 | Register::R8D | Register::R8W => registers.r8,
+        Register::R9 | Register::R9D | Register::R9W => registers.r9,
+        Register::R10 | Register::R10D | Register::R10W => registers.r10,
+        Register::R11 | Register::R11D | Register::R11W => registers.r11,
+        Register::R12 | Register::R12D | Register::R12W => registers.r12,
+        Register::R13 | Register::R13D | Register::R13W => registers.r13,
+        Register::R14 | Register::R14D | Register::R14W => registers.r14,
+        Register::R15 | Register::R15D | Register::R15W => registers.r15,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    };
+    Ok(value as u16)
 }
 
 fn read_reg32(registers: &GuestRegisters, register: Register) -> Result<u32, ExecutionError> {
@@ -1798,6 +2020,79 @@ mod tests {
             memory.read::<8>(0x71000c),
             [0xef, 0xcd, 0xab, 0x89, 0xaa, 0xaa, 0xaa, 0xaa]
         );
+    }
+
+    #[test]
+    fn execution_core_zero_and_sign_extends_narrow_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x0f, 0xb6, 0x03, // movzx eax, byte ptr [rbx]
+                0x4c, 0x0f, 0xb7, 0x43, 0x01, // movzx r8, word ptr [rbx+1]
+                0x0f, 0xbe, 0x4b, 0x03, // movsx ecx, byte ptr [rbx+3]
+                0x48, 0x0f, 0xbf, 0x53, 0x04, // movsx rdx, word ptr [rbx+4]
+                0x48, 0x63, 0x73, 0x06, // movsxd rsi, dword ptr [rbx+6]
+                0x48, 0x98, // cdqe
+                0x0f, 0x05, // syscall
+            ],
+            0x461180,
+        );
+        let registers = GuestRegisters {
+            rax: 0xffff_ffff_ffff_ffff,
+            rbx: 0x711000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(
+            0x711000,
+            &[0x7f, 0x34, 0x12, 0x80, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff],
+        );
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute narrow extension loads before syscall");
+
+        assert_eq!(trap.registers().rax, 0x7f);
+        assert_eq!(trap.registers().r8, 0x1234);
+        assert_eq!(trap.registers().rcx, 0xffff_ff80);
+        assert_eq!(trap.registers().rdx, 0xffff_ffff_ffff_8000);
+        assert_eq!(trap.registers().rsi, 0xffff_ffff_ffff_ffff);
+        assert_eq!(trap.site().rip, 0x461197);
+    }
+
+    #[test]
+    fn execution_core_zero_and_sign_extends_narrow_register_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x0f, 0xb6, 0xc0, // movzx eax,al
+                0x4c, 0x0f, 0xb7, 0xc1, // movzx r8,cx
+                0x0f, 0xbe, 0xcb, // movsx ecx,bl
+                0x48, 0x0f, 0xbf, 0xd2, // movsx rdx,dx
+                0x48, 0x63, 0xf6, // movsxd rsi,esi
+                0x0f, 0x05, // syscall
+            ],
+            0x4611c0,
+        );
+        let registers = GuestRegisters {
+            rax: 0xffff_ffff_ffff_12fe,
+            rbx: 0x80,
+            rcx: 0xabcd,
+            rdx: 0x8000,
+            rsi: 0xffff_ffff,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute narrow register extensions before syscall");
+
+        assert_eq!(trap.registers().rax, 0xfe);
+        assert_eq!(trap.registers().r8, 0xabcd);
+        assert_eq!(trap.registers().rcx, 0xffff_ff80);
+        assert_eq!(trap.registers().rdx, 0xffff_ffff_ffff_8000);
+        assert_eq!(trap.registers().rsi, 0xffff_ffff_ffff_ffff);
+        assert_eq!(trap.site().rip, 0x4611d1);
     }
 
     #[test]
