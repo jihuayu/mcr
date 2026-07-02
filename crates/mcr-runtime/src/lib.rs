@@ -13,10 +13,11 @@ use mcr_elf::{
 use mcr_jit::GuestRegisters;
 use mcr_sys::{
     Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls, FcntlSyscallArgs,
-    FileSyscalls, GuestContext, IoctlSyscallArgs, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
-    LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
-    PipeSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
-    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
+    FileSyscalls, FutexSyscallArgs, GuestContext, IoctlSyscallArgs, LINUX_FUTEX_CMD_MASK,
+    LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LinuxErrno, LinuxIovec,
+    LinuxStat, LinuxStatx, LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer,
+    Pipe2SyscallArgs, PipeSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome,
+    SyscallRequest, SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
@@ -1055,8 +1056,58 @@ impl EventSyscalls for RuntimeSubsystems {}
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
     fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
-        self.tasks.dispatch_for_current_task(request)
+        match request.syscall {
+            mcr_sys::Syscall::Futex => self.dispatch_futex(FutexSyscallArgs::new(
+                arg(request, 0),
+                arg_u32(request, 1),
+                arg_u32(request, 2),
+                arg(request, 3),
+                arg(request, 4),
+                arg_u32(request, 5),
+            )),
+            _ => self.tasks.dispatch_for_current_task(request),
+        }
     }
+}
+
+impl RuntimeSubsystems {
+    fn dispatch_futex(&self, args: FutexSyscallArgs) -> SyscallOutcome {
+        outcome(self.futex(args))
+    }
+
+    fn futex(&self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+        if args.op & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG) != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if !args.is_private() {
+            return Err(LinuxErrno::ENOSYS);
+        }
+        if args.uaddr % 4 != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+
+        match args.command() {
+            LINUX_FUTEX_WAIT => self.futex_wait(args),
+            LINUX_FUTEX_WAKE => Ok(0),
+            _ => Err(LinuxErrno::EINVAL),
+        }
+    }
+
+    fn futex_wait(&self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+        let value = read_guest_u32(self.current_image(), args.uaddr)?;
+        if value != args.val {
+            return Err(LinuxErrno::EAGAIN);
+        }
+        if args.timeout == 0 {
+            return Err(LinuxErrno::ENOSYS);
+        }
+        Err(LinuxErrno::ETIMEDOUT)
+    }
+}
+
+fn read_guest_u32(image: &GuestMemoryImage, addr: u64) -> Result<u32, LinuxErrno> {
+    let bytes = image.read(addr, 4).ok_or(LinuxErrno::EFAULT)?;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("slice len")))
 }
 
 #[derive(Debug)]
@@ -1196,6 +1247,133 @@ mod tests {
             runtime.kernel().process(INITIAL_GUEST_PID).unwrap().pid(),
             1
         );
+    }
+
+    #[test]
+    fn private_futex_wait_mismatch_returns_eagain() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+    }
+
+    #[test]
+    fn private_futex_wait_unmapped_returns_efault() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x7000_0000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Errno(LinuxErrno::EFAULT));
+    }
+
+    #[test]
+    fn private_futex_unaligned_uaddr_returns_einval() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402001,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+    }
+
+    #[test]
+    fn process_shared_futex_wait_and_wake_return_enosys() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let wait = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [0x402000, u64::from(LINUX_FUTEX_WAIT), 0, 0, 0, 0],
+        ));
+        let wake = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [0x402000, u64::from(LINUX_FUTEX_WAKE), 1, 0, 0, 0],
+        ));
+
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+        assert_eq!(wake.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+    }
+
+    #[test]
+    fn futex_unknown_command_and_unsupported_flags_return_einval() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let unknown = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(99 | LINUX_FUTEX_PRIVATE_FLAG),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+        let unsupported_flags = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG | 0x100),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(unknown.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+        assert_eq!(
+            unsupported_flags.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn private_futex_wake_returns_zero_without_waiter_registry() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Success(0));
     }
 
     #[test]
