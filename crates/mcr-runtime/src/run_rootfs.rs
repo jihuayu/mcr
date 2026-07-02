@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use mcr_net::WinHostSocketTransport;
 use mcr_sys::LinuxErrno;
 use mcr_vfs::{
     AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, ProcSelfData, Rootfs, VirtualFileSystem,
@@ -210,10 +211,12 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         program.argv().to_vec(),
         program.envp().to_vec(),
     ));
-    let mut runtime = crate::Runtime::with_tracer_and_vfs(
+    let transport = WinHostSocketTransport::new().map_err(crate::RuntimeError::from)?;
+    let mut runtime = crate::Runtime::with_tracer_vfs_and_socket_transport(
         program,
         vfs.clone(),
         crate::RuntimeDiagnosticsTracer::new(),
+        transport,
     )?;
 
     match runtime.run_guest_until_exit() {
@@ -711,6 +714,7 @@ impl From<crate::RuntimeError> for RunRootfsError {
         match value {
             crate::RuntimeError::Task(error) => Self::UnsupportedProgram(error.to_string()),
             crate::RuntimeError::Memory(error) => Self::UnsupportedProgram(format!("{error:?}")),
+            crate::RuntimeError::Network(error) => Self::UnsupportedProgram(error.to_string()),
         }
     }
 }

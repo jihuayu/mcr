@@ -2611,6 +2611,15 @@ impl VirtualFileSystem {
         Ok(())
     }
 
+    pub fn close_with_file(&mut self, fd: Fd) -> VfsResult<FileRef> {
+        let file = self.fds.close(fd)?;
+        let inode_id = file.inode().id();
+        if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
+            self.tree.inodes.remove(&inode_id);
+        }
+        Ok(file)
+    }
+
     pub fn read(&mut self, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
         self.fds.read(&self.tree, &self.proc_self, fd, buffer)
     }

@@ -1100,7 +1100,16 @@ where
     }
 
     fn sys_close(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
-        self.vfs.close(arg_i32(request, 0)).map_err(vfs_errno)?;
+        let fd = arg_i32(request, 0);
+        let socket_id = match self.vfs.socket_id_for_fd(fd) {
+            Ok(raw) => SocketId::new(raw),
+            Err(VfsError::NotSocket) => None,
+            Err(error) => return Err(vfs_errno(error)),
+        };
+        self.vfs.close_with_file(fd).map_err(vfs_errno)?;
+        if let Some(socket_id) = socket_id {
+            self.sockets.close(socket_id).map_err(net_errno)?;
+        }
         Ok(0)
     }
 
@@ -1686,6 +1695,18 @@ impl Runtime {
         })
     }
 
+    pub fn with_vfs_and_socket_transport(
+        program: GuestProgram,
+        vfs: VirtualFileSystem,
+        transport: impl HostSocketTransport + 'static,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            dispatcher: SyscallDispatcher::new(RuntimeSubsystems::with_vfs_and_socket_transport(
+                program, vfs, transport,
+            )?),
+        })
+    }
+
     pub fn with_tracer_and_vfs<T>(
         program: GuestProgram,
         vfs: VirtualFileSystem,
@@ -1697,6 +1718,23 @@ impl Runtime {
         Ok(RuntimeWithTracer {
             dispatcher: SyscallDispatcher::with_tracer(
                 RuntimeSubsystems::with_vfs(program, vfs)?,
+                tracer,
+            ),
+        })
+    }
+
+    pub fn with_tracer_vfs_and_socket_transport<T>(
+        program: GuestProgram,
+        vfs: VirtualFileSystem,
+        tracer: T,
+        transport: impl HostSocketTransport + 'static,
+    ) -> Result<RuntimeWithTracer<T>, RuntimeError>
+    where
+        T: SyscallTracer,
+    {
+        Ok(RuntimeWithTracer {
+            dispatcher: SyscallDispatcher::with_tracer(
+                RuntimeSubsystems::with_vfs_and_socket_transport(program, vfs, transport)?,
                 tracer,
             ),
         })
@@ -2142,6 +2180,27 @@ impl RuntimeSubsystems {
         })
     }
 
+    pub fn with_vfs_and_socket_transport(
+        program: GuestProgram,
+        mut vfs: VirtualFileSystem,
+        transport: impl HostSocketTransport + 'static,
+    ) -> Result<Self, RuntimeError> {
+        let tasks = GuestKernel::new(program)?;
+        let memory = GuestMemory::from_image(
+            tasks
+                .process(mcr_task::INITIAL_GUEST_PID)
+                .expect("runtime always starts with an initial process")
+                .image()
+                .memory(),
+        )?;
+        sync_proc_self(&mut vfs, &tasks);
+        Ok(Self {
+            tasks,
+            files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
+            futexes: FutexRegistry::default(),
+        })
+    }
+
     fn default_vfs() -> VirtualFileSystem {
         // Runtime::new has no rootfs argument yet. Keep the placeholder explicit and route
         // future rootfs-aware callers through Runtime::with_vfs after loading their VFS.
@@ -2368,6 +2427,7 @@ fn read_vfs_file_to_end(
 pub enum RuntimeError {
     Task(TaskError),
     Memory(GuestMemoryError),
+    Network(mcr_net::HostIoError),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -2375,6 +2435,7 @@ impl std::fmt::Display for RuntimeError {
         match self {
             Self::Task(error) => write!(formatter, "{error}"),
             Self::Memory(error) => write!(formatter, "{error:?}"),
+            Self::Network(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -2390,6 +2451,12 @@ impl From<TaskError> for RuntimeError {
 impl From<GuestMemoryError> for RuntimeError {
     fn from(value: GuestMemoryError) -> Self {
         Self::Memory(value)
+    }
+}
+
+impl From<mcr_net::HostIoError> for RuntimeError {
+    fn from(value: mcr_net::HostIoError) -> Self {
+        Self::Network(value)
     }
 }
 
@@ -2439,6 +2506,7 @@ impl SyscallTracer for RuntimeDiagnosticsTracer {
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
+    use mcr_net::SocketState;
     use mcr_sys::{
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP,
         LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR,
@@ -2496,6 +2564,55 @@ mod tests {
         );
         assert_eq!(
             dispatch(&mut runtime, Syscall::Read, [3, 0x3000, 1, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::EBADF)
+        );
+    }
+
+    #[test]
+    fn close_releases_socket_table_entry_after_vfs_fd() {
+        let transport = runtime_socket_transport();
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Close, [3, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+
+        let socket_id = SocketId::new(1).unwrap();
+        assert_eq!(
+            runtime.sockets().socket(socket_id).unwrap().state(),
+            SocketState::Closed
+        );
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Sendto, [3, 0x2000, 0, 0, 0, 0],),
             SyscallReturn::Errno(LinuxErrno::EBADF)
         );
     }
