@@ -1,5 +1,13 @@
-use std::collections::BTreeMap;
 use std::fmt;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+};
+
+use mcr_win::{
+    AddressFamily, HostError, HostErrorKind, HostShutdown, HostSocket, HostSocketOptionName,
+    HostSocketOptionValue, NetworkStack, SocketKind, SocketProtocol as HostSocketProtocol,
+};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -280,6 +288,41 @@ impl SocketAddress {
     }
 }
 
+impl From<SocketAddress> for SocketAddr {
+    fn from(value: SocketAddress) -> Self {
+        match value {
+            SocketAddress::Inet { address, port } => {
+                Self::new(IpAddr::V4(Ipv4Addr::from(address)), port)
+            }
+            SocketAddress::Inet6 {
+                address,
+                port,
+                flowinfo,
+                scope_id,
+            } => Self::V6(SocketAddrV6::new(
+                Ipv6Addr::from(address),
+                port,
+                flowinfo,
+                scope_id,
+            )),
+        }
+    }
+}
+
+impl From<SocketAddr> for SocketAddress {
+    fn from(value: SocketAddr) -> Self {
+        match value {
+            SocketAddr::V4(address) => Self::inet(address.ip().octets(), address.port()),
+            SocketAddr::V6(address) => Self::inet6(
+                address.ip().octets(),
+                address.port(),
+                address.flowinfo(),
+                address.scope_id(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShutdownFlags {
     pub read: bool,
@@ -332,6 +375,7 @@ pub struct GuestSocket {
     domain: SocketDomain,
     socket_type: SocketType,
     protocol: SocketProtocol,
+    flags: SocketCreationFlags,
     state: SocketState,
     shutdown: ShutdownFlags,
     options: SocketOptions,
@@ -345,6 +389,7 @@ impl GuestSocket {
             domain: spec.domain,
             socket_type: spec.socket_type,
             protocol: spec.protocol,
+            flags: spec.flags,
             state: SocketState::Created,
             shutdown: ShutdownFlags::default(),
             options: SocketOptions::default(),
@@ -370,6 +415,11 @@ impl GuestSocket {
     #[must_use]
     pub const fn protocol(&self) -> SocketProtocol {
         self.protocol
+    }
+
+    #[must_use]
+    pub const fn flags(&self) -> SocketCreationFlags {
+        self.flags
     }
 
     #[must_use]
@@ -399,6 +449,181 @@ impl GuestSocket {
     #[must_use]
     pub const fn last_error(&self) -> Option<LinuxErrno> {
         self.last_error
+    }
+}
+
+pub trait HostSocketTransport {
+    fn open_socket(
+        &self,
+        spec: SocketSpec,
+        options: SocketOptions,
+    ) -> Result<Box<dyn HostSocketHandle>, HostIoError>;
+}
+
+pub trait HostSocketHandle: fmt::Debug {
+    fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
+    fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
+    fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
+}
+
+#[derive(Debug)]
+pub struct WinHostSocketTransport {
+    stack: NetworkStack,
+}
+
+impl WinHostSocketTransport {
+    pub fn new() -> Result<Self, HostIoError> {
+        Ok(Self {
+            stack: NetworkStack::start().map_err(HostIoError::from)?,
+        })
+    }
+}
+
+impl HostSocketTransport for WinHostSocketTransport {
+    fn open_socket(
+        &self,
+        spec: SocketSpec,
+        options: SocketOptions,
+    ) -> Result<Box<dyn HostSocketHandle>, HostIoError> {
+        let socket = self
+            .stack
+            .open_socket(
+                address_family_from_socket_domain(spec.domain),
+                socket_kind_from_socket_type(spec.socket_type),
+                host_protocol_from_socket_protocol(spec.effective_protocol()),
+            )
+            .map_err(HostIoError::from)?;
+        apply_socket_options(&socket, options)?;
+        if spec.flags.nonblocking {
+            socket.set_nonblocking(true).map_err(HostIoError::from)?;
+        }
+        Ok(Box::new(WinHostSocketHandle { socket }))
+    }
+}
+
+#[derive(Debug)]
+struct WinHostSocketHandle {
+    socket: HostSocket,
+}
+
+impl HostSocketHandle for WinHostSocketHandle {
+    fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+        self.socket
+            .connect(SocketAddr::from(address))
+            .map_err(HostIoError::from)?;
+        self.socket
+            .peer_addr()
+            .map(SocketAddress::from)
+            .map_err(HostIoError::from)
+    }
+
+    fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
+        self.socket.send(buffer).map_err(HostIoError::from)
+    }
+
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
+        self.socket.recv(buffer).map_err(HostIoError::from)
+    }
+
+    fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError> {
+        self.socket
+            .shutdown(host_shutdown_from_how(how))
+            .map_err(HostIoError::from)
+    }
+}
+
+#[derive(Default)]
+pub struct NoopHostSocketTransport;
+
+impl HostSocketTransport for NoopHostSocketTransport {
+    fn open_socket(
+        &self,
+        _spec: SocketSpec,
+        _options: SocketOptions,
+    ) -> Result<Box<dyn HostSocketHandle>, HostIoError> {
+        Err(HostIoError::unsupported())
+    }
+}
+
+#[derive(Debug)]
+struct HostSocketEntry {
+    handle: Box<dyn HostSocketHandle>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostIoError {
+    errno: LinuxErrno,
+    reason: String,
+}
+
+impl HostIoError {
+    #[must_use]
+    pub fn new(errno: LinuxErrno, reason: impl Into<String>) -> Self {
+        Self {
+            errno,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn unsupported() -> Self {
+        Self {
+            errno: LinuxErrno::FunctionNotImplemented,
+            reason: "host socket transport is not supported".to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub const fn linux_errno(&self) -> LinuxErrno {
+        self.errno
+    }
+}
+
+impl fmt::Display for HostIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.errno, self.reason)
+    }
+}
+
+impl std::error::Error for HostIoError {}
+
+impl From<HostError> for HostIoError {
+    fn from(error: HostError) -> Self {
+        Self {
+            errno: host_error_errno(error.kind()),
+            reason: error.to_string(),
+        }
+    }
+}
+
+const fn address_family_from_socket_domain(domain: SocketDomain) -> AddressFamily {
+    match domain {
+        SocketDomain::Inet => AddressFamily::Inet,
+        SocketDomain::Inet6 => AddressFamily::Inet6,
+    }
+}
+
+const fn socket_kind_from_socket_type(socket_type: SocketType) -> SocketKind {
+    match socket_type {
+        SocketType::Stream => SocketKind::Stream,
+        SocketType::Datagram => SocketKind::Datagram,
+    }
+}
+
+const fn host_protocol_from_socket_protocol(protocol: SocketProtocol) -> HostSocketProtocol {
+    match protocol {
+        SocketProtocol::Default => HostSocketProtocol::Default,
+        SocketProtocol::Tcp => HostSocketProtocol::Tcp,
+        SocketProtocol::Udp => HostSocketProtocol::Udp,
+    }
+}
+
+const fn host_shutdown_from_how(how: ShutdownHow) -> HostShutdown {
+    match how {
+        ShutdownHow::Read => HostShutdown::Read,
+        ShutdownHow::Write => HostShutdown::Write,
+        ShutdownHow::ReadWrite => HostShutdown::Both,
     }
 }
 
@@ -463,10 +688,26 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Default)]
 pub struct GuestSocketTable {
     next_id: u64,
     sockets: BTreeMap<SocketId, GuestSocket>,
+    host_handles: BTreeMap<SocketId, HostSocketEntry>,
+    transport: Option<Box<dyn HostSocketTransport>>,
+}
+
+impl fmt::Debug for GuestSocketTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuestSocketTable")
+            .field("next_id", &self.next_id)
+            .field("sockets", &self.sockets)
+            .field(
+                "host_handles",
+                &self.host_handles.keys().collect::<Vec<_>>(),
+            )
+            .field("has_transport", &self.transport.is_some())
+            .finish()
+    }
 }
 
 impl GuestSocketTable {
@@ -475,6 +716,18 @@ impl GuestSocketTable {
         Self {
             next_id: SocketId::MIN.get(),
             sockets: BTreeMap::new(),
+            host_handles: BTreeMap::new(),
+            transport: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_transport(transport: impl HostSocketTransport + 'static) -> Self {
+        Self {
+            next_id: SocketId::MIN.get(),
+            sockets: BTreeMap::new(),
+            host_handles: BTreeMap::new(),
+            transport: Some(Box::new(transport)),
         }
     }
 
@@ -492,6 +745,20 @@ impl GuestSocketTable {
         let id = self.allocate_id()?;
         let previous = self.sockets.insert(id, GuestSocket::new(id, spec));
         debug_assert!(previous.is_none());
+        Ok(id)
+    }
+
+    pub fn create_socket_with_handle(
+        &mut self,
+        spec: SocketSpec,
+        handle: Box<dyn HostSocketHandle>,
+    ) -> Result<SocketId, SocketError> {
+        validate_socket_protocol(spec.socket_type, spec.protocol)?;
+        let id = self.allocate_id()?;
+        let previous_socket = self.sockets.insert(id, GuestSocket::new(id, spec));
+        debug_assert!(previous_socket.is_none());
+        let previous_handle = self.host_handles.insert(id, HostSocketEntry { handle });
+        debug_assert!(previous_handle.is_none());
         Ok(id)
     }
 
@@ -619,26 +886,19 @@ impl GuestSocketTable {
     }
 
     pub fn connect(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
-        let socket = self.socket_mut(id)?;
-        validate_address_domain(socket.domain, address)?;
-
-        match socket.state {
-            SocketState::Created | SocketState::Bound(_) => {
-                socket.state = SocketState::Connected(address);
-                Ok(())
-            }
-            SocketState::Connected(_) => Err(SocketError::invalid_state(
-                SocketOperation::Connect,
-                LinuxErrno::AlreadyConnected,
-                "socket is already connected",
-            )),
-            SocketState::Listening(_) => Err(SocketError::invalid_state(
-                SocketOperation::Connect,
-                LinuxErrno::InvalidArgument,
-                "listening socket cannot connect",
-            )),
-            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        {
+            let socket = self.socket(id)?;
+            validate_address_domain(socket.domain, address)?;
+            validate_connect(socket, id)?;
         }
+
+        if self.transport.is_some() || self.host_handles.contains_key(&id) {
+            let connected = self.connect_host_socket(id, address)?;
+            self.socket_mut(id)?.state = SocketState::Connected(connected);
+        } else {
+            self.socket_mut(id)?.state = SocketState::Connected(address);
+        }
+        Ok(())
     }
 
     pub fn accept_placeholder(&mut self, id: SocketId) -> Result<SocketId, SocketError> {
@@ -660,21 +920,147 @@ impl GuestSocketTable {
     }
 
     pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
-        let socket = self.socket_mut(id)?;
-        match socket.state {
-            SocketState::Connected(_) => {
-                socket.shutdown.apply(how);
-                Ok(())
+        {
+            let socket = self.socket(id)?;
+            match socket.state {
+                SocketState::Connected(_) => {}
+                SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
+                    return Err(SocketError::invalid_state(
+                        SocketOperation::Shutdown,
+                        LinuxErrno::NotConnected,
+                        "socket is not connected",
+                    ));
+                }
+                SocketState::Closed => return Err(SocketError::BadSocket { id }),
             }
-            SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
-                Err(SocketError::invalid_state(
-                    SocketOperation::Shutdown,
-                    LinuxErrno::NotConnected,
-                    "socket is not connected",
-                ))
-            }
-            SocketState::Closed => Err(SocketError::BadSocket { id }),
         }
+
+        if let Some(entry) = self.host_handles.get_mut(&id) {
+            entry.handle.shutdown(how).map_err(SocketError::from_host)?;
+        }
+
+        let socket = self.socket_mut(id)?;
+        socket.shutdown.apply(how);
+        Ok(())
+    }
+
+    pub fn send_connected(&mut self, id: SocketId, buffer: &[u8]) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_stream_io(socket, SocketOperation::Send)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::Send,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::Send)?;
+        entry.handle.send(buffer).map_err(SocketError::from_host)
+    }
+
+    pub fn recv_connected(
+        &mut self,
+        id: SocketId,
+        buffer: &mut [u8],
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_stream_io(socket, SocketOperation::Recv)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::Recv,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::Recv)?;
+        entry.handle.recv(buffer).map_err(SocketError::from_host)
+    }
+
+    pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {
+        let socket = self.socket(id)?;
+        validate_connected_stream_io(socket, SocketOperation::Send)
+    }
+
+    pub fn unsupported_socket_io(operation: SocketOperation) -> SocketError {
+        SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "socket I/O shape is not implemented",
+        )
+    }
+
+    pub fn unsupported_datagram_io(operation: SocketOperation) -> SocketError {
+        SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "addressed datagram socket I/O is not implemented",
+        )
+    }
+
+    pub fn unsupported_socket_flags(operation: SocketOperation) -> SocketError {
+        SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "socket message flags are not implemented",
+        )
+    }
+
+    fn host_entry_mut(
+        &mut self,
+        id: SocketId,
+        operation: SocketOperation,
+    ) -> Result<&mut HostSocketEntry, SocketError> {
+        self.host_handles.get_mut(&id).ok_or_else(|| {
+            SocketError::unsupported(
+                operation,
+                LinuxErrno::FunctionNotImplemented,
+                "socket has no host transport handle",
+            )
+        })
+    }
+
+    fn connect_host_socket(
+        &mut self,
+        id: SocketId,
+        address: SocketAddress,
+    ) -> Result<SocketAddress, SocketError> {
+        if !self.host_handles.contains_key(&id) {
+            let spec = self.socket_spec(id)?;
+            let options = self.socket(id)?.options();
+            let transport = self.transport.as_ref().ok_or_else(|| {
+                SocketError::unsupported(
+                    SocketOperation::Connect,
+                    LinuxErrno::FunctionNotImplemented,
+                    "host socket transport is not configured",
+                )
+            })?;
+            let handle = transport
+                .open_socket(spec, options)
+                .map_err(SocketError::from_host)?;
+            self.host_handles.insert(id, HostSocketEntry { handle });
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::Connect)?;
+        entry
+            .handle
+            .connect(address)
+            .map_err(SocketError::from_host)
+    }
+
+    fn socket_spec(&self, id: SocketId) -> Result<SocketSpec, SocketError> {
+        let socket = self.socket(id)?;
+        SocketSpec::with_flags(
+            socket.domain,
+            socket.socket_type,
+            socket.protocol,
+            socket.flags,
+        )
     }
 
     pub fn close(&mut self, id: SocketId) -> Result<(), SocketError> {
@@ -690,6 +1076,7 @@ impl GuestSocketTable {
                     read: true,
                     write: true,
                 };
+                self.host_handles.remove(&id);
                 Ok(())
             }
         }
@@ -728,6 +1115,10 @@ pub enum SocketOperation {
     CreateSocket,
     GetSocketOption,
     Listen,
+    Recv,
+    RecvMsg,
+    Send,
+    SendMsg,
     SetSocketOption,
     Shutdown,
 }
@@ -736,6 +1127,10 @@ pub enum SocketOperation {
 pub enum LinuxErrno {
     AlreadyConnected,
     BadFileDescriptor,
+    BrokenPipe,
+    ConnectionRefused,
+    ConnectionReset,
+    FunctionNotImplemented,
     InvalidArgument,
     NotConnected,
     OperationWouldBlock,
@@ -744,7 +1139,9 @@ pub enum LinuxErrno {
     ProtocolNotAvailable,
     ProtocolNotSupported,
     ProtocolWrongTypeForSocket,
+    Shutdown,
     SocketTypeNotSupported,
+    TimedOut,
 }
 
 impl LinuxErrno {
@@ -753,6 +1150,10 @@ impl LinuxErrno {
         match self {
             Self::AlreadyConnected => 106,
             Self::BadFileDescriptor => 9,
+            Self::BrokenPipe => 32,
+            Self::ConnectionRefused => 111,
+            Self::ConnectionReset => 104,
+            Self::FunctionNotImplemented => 38,
             Self::InvalidArgument => 22,
             Self::OperationNotSupported => 95,
             Self::NotConnected => 107,
@@ -762,6 +1163,8 @@ impl LinuxErrno {
             Self::ProtocolNotSupported => 93,
             Self::SocketTypeNotSupported => 94,
             Self::AddressFamilyNotSupported => 97,
+            Self::Shutdown => 108,
+            Self::TimedOut => 110,
         }
     }
 }
@@ -787,6 +1190,10 @@ pub enum SocketError {
         operation: SocketOperation,
         errno: LinuxErrno,
         reason: &'static str,
+    },
+    HostIo {
+        errno: LinuxErrno,
+        reason: String,
     },
     BadSocket {
         id: SocketId,
@@ -826,13 +1233,21 @@ impl SocketError {
         }
     }
 
+    fn from_host(error: HostIoError) -> Self {
+        Self::HostIo {
+            errno: error.linux_errno(),
+            reason: error.to_string(),
+        }
+    }
+
     #[must_use]
     pub const fn linux_errno(&self) -> LinuxErrno {
         match self {
             Self::InvalidInput { errno, .. }
             | Self::Unsupported { errno, .. }
             | Self::InvalidState { errno, .. }
-            | Self::WouldBlock { errno, .. } => *errno,
+            | Self::WouldBlock { errno, .. }
+            | Self::HostIo { errno, .. } => *errno,
             Self::BadSocket { .. } => LinuxErrno::BadFileDescriptor,
         }
     }
@@ -853,6 +1268,7 @@ impl fmt::Display for SocketError {
             Self::WouldBlock {
                 operation, reason, ..
             } => write!(f, "{operation:?}: would block: {reason}"),
+            Self::HostIo { reason, .. } => write!(f, "host socket I/O failed: {reason}"),
             Self::BadSocket { id } => write!(f, "bad socket id {id}"),
         }
     }
@@ -884,6 +1300,100 @@ fn validate_socket_protocol(
                 "socket protocol does not match socket type",
             ))
         }
+    }
+}
+
+fn validate_connect(socket: &GuestSocket, id: SocketId) -> Result<(), SocketError> {
+    match socket.state {
+        SocketState::Created | SocketState::Bound(_) => Ok(()),
+        SocketState::Connected(_) => Err(SocketError::invalid_state(
+            SocketOperation::Connect,
+            LinuxErrno::AlreadyConnected,
+            "socket is already connected",
+        )),
+        SocketState::Listening(_) => Err(SocketError::invalid_state(
+            SocketOperation::Connect,
+            LinuxErrno::InvalidArgument,
+            "listening socket cannot connect",
+        )),
+        SocketState::Closed => Err(SocketError::BadSocket { id }),
+    }
+}
+
+fn validate_connected_stream_io(
+    socket: &GuestSocket,
+    operation: SocketOperation,
+) -> Result<(), SocketError> {
+    if socket.socket_type != SocketType::Stream
+        || socket.effective_protocol() != SocketProtocol::Tcp
+    {
+        return Err(SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "only connected TCP stream socket I/O is implemented",
+        ));
+    }
+
+    match socket.state {
+        SocketState::Connected(_) => Ok(()),
+        SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
+            Err(SocketError::invalid_state(
+                operation,
+                LinuxErrno::NotConnected,
+                "socket is not connected",
+            ))
+        }
+        SocketState::Closed => Err(SocketError::BadSocket { id: socket.id }),
+    }
+}
+
+fn apply_socket_options(socket: &HostSocket, options: SocketOptions) -> Result<(), HostIoError> {
+    socket
+        .set_option(
+            HostSocketOptionName::ReuseAddress,
+            HostSocketOptionValue::Bool(options.reuse_addr),
+        )
+        .map_err(HostIoError::from)?;
+    socket
+        .set_option(
+            HostSocketOptionName::KeepAlive,
+            HostSocketOptionValue::Bool(options.keep_alive),
+        )
+        .map_err(HostIoError::from)?;
+    socket
+        .set_option(
+            HostSocketOptionName::SendBufferSize,
+            HostSocketOptionValue::Int(options.send_buffer_size as i32),
+        )
+        .map_err(HostIoError::from)?;
+    socket
+        .set_option(
+            HostSocketOptionName::ReceiveBufferSize,
+            HostSocketOptionValue::Int(options.receive_buffer_size as i32),
+        )
+        .map_err(HostIoError::from)?;
+    socket
+        .set_option(
+            HostSocketOptionName::TcpNoDelay,
+            HostSocketOptionValue::Bool(options.tcp_no_delay),
+        )
+        .map_err(HostIoError::from)
+}
+
+const fn host_error_errno(kind: HostErrorKind) -> LinuxErrno {
+    match kind {
+        HostErrorKind::InvalidInput => LinuxErrno::InvalidArgument,
+        HostErrorKind::Interrupted | HostErrorKind::WouldBlock => LinuxErrno::OperationWouldBlock,
+        HostErrorKind::TimedOut => LinuxErrno::TimedOut,
+        HostErrorKind::BrokenPipe => LinuxErrno::BrokenPipe,
+        HostErrorKind::Unsupported => LinuxErrno::FunctionNotImplemented,
+        HostErrorKind::Unavailable => LinuxErrno::ConnectionRefused,
+        HostErrorKind::AccessDenied
+        | HostErrorKind::NotFound
+        | HostErrorKind::AlreadyExists
+        | HostErrorKind::OutOfMemory
+        | HostErrorKind::Poisoned
+        | HostErrorKind::Other => LinuxErrno::ConnectionReset,
     }
 }
 
@@ -925,6 +1435,56 @@ fn validate_address_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct FakeHostSocketHandle {
+        sent: Vec<u8>,
+        incoming: Vec<u8>,
+        connected: Option<SocketAddress>,
+        fail_send: Option<HostIoError>,
+    }
+
+    impl FakeHostSocketHandle {
+        fn with_incoming(bytes: &[u8]) -> Self {
+            Self {
+                incoming: bytes.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn with_send_error(error: HostIoError) -> Self {
+            Self {
+                fail_send: Some(error),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl HostSocketHandle for FakeHostSocketHandle {
+        fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+            self.connected = Some(address);
+            Ok(address)
+        }
+
+        fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
+            if let Some(error) = &self.fail_send {
+                return Err(error.clone());
+            }
+            self.sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
+            let count = buffer.len().min(self.incoming.len());
+            buffer[..count].copy_from_slice(&self.incoming[..count]);
+            self.incoming.drain(..count);
+            Ok(count)
+        }
+
+        fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn package_name_is_stable() {
@@ -1225,6 +1785,64 @@ mod tests {
         assert_eq!(
             ShutdownHow::from_linux(LINUX_SHUT_RDWR).expect("shutdown mode"),
             ShutdownHow::ReadWrite
+        );
+    }
+
+    #[test]
+    fn connected_tcp_socket_handle_sends_and_receives_bytes() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_incoming(b"pong")),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.connect(stream, peer).expect("connect handle");
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected(peer)
+        );
+        assert_eq!(
+            table
+                .send_connected(stream, b"ping")
+                .expect("send connected"),
+            4
+        );
+
+        let mut buffer = [0; 8];
+        let count = table
+            .recv_connected(stream, &mut buffer)
+            .expect("recv connected");
+        assert_eq!(count, 4);
+        assert_eq!(&buffer[..count], b"pong");
+    }
+
+    #[test]
+    fn connected_tcp_socket_handle_maps_host_failure() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_send_error(HostIoError::new(
+                    LinuxErrno::BrokenPipe,
+                    "send failed",
+                ))),
+            )
+            .expect("socket with handle");
+        table
+            .connect(stream, SocketAddress::inet([127, 0, 0, 1], 8080))
+            .expect("connect handle");
+
+        assert_eq!(
+            table
+                .send_connected(stream, b"ping")
+                .expect_err("host send failure")
+                .linux_errno(),
+            LinuxErrno::BrokenPipe
         );
     }
 
