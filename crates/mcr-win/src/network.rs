@@ -232,6 +232,9 @@ fn open_socket_platform(
 
 #[cfg(windows)]
 fn poll_platform(entries: &mut [SocketPoll<'_>], timeout: Option<Duration>) -> HostResult<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
     if entries.len() > u32::MAX as usize {
         return Err(HostError::invalid_input(HostOperation::PollSockets));
     }
