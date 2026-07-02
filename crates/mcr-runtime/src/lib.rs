@@ -18,7 +18,7 @@ pub use memory::{
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
-use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore, TrampolineCore};
+use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore};
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
     SocketOptionName, SocketSpec,
@@ -2292,20 +2292,22 @@ where
     }
 
     let before_rip = gpr.rip();
-    let memory = dispatcher
-        .subsystems()
-        .memory_for_process(pid)
-        .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-    let block = read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?;
-    let mut registers = registers_from_gpr(gpr);
-    let mut trampoline =
-        TrampolineCore::new(pid, tid, |context| dispatcher.dispatch(context).encoded_rax);
-
-    SameIsaExecutionCore::new().execute_until_syscall(
-        GuestBlock::new(&block, before_rip),
-        &mut registers,
-        &mut trampoline,
-    )?;
+    let block = {
+        let memory = dispatcher
+            .subsystems()
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
+    };
+    let trap = SameIsaExecutionCore::new()
+        .execute_to_syscall_trap(GuestBlock::new(&block, before_rip), registers_from_gpr(gpr))?;
+    let dispatch_result = dispatcher.dispatch(GuestContext::new(
+        pid,
+        tid,
+        trap.registers().syscall_registers(),
+    ));
+    let mut registers = trap.registers();
+    registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
 
     let task = dispatcher
         .subsystems_mut()

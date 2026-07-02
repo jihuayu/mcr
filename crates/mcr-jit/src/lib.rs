@@ -266,6 +266,53 @@ impl GuestRegisters {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyscallTrap {
+    decoded: DecodedBlock,
+    site: SyscallSite,
+    registers: GuestRegisters,
+}
+
+impl SyscallTrap {
+    fn new(decoded: DecodedBlock, site: SyscallSite, registers: GuestRegisters) -> Self {
+        Self {
+            decoded,
+            site,
+            registers,
+        }
+    }
+
+    #[must_use]
+    pub const fn decoded(&self) -> &DecodedBlock {
+        &self.decoded
+    }
+
+    #[must_use]
+    pub const fn site(&self) -> SyscallSite {
+        self.site
+    }
+
+    #[must_use]
+    pub const fn registers(&self) -> GuestRegisters {
+        self.registers
+    }
+
+    #[must_use]
+    pub fn into_decoded(self) -> DecodedBlock {
+        self.decoded
+    }
+
+    #[must_use]
+    pub fn into_registers(self) -> GuestRegisters {
+        self.registers
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (DecodedBlock, SyscallSite, GuestRegisters) {
+        (self.decoded, self.site, self.registers)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrampolineResult {
     pub encoded_rax: u64,
@@ -420,10 +467,23 @@ impl SameIsaExecutionCore {
     where
         T: GuestSyscallDispatcher,
     {
+        let trap = self.execute_to_syscall_trap(block, *registers)?;
+        let mut trapped_registers = trap.registers();
+        trampoline.enter_syscall(&mut trapped_registers, trap.site());
+        *registers = trapped_registers;
+        Ok(trap.into_decoded())
+    }
+
+    pub fn execute_to_syscall_trap(
+        &self,
+        block: GuestBlock<'_>,
+        registers: GuestRegisters,
+    ) -> Result<SyscallTrap, ExecutionError> {
         const MAX_CONTROL_FLOW_STEPS: usize = 32;
 
+        let mut registers = registers;
         let mut current_rip = block.rip();
-        let mut flags = GuestFlags::from_registers(registers);
+        let mut flags = GuestFlags::from_registers(&registers);
         for _ in 0..MAX_CONTROL_FLOW_STEPS {
             let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
             let syscall_site = decoded.syscall_site();
@@ -439,7 +499,7 @@ impl SameIsaExecutionCore {
                 }
                 execute_simple_instruction(
                     block,
-                    registers,
+                    &mut registers,
                     &mut flags,
                     instruction.rip,
                     instruction.len,
@@ -448,8 +508,7 @@ impl SameIsaExecutionCore {
 
             if let Some(site) = decoded.syscall_site() {
                 registers.rip = site.rip;
-                trampoline.enter_syscall(registers, site);
-                return Ok(decoded);
+                return Ok(SyscallTrap::new(decoded, site, registers));
             }
 
             if let Some(target) = control_flow_target(block, &decoded, flags)? {
@@ -1177,6 +1236,64 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x410009);
+    }
+
+    #[test]
+    fn execution_core_returns_syscall_trap_without_dispatching() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax,1
+                0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00, // mov rdi,2
+                0x48, 0xc7, 0xc6, 0x34, 0x12, 0x00, 0x00, // mov rsi,0x1234
+                0x48, 0xc7, 0xc2, 0x05, 0x00, 0x00, 0x00, // mov rdx,5
+                0x0f, 0x05, // syscall
+            ],
+            0x411000,
+        );
+        let registers = GuestRegisters {
+            rax: Syscall::Getpid.number().raw(),
+            rdi: 0x10,
+            rsi: 0x20,
+            rdx: 0x30,
+            r10: 0x40,
+            r8: 0x50,
+            r9: 0x60,
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut dispatcher_called = false;
+
+        let trap = {
+            let _trampoline = TrampolineCore::new(42, 43, |_: mcr_sys::GuestContext| {
+                dispatcher_called = true;
+                SyscallReturn::success(4242).encode_u64()
+            });
+            SameIsaExecutionCore::new()
+                .execute_to_syscall_trap(block, registers)
+                .expect("execute to syscall trap")
+        };
+
+        assert!(!dispatcher_called);
+        assert_eq!(
+            trap.site(),
+            super::SyscallSite {
+                rip: 0x41101c,
+                next_rip: 0x41101e,
+            }
+        );
+        assert_eq!(trap.decoded().syscall_site(), Some(trap.site()));
+        assert_eq!(
+            trap.registers().syscall_registers().args().raw(),
+            [2, 0x1234, 5, 0x40, 0x50, 0x60]
+        );
+        assert_eq!(
+            trap.registers().syscall_registers().rax,
+            Syscall::Write.number().raw()
+        );
+        assert_eq!(trap.registers().rip, trap.site().rip);
+        assert_eq!(registers.rax, Syscall::Getpid.number().raw());
+        assert_eq!(registers.rip, block.rip());
     }
 
     #[test]
