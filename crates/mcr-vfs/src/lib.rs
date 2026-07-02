@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -68,6 +68,7 @@ pub const X_OK: u32 = 1;
 const FIRST_USER_FD: Fd = 3;
 const FIRST_PIPE_INODE_ID: InodeId = 1 << 62;
 const DEFAULT_PIPE_CAPACITY: usize = 65_536;
+const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
@@ -76,6 +77,8 @@ const SYMLINK_LIMIT: usize = 40;
 pub enum VfsError {
     AlreadyExists,
     BadFd,
+    BrokenPipe,
+    Busy,
     InvalidPath,
     IsDirectory,
     Loop,
@@ -84,6 +87,7 @@ pub enum VfsError {
     NotEmpty,
     NoSpace,
     NotSeekable,
+    NotTerminal,
     NotDirectory,
     NotPermitted,
     PermissionDenied,
@@ -95,6 +99,8 @@ impl VfsError {
         match self {
             Self::AlreadyExists => 17,
             Self::BadFd => 9,
+            Self::BrokenPipe => 32,
+            Self::Busy => 16,
             Self::InvalidPath => 22,
             Self::IsDirectory => 21,
             Self::Loop => 40,
@@ -103,6 +109,7 @@ impl VfsError {
             Self::NotEmpty => 39,
             Self::NoSpace => 28,
             Self::NotSeekable => 29,
+            Self::NotTerminal => 25,
             Self::NotDirectory => 20,
             Self::NotPermitted => 1,
             Self::PermissionDenied => 13,
@@ -116,6 +123,8 @@ impl fmt::Display for VfsError {
         let message = match self {
             Self::AlreadyExists => "file exists",
             Self::BadFd => "bad file descriptor",
+            Self::BrokenPipe => "broken pipe",
+            Self::Busy => "device or resource busy",
             Self::InvalidPath => "invalid path",
             Self::IsDirectory => "is a directory",
             Self::Loop => "too many symbolic links",
@@ -124,6 +133,7 @@ impl fmt::Display for VfsError {
             Self::NotEmpty => "directory not empty",
             Self::NoSpace => "no space left on device",
             Self::NotSeekable => "illegal seek",
+            Self::NotTerminal => "inappropriate ioctl for device",
             Self::NotDirectory => "not a directory",
             Self::NotPermitted => "operation not permitted",
             Self::PermissionDenied => "permission denied",
@@ -1089,7 +1099,7 @@ impl DevNode {
 #[derive(Clone, Debug)]
 pub struct PipeNode {
     id: u64,
-    state: Arc<Mutex<PipeState>>,
+    inner: Arc<PipeInner>,
 }
 
 impl PartialEq for PipeNode {
@@ -1104,7 +1114,7 @@ impl PipeNode {
     pub fn new(id: u64) -> Self {
         Self {
             id,
-            state: Arc::new(Mutex::new(PipeState::new(DEFAULT_PIPE_CAPACITY))),
+            inner: Arc::new(PipeInner::new(DEFAULT_PIPE_CAPACITY)),
         }
     }
 
@@ -1113,7 +1123,53 @@ impl PipeNode {
     }
 
     fn state(&self) -> MutexGuard<'_, PipeState> {
-        self.state.lock().expect("pipe mutex poisoned")
+        self.inner.state.lock().expect("pipe mutex poisoned")
+    }
+
+    fn wait_readable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
+        self.inner
+            .readable
+            .wait(state)
+            .expect("pipe mutex poisoned while waiting for readable state")
+    }
+
+    fn wait_writable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
+        self.inner
+            .writable
+            .wait(state)
+            .expect("pipe mutex poisoned while waiting for writable state")
+    }
+
+    fn notify_readable(&self) {
+        self.inner.readable.notify_all();
+    }
+
+    fn notify_writable(&self) {
+        self.inner.writable.notify_all();
+    }
+}
+
+impl Drop for PipeNode {
+    fn drop(&mut self) {
+        self.inner.readable.notify_all();
+        self.inner.writable.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct PipeInner {
+    state: Mutex<PipeState>,
+    readable: Condvar,
+    writable: Condvar,
+}
+
+impl PipeInner {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(PipeState::new(capacity)),
+            readable: Condvar::new(),
+            writable: Condvar::new(),
+        }
     }
 }
 
@@ -1121,6 +1177,8 @@ impl PipeNode {
 struct PipeState {
     buffer: VecDeque<u8>,
     capacity: usize,
+    readers: usize,
+    writers: usize,
 }
 
 impl PipeState {
@@ -1128,6 +1186,8 @@ impl PipeState {
         Self {
             buffer: VecDeque::new(),
             capacity,
+            readers: 0,
+            writers: 0,
         }
     }
 
@@ -1146,6 +1206,15 @@ impl PipeState {
         count
     }
 
+    fn set_capacity(&mut self, capacity: usize) -> VfsResult<usize> {
+        let capacity = capacity.max(MIN_PIPE_CAPACITY);
+        if capacity < self.buffer.len() {
+            return Err(VfsError::Busy);
+        }
+        self.capacity = capacity;
+        Ok(self.capacity)
+    }
+
     fn write(&mut self, buffer: &[u8]) -> VfsResult<usize> {
         let available = self.capacity.saturating_sub(self.buffer.len());
         if available == 0 && !buffer.is_empty() {
@@ -1155,6 +1224,22 @@ impl PipeState {
         let count = available.min(buffer.len());
         self.buffer.extend(buffer[..count].iter().copied());
         Ok(count)
+    }
+
+    fn register_endpoint(&mut self, kind: FileKind) {
+        match kind {
+            FileKind::PipeRead => self.readers += 1,
+            FileKind::PipeWrite => self.writers += 1,
+            _ => {}
+        }
+    }
+
+    fn unregister_endpoint(&mut self, kind: FileKind) {
+        match kind {
+            FileKind::PipeRead => self.readers = self.readers.saturating_sub(1),
+            FileKind::PipeWrite => self.writers = self.writers.saturating_sub(1),
+            _ => {}
+        }
     }
 }
 
@@ -1318,13 +1403,10 @@ impl StdioKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FdEntry {
     file: FileRef,
-    cloexec: bool,
-    offset: u64,
-    flags: OpenFlags,
-    dir_cursor: usize,
+    description: Arc<Mutex<FdDescription>>,
     path: Option<GuestPath>,
 }
 
@@ -1337,20 +1419,16 @@ impl FdEntry {
         &mut self.file
     }
 
-    pub fn cloexec(&self) -> bool {
-        self.cloexec
-    }
-
     pub fn offset(&self) -> u64 {
-        self.offset
+        self.description().offset
     }
 
     pub fn flags(&self) -> OpenFlags {
-        self.flags
+        self.description().flags
     }
 
     pub fn set_flags(&mut self, flags: OpenFlags) {
-        self.flags = flags;
+        self.description().flags = flags;
     }
 
     pub fn path(&self) -> Option<&GuestPath> {
@@ -1359,6 +1437,12 @@ impl FdEntry {
 
     fn inode_id(&self) -> InodeId {
         self.file.inode().id()
+    }
+
+    fn description(&self) -> MutexGuard<'_, FdDescription> {
+        self.description
+            .lock()
+            .expect("fd description mutex poisoned")
     }
 
     fn rebind_path(&mut self, old_path: &GuestPath, new_path: &GuestPath) {
@@ -1372,11 +1456,46 @@ impl FdEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FdDescription {
+    offset: u64,
+    flags: OpenFlags,
+    dir_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoctlReply {
+    None,
+    U32(u32),
+}
+
+#[derive(Debug)]
 pub struct FdTable {
     entries: BTreeMap<Fd, FdEntry>,
     cloexec: HashSet<Fd>,
     next_pipe_id: u64,
+}
+
+impl Clone for FdTable {
+    fn clone(&self) -> Self {
+        let entries = self.entries.clone();
+        for entry in entries.values() {
+            register_fd_endpoint(entry.file());
+        }
+        Self {
+            entries,
+            cloexec: self.cloexec.clone(),
+            next_pipe_id: self.next_pipe_id,
+        }
+    }
+}
+
+impl Drop for FdTable {
+    fn drop(&mut self) {
+        for entry in self.entries.values() {
+            unregister_fd_endpoint(entry.file());
+        }
+    }
 }
 
 impl FdTable {
@@ -1486,19 +1605,48 @@ impl FdTable {
             return Err(VfsError::BadFd);
         }
 
+        register_fd_endpoint(&file);
         self.entries.insert(
             fd,
             FdEntry {
                 file,
-                cloexec,
-                offset: 0,
-                flags,
-                dir_cursor: 0,
+                description: Arc::new(Mutex::new(FdDescription {
+                    offset: 0,
+                    flags,
+                    dir_cursor: 0,
+                })),
                 path,
             },
         );
         self.set_cloexec(fd, cloexec)?;
         Ok(fd)
+    }
+
+    pub fn dup(&mut self, oldfd: Fd, min_fd: Fd, cloexec: bool) -> VfsResult<Fd> {
+        if min_fd < 0 {
+            return Err(VfsError::BadFd);
+        }
+        let entry = self.get(oldfd)?.clone();
+        let newfd = self.next_fd_from(min_fd)?;
+        register_fd_endpoint(entry.file());
+        self.entries.insert(newfd, entry);
+        self.set_cloexec(newfd, cloexec)?;
+        Ok(newfd)
+    }
+
+    pub fn dup2(&mut self, oldfd: Fd, newfd: Fd, cloexec: bool) -> VfsResult<Fd> {
+        if newfd < 0 {
+            return Err(VfsError::BadFd);
+        }
+        let entry = self.get(oldfd)?.clone();
+        if oldfd == newfd {
+            return Ok(newfd);
+        }
+        let _ = self.close(newfd);
+        register_fd_endpoint(entry.file());
+        self.entries.insert(newfd, entry);
+        self.set_cloexec(newfd, cloexec)?;
+        Ok(newfd)
     }
 
     pub fn get(&self, fd: Fd) -> VfsResult<&FdEntry> {
@@ -1512,7 +1660,59 @@ impl FdTable {
     pub fn close(&mut self, fd: Fd) -> VfsResult<FileRef> {
         let entry = self.entries.remove(&fd).ok_or(VfsError::BadFd)?;
         self.cloexec.remove(&fd);
+        unregister_fd_endpoint(&entry.file);
         Ok(entry.file)
+    }
+
+    pub fn set_fd_flags(&mut self, fd: Fd, flags: u32) -> VfsResult<()> {
+        self.set_cloexec(fd, flags & FD_CLOEXEC != 0)
+    }
+
+    pub fn fd_flags(&self, fd: Fd) -> VfsResult<u32> {
+        Ok(if self.cloexec(fd)? { FD_CLOEXEC } else { 0 })
+    }
+
+    pub fn status_flags(&self, fd: Fd) -> VfsResult<u32> {
+        Ok(self.get(fd)?.flags().raw())
+    }
+
+    pub fn set_status_flags(&mut self, fd: Fd, flags: u32) -> VfsResult<()> {
+        let entry = self.get_mut(fd)?;
+        entry.set_flags(entry.flags().with_status_flags(flags));
+        Ok(())
+    }
+
+    pub fn pipe_capacity(&self, fd: Fd) -> VfsResult<usize> {
+        Ok(pipe_node(self.get(fd)?.file())?.state().capacity)
+    }
+
+    pub fn set_pipe_capacity(&mut self, fd: Fd, capacity: usize) -> VfsResult<usize> {
+        let pipe = pipe_node(self.get(fd)?.file())?;
+        let new_capacity = pipe.state().set_capacity(capacity)?;
+        pipe.notify_writable();
+        Ok(new_capacity)
+    }
+
+    pub fn available_bytes(&self, tree: &PathTree, fd: Fd) -> VfsResult<usize> {
+        let entry = self.get(fd)?;
+        match entry.file().kind() {
+            FileKind::Regular | FileKind::Symlink => {
+                let attr = tree
+                    .lookup_inode(entry.inode_id())
+                    .ok_or(VfsError::NoEntry)?
+                    .attr();
+                let offset = entry.offset();
+                if attr.size <= offset {
+                    return Ok(0);
+                }
+                usize::try_from(attr.size - offset).map_err(|_| VfsError::InvalidPath)
+            }
+            FileKind::Directory => Ok(0),
+            FileKind::PipeRead | FileKind::PipeWrite => {
+                Ok(pipe_node(entry.file())?.state().available())
+            }
+            FileKind::Stdio(_) => Ok(0),
+        }
     }
 
     fn open_count(&self, inode_id: InodeId) -> usize {
@@ -1538,15 +1738,11 @@ impl FdTable {
         } else {
             self.cloexec.remove(&fd);
         }
-
-        if let Some(entry) = self.entries.get_mut(&fd) {
-            entry.cloexec = cloexec;
-        }
         Ok(())
     }
 
     pub fn cloexec(&self, fd: Fd) -> VfsResult<bool> {
-        self.get(fd).map(|entry| entry.cloexec)
+        self.get(fd).map(|_| self.cloexec.contains(&fd))
     }
 
     pub fn close_on_exec(&mut self) {
@@ -1558,7 +1754,7 @@ impl FdTable {
 
     pub fn read(&mut self, tree: &PathTree, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
         let entry = self.get_mut(fd)?;
-        if !entry.flags.can_read() {
+        if !entry.flags().can_read() {
             return Err(VfsError::BadFd);
         }
 
@@ -1570,21 +1766,16 @@ impl FdTable {
                 if node.attr().is_directory() {
                     return Err(VfsError::IsDirectory);
                 }
-                let offset = usize::try_from(entry.offset).map_err(|_| VfsError::InvalidPath)?;
+                let mut description = entry.description();
+                let offset =
+                    usize::try_from(description.offset).map_err(|_| VfsError::InvalidPath)?;
                 let available = node.data().get(offset..).unwrap_or(&[]);
                 let count = available.len().min(buffer.len());
                 buffer[..count].copy_from_slice(&available[..count]);
-                entry.offset += count as u64;
+                description.offset += count as u64;
                 Ok(count)
             }
-            FileKind::PipeRead => {
-                let pipe = pipe_node(&entry.file)?;
-                let mut state = pipe.state();
-                if state.available() == 0 && entry.flags.nonblock() && !buffer.is_empty() {
-                    return Err(VfsError::WouldBlock);
-                }
-                Ok(state.read(buffer))
-            }
+            FileKind::PipeRead => pipe_read(entry, buffer),
             FileKind::PipeWrite => Err(VfsError::BadFd),
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Stdio(StdioKind::Stdin) => Ok(0),
@@ -1608,7 +1799,7 @@ impl FdTable {
 
     pub fn write(&mut self, tree: &mut PathTree, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
         let entry = self.get_mut(fd)?;
-        if !entry.flags.can_write() {
+        if !entry.flags().can_write() {
             return Err(VfsError::BadFd);
         }
 
@@ -1616,22 +1807,20 @@ impl FdTable {
             FileKind::Regular => {
                 let inode_id = entry.inode_id();
                 let node = tree.lookup_inode_mut(inode_id).ok_or(VfsError::NoEntry)?;
-                let offset = if entry.flags.append() {
+                let mut description = entry.description();
+                let offset = if description.flags.append() {
                     node.attr().size
                 } else {
-                    entry.offset
+                    description.offset
                 };
                 let count = node.write_at(offset, buffer)?;
-                entry.offset = offset + count as u64;
+                description.offset = offset + count as u64;
                 Ok(count)
             }
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Symlink => Err(VfsError::InvalidPath),
             FileKind::PipeRead => Err(VfsError::BadFd),
-            FileKind::PipeWrite => {
-                let pipe = pipe_node(&entry.file)?;
-                pipe.state().write(buffer)
-            }
+            FileKind::PipeWrite => pipe_write(entry, buffer),
             FileKind::Stdio(StdioKind::Stdout | StdioKind::Stderr) => Ok(buffer.len()),
             FileKind::Stdio(StdioKind::Stdin) => Err(VfsError::BadFd),
         }
@@ -1665,18 +1854,19 @@ impl FdTable {
         };
         let base = match whence {
             SeekWhence::Set => 0,
-            SeekWhence::Cur => i128::from(entry.offset),
+            SeekWhence::Cur => i128::from(entry.offset()),
             SeekWhence::End => i128::from(size),
         };
         let next = base + i128::from(offset);
         if next < 0 || next > i128::from(u64::MAX) {
             return Err(VfsError::InvalidPath);
         }
-        entry.offset = next as u64;
+        let mut description = entry.description();
+        description.offset = next as u64;
         if matches!(entry.file.kind, FileKind::Directory) {
-            entry.dir_cursor = usize::try_from(entry.offset).unwrap_or(usize::MAX);
+            description.dir_cursor = usize::try_from(description.offset).unwrap_or(usize::MAX);
         }
-        Ok(entry.offset)
+        Ok(description.offset)
     }
 
     pub fn getdents64(
@@ -1723,7 +1913,11 @@ impl FdTable {
 
         let mut returned = Vec::new();
         let mut used = 0usize;
-        for item in entries.into_iter().skip(entry.dir_cursor) {
+        let description_arc = entry.description.clone();
+        let mut description = description_arc
+            .lock()
+            .expect("fd description mutex poisoned");
+        for item in entries.into_iter().skip(description.dir_cursor) {
             let record_len = item.record_len();
             if used + record_len > max_bytes {
                 if returned.is_empty() {
@@ -1733,8 +1927,8 @@ impl FdTable {
             }
             used += record_len;
             returned.push(item);
-            entry.dir_cursor += 1;
-            entry.offset = entry.dir_cursor as u64;
+            description.dir_cursor += 1;
+            description.offset = description.dir_cursor as u64;
         }
         Ok(returned)
     }
@@ -1766,7 +1960,7 @@ impl Default for FdTable {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VirtualFileSystem {
     rootfs: Rootfs,
     tree: PathTree,
@@ -1908,7 +2102,7 @@ impl VirtualFileSystem {
     pub fn close(&mut self, fd: Fd) -> VfsResult<()> {
         let file = self.fds.close(fd)?;
         let inode_id = file.inode().id();
-        if self.tree.link_count(inode_id) == 0 {
+        if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
             self.tree.inodes.remove(&inode_id);
         }
         Ok(())
@@ -1933,6 +2127,70 @@ impl VirtualFileSystem {
         }
 
         Ok(anonymous_attr(entry.file()))
+    }
+
+    pub fn pipe(&mut self, flags: OpenFlags) -> VfsResult<[Fd; 2]> {
+        self.fds.pipe(flags)
+    }
+
+    pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {
+        self.fds.dup(oldfd, FIRST_USER_FD, false)
+    }
+
+    pub fn dup2(&mut self, oldfd: Fd, newfd: Fd) -> VfsResult<Fd> {
+        self.fds.dup2(oldfd, newfd, false)
+    }
+
+    pub fn dup3(&mut self, oldfd: Fd, newfd: Fd, flags: OpenFlags) -> VfsResult<Fd> {
+        if flags.raw() & !O_CLOEXEC != 0 || oldfd == newfd {
+            return Err(VfsError::InvalidPath);
+        }
+        self.fds.dup2(oldfd, newfd, flags.cloexec())
+    }
+
+    pub fn fcntl(&mut self, fd: Fd, cmd: u32, arg: u64) -> VfsResult<u64> {
+        match cmd {
+            F_DUPFD => {
+                let min_fd = i32::try_from(arg).map_err(|_| VfsError::BadFd)?;
+                Ok(self.fds.dup(fd, min_fd, false)? as u64)
+            }
+            F_DUPFD_CLOEXEC => {
+                let min_fd = i32::try_from(arg).map_err(|_| VfsError::BadFd)?;
+                Ok(self.fds.dup(fd, min_fd, true)? as u64)
+            }
+            F_GETFD => Ok(self.fds.fd_flags(fd)? as u64),
+            F_SETFD => {
+                self.fds.set_fd_flags(fd, arg as u32)?;
+                Ok(0)
+            }
+            F_GETFL => Ok(self.fds.status_flags(fd)? as u64),
+            F_SETFL => {
+                self.fds.set_status_flags(fd, arg as u32)?;
+                Ok(0)
+            }
+            F_GETPIPE_SZ => Ok(self.fds.pipe_capacity(fd)? as u64),
+            F_SETPIPE_SZ => {
+                let capacity = usize::try_from(arg).map_err(|_| VfsError::InvalidPath)?;
+                Ok(self.fds.set_pipe_capacity(fd, capacity)? as u64)
+            }
+            _ => Err(VfsError::InvalidPath),
+        }
+    }
+
+    pub fn ioctl(&self, fd: Fd, request: u64) -> VfsResult<IoctlReply> {
+        let entry = self.fds.get(fd)?;
+        match request {
+            FIONREAD => Ok(IoctlReply::U32(
+                u32::try_from(self.fds.available_bytes(&self.tree, fd)?).unwrap_or(u32::MAX),
+            )),
+            TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGPGRP | TIOCSPGRP | TIOCGWINSZ => {
+                match entry.file().kind() {
+                    FileKind::Stdio(_) => Err(VfsError::NotTerminal),
+                    _ => Err(VfsError::NotTerminal),
+                }
+            }
+            _ => Err(VfsError::NotTerminal),
+        }
     }
 
     pub fn newfstatat(&self, dirfd: Fd, path: &str, flags: u32) -> VfsResult<LinuxFileAttr> {
@@ -2433,6 +2691,57 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
     }
 }
 
+fn register_fd_endpoint(file: &FileRef) {
+    if let Ok(pipe) = pipe_node(file) {
+        pipe.state().register_endpoint(file.kind());
+    }
+}
+
+fn unregister_fd_endpoint(file: &FileRef) {
+    if let Ok(pipe) = pipe_node(file) {
+        let mut state = pipe.state();
+        state.unregister_endpoint(file.kind());
+        drop(state);
+        pipe.notify_readable();
+        pipe.notify_writable();
+    }
+}
+
+fn pipe_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
+    let pipe = pipe_node(entry.file())?;
+    let mut state = pipe.state();
+    while state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
+        if entry.flags().nonblock() {
+            return Err(VfsError::WouldBlock);
+        }
+        state = pipe.wait_readable(state);
+    }
+    let count = state.read(buffer);
+    if count > 0 {
+        pipe.notify_writable();
+    }
+    Ok(count)
+}
+
+fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
+    let pipe = pipe_node(entry.file())?;
+    let mut state = pipe.state();
+    if state.readers == 0 {
+        return Err(VfsError::BrokenPipe);
+    }
+    while state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
+        if entry.flags().nonblock() {
+            return Err(VfsError::WouldBlock);
+        }
+        state = pipe.wait_writable(state);
+    }
+    let count = state.write(buffer)?;
+    if count > 0 {
+        pipe.notify_readable();
+    }
+    Ok(count)
+}
+
 fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
     match file.inode().backend() {
         InodeBackend::Pipe(pipe) => Ok(pipe),
@@ -2587,6 +2896,94 @@ mod tests {
         assert_eq!(table.get(keep).unwrap_err(), VfsError::BadFd);
         assert!(table.get(close).is_ok());
         assert!(table.get(0).is_ok());
+    }
+
+    #[test]
+    fn fd_duplication_clones_open_file_state_and_tracks_descriptor_flags() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDWR | O_CLOEXEC), 0)
+            .unwrap();
+        assert_eq!(fd, 3);
+        let dup = vfs.dup(fd).unwrap();
+        let dup_min = vfs.fcntl(fd, F_DUPFD_CLOEXEC, 10).unwrap() as Fd;
+
+        assert_eq!(dup, 4);
+        assert_eq!(dup_min, 10);
+        assert!(!vfs.fds().cloexec(dup).unwrap());
+        assert!(vfs.fds().cloexec(dup_min).unwrap());
+
+        assert_eq!(vfs.lseek(fd, 2, SeekWhence::Set).unwrap(), 2);
+        assert_eq!(vfs.fds().get(dup).unwrap().offset(), 2);
+        assert_eq!(vfs.fcntl(dup, F_GETFD, 0).unwrap(), 0);
+        assert_eq!(
+            vfs.fcntl(dup_min, F_GETFD, 0).unwrap(),
+            u64::from(FD_CLOEXEC)
+        );
+        assert_eq!(vfs.fcntl(dup, F_SETFD, u64::from(FD_CLOEXEC)).unwrap(), 0);
+        assert!(vfs.fds().cloexec(dup).unwrap());
+
+        assert_eq!(
+            vfs.fcntl(fd, F_SETFL, u64::from(O_APPEND | O_NONBLOCK))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            vfs.fcntl(dup, F_GETFL, 0).unwrap() as u32 & (O_APPEND | O_NONBLOCK),
+            O_APPEND | O_NONBLOCK
+        );
+
+        assert_eq!(vfs.dup2(fd, 1).unwrap(), 1);
+        assert_eq!(vfs.dup3(fd, 11, OpenFlags::new(O_CLOEXEC)).unwrap(), 11);
+        assert!(vfs.fds().cloexec(11).unwrap());
+        assert_eq!(
+            vfs.dup3(fd, fd, OpenFlags::new(O_CLOEXEC)).unwrap_err(),
+            VfsError::InvalidPath
+        );
+    }
+
+    #[test]
+    fn pipes_move_bytes_and_report_nonblocking_and_capacity_state() {
+        let mut vfs = sample_vfs();
+        let [read_fd, write_fd] = vfs.pipe(OpenFlags::new(O_CLOEXEC | O_NONBLOCK)).unwrap();
+        let mut buffer = [0; 5];
+
+        assert!(vfs.fds().cloexec(read_fd).unwrap());
+        assert!(vfs.fds().cloexec(write_fd).unwrap());
+        assert_eq!(
+            vfs.fds().get(read_fd).unwrap().flags().raw(),
+            O_RDONLY | O_NONBLOCK
+        );
+        assert_eq!(
+            vfs.fds().get(write_fd).unwrap().flags().raw(),
+            O_WRONLY | O_NONBLOCK
+        );
+        assert_eq!(
+            vfs.read(read_fd, &mut buffer).unwrap_err(),
+            VfsError::WouldBlock
+        );
+
+        assert_eq!(vfs.write(write_fd, b"hello").unwrap(), 5);
+        assert_eq!(vfs.ioctl(read_fd, FIONREAD).unwrap(), IoctlReply::U32(5));
+        assert_eq!(vfs.read(read_fd, &mut buffer).unwrap(), 5);
+        assert_eq!(&buffer, b"hello");
+        assert_eq!(
+            vfs.fcntl(read_fd, F_GETPIPE_SZ, 0).unwrap(),
+            DEFAULT_PIPE_CAPACITY as u64
+        );
+        assert_eq!(vfs.fcntl(read_fd, F_SETPIPE_SZ, 1024).unwrap(), 4096);
+
+        vfs.close(read_fd).unwrap();
+        assert_eq!(vfs.write(write_fd, b"!").unwrap_err(), VfsError::BrokenPipe);
+    }
+
+    #[test]
+    fn ioctl_subset_reports_terminal_errors_without_tty_completeness() {
+        let vfs = sample_vfs();
+
+        assert_eq!(vfs.ioctl(1, TIOCGWINSZ).unwrap_err(), VfsError::NotTerminal);
+        assert_eq!(vfs.ioctl(1, TCGETS).unwrap_err(), VfsError::NotTerminal);
+        assert_eq!(vfs.ioctl(99, FIONREAD).unwrap_err(), VfsError::BadFd);
     }
 
     #[test]
