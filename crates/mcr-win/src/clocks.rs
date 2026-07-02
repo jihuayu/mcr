@@ -1,6 +1,8 @@
+#[cfg(not(windows))]
+use std::time::Instant;
 #[cfg(windows)]
 use std::time::UNIX_EPOCH;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::error::HostResult;
 #[cfg(windows)]

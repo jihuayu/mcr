@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::error::{HostError, HostOperation, HostResult};
+#[cfg(not(windows))]
+use crate::error::HostError;
+use crate::error::{HostOperation, HostResult};
 
 /// Result of waiting on a host address.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
