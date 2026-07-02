@@ -3,6 +3,7 @@ pub mod dispatcher;
 pub mod errno;
 pub mod fd;
 pub mod memory;
+pub mod net;
 pub mod return_value;
 pub mod syscall;
 pub mod task;
@@ -37,6 +38,18 @@ pub use memory::{
     LINUX_MAP_TYPE_MASK, LINUX_MAP_VALID_MASK, LINUX_PROT_EXEC, LINUX_PROT_NONE, LINUX_PROT_READ,
     LINUX_PROT_VALID_MASK, LINUX_PROT_WRITE, MmapSyscallArgs, MprotectSyscallArgs,
     MunmapSyscallArgs,
+};
+pub use net::{
+    Accept4SyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_IPPROTO_IP,
+    LINUX_IPPROTO_TCP, LINUX_IPPROTO_UDP, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_CTRUNC,
+    LINUX_MSG_DONTROUTE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_MSG_OOB, LINUX_MSG_PEEK,
+    LINUX_MSG_TRUNC, LINUX_SHUT_RD, LINUX_SHUT_RDWR, LINUX_SHUT_WR, LINUX_SO_DEBUG, LINUX_SO_ERROR,
+    LINUX_SO_KEEPALIVE, LINUX_SO_RCVBUF, LINUX_SO_REUSEADDR, LINUX_SO_REUSEPORT, LINUX_SO_SNDBUF,
+    LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_FLAG_MASK, LINUX_SOCK_NONBLOCK,
+    LINUX_SOCK_RAW, LINUX_SOCK_STREAM, LINUX_SOCK_TYPE_MASK, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY,
+    LinuxCmsghdr, LinuxIn6Addr, LinuxMsghdr, LinuxSockaddr, LinuxSockaddrIn, LinuxSockaddrIn6,
+    LinuxSockaddrStorage, LinuxSockaddrUn, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs,
+    ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs,
 };
 pub use return_value::{LINUX_MAX_ERRNO, SyscallReturn};
 pub use syscall::{Syscall, SyscallNumber};

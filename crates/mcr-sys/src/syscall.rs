@@ -61,11 +61,15 @@ pub enum Syscall {
     Socket,
     Connect,
     Accept,
+    Sendto,
+    Recvfrom,
     Sendmsg,
     Recvmsg,
     Shutdown,
     Bind,
     Listen,
+    Getsockname,
+    Getpeername,
     Setsockopt,
     Getsockopt,
     Clone,
@@ -103,6 +107,7 @@ pub enum Syscall {
     Ppoll,
     SetRobustList,
     EpollCreate1,
+    Accept4,
     Dup3,
     Pipe2,
     Renameat2,
@@ -138,11 +143,15 @@ impl Syscall {
     pub const SOCKET: SyscallNumber = SyscallNumber::new(41);
     pub const CONNECT: SyscallNumber = SyscallNumber::new(42);
     pub const ACCEPT: SyscallNumber = SyscallNumber::new(43);
+    pub const SENDTO: SyscallNumber = SyscallNumber::new(44);
+    pub const RECVFROM: SyscallNumber = SyscallNumber::new(45);
     pub const SENDMSG: SyscallNumber = SyscallNumber::new(46);
     pub const RECVMSG: SyscallNumber = SyscallNumber::new(47);
     pub const SHUTDOWN: SyscallNumber = SyscallNumber::new(48);
     pub const BIND: SyscallNumber = SyscallNumber::new(49);
     pub const LISTEN: SyscallNumber = SyscallNumber::new(50);
+    pub const GETSOCKNAME: SyscallNumber = SyscallNumber::new(51);
+    pub const GETPEERNAME: SyscallNumber = SyscallNumber::new(52);
     pub const SETSOCKOPT: SyscallNumber = SyscallNumber::new(54);
     pub const GETSOCKOPT: SyscallNumber = SyscallNumber::new(55);
     pub const CLONE: SyscallNumber = SyscallNumber::new(56);
@@ -180,6 +189,7 @@ impl Syscall {
     pub const PPOLL: SyscallNumber = SyscallNumber::new(271);
     pub const SET_ROBUST_LIST: SyscallNumber = SyscallNumber::new(273);
     pub const EPOLL_CREATE1: SyscallNumber = SyscallNumber::new(291);
+    pub const ACCEPT4: SyscallNumber = SyscallNumber::new(288);
     pub const DUP3: SyscallNumber = SyscallNumber::new(292);
     pub const PIPE2: SyscallNumber = SyscallNumber::new(293);
     pub const RENAMEAT2: SyscallNumber = SyscallNumber::new(316);
@@ -215,11 +225,15 @@ impl Syscall {
             41 => Self::Socket,
             42 => Self::Connect,
             43 => Self::Accept,
+            44 => Self::Sendto,
+            45 => Self::Recvfrom,
             46 => Self::Sendmsg,
             47 => Self::Recvmsg,
             48 => Self::Shutdown,
             49 => Self::Bind,
             50 => Self::Listen,
+            51 => Self::Getsockname,
+            52 => Self::Getpeername,
             54 => Self::Setsockopt,
             55 => Self::Getsockopt,
             56 => Self::Clone,
@@ -256,6 +270,7 @@ impl Syscall {
             267 => Self::Readlinkat,
             271 => Self::Ppoll,
             273 => Self::SetRobustList,
+            288 => Self::Accept4,
             291 => Self::EpollCreate1,
             292 => Self::Dup3,
             293 => Self::Pipe2,
@@ -295,11 +310,15 @@ impl Syscall {
             Self::Socket => Self::SOCKET,
             Self::Connect => Self::CONNECT,
             Self::Accept => Self::ACCEPT,
+            Self::Sendto => Self::SENDTO,
+            Self::Recvfrom => Self::RECVFROM,
             Self::Sendmsg => Self::SENDMSG,
             Self::Recvmsg => Self::RECVMSG,
             Self::Shutdown => Self::SHUTDOWN,
             Self::Bind => Self::BIND,
             Self::Listen => Self::LISTEN,
+            Self::Getsockname => Self::GETSOCKNAME,
+            Self::Getpeername => Self::GETPEERNAME,
             Self::Setsockopt => Self::SETSOCKOPT,
             Self::Getsockopt => Self::GETSOCKOPT,
             Self::Clone => Self::CLONE,
@@ -336,6 +355,7 @@ impl Syscall {
             Self::Readlinkat => Self::READLINKAT,
             Self::Ppoll => Self::PPOLL,
             Self::SetRobustList => Self::SET_ROBUST_LIST,
+            Self::Accept4 => Self::ACCEPT4,
             Self::EpollCreate1 => Self::EPOLL_CREATE1,
             Self::Dup3 => Self::DUP3,
             Self::Pipe2 => Self::PIPE2,
@@ -375,11 +395,15 @@ impl Syscall {
             Self::Socket => "socket",
             Self::Connect => "connect",
             Self::Accept => "accept",
+            Self::Sendto => "sendto",
+            Self::Recvfrom => "recvfrom",
             Self::Sendmsg => "sendmsg",
             Self::Recvmsg => "recvmsg",
             Self::Shutdown => "shutdown",
             Self::Bind => "bind",
             Self::Listen => "listen",
+            Self::Getsockname => "getsockname",
+            Self::Getpeername => "getpeername",
             Self::Setsockopt => "setsockopt",
             Self::Getsockopt => "getsockopt",
             Self::Clone => "clone",
@@ -416,6 +440,7 @@ impl Syscall {
             Self::Readlinkat => "readlinkat",
             Self::Ppoll => "ppoll",
             Self::SetRobustList => "set_robust_list",
+            Self::Accept4 => "accept4",
             Self::EpollCreate1 => "epoll_create1",
             Self::Dup3 => "dup3",
             Self::Pipe2 => "pipe2",
@@ -450,6 +475,8 @@ mod tests {
     fn maps_linux_x86_64_syscall_numbers() {
         assert_eq!(Syscall::from_number(Syscall::READ), Syscall::Read);
         assert_eq!(Syscall::from_number(Syscall::OPENAT), Syscall::Openat);
+        assert_eq!(Syscall::from_number(Syscall::SENDTO), Syscall::Sendto);
+        assert_eq!(Syscall::from_number(Syscall::ACCEPT4), Syscall::Accept4);
         assert_eq!(Syscall::from_number(Syscall::STATX), Syscall::Statx);
         assert_eq!(Syscall::ExitGroup.number().raw(), 231);
         assert_eq!(Syscall::ClockGettime.name(), "clock_gettime");

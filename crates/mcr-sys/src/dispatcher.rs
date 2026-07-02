@@ -107,11 +107,15 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Socket, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Connect, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Accept, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Sendto, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Recvfrom, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Sendmsg, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Recvmsg, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Shutdown, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Bind, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Listen, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Getsockname, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Getpeername, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Setsockopt, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Getsockopt, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::Clone, SyscallSubsystem::Task),
@@ -148,6 +152,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Readlinkat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Ppoll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::SetRobustList, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Accept4, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::EpollCreate1, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Dup3, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pipe2, SyscallSubsystem::File),
@@ -626,10 +631,16 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("sockaddr", arg(1)),
             decimal_field("addrlen", arg(2)),
         ],
-        Syscall::Accept => vec![
+        Syscall::Accept | Syscall::Getsockname | Syscall::Getpeername => vec![
             decimal_field("fd", arg(0)),
             hex_field("sockaddr", arg(1)),
             hex_field("addrlen", arg(2)),
+        ],
+        Syscall::Accept4 => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("sockaddr", arg(1)),
+            hex_field("addrlen", arg(2)),
+            hex_field("flags", arg(3)),
         ],
         Syscall::Listen => {
             vec![
@@ -641,6 +652,14 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             decimal_field("fd", arg(0)),
             hex_field("msg", arg(1)),
             hex_field("flags", arg(2)),
+        ],
+        Syscall::Sendto | Syscall::Recvfrom => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("buf", arg(1)),
+            decimal_field("len", arg(2)),
+            hex_field("flags", arg(3)),
+            hex_field("sockaddr", arg(4)),
+            hex_field("addrlen", arg(5)),
         ],
         Syscall::Shutdown => vec![decimal_field("fd", arg(0)), decimal_field("how", arg(1))],
         Syscall::Setsockopt => vec![
@@ -743,6 +762,10 @@ mod tests {
         );
         assert_eq!(
             syscall_descriptor(Syscall::Socket).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Network)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::Accept4).map(|descriptor| descriptor.subsystem),
             Some(SyscallSubsystem::Network)
         );
         assert_eq!(
