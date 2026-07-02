@@ -128,10 +128,7 @@ fn wait_on_address_u32_platform(
     timeout: Option<Duration>,
 ) -> HostResult<AddressWaitResult> {
     let compare = expected;
-    let timeout_ms = timeout.map(duration_to_millis);
-    let timeout_ptr = timeout_ms
-        .as_ref()
-        .map_or(std::ptr::null(), std::ptr::from_ref);
+    let timeout_ms = timeout.map_or(INFINITE, duration_to_millis);
 
     // SAFETY: AtomicU32 exposes a stable pointer to the u32 storage for address waits.
     let ok = unsafe {
@@ -139,12 +136,15 @@ fn wait_on_address_u32_platform(
             address.as_ptr().cast(),
             std::ptr::from_ref(&compare).cast(),
             std::mem::size_of::<u32>(),
-            timeout_ptr,
+            timeout_ms,
         )
     };
 
     if ok != crate::windows::FALSE {
-        return Ok(AddressWaitResult::Woken);
+        if address.load(Ordering::SeqCst) == expected {
+            return Ok(AddressWaitResult::Woken);
+        }
+        return Ok(AddressWaitResult::ValueChanged);
     }
 
     let code = crate::windows::last_error();
@@ -187,13 +187,16 @@ fn duration_to_millis(duration: Duration) -> u32 {
 }
 
 #[cfg(windows)]
+const INFINITE: u32 = u32::MAX;
+
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn WaitOnAddress(
         address: *mut std::ffi::c_void,
         compare_address: *const std::ffi::c_void,
         address_size: usize,
-        milliseconds: *const u32,
+        milliseconds: u32,
     ) -> crate::windows::Bool;
     fn WakeByAddressSingle(address: *mut std::ffi::c_void);
     fn WakeByAddressAll(address: *mut std::ffi::c_void);
