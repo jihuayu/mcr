@@ -99,6 +99,7 @@ pub enum VfsError {
     NotEmpty,
     NoSpace,
     NotSeekable,
+    NotSocket,
     NotTerminal,
     NotDirectory,
     NotPermitted,
@@ -121,6 +122,7 @@ impl VfsError {
             Self::NotEmpty => 39,
             Self::NoSpace => 28,
             Self::NotSeekable => 29,
+            Self::NotSocket => 88,
             Self::NotTerminal => 25,
             Self::NotDirectory => 20,
             Self::NotPermitted => 1,
@@ -145,6 +147,7 @@ impl fmt::Display for VfsError {
             Self::NotEmpty => "directory not empty",
             Self::NoSpace => "no space left on device",
             Self::NotSeekable => "illegal seek",
+            Self::NotSocket => "socket operation on non-socket",
             Self::NotTerminal => "inappropriate ioctl for device",
             Self::NotDirectory => "not a directory",
             Self::NotPermitted => "operation not permitted",
@@ -1826,6 +1829,13 @@ impl FdTable {
         )
     }
 
+    pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
+        match self.get(fd)?.file().inode().backend() {
+            InodeBackend::Socket(socket) => Ok(socket.id()),
+            _ => Err(VfsError::NotSocket),
+        }
+    }
+
     pub fn insert_at_or_above(
         &mut self,
         min_fd: Fd,
@@ -2430,6 +2440,10 @@ impl VirtualFileSystem {
 
     pub fn insert_socket(&mut self, socket_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
         self.fds.insert_socket(socket_id, flags)
+    }
+
+    pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
+        self.fds.socket_id_for_fd(fd)
     }
 
     pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {
@@ -3315,6 +3329,7 @@ mod tests {
             panic!("socket fd should reference a socket inode");
         };
         assert_eq!(socket.id(), 42);
+        assert_eq!(vfs.socket_id_for_fd(fd).unwrap(), 42);
 
         let stat = vfs.fstat(fd).unwrap();
         assert!(stat.is_socket());
@@ -3344,9 +3359,26 @@ mod tests {
         assert!(!vfs.fds().cloexec(dup).unwrap());
         assert!(vfs.fds().cloexec(dup3).unwrap());
         assert!(vfs.fstat(dup).unwrap().is_socket());
+        assert_eq!(vfs.socket_id_for_fd(dup).unwrap(), 42);
+        assert_eq!(vfs.socket_id_for_fd(dup3).unwrap(), 42);
         vfs.close(fd).unwrap();
         assert_eq!(vfs.fstat(fd).unwrap_err(), VfsError::BadFd);
+        assert_eq!(vfs.socket_id_for_fd(fd).unwrap_err(), VfsError::BadFd);
         assert!(vfs.fstat(dup).unwrap().is_socket());
+    }
+
+    #[test]
+    fn socket_id_lookup_rejects_non_socket_descriptors() {
+        let mut vfs = sample_vfs();
+        let regular = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+
+        assert_eq!(
+            vfs.socket_id_for_fd(regular).unwrap_err(),
+            VfsError::NotSocket
+        );
+        assert_eq!(vfs.socket_id_for_fd(99).unwrap_err(), VfsError::BadFd);
     }
 
     #[test]
