@@ -1,7 +1,7 @@
 ---
 id: integ-001
 scope: mvp-integration
-status: in-progress
+status: done
 depends-on: [testkit-001, jit-001, sys-001, mem-001, vfs-002, task-001, diag-001]
 ---
 
@@ -44,3 +44,7 @@ mcr run-rootfs alpine-rootfs /bin/busybox cat /etc/os-release
 
 - This task is the MVP gate.
 - No subsystem mock may remain on this execution path.
+- The committed CLI smoke uses a generated static ELF fixture rootfs so normal
+  workspace tests do not require checking an Alpine rootfs payload into git.
+  The `alpine-rootfs` commands remain the external fixture smoke contract when
+  the local fixture cache is materialized.
