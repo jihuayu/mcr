@@ -18,6 +18,7 @@ pub const INITIAL_GUEST_TID: GuestTid = 1;
 pub const DEFAULT_STACK_TOP: GuestAddress = 0x8000_0000;
 pub const DEFAULT_STACK_SIZE: u64 = 0x20_0000;
 const X86_64_SYSCALL_INSTRUCTION_LEN: GuestAddress = 2;
+const X86_64_DEFAULT_RFLAGS: u64 = 0x202;
 
 pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
@@ -210,12 +211,21 @@ pub struct GprState {
     rip: GuestAddress,
     rsp: GuestAddress,
     rax: u64,
+    rbx: u64,
+    rcx: u64,
     rdi: u64,
     rsi: u64,
     rdx: u64,
+    rbp: u64,
     r10: u64,
     r8: u64,
     r9: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rflags: u64,
 }
 
 impl GprState {
@@ -235,12 +245,50 @@ impl GprState {
             rip,
             rsp,
             rax,
+            rbx: 0,
+            rcx: 0,
             rdi: args[0],
             rsi: args[1],
             rdx: args[2],
+            rbp: 0,
             r10: args[3],
             r8: args[4],
             r9: args[5],
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rflags: X86_64_DEFAULT_RFLAGS,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_full_registers(
+        rip: GuestAddress,
+        rsp: GuestAddress,
+        registers: [u64; 15],
+        rflags: u64,
+    ) -> Self {
+        Self {
+            rip,
+            rsp,
+            rax: registers[0],
+            rbx: registers[1],
+            rcx: registers[2],
+            rdx: registers[3],
+            rsi: registers[4],
+            rdi: registers[5],
+            rbp: registers[6],
+            r8: registers[7],
+            r9: registers[8],
+            r10: registers[9],
+            r11: registers[10],
+            r12: registers[11],
+            r13: registers[12],
+            r14: registers[13],
+            r15: registers[14],
+            rflags,
         }
     }
 
@@ -265,6 +313,16 @@ impl GprState {
     }
 
     #[must_use]
+    pub const fn rbx(self) -> u64 {
+        self.rbx
+    }
+
+    #[must_use]
+    pub const fn rcx(self) -> u64 {
+        self.rcx
+    }
+
+    #[must_use]
     pub const fn rdi(self) -> u64 {
         self.rdi
     }
@@ -280,6 +338,11 @@ impl GprState {
     }
 
     #[must_use]
+    pub const fn rbp(self) -> u64 {
+        self.rbp
+    }
+
+    #[must_use]
     pub const fn r10(self) -> u64 {
         self.r10
     }
@@ -292,6 +355,36 @@ impl GprState {
     #[must_use]
     pub const fn r9(self) -> u64 {
         self.r9
+    }
+
+    #[must_use]
+    pub const fn r11(self) -> u64 {
+        self.r11
+    }
+
+    #[must_use]
+    pub const fn r12(self) -> u64 {
+        self.r12
+    }
+
+    #[must_use]
+    pub const fn r13(self) -> u64 {
+        self.r13
+    }
+
+    #[must_use]
+    pub const fn r14(self) -> u64 {
+        self.r14
+    }
+
+    #[must_use]
+    pub const fn r15(self) -> u64 {
+        self.r15
+    }
+
+    #[must_use]
+    pub const fn rflags(self) -> u64 {
+        self.rflags
     }
 }
 
@@ -1572,6 +1665,59 @@ mod tests {
     #[test]
     fn package_name_is_stable() {
         assert_eq!(CRATE_NAME, "mcr-task");
+    }
+
+    #[test]
+    fn gpr_state_new_initializes_full_guest_register_defaults() {
+        let regs = GprState::new(0x401000, 0x8000_0000);
+
+        assert_eq!(regs.rip(), 0x401000);
+        assert_eq!(regs.rsp(), 0x8000_0000);
+        assert_eq!(regs.rax(), 0);
+        assert_eq!(regs.rbx(), 0);
+        assert_eq!(regs.rcx(), 0);
+        assert_eq!(regs.rdi(), 0);
+        assert_eq!(regs.rsi(), 0);
+        assert_eq!(regs.rdx(), 0);
+        assert_eq!(regs.rbp(), 0);
+        assert_eq!(regs.r8(), 0);
+        assert_eq!(regs.r9(), 0);
+        assert_eq!(regs.r10(), 0);
+        assert_eq!(regs.r11(), 0);
+        assert_eq!(regs.r12(), 0);
+        assert_eq!(regs.r13(), 0);
+        assert_eq!(regs.r14(), 0);
+        assert_eq!(regs.r15(), 0);
+        assert_eq!(regs.rflags(), 0x202);
+    }
+
+    #[test]
+    fn gpr_state_syscall_constructor_preserves_full_guest_register_defaults() {
+        let regs = GprState::with_syscall_registers(
+            0x401002,
+            0x8000_0008,
+            Syscall::Write.number().raw(),
+            [1, 0x402000, 3, 4, 5, 6],
+        );
+
+        assert_eq!(regs.rip(), 0x401002);
+        assert_eq!(regs.rsp(), 0x8000_0008);
+        assert_eq!(regs.rax(), Syscall::Write.number().raw());
+        assert_eq!(regs.rdi(), 1);
+        assert_eq!(regs.rsi(), 0x402000);
+        assert_eq!(regs.rdx(), 3);
+        assert_eq!(regs.r10(), 4);
+        assert_eq!(regs.r8(), 5);
+        assert_eq!(regs.r9(), 6);
+        assert_eq!(regs.rbx(), 0);
+        assert_eq!(regs.rcx(), 0);
+        assert_eq!(regs.rbp(), 0);
+        assert_eq!(regs.r11(), 0);
+        assert_eq!(regs.r12(), 0);
+        assert_eq!(regs.r13(), 0);
+        assert_eq!(regs.r14(), 0);
+        assert_eq!(regs.r15(), 0);
+        assert_eq!(regs.rflags(), 0x202);
     }
 
     #[test]

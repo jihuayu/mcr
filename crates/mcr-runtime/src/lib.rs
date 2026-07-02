@@ -2350,26 +2350,35 @@ fn read_guest_block(
 fn registers_from_gpr(value: GprState) -> GuestRegisters {
     GuestRegisters {
         rax: value.rax(),
-        rdi: value.rdi(),
-        rsi: value.rsi(),
+        rbx: value.rbx(),
+        rcx: value.rcx(),
         rdx: value.rdx(),
-        r10: value.r10(),
+        rsi: value.rsi(),
+        rdi: value.rdi(),
+        rbp: value.rbp(),
+        rsp: value.rsp(),
         r8: value.r8(),
         r9: value.r9(),
+        r10: value.r10(),
+        r11: value.r11(),
+        r12: value.r12(),
+        r13: value.r13(),
+        r14: value.r14(),
+        r15: value.r15(),
         rip: value.rip(),
-        rsp: value.rsp(),
-        ..GuestRegisters::default()
+        rflags: value.rflags(),
     }
 }
 
 fn gpr_from_registers(value: GuestRegisters) -> GprState {
-    GprState::with_syscall_registers(
+    GprState::with_full_registers(
         value.rip,
         value.rsp,
-        value.rax,
         [
-            value.rdi, value.rsi, value.rdx, value.r10, value.r8, value.r9,
+            value.rax, value.rbx, value.rcx, value.rdx, value.rsi, value.rdi, value.rbp, value.r8,
+            value.r9, value.r10, value.r11, value.r12, value.r13, value.r14, value.r15,
         ],
+        value.rflags,
     )
 }
 
@@ -6759,6 +6768,56 @@ mod tests {
                 .unwrap()
                 .exit_state(),
             ExitState::Exited { status: 42 }
+        );
+    }
+
+    #[test]
+    fn guest_execution_preserves_non_syscall_registers_across_steps() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x48, 0xbb, 0x7f, 0x4d, 0x3c, 0x2b, 0x1a, 0x09, 0x08,
+                0x07, // mov rbx,0x0708091a2b3c4d7f
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,getpid
+                0x0f, 0x05, // syscall
+                0x48, 0x89, 0xdf, // mov rdi,rbx
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+
+        let first_step = runtime
+            .dispatch_guest_execution()
+            .expect("getpid step executes");
+        assert_eq!(first_step.before_rip(), 0x401000);
+        assert_eq!(first_step.after_rip(), 0x401011);
+        assert_eq!(first_step.encoded_rax(), u64::from(INITIAL_GUEST_PID));
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .regs()
+                .rbx(),
+            0x0708_091a_2b3c_4d7f
+        );
+
+        let second_step = runtime
+            .dispatch_guest_execution()
+            .expect("exit_group step executes");
+
+        assert_eq!(second_step.before_rip(), 0x401011);
+        assert_eq!(second_step.after_rip(), 0x40101b);
+        assert_eq!(second_step.task_state(), TaskState::Exited { status: 0x7f });
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .exit_state(),
+            ExitState::Exited { status: 0x7f }
         );
     }
 
