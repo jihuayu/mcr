@@ -3,6 +3,7 @@ pub mod run_rootfs;
 
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -17,7 +18,7 @@ pub use memory::{
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
-use mcr_jit::GuestRegisters;
+use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore, TrampolineCore};
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
     SocketOptionName, SocketSpec,
@@ -33,7 +34,9 @@ use mcr_sys::{
     SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn,
     SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
-use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
+use mcr_task::{
+    GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_TID, TaskError, TaskState,
+};
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, ProcSelfData,
     SeekWhence, VfsError, VirtualFileSystem,
@@ -1722,6 +1725,10 @@ impl Runtime {
         self.dispatcher.dispatch(context)
     }
 
+    pub fn dispatch_guest_execution(&mut self) -> Result<GuestExecutionStep, GuestExecutionError> {
+        dispatch_guest_execution_with_dispatcher(&mut self.dispatcher)
+    }
+
     pub fn into_kernel(self) -> GuestKernel {
         self.dispatcher.into_parts().0.tasks
     }
@@ -1769,10 +1776,210 @@ where
         self.dispatcher.dispatch(context)
     }
 
+    pub fn dispatch_guest_execution(&mut self) -> Result<GuestExecutionStep, GuestExecutionError> {
+        dispatch_guest_execution_with_dispatcher(&mut self.dispatcher)
+    }
+
     pub fn into_parts(self) -> (GuestKernel, T) {
         let (subsystems, tracer) = self.dispatcher.into_parts();
         (subsystems.tasks, tracer)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestExecutionStep {
+    tid: mcr_sys::GuestTid,
+    before_rip: u64,
+    after_rip: u64,
+    encoded_rax: u64,
+    task_state: TaskState,
+}
+
+impl GuestExecutionStep {
+    #[must_use]
+    pub const fn new(
+        tid: mcr_sys::GuestTid,
+        before_rip: u64,
+        after_rip: u64,
+        encoded_rax: u64,
+        task_state: TaskState,
+    ) -> Self {
+        Self {
+            tid,
+            before_rip,
+            after_rip,
+            encoded_rax,
+            task_state,
+        }
+    }
+
+    #[must_use]
+    pub const fn tid(self) -> mcr_sys::GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn before_rip(self) -> u64 {
+        self.before_rip
+    }
+
+    #[must_use]
+    pub const fn after_rip(self) -> u64 {
+        self.after_rip
+    }
+
+    #[must_use]
+    pub const fn encoded_rax(self) -> u64 {
+        self.encoded_rax
+    }
+
+    #[must_use]
+    pub const fn task_state(self) -> TaskState {
+        self.task_state
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestExecutionError {
+    MissingInitialTask,
+    TaskExited {
+        tid: mcr_sys::GuestTid,
+        state: TaskState,
+    },
+    Memory(GuestMemoryError),
+    Execution(ExecutionError),
+}
+
+impl fmt::Display for GuestExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingInitialTask => write!(formatter, "initial guest task is missing"),
+            Self::TaskExited { tid, state } => {
+                write!(formatter, "guest task {tid} is not runnable: {state:?}")
+            }
+            Self::Memory(error) => write!(formatter, "guest memory fault: {error:?}"),
+            Self::Execution(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GuestExecutionError {}
+
+impl From<GuestMemoryError> for GuestExecutionError {
+    fn from(value: GuestMemoryError) -> Self {
+        Self::Memory(value)
+    }
+}
+
+impl From<ExecutionError> for GuestExecutionError {
+    fn from(value: ExecutionError) -> Self {
+        Self::Execution(value)
+    }
+}
+
+fn dispatch_guest_execution_with_dispatcher<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
+
+    let task = dispatcher
+        .subsystems()
+        .tasks
+        .task(INITIAL_GUEST_TID)
+        .ok_or(GuestExecutionError::MissingInitialTask)?;
+    let pid = task.pid();
+    let tid = task.tid();
+    let gpr = task.regs();
+    if !matches!(task.state(), TaskState::Runnable) {
+        return Err(GuestExecutionError::TaskExited {
+            tid,
+            state: task.state(),
+        });
+    }
+
+    let before_rip = gpr.rip();
+    let block = read_guest_block(
+        dispatcher.subsystems().files.memory(),
+        before_rip,
+        MAX_GUEST_BLOCK_BYTES,
+    )?;
+    let mut registers = registers_from_gpr(gpr);
+    let mut trampoline =
+        TrampolineCore::new(pid, tid, |context| dispatcher.dispatch(context).encoded_rax);
+
+    SameIsaExecutionCore::new().execute_until_syscall(
+        GuestBlock::new(&block, before_rip),
+        &mut registers,
+        &mut trampoline,
+    )?;
+
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingInitialTask)?;
+    let final_regs = if task.regs() == gpr {
+        let updated_regs = gpr_from_registers(registers);
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    ))
+}
+
+fn read_guest_block(
+    memory: &GuestMemory,
+    rip: u64,
+    max_len: usize,
+) -> Result<Vec<u8>, GuestMemoryError> {
+    let Some(vma) = memory.vma_containing(rip) else {
+        return Err(GuestMemoryError::NotMapped);
+    };
+    if !vma.protection().execute {
+        return Err(GuestMemoryError::AccessDenied);
+    }
+
+    let len = usize::try_from((vma.end() - rip).min(max_len as u64))
+        .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+    let mut bytes = vec![0; len];
+    memory.read(rip, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn registers_from_gpr(value: GprState) -> GuestRegisters {
+    GuestRegisters {
+        rax: value.rax(),
+        rdi: value.rdi(),
+        rsi: value.rsi(),
+        rdx: value.rdx(),
+        r10: value.r10(),
+        r8: value.r8(),
+        r9: value.r9(),
+        rip: value.rip(),
+        rsp: value.rsp(),
+        ..GuestRegisters::default()
+    }
+}
+
+fn gpr_from_registers(value: GuestRegisters) -> GprState {
+    GprState::with_syscall_registers(
+        value.rip,
+        value.rsp,
+        value.rax,
+        [
+            value.rdi, value.rsi, value.rdx, value.r10, value.r8, value.r9,
+        ],
+    )
 }
 
 #[derive(Debug)]
@@ -3874,6 +4081,61 @@ mod tests {
     }
 
     #[test]
+    fn guest_execution_dispatch_advances_registers_and_exposes_exit_state() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        let rsp = runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .regs()
+            .rsp();
+        runtime
+            .kernel_mut()
+            .task_mut(INITIAL_GUEST_TID)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                0x401000,
+                rsp,
+                Syscall::ExitGroup.number().raw(),
+                [42, 0, 0, 0, 0, 0],
+            ));
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("execute guest syscall block");
+
+        assert_eq!(step.tid(), INITIAL_GUEST_TID);
+        assert_eq!(step.before_rip(), 0x401000);
+        assert_eq!(step.after_rip(), 0x401002);
+        assert_eq!(step.encoded_rax(), 0);
+        assert_eq!(step.task_state(), TaskState::Exited { status: 42 });
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .regs()
+                .rip(),
+            0x401002
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .exit_state(),
+            ExitState::Exited { status: 42 }
+        );
+    }
+
+    #[test]
     fn runtime_dispatches_fork_child_exit_and_wait4() {
         let mut runtime = Runtime::new(test_program("/bin/parent", 0x401000)).unwrap();
 
@@ -4240,6 +4502,42 @@ mod tests {
 
     fn test_program_bytes(entrypoint: u64) -> Vec<u8> {
         test_program_bytes_with_marker(entrypoint, 0x90)
+    }
+
+    fn test_program_with_entry_code(path: &str, entrypoint: u64, code: &[u8]) -> GuestProgram {
+        GuestProgram::new(GuestExecutable::new(
+            path.as_bytes().to_vec(),
+            test_program_bytes_with_entry_code(entrypoint, code),
+        ))
+    }
+
+    fn test_program_bytes_with_entry_code(entrypoint: u64, code: &[u8]) -> Vec<u8> {
+        Elf64Builder::new()
+            .entrypoint(entrypoint)
+            .program_header(Elf64ProgramHeader::load(
+                PF_R | PF_X,
+                0x1000,
+                entrypoint & !0xfff,
+                0x1000,
+                0x1000,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                PF_R | PF_W,
+                0x2000,
+                (entrypoint & !0xfff) + 0x1000,
+                0x08,
+                0x100,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                PF_R,
+                0,
+                (entrypoint & !0xfff) + 0x2000,
+                0x100,
+                0x100,
+            ))
+            .data_at(0x1000 + (entrypoint & 0xfff), code.to_vec())
+            .data_at(0x2000, vec![0; 0x08])
+            .build()
     }
 
     fn test_program_bytes_with_marker(entrypoint: u64, marker: u8) -> Vec<u8> {
