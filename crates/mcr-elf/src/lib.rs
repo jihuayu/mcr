@@ -281,6 +281,856 @@ impl TryFrom<u32> for SegmentPermissions {
     }
 }
 
+pub mod auxv {
+    pub const AT_NULL: u64 = 0;
+    pub const AT_PHDR: u64 = 3;
+    pub const AT_PHENT: u64 = 4;
+    pub const AT_PHNUM: u64 = 5;
+    pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
+    pub const AT_ENTRY: u64 = 9;
+    pub const AT_PLATFORM: u64 = 15;
+    pub const AT_RANDOM: u64 = 25;
+    pub const AT_EXECFN: u64 = 31;
+}
+
+pub const AT_RANDOM_BYTES: usize = 16;
+pub const INITIAL_STACK_ALIGNMENT: u64 = 16;
+pub const DEFAULT_PLATFORM: &[u8] = b"x86_64";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuxiliaryVectorEntry {
+    key: u64,
+    value: u64,
+}
+
+impl AuxiliaryVectorEntry {
+    #[must_use]
+    pub const fn new(key: u64, value: u64) -> Self {
+        Self { key, value }
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> u64 {
+        self.key
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialStackConfig {
+    stack_top: u64,
+    stack_size: u64,
+    executable_path: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    random_bytes: [u8; AT_RANDOM_BYTES],
+    interpreter_base: u64,
+    platform: Vec<u8>,
+}
+
+impl InitialStackConfig {
+    #[must_use]
+    pub fn new(stack_top: u64, stack_size: u64, executable_path: impl Into<Vec<u8>>) -> Self {
+        let executable_path = executable_path.into();
+        Self {
+            stack_top,
+            stack_size,
+            argv: vec![executable_path.clone()],
+            executable_path,
+            envp: Vec::new(),
+            random_bytes: [0; AT_RANDOM_BYTES],
+            interpreter_base: 0,
+            platform: DEFAULT_PLATFORM.to_vec(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_argv<I, A>(mut self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<Vec<u8>>,
+    {
+        self.argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_envp<I, E>(mut self, envp: I) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<Vec<u8>>,
+    {
+        self.envp = envp.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_random_bytes(mut self, random_bytes: [u8; AT_RANDOM_BYTES]) -> Self {
+        self.random_bytes = random_bytes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_interpreter_base(mut self, interpreter_base: u64) -> Self {
+        self.interpreter_base = interpreter_base;
+        self
+    }
+
+    #[must_use]
+    pub fn with_platform(mut self, platform: impl Into<Vec<u8>>) -> Self {
+        self.platform = platform.into();
+        self
+    }
+
+    #[must_use]
+    pub const fn stack_top(&self) -> u64 {
+        self.stack_top
+    }
+
+    #[must_use]
+    pub const fn stack_size(&self) -> u64 {
+        self.stack_size
+    }
+
+    #[must_use]
+    pub fn executable_path(&self) -> &[u8] {
+        &self.executable_path
+    }
+
+    #[must_use]
+    pub fn argv(&self) -> &[Vec<u8>] {
+        &self.argv
+    }
+
+    #[must_use]
+    pub fn envp(&self) -> &[Vec<u8>] {
+        &self.envp
+    }
+
+    #[must_use]
+    pub const fn random_bytes(&self) -> &[u8; AT_RANDOM_BYTES] {
+        &self.random_bytes
+    }
+
+    #[must_use]
+    pub const fn interpreter_base(&self) -> u64 {
+        self.interpreter_base
+    }
+
+    #[must_use]
+    pub fn platform(&self) -> &[u8] {
+        &self.platform
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialStack {
+    stack_top: u64,
+    stack_size: u64,
+    stack_pointer: u64,
+    bytes: Vec<u8>,
+    argv_addresses: Vec<u64>,
+    envp_addresses: Vec<u64>,
+    executable_path_address: u64,
+    platform_address: u64,
+    random_address: u64,
+    auxv_entries: Vec<AuxiliaryVectorEntry>,
+}
+
+impl InitialStack {
+    #[must_use]
+    pub const fn stack_top(&self) -> u64 {
+        self.stack_top
+    }
+
+    #[must_use]
+    pub const fn stack_size(&self) -> u64 {
+        self.stack_size
+    }
+
+    #[must_use]
+    pub fn stack_base(&self) -> u64 {
+        self.stack_top - self.stack_size
+    }
+
+    #[must_use]
+    pub const fn stack_pointer(&self) -> u64 {
+        self.stack_pointer
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn argv_addresses(&self) -> &[u64] {
+        &self.argv_addresses
+    }
+
+    #[must_use]
+    pub fn envp_addresses(&self) -> &[u64] {
+        &self.envp_addresses
+    }
+
+    #[must_use]
+    pub const fn executable_path_address(&self) -> u64 {
+        self.executable_path_address
+    }
+
+    #[must_use]
+    pub const fn platform_address(&self) -> u64 {
+        self.platform_address
+    }
+
+    #[must_use]
+    pub const fn random_address(&self) -> u64 {
+        self.random_address
+    }
+
+    #[must_use]
+    pub fn auxv_entries(&self) -> &[AuxiliaryVectorEntry] {
+        &self.auxv_entries
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitialStackError {
+    MissingProgramHeaderAddress,
+    InvalidStackSize { stack_size: u64 },
+    StackRangeUnderflow { stack_top: u64, stack_size: u64 },
+    StackLayoutOverflow,
+    StackDataExceedsStack { needed: u64, stack_size: u64 },
+    InteriorNul { field: &'static str, index: usize },
+    EmptyPlatform,
+}
+
+impl fmt::Display for InitialStackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingProgramHeaderAddress => {
+                write!(formatter, "ELF load plan has no guest AT_PHDR address")
+            }
+            Self::InvalidStackSize { stack_size } => {
+                write!(formatter, "invalid initial stack size {stack_size:#x}")
+            }
+            Self::StackRangeUnderflow {
+                stack_top,
+                stack_size,
+            } => write!(
+                formatter,
+                "initial stack range underflows: top {stack_top:#x}, size {stack_size:#x}"
+            ),
+            Self::StackLayoutOverflow => write!(formatter, "initial stack layout overflows"),
+            Self::StackDataExceedsStack { needed, stack_size } => write!(
+                formatter,
+                "initial stack needs {needed:#x} bytes but stack size is {stack_size:#x}"
+            ),
+            Self::InteriorNul { field, index } => {
+                write!(
+                    formatter,
+                    "initial stack {field}[{index}] contains an interior NUL"
+                )
+            }
+            Self::EmptyPlatform => write!(formatter, "initial stack platform string is empty"),
+        }
+    }
+}
+
+impl std::error::Error for InitialStackError {}
+
+pub fn build_initial_stack(
+    load_plan: &LoadPlan,
+    config: InitialStackConfig,
+) -> Result<InitialStack, InitialStackError> {
+    validate_stack_config(&config)?;
+
+    let phdr_address = load_plan
+        .program_headers()
+        .virtual_address()
+        .ok_or(InitialStackError::MissingProgramHeaderAddress)?;
+
+    let stack_base = config.stack_top.checked_sub(config.stack_size).ok_or(
+        InitialStackError::StackRangeUnderflow {
+            stack_top: config.stack_top,
+            stack_size: config.stack_size,
+        },
+    )?;
+
+    let mut cursor = config.stack_top;
+    let mut placed = Vec::new();
+
+    let executable_path_address =
+        place_c_string(&mut cursor, &mut placed, &config.executable_path)?;
+    let platform_address = place_c_string(&mut cursor, &mut placed, &config.platform)?;
+    let envp_addresses = place_c_strings(&mut cursor, &mut placed, &config.envp)?;
+    let argv_addresses = place_c_strings(&mut cursor, &mut placed, &config.argv)?;
+
+    cursor = cursor
+        .checked_sub(AT_RANDOM_BYTES as u64)
+        .ok_or(InitialStackError::StackLayoutOverflow)?;
+    let random_address = cursor;
+    placed.push(PlacedStackBytes {
+        address: random_address,
+        bytes: config.random_bytes.to_vec(),
+    });
+
+    cursor = align_down(cursor, INITIAL_STACK_ALIGNMENT);
+
+    let auxv_entries = vec![
+        AuxiliaryVectorEntry::new(auxv::AT_PHDR, phdr_address),
+        AuxiliaryVectorEntry::new(
+            auxv::AT_PHENT,
+            u64::from(load_plan.program_headers().entry_size()),
+        ),
+        AuxiliaryVectorEntry::new(
+            auxv::AT_PHNUM,
+            u64::from(load_plan.program_headers().entry_count()),
+        ),
+        AuxiliaryVectorEntry::new(auxv::AT_PAGESZ, PAGE_SIZE),
+        AuxiliaryVectorEntry::new(auxv::AT_BASE, config.interpreter_base),
+        AuxiliaryVectorEntry::new(auxv::AT_ENTRY, load_plan.entrypoint()),
+        AuxiliaryVectorEntry::new(auxv::AT_RANDOM, random_address),
+        AuxiliaryVectorEntry::new(auxv::AT_EXECFN, executable_path_address),
+        AuxiliaryVectorEntry::new(auxv::AT_PLATFORM, platform_address),
+        AuxiliaryVectorEntry::new(auxv::AT_NULL, 0),
+    ];
+
+    let pointer_area = build_pointer_area(&argv_addresses, &envp_addresses, &auxv_entries)?;
+    let pointer_area_len =
+        u64::try_from(pointer_area.len()).map_err(|_| InitialStackError::StackLayoutOverflow)?;
+    let stack_pointer = align_down(
+        cursor
+            .checked_sub(pointer_area_len)
+            .ok_or(InitialStackError::StackLayoutOverflow)?,
+        INITIAL_STACK_ALIGNMENT,
+    );
+
+    if stack_pointer < stack_base {
+        return Err(InitialStackError::StackDataExceedsStack {
+            needed: config.stack_top - stack_pointer,
+            stack_size: config.stack_size,
+        });
+    }
+
+    let used_len = usize::try_from(config.stack_top - stack_pointer)
+        .map_err(|_| InitialStackError::StackLayoutOverflow)?;
+    let mut bytes = vec![0; used_len];
+    bytes[..pointer_area.len()].copy_from_slice(&pointer_area);
+
+    for item in placed {
+        let offset = usize::try_from(item.address - stack_pointer)
+            .map_err(|_| InitialStackError::StackLayoutOverflow)?;
+        let end = offset
+            .checked_add(item.bytes.len())
+            .ok_or(InitialStackError::StackLayoutOverflow)?;
+        bytes[offset..end].copy_from_slice(&item.bytes);
+    }
+
+    Ok(InitialStack {
+        stack_top: config.stack_top,
+        stack_size: config.stack_size,
+        stack_pointer,
+        bytes,
+        argv_addresses,
+        envp_addresses,
+        executable_path_address,
+        platform_address,
+        random_address,
+        auxv_entries,
+    })
+}
+
+fn validate_stack_config(config: &InitialStackConfig) -> Result<(), InitialStackError> {
+    if config.stack_size == 0 {
+        return Err(InitialStackError::InvalidStackSize {
+            stack_size: config.stack_size,
+        });
+    }
+
+    validate_no_interior_nul("executable_path", 0, &config.executable_path)?;
+    validate_no_interior_nul_entries("argv", &config.argv)?;
+    validate_no_interior_nul_entries("envp", &config.envp)?;
+
+    if config.platform.is_empty() {
+        return Err(InitialStackError::EmptyPlatform);
+    }
+    validate_no_interior_nul("platform", 0, &config.platform)?;
+
+    Ok(())
+}
+
+fn validate_no_interior_nul_entries(
+    field: &'static str,
+    entries: &[Vec<u8>],
+) -> Result<(), InitialStackError> {
+    for (index, entry) in entries.iter().enumerate() {
+        validate_no_interior_nul(field, index, entry)?;
+    }
+    Ok(())
+}
+
+fn validate_no_interior_nul(
+    field: &'static str,
+    index: usize,
+    bytes: &[u8],
+) -> Result<(), InitialStackError> {
+    if bytes.contains(&0) {
+        return Err(InitialStackError::InteriorNul { field, index });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PlacedStackBytes {
+    address: u64,
+    bytes: Vec<u8>,
+}
+
+fn place_c_strings(
+    cursor: &mut u64,
+    placed: &mut Vec<PlacedStackBytes>,
+    strings: &[Vec<u8>],
+) -> Result<Vec<u64>, InitialStackError> {
+    let mut addresses = Vec::with_capacity(strings.len());
+    for string in strings.iter().rev() {
+        addresses.push(place_c_string(cursor, placed, string)?);
+    }
+    addresses.reverse();
+    Ok(addresses)
+}
+
+fn place_c_string(
+    cursor: &mut u64,
+    placed: &mut Vec<PlacedStackBytes>,
+    bytes: &[u8],
+) -> Result<u64, InitialStackError> {
+    let len_with_nul = u64::try_from(bytes.len())
+        .map_err(|_| InitialStackError::StackLayoutOverflow)?
+        .checked_add(1)
+        .ok_or(InitialStackError::StackLayoutOverflow)?;
+    *cursor = cursor
+        .checked_sub(len_with_nul)
+        .ok_or(InitialStackError::StackLayoutOverflow)?;
+
+    let mut stored = Vec::with_capacity(bytes.len() + 1);
+    stored.extend_from_slice(bytes);
+    stored.push(0);
+
+    placed.push(PlacedStackBytes {
+        address: *cursor,
+        bytes: stored,
+    });
+
+    Ok(*cursor)
+}
+
+fn build_pointer_area(
+    argv_addresses: &[u64],
+    envp_addresses: &[u64],
+    auxv_entries: &[AuxiliaryVectorEntry],
+) -> Result<Vec<u8>, InitialStackError> {
+    let mut bytes = Vec::new();
+    push_u64(
+        &mut bytes,
+        u64::try_from(argv_addresses.len()).map_err(|_| InitialStackError::StackLayoutOverflow)?,
+    );
+    for address in argv_addresses {
+        push_u64(&mut bytes, *address);
+    }
+    push_u64(&mut bytes, 0);
+    for address in envp_addresses {
+        push_u64(&mut bytes, *address);
+    }
+    push_u64(&mut bytes, 0);
+    for entry in auxv_entries {
+        push_u64(&mut bytes, entry.key());
+        push_u64(&mut bytes, entry.value());
+    }
+    Ok(bytes)
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestMemoryImage {
+    entrypoint: u64,
+    initial_stack_pointer: u64,
+    initial_stack: InitialStack,
+    brk: u64,
+    vmas: Vec<GuestVma>,
+    regions: Vec<GuestMemoryRegion>,
+}
+
+impl GuestMemoryImage {
+    #[must_use]
+    pub const fn entrypoint(&self) -> u64 {
+        self.entrypoint
+    }
+
+    #[must_use]
+    pub const fn initial_stack_pointer(&self) -> u64 {
+        self.initial_stack_pointer
+    }
+
+    #[must_use]
+    pub const fn initial_stack(&self) -> &InitialStack {
+        &self.initial_stack
+    }
+
+    #[must_use]
+    pub const fn brk(&self) -> u64 {
+        self.brk
+    }
+
+    #[must_use]
+    pub fn vmas(&self) -> &[GuestVma] {
+        &self.vmas
+    }
+
+    #[must_use]
+    pub fn regions(&self) -> &[GuestMemoryRegion] {
+        &self.regions
+    }
+
+    #[must_use]
+    pub fn read(&self, address: u64, len: usize) -> Option<&[u8]> {
+        let len = u64::try_from(len).ok()?;
+        let end = address.checked_add(len)?;
+        let region = self
+            .regions
+            .iter()
+            .find(|region| region.start <= address && end <= region.end)?;
+        let offset = usize::try_from(address - region.start).ok()?;
+        let end = offset.checked_add(usize::try_from(len).ok()?)?;
+        Some(&region.bytes[offset..end])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestVma {
+    start: u64,
+    end: u64,
+    permissions: SegmentPermissions,
+    kind: GuestVmaKind,
+}
+
+impl GuestVma {
+    #[must_use]
+    pub const fn new(
+        start: u64,
+        end: u64,
+        permissions: SegmentPermissions,
+        kind: GuestVmaKind,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            permissions,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn permissions(&self) -> SegmentPermissions {
+        self.permissions
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &GuestVmaKind {
+        &self.kind
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestVmaKind {
+    ElfLoad {
+        program_header_index: u16,
+        file_offset: u64,
+        file_size: u64,
+    },
+    Stack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestMemoryRegion {
+    start: u64,
+    end: u64,
+    bytes: Vec<u8>,
+}
+
+impl GuestMemoryRegion {
+    pub fn new(start: u64, bytes: Vec<u8>) -> Result<Self, GuestImageError> {
+        let len = u64::try_from(bytes.len()).map_err(|_| GuestImageError::RegionTooLarge {
+            start,
+            size: u64::MAX,
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or(GuestImageError::AddressRangeOverflow { start, size: len })?;
+        Ok(Self { start, end, bytes })
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestImageError {
+    Stack(InitialStackError),
+    SegmentFileRangeOverflow {
+        index: u16,
+        file_offset: u64,
+        file_size: u64,
+    },
+    SegmentFileRangeOutOfBounds {
+        index: u16,
+        file_offset: u64,
+        file_size: u64,
+        file_len: usize,
+    },
+    AddressRangeOverflow {
+        start: u64,
+        size: u64,
+    },
+    RegionTooLarge {
+        start: u64,
+        size: u64,
+    },
+    InvalidVmaRange {
+        start: u64,
+        end: u64,
+    },
+    VmaOverlap {
+        existing: GuestVma,
+        requested: GuestVma,
+    },
+}
+
+impl fmt::Display for GuestImageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stack(error) => write!(formatter, "{error}"),
+            Self::SegmentFileRangeOverflow {
+                index,
+                file_offset,
+                file_size,
+            } => write!(
+                formatter,
+                "ELF segment #{index} file range overflows: offset {file_offset:#x}, size {file_size:#x}"
+            ),
+            Self::SegmentFileRangeOutOfBounds {
+                index,
+                file_offset,
+                file_size,
+                file_len,
+            } => write!(
+                formatter,
+                "ELF segment #{index} file range [{file_offset:#x}, +{file_size:#x}) exceeds file size {file_len:#x}"
+            ),
+            Self::AddressRangeOverflow { start, size } => write!(
+                formatter,
+                "guest address range overflows: start {start:#x}, size {size:#x}"
+            ),
+            Self::RegionTooLarge { start, size } => write!(
+                formatter,
+                "guest memory region at {start:#x} is too large for this host: {size:#x} bytes"
+            ),
+            Self::InvalidVmaRange { start, end } => {
+                write!(formatter, "invalid guest VMA range [{start:#x}, {end:#x})")
+            }
+            Self::VmaOverlap {
+                existing,
+                requested,
+            } => write!(
+                formatter,
+                "guest VMA [{:#x}, {:#x}) overlaps existing [{:#x}, {:#x})",
+                requested.start, requested.end, existing.start, existing.end
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GuestImageError {}
+
+impl From<InitialStackError> for GuestImageError {
+    fn from(value: InitialStackError) -> Self {
+        Self::Stack(value)
+    }
+}
+
+pub fn build_guest_memory_image(
+    load_plan: &LoadPlan,
+    elf_bytes: &[u8],
+    stack_config: InitialStackConfig,
+) -> Result<GuestMemoryImage, GuestImageError> {
+    let mut vmas = Vec::new();
+    let mut regions = Vec::new();
+
+    for segment in load_plan.segments() {
+        let mapping = segment.mapping();
+        let mapped_bytes = read_segment_mapping_bytes(
+            elf_bytes,
+            segment.program_header_index(),
+            mapping.file_offset(),
+            mapping.file_size(),
+        )?;
+        let region_size = usize::try_from(mapping.memory_size()).map_err(|_| {
+            GuestImageError::RegionTooLarge {
+                start: mapping.start(),
+                size: mapping.memory_size(),
+            }
+        })?;
+        let mut region_bytes = vec![0; region_size];
+        region_bytes[..mapped_bytes.len()].copy_from_slice(mapped_bytes);
+
+        register_vma(
+            &mut vmas,
+            GuestVma::new(
+                mapping.start(),
+                mapping.end(),
+                mapping.permissions(),
+                GuestVmaKind::ElfLoad {
+                    program_header_index: segment.program_header_index(),
+                    file_offset: mapping.file_offset(),
+                    file_size: mapping.file_size(),
+                },
+            ),
+        )?;
+        regions.push(GuestMemoryRegion::new(mapping.start(), region_bytes)?);
+    }
+
+    let initial_stack = build_initial_stack(load_plan, stack_config)?;
+    let stack_size = usize::try_from(initial_stack.stack_size()).map_err(|_| {
+        GuestImageError::RegionTooLarge {
+            start: initial_stack.stack_base(),
+            size: initial_stack.stack_size(),
+        }
+    })?;
+    let stack_offset = usize::try_from(initial_stack.stack_pointer() - initial_stack.stack_base())
+        .map_err(|_| GuestImageError::AddressRangeOverflow {
+            start: initial_stack.stack_base(),
+            size: initial_stack.stack_size(),
+        })?;
+    let stack_end = stack_offset
+        .checked_add(initial_stack.bytes().len())
+        .ok_or(GuestImageError::AddressRangeOverflow {
+            start: initial_stack.stack_pointer(),
+            size: initial_stack.bytes().len() as u64,
+        })?;
+    let mut stack_region = vec![0; stack_size];
+    stack_region[stack_offset..stack_end].copy_from_slice(initial_stack.bytes());
+
+    register_vma(
+        &mut vmas,
+        GuestVma::new(
+            initial_stack.stack_base(),
+            initial_stack.stack_top(),
+            SegmentPermissions::new(true, true, false),
+            GuestVmaKind::Stack,
+        ),
+    )?;
+    regions.push(GuestMemoryRegion::new(
+        initial_stack.stack_base(),
+        stack_region,
+    )?);
+
+    regions.sort_by_key(|region| region.start);
+
+    Ok(GuestMemoryImage {
+        entrypoint: load_plan.entrypoint(),
+        initial_stack_pointer: initial_stack.stack_pointer(),
+        initial_stack,
+        brk: load_plan
+            .segments()
+            .iter()
+            .map(|segment| segment.mapping().end())
+            .max()
+            .unwrap_or(0),
+        vmas,
+        regions,
+    })
+}
+
+fn read_segment_mapping_bytes(
+    elf_bytes: &[u8],
+    index: u16,
+    file_offset: u64,
+    file_size: u64,
+) -> Result<&[u8], GuestImageError> {
+    let file_end =
+        file_offset
+            .checked_add(file_size)
+            .ok_or(GuestImageError::SegmentFileRangeOverflow {
+                index,
+                file_offset,
+                file_size,
+            })?;
+
+    if file_end > elf_bytes.len() as u64 {
+        return Err(GuestImageError::SegmentFileRangeOutOfBounds {
+            index,
+            file_offset,
+            file_size,
+            file_len: elf_bytes.len(),
+        });
+    }
+
+    Ok(&elf_bytes[file_offset as usize..file_end as usize])
+}
+
+fn register_vma(vmas: &mut Vec<GuestVma>, vma: GuestVma) -> Result<(), GuestImageError> {
+    if vma.start >= vma.end {
+        return Err(GuestImageError::InvalidVmaRange {
+            start: vma.start,
+            end: vma.end,
+        });
+    }
+
+    if let Some(existing) = vmas
+        .iter()
+        .find(|existing| existing.start < vma.end && vma.start < existing.end)
+    {
+        return Err(GuestImageError::VmaOverlap {
+            existing: existing.clone(),
+            requested: vma,
+        });
+    }
+
+    vmas.push(vma);
+    vmas.sort_by_key(|vma| vma.start);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElfValidationError {
     FileTooSmall {
@@ -1073,8 +1923,9 @@ mod tests {
     };
 
     use super::{
-        CRATE_NAME, ElfObjectType, ElfValidationError, SegmentPermissions, is_elf64,
-        parse_load_plan,
+        AuxiliaryVectorEntry, CRATE_NAME, ElfObjectType, ElfValidationError, GuestVma,
+        GuestVmaKind, InitialStackConfig, InitialStackError, SegmentPermissions, auxv,
+        build_guest_memory_image, build_initial_stack, is_elf64, parse_load_plan,
     };
 
     #[test]
@@ -1200,6 +2051,238 @@ mod tests {
             plan.interpreter().expect("interpreter").as_bytes(),
             b"/lib64/ld-linux-x86-64.so.2"
         );
+    }
+
+    #[test]
+    fn builds_deterministic_initial_stack_layout() {
+        let elf = Elf64Builder::new()
+            .entrypoint(0x401000)
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0x400000,
+                0x80,
+                0x2000,
+            ))
+            .build();
+        let plan = parse_load_plan(&elf).expect("valid static ELF should parse");
+        let random_bytes = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+
+        let stack = build_initial_stack(
+            &plan,
+            InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/app".to_vec())
+                .with_argv([b"/bin/app".to_vec(), b"--flag".to_vec()])
+                .with_envp([b"HOME=/root".to_vec(), b"PATH=/bin".to_vec()])
+                .with_random_bytes(random_bytes),
+        )
+        .expect("initial stack should build");
+
+        assert_eq!(stack.stack_top(), 0x8000_0000);
+        assert_eq!(stack.stack_base(), 0x7fff_c000);
+        assert_eq!(stack.stack_pointer(), 0x7fff_fed0);
+        assert_eq!(stack.bytes().len(), 0x130);
+        assert_eq!(stack.argv_addresses(), &[0x7fff_ffcb, 0x7fff_ffd4]);
+        assert_eq!(stack.envp_addresses(), &[0x7fff_ffdb, 0x7fff_ffe6]);
+        assert_eq!(stack.executable_path_address(), 0x7fff_fff7);
+        assert_eq!(stack.platform_address(), 0x7fff_fff0);
+        assert_eq!(stack.random_address(), 0x7fff_ffbb);
+
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fed0), 2);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fed8), 0x7fff_ffcb);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fee0), 0x7fff_ffd4);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fee8), 0);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fef0), 0x7fff_ffdb);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fef8), 0x7fff_ffe6);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_ff00), 0);
+
+        assert_eq!(
+            read_stack_bytes(&stack, 0x7fff_ffbb, 16),
+            random_bytes.as_slice()
+        );
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_ffcb), b"/bin/app");
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_ffd4), b"--flag");
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_ffdb), b"HOME=/root");
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_ffe6), b"PATH=/bin");
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_fff0), b"x86_64");
+        assert_eq!(read_stack_c_string(&stack, 0x7fff_fff7), b"/bin/app");
+    }
+
+    #[test]
+    fn builds_mvp_auxiliary_vector_values() {
+        let elf = Elf64Builder::new()
+            .entrypoint(0x401000)
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0x400000,
+                0x80,
+                0x2000,
+            ))
+            .build();
+        let plan = parse_load_plan(&elf).expect("valid static ELF should parse");
+
+        let stack = build_initial_stack(
+            &plan,
+            InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/app".to_vec())
+                .with_argv([b"/bin/app".to_vec()])
+                .with_envp([b"LANG=C".to_vec()])
+                .with_interpreter_base(0x7000_0000),
+        )
+        .expect("initial stack should build");
+
+        assert_eq!(
+            stack.auxv_entries(),
+            &[
+                AuxiliaryVectorEntry::new(auxv::AT_PHDR, 0x400040),
+                AuxiliaryVectorEntry::new(auxv::AT_PHENT, 56),
+                AuxiliaryVectorEntry::new(auxv::AT_PHNUM, 1),
+                AuxiliaryVectorEntry::new(auxv::AT_PAGESZ, 4096),
+                AuxiliaryVectorEntry::new(auxv::AT_BASE, 0x7000_0000),
+                AuxiliaryVectorEntry::new(auxv::AT_ENTRY, 0x401000),
+                AuxiliaryVectorEntry::new(auxv::AT_RANDOM, stack.random_address()),
+                AuxiliaryVectorEntry::new(auxv::AT_EXECFN, stack.executable_path_address()),
+                AuxiliaryVectorEntry::new(auxv::AT_PLATFORM, stack.platform_address()),
+                AuxiliaryVectorEntry::new(auxv::AT_NULL, 0),
+            ]
+        );
+
+        let auxv_start = stack.stack_pointer() + 8 + 8 * 2 + 8 * 2;
+        for (index, entry) in stack.auxv_entries().iter().enumerate() {
+            let address = auxv_start + u64::try_from(index).unwrap() * 16;
+            assert_eq!(read_stack_u64(&stack, address), entry.key());
+            assert_eq!(read_stack_u64(&stack, address + 8), entry.value());
+        }
+    }
+
+    #[test]
+    fn builds_guest_memory_image_from_load_plan() {
+        let elf = Elf64Builder::new()
+            .entrypoint(0x401000)
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0x400000,
+                0x1000,
+                0x2000,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_W,
+                0x3000,
+                0x402000,
+                0x03,
+                0x08,
+            ))
+            .data_at(0x100, vec![0xaa, 0xbb, 0xcc, 0xdd])
+            .data_at(0x3000, vec![0x11, 0x22, 0x33])
+            .build();
+        let plan = parse_load_plan(&elf).expect("valid ELF should parse");
+
+        let image = build_guest_memory_image(
+            &plan,
+            &elf,
+            InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/app".to_vec()),
+        )
+        .expect("guest memory image should build");
+
+        assert_eq!(image.entrypoint(), 0x401000);
+        assert_eq!(
+            image.initial_stack_pointer(),
+            image.initial_stack().stack_pointer()
+        );
+        assert_eq!(image.brk(), 0x403000);
+        assert_eq!(image.read(0x400100, 4).unwrap(), &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(
+            image.read(0x402000, 8).unwrap(),
+            &[0x11, 0x22, 0x33, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            image
+                .read(
+                    image.initial_stack().stack_pointer(),
+                    image.initial_stack().bytes().len()
+                )
+                .unwrap(),
+            image.initial_stack().bytes()
+        );
+
+        assert_eq!(
+            image.vmas(),
+            &[
+                GuestVma::new(
+                    0x400000,
+                    0x402000,
+                    SegmentPermissions::new(true, false, true),
+                    GuestVmaKind::ElfLoad {
+                        program_header_index: 0,
+                        file_offset: 0,
+                        file_size: 0x1000,
+                    },
+                ),
+                GuestVma::new(
+                    0x402000,
+                    0x403000,
+                    SegmentPermissions::new(true, true, false),
+                    GuestVmaKind::ElfLoad {
+                        program_header_index: 1,
+                        file_offset: 0x3000,
+                        file_size: 0x03,
+                    },
+                ),
+                GuestVma::new(
+                    0x7fff_c000,
+                    0x8000_0000,
+                    SegmentPermissions::new(true, true, false),
+                    GuestVmaKind::Stack,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_initial_stack_when_phdr_address_is_unavailable() {
+        let elf = Elf64Builder::new()
+            .entrypoint(0x401000)
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0x1000,
+                0x401000,
+                0x20,
+                0x20,
+            ))
+            .data_at(0x1000, vec![0xcc; 0x20])
+            .build();
+        let plan = parse_load_plan(&elf).expect("valid static ELF should parse");
+
+        assert_eq!(
+            build_initial_stack(
+                &plan,
+                InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/app".to_vec())
+            ),
+            Err(InitialStackError::MissingProgramHeaderAddress)
+        );
+    }
+
+    fn read_stack_u64(stack: &super::InitialStack, guest_address: u64) -> u64 {
+        let bytes = read_stack_bytes(stack, guest_address, 8);
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    fn read_stack_bytes(stack: &super::InitialStack, guest_address: u64, len: usize) -> &[u8] {
+        let offset = usize::try_from(guest_address - stack.stack_pointer()).unwrap();
+        &stack.bytes()[offset..offset + len]
+    }
+
+    fn read_stack_c_string(stack: &super::InitialStack, guest_address: u64) -> &[u8] {
+        let start = usize::try_from(guest_address - stack.stack_pointer()).unwrap();
+        let end = stack.bytes()[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| start + offset)
+            .expect("NUL terminator");
+        &stack.bytes()[start..end]
     }
 
     #[test]
