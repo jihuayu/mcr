@@ -63,6 +63,7 @@ pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFSOCK: u32 = 0o140000;
 pub const W_OK: u32 = 2;
 pub const X_OK: u32 = 1;
 
@@ -80,6 +81,7 @@ const PROC_SELF_FD_INODE_ID: InodeId = PROC_INODE_ID + 5;
 const DEFAULT_PIPE_CAPACITY: usize = 65_536;
 const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
+const FIRST_SOCKET_INODE_ID: InodeId = 1 << 59;
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
 
@@ -972,6 +974,10 @@ impl LinuxFileAttr {
         Self::new(inode, S_IFCHR | (mode & 0o7777), 0)
     }
 
+    pub fn socket(inode: InodeId) -> Self {
+        Self::new(inode, S_IFSOCK | 0o666, 0)
+    }
+
     fn new(inode: InodeId, mode: u32, size: u64) -> Self {
         Self {
             inode,
@@ -1015,6 +1021,10 @@ impl LinuxFileAttr {
         self.kind_bits() == S_IFCHR
     }
 
+    pub fn is_socket(self) -> bool {
+        self.kind_bits() == S_IFSOCK
+    }
+
     pub fn is_symlink(self) -> bool {
         self.kind_bits() == S_IFLNK
     }
@@ -1025,6 +1035,7 @@ impl LinuxFileAttr {
             S_IFREG => DT_REG,
             S_IFLNK => DT_LNK,
             S_IFCHR => DT_CHR,
+            S_IFSOCK => DT_SOCK,
             _ => DT_UNKNOWN,
         }
     }
@@ -1508,6 +1519,7 @@ pub enum FileKind {
     Dev(DevNodeKind),
     PipeRead,
     PipeWrite,
+    Socket,
     Stdio(StdioKind),
 }
 
@@ -1792,6 +1804,28 @@ impl FdTable {
         Ok([read_fd, write_fd])
     }
 
+    pub fn insert_socket(&mut self, socket_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        let access_mode = flags.access_mode();
+        if flags.raw() & !(O_ACCMODE | O_CLOEXEC | O_NONBLOCK) != 0
+            || (access_mode != 0 && access_mode != O_RDWR)
+        {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let inode = Arc::new(Inode::new(
+            socket_inode_id(socket_id)?,
+            InodeBackend::Socket(SocketNode::new(socket_id)),
+        ));
+        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        self.insert_entry(
+            fd,
+            FileRef::new(inode, FileKind::Socket),
+            flags.cloexec(),
+            OpenFlags::new(O_RDWR | (flags.raw() & O_NONBLOCK)),
+            None,
+        )
+    }
+
     pub fn insert_at_or_above(
         &mut self,
         min_fd: Fd,
@@ -1931,6 +1965,7 @@ impl FdTable {
             FileKind::PipeRead | FileKind::PipeWrite => {
                 Ok(pipe_node(entry.file())?.state().available())
             }
+            FileKind::Socket => Ok(0),
             FileKind::Stdio(_) => Ok(0),
         }
     }
@@ -2008,6 +2043,7 @@ impl FdTable {
             FileKind::Dev(_) => Err(VfsError::BadFd),
             FileKind::PipeRead => pipe_read(entry, buffer),
             FileKind::PipeWrite => Err(VfsError::BadFd),
+            FileKind::Socket => Err(VfsError::BadFd),
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Stdio(StdioKind::Stdin) => Ok(0),
             FileKind::Stdio(_) => Err(VfsError::BadFd),
@@ -2060,6 +2096,7 @@ impl FdTable {
             FileKind::Symlink => Err(VfsError::InvalidPath),
             FileKind::PipeRead => Err(VfsError::BadFd),
             FileKind::PipeWrite => pipe_write(entry, buffer),
+            FileKind::Socket => Err(VfsError::BadFd),
             FileKind::Stdio(StdioKind::Stdout | StdioKind::Stderr) => Ok(buffer.len()),
             FileKind::Stdio(StdioKind::Stdin) => Err(VfsError::BadFd),
         }
@@ -2075,7 +2112,11 @@ impl FdTable {
         let entry = self.get_mut(fd)?;
         if matches!(
             entry.file.kind,
-            FileKind::Dev(_) | FileKind::PipeRead | FileKind::PipeWrite | FileKind::Stdio(_)
+            FileKind::Dev(_)
+                | FileKind::PipeRead
+                | FileKind::PipeWrite
+                | FileKind::Socket
+                | FileKind::Stdio(_)
         ) {
             return Err(VfsError::NotSeekable);
         }
@@ -2090,6 +2131,7 @@ impl FdTable {
             FileKind::Directory => 0,
             FileKind::Dev(_) => unreachable!(),
             FileKind::PipeRead | FileKind::PipeWrite => unreachable!(),
+            FileKind::Socket => unreachable!(),
             FileKind::Stdio(_) => unreachable!(),
         };
         let base = match whence {
@@ -2384,6 +2426,10 @@ impl VirtualFileSystem {
 
     pub fn pipe(&mut self, flags: OpenFlags) -> VfsResult<[Fd; 2]> {
         self.fds.pipe(flags)
+    }
+
+    pub fn insert_socket(&mut self, socket_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        self.fds.insert_socket(socket_id, flags)
     }
 
     pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {
@@ -2938,6 +2984,7 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
         }
         FileKind::PipeRead | FileKind::PipeWrite => LinuxFileAttr::fifo(file.inode().id()),
+        FileKind::Socket => LinuxFileAttr::socket(file.inode().id()),
         FileKind::Dev(_) => LinuxFileAttr::character_device(file.inode().id(), 0o666),
         FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
@@ -3011,6 +3058,12 @@ fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
         InodeBackend::Pipe(pipe) => Ok(pipe),
         _ => Err(VfsError::BadFd),
     }
+}
+
+fn socket_inode_id(socket_id: u64) -> VfsResult<InodeId> {
+    FIRST_SOCKET_INODE_ID
+        .checked_add(socket_id)
+        .ok_or(VfsError::BadFd)
 }
 
 fn fill_urandom(buffer: &mut [u8]) -> VfsResult<()> {
@@ -3243,6 +3296,57 @@ mod tests {
 
         vfs.close(read_fd).unwrap();
         assert_eq!(vfs.write(write_fd, b"!").unwrap_err(), VfsError::BrokenPipe);
+    }
+
+    #[test]
+    fn socket_fds_share_guest_fd_namespace_and_metadata() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .insert_socket(42, OpenFlags::new(O_RDWR | O_CLOEXEC | O_NONBLOCK))
+            .unwrap();
+        let mut buffer = [0; 8];
+
+        assert_eq!(fd, 3);
+        let entry = vfs.fds().get(fd).unwrap();
+        assert_eq!(entry.file().kind(), FileKind::Socket);
+        assert_eq!(entry.flags().raw(), O_RDWR | O_NONBLOCK);
+        assert!(vfs.fds().cloexec(fd).unwrap());
+        let InodeBackend::Socket(socket) = entry.file().inode().backend() else {
+            panic!("socket fd should reference a socket inode");
+        };
+        assert_eq!(socket.id(), 42);
+
+        let stat = vfs.fstat(fd).unwrap();
+        assert!(stat.is_socket());
+        assert_eq!(stat.kind_bits(), S_IFSOCK);
+        assert_eq!(stat.mode & 0o777, 0o666);
+        assert_eq!(stat.inode, socket_inode_id(42).unwrap());
+        assert_eq!(vfs.ioctl(fd, FIONREAD).unwrap(), IoctlReply::U32(0));
+        assert_eq!(
+            vfs.lseek(fd, 0, SeekWhence::Set).unwrap_err(),
+            VfsError::NotSeekable
+        );
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap_err(), VfsError::BadFd);
+        assert_eq!(vfs.write(fd, b"ignored").unwrap_err(), VfsError::BadFd);
+
+        assert_eq!(vfs.fcntl(fd, F_GETFD, 0).unwrap(), u64::from(FD_CLOEXEC));
+        assert_eq!(
+            vfs.fcntl(fd, F_GETFL, 0).unwrap() as u32,
+            O_RDWR | O_NONBLOCK
+        );
+        assert_eq!(vfs.fcntl(fd, F_SETFL, 0).unwrap(), 0);
+        assert_eq!(vfs.fcntl(fd, F_GETFL, 0).unwrap() as u32, O_RDWR);
+
+        let dup = vfs.dup(fd).unwrap();
+        let dup3 = vfs.dup3(fd, 10, OpenFlags::new(O_CLOEXEC)).unwrap();
+        assert_eq!(dup, 4);
+        assert_eq!(dup3, 10);
+        assert!(!vfs.fds().cloexec(dup).unwrap());
+        assert!(vfs.fds().cloexec(dup3).unwrap());
+        assert!(vfs.fstat(dup).unwrap().is_socket());
+        vfs.close(fd).unwrap();
+        assert_eq!(vfs.fstat(fd).unwrap_err(), VfsError::BadFd);
+        assert!(vfs.fstat(dup).unwrap().is_socket());
     }
 
     #[test]
