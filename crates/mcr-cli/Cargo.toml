@@ -8,5 +8,8 @@ rust-version.workspace = true
 name = "mcr"
 path = "src/main.rs"
 
+[dependencies]
+mcr-runtime.workspace = true
+
 [lints]
 workspace = true
