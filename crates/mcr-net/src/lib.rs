@@ -31,6 +31,10 @@ pub const LINUX_SO_RCVBUF: u32 = 8;
 
 pub const LINUX_TCP_NODELAY: u32 = 1;
 
+pub const LINUX_SHUT_RD: u32 = 0;
+pub const LINUX_SHUT_WR: u32 = 1;
+pub const LINUX_SHUT_RDWR: u32 = 2;
+
 const DEFAULT_SOCKET_BUFFER_SIZE: u32 = 212_992;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -213,6 +217,113 @@ impl SocketSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketState {
     Created,
+    Bound(SocketAddress),
+    Listening(SocketAddress),
+    Connected(SocketAddress),
+    Closed,
+}
+
+impl SocketState {
+    #[must_use]
+    pub const fn local_address(self) -> Option<SocketAddress> {
+        match self {
+            Self::Bound(address) | Self::Listening(address) => Some(address),
+            Self::Created | Self::Connected(_) | Self::Closed => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn peer_address(self) -> Option<SocketAddress> {
+        match self {
+            Self::Connected(address) => Some(address),
+            Self::Created | Self::Bound(_) | Self::Listening(_) | Self::Closed => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketAddress {
+    Inet {
+        address: [u8; 4],
+        port: u16,
+    },
+    Inet6 {
+        address: [u8; 16],
+        port: u16,
+        flowinfo: u32,
+        scope_id: u32,
+    },
+}
+
+impl SocketAddress {
+    #[must_use]
+    pub const fn inet(address: [u8; 4], port: u16) -> Self {
+        Self::Inet { address, port }
+    }
+
+    #[must_use]
+    pub const fn inet6(address: [u8; 16], port: u16, flowinfo: u32, scope_id: u32) -> Self {
+        Self::Inet6 {
+            address,
+            port,
+            flowinfo,
+            scope_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn domain(self) -> SocketDomain {
+        match self {
+            Self::Inet { .. } => SocketDomain::Inet,
+            Self::Inet6 { .. } => SocketDomain::Inet6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShutdownFlags {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl ShutdownFlags {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.read && !self.write
+    }
+
+    pub fn apply(&mut self, how: ShutdownHow) {
+        match how {
+            ShutdownHow::Read => self.read = true,
+            ShutdownHow::Write => self.write = true,
+            ShutdownHow::ReadWrite => {
+                self.read = true;
+                self.write = true;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownHow {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl ShutdownHow {
+    pub fn from_linux(value: u32) -> Result<Self, SocketError> {
+        match value {
+            LINUX_SHUT_RD => Ok(Self::Read),
+            LINUX_SHUT_WR => Ok(Self::Write),
+            LINUX_SHUT_RDWR => Ok(Self::ReadWrite),
+            _ => Err(SocketError::invalid_input(
+                SocketOperation::Shutdown,
+                LinuxErrno::InvalidArgument,
+                "shutdown mode is not supported",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,6 +333,7 @@ pub struct GuestSocket {
     socket_type: SocketType,
     protocol: SocketProtocol,
     state: SocketState,
+    shutdown: ShutdownFlags,
     options: SocketOptions,
     last_error: Option<LinuxErrno>,
 }
@@ -234,6 +346,7 @@ impl GuestSocket {
             socket_type: spec.socket_type,
             protocol: spec.protocol,
             state: SocketState::Created,
+            shutdown: ShutdownFlags::default(),
             options: SocketOptions::default(),
             last_error: None,
         }
@@ -271,6 +384,11 @@ impl GuestSocket {
     #[must_use]
     pub const fn state(&self) -> SocketState {
         self.state
+    }
+
+    #[must_use]
+    pub const fn shutdown(&self) -> ShutdownFlags {
+        self.shutdown
     }
 
     #[must_use]
@@ -447,6 +565,136 @@ impl GuestSocketTable {
         Ok(())
     }
 
+    pub fn bind(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
+        let socket = self.socket_mut(id)?;
+        validate_address_domain(socket.domain, address)?;
+
+        match socket.state {
+            SocketState::Created => {
+                socket.state = SocketState::Bound(address);
+                Ok(())
+            }
+            SocketState::Bound(_) | SocketState::Listening(_) => Err(SocketError::invalid_state(
+                SocketOperation::Bind,
+                LinuxErrno::InvalidArgument,
+                "socket is already bound",
+            )),
+            SocketState::Connected(_) => Err(SocketError::invalid_state(
+                SocketOperation::Bind,
+                LinuxErrno::InvalidArgument,
+                "connected socket cannot be bound",
+            )),
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        }
+    }
+
+    pub fn listen(&mut self, id: SocketId, _backlog: u32) -> Result<(), SocketError> {
+        let socket = self.socket_mut(id)?;
+        if socket.socket_type != SocketType::Stream {
+            return Err(SocketError::invalid_state(
+                SocketOperation::Listen,
+                LinuxErrno::OperationNotSupported,
+                "only stream sockets can listen",
+            ));
+        }
+
+        match socket.state {
+            SocketState::Created => Err(SocketError::invalid_state(
+                SocketOperation::Listen,
+                LinuxErrno::InvalidArgument,
+                "socket must be bound before listen",
+            )),
+            SocketState::Bound(address) => {
+                socket.state = SocketState::Listening(address);
+                Ok(())
+            }
+            SocketState::Listening(_) => Ok(()),
+            SocketState::Connected(_) => Err(SocketError::invalid_state(
+                SocketOperation::Listen,
+                LinuxErrno::InvalidArgument,
+                "connected socket cannot listen",
+            )),
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        }
+    }
+
+    pub fn connect(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
+        let socket = self.socket_mut(id)?;
+        validate_address_domain(socket.domain, address)?;
+
+        match socket.state {
+            SocketState::Created | SocketState::Bound(_) => {
+                socket.state = SocketState::Connected(address);
+                Ok(())
+            }
+            SocketState::Connected(_) => Err(SocketError::invalid_state(
+                SocketOperation::Connect,
+                LinuxErrno::AlreadyConnected,
+                "socket is already connected",
+            )),
+            SocketState::Listening(_) => Err(SocketError::invalid_state(
+                SocketOperation::Connect,
+                LinuxErrno::InvalidArgument,
+                "listening socket cannot connect",
+            )),
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        }
+    }
+
+    pub fn accept_placeholder(&mut self, id: SocketId) -> Result<SocketId, SocketError> {
+        let socket = self.socket(id)?;
+        match socket.state {
+            SocketState::Listening(_) => Err(SocketError::would_block(
+                SocketOperation::Accept,
+                "no pending guest socket connection is available",
+            )),
+            SocketState::Created | SocketState::Bound(_) | SocketState::Connected(_) => {
+                Err(SocketError::invalid_state(
+                    SocketOperation::Accept,
+                    LinuxErrno::InvalidArgument,
+                    "socket is not listening",
+                ))
+            }
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        }
+    }
+
+    pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
+        let socket = self.socket_mut(id)?;
+        match socket.state {
+            SocketState::Connected(_) => {
+                socket.shutdown.apply(how);
+                Ok(())
+            }
+            SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
+                Err(SocketError::invalid_state(
+                    SocketOperation::Shutdown,
+                    LinuxErrno::NotConnected,
+                    "socket is not connected",
+                ))
+            }
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+        }
+    }
+
+    pub fn close(&mut self, id: SocketId) -> Result<(), SocketError> {
+        let socket = self.socket_mut(id)?;
+        match socket.state {
+            SocketState::Closed => Err(SocketError::BadSocket { id }),
+            SocketState::Created
+            | SocketState::Bound(_)
+            | SocketState::Listening(_)
+            | SocketState::Connected(_) => {
+                socket.state = SocketState::Closed;
+                socket.shutdown = ShutdownFlags {
+                    read: true,
+                    write: true,
+                };
+                Ok(())
+            }
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.sockets.len()
@@ -472,16 +720,26 @@ impl GuestSocketTable {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketOperation {
+    Accept,
     AllocateSocketId,
+    Bind,
+    Close,
+    Connect,
     CreateSocket,
     GetSocketOption,
+    Listen,
     SetSocketOption,
+    Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinuxErrno {
+    AlreadyConnected,
     BadFileDescriptor,
     InvalidArgument,
+    NotConnected,
+    OperationWouldBlock,
+    OperationNotSupported,
     AddressFamilyNotSupported,
     ProtocolNotAvailable,
     ProtocolNotSupported,
@@ -493,8 +751,12 @@ impl LinuxErrno {
     #[must_use]
     pub const fn code(self) -> i32 {
         match self {
+            Self::AlreadyConnected => 106,
             Self::BadFileDescriptor => 9,
             Self::InvalidArgument => 22,
+            Self::OperationNotSupported => 95,
+            Self::NotConnected => 107,
+            Self::OperationWouldBlock => 11,
             Self::ProtocolWrongTypeForSocket => 91,
             Self::ProtocolNotAvailable => 92,
             Self::ProtocolNotSupported => 93,
@@ -512,6 +774,16 @@ pub enum SocketError {
         reason: &'static str,
     },
     Unsupported {
+        operation: SocketOperation,
+        errno: LinuxErrno,
+        reason: &'static str,
+    },
+    InvalidState {
+        operation: SocketOperation,
+        errno: LinuxErrno,
+        reason: &'static str,
+    },
+    WouldBlock {
         operation: SocketOperation,
         errno: LinuxErrno,
         reason: &'static str,
@@ -538,10 +810,29 @@ impl SocketError {
         }
     }
 
+    fn invalid_state(operation: SocketOperation, errno: LinuxErrno, reason: &'static str) -> Self {
+        Self::InvalidState {
+            operation,
+            errno,
+            reason,
+        }
+    }
+
+    fn would_block(operation: SocketOperation, reason: &'static str) -> Self {
+        Self::WouldBlock {
+            operation,
+            errno: LinuxErrno::OperationWouldBlock,
+            reason,
+        }
+    }
+
     #[must_use]
     pub const fn linux_errno(&self) -> LinuxErrno {
         match self {
-            Self::InvalidInput { errno, .. } | Self::Unsupported { errno, .. } => *errno,
+            Self::InvalidInput { errno, .. }
+            | Self::Unsupported { errno, .. }
+            | Self::InvalidState { errno, .. }
+            | Self::WouldBlock { errno, .. } => *errno,
             Self::BadSocket { .. } => LinuxErrno::BadFileDescriptor,
         }
     }
@@ -556,6 +847,12 @@ impl fmt::Display for SocketError {
             Self::Unsupported {
                 operation, reason, ..
             } => write!(f, "{operation:?}: unsupported: {reason}"),
+            Self::InvalidState {
+                operation, reason, ..
+            } => write!(f, "{operation:?}: invalid state: {reason}"),
+            Self::WouldBlock {
+                operation, reason, ..
+            } => write!(f, "{operation:?}: would block: {reason}"),
             Self::BadSocket { id } => write!(f, "bad socket id {id}"),
         }
     }
@@ -607,6 +904,21 @@ fn validate_buffer_size(value: u32) -> Result<u32, SocketError> {
         ))
     } else {
         Ok(value)
+    }
+}
+
+fn validate_address_domain(
+    domain: SocketDomain,
+    address: SocketAddress,
+) -> Result<(), SocketError> {
+    if domain == address.domain() {
+        Ok(())
+    } else {
+        Err(SocketError::invalid_input(
+            SocketOperation::Bind,
+            LinuxErrno::AddressFamilyNotSupported,
+            "socket address family does not match socket domain",
+        ))
     }
 }
 
@@ -829,6 +1141,159 @@ mod tests {
                     SocketOptionName::SocketType
                 )
                 .expect_err("unknown socket")
+                .linux_errno(),
+            LinuxErrno::BadFileDescriptor
+        );
+    }
+
+    #[test]
+    fn bind_and_listen_update_stream_socket_state() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket(
+                SocketDomain::Inet,
+                SocketType::Stream,
+                SocketProtocol::Default,
+            )
+            .expect("stream socket");
+        let address = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(stream, address).expect("bind stream");
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Bound(address)
+        );
+        assert_eq!(
+            table
+                .socket(stream)
+                .expect("socket")
+                .state()
+                .local_address(),
+            Some(address)
+        );
+
+        table.listen(stream, 128).expect("listen stream");
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Listening(address)
+        );
+        table
+            .listen(stream, 128)
+            .expect("listen is idempotent while listening");
+    }
+
+    #[test]
+    fn connect_and_shutdown_record_placeholder_state() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket(SocketDomain::Inet6, SocketType::Stream, SocketProtocol::Tcp)
+            .expect("stream socket");
+        let peer =
+            SocketAddress::inet6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443, 0, 0);
+
+        table.connect(stream, peer).expect("connect placeholder");
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected(peer)
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state().peer_address(),
+            Some(peer)
+        );
+
+        table
+            .shutdown(stream, ShutdownHow::Write)
+            .expect("shutdown write");
+        assert_eq!(
+            table.socket(stream).expect("socket").shutdown(),
+            ShutdownFlags {
+                read: false,
+                write: true
+            }
+        );
+
+        table
+            .shutdown(stream, ShutdownHow::ReadWrite)
+            .expect("shutdown both");
+        assert_eq!(
+            table.socket(stream).expect("socket").shutdown(),
+            ShutdownFlags {
+                read: true,
+                write: true
+            }
+        );
+        assert_eq!(
+            ShutdownHow::from_linux(LINUX_SHUT_RDWR).expect("shutdown mode"),
+            ShutdownHow::ReadWrite
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_state_transitions() {
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket(
+                SocketDomain::Inet,
+                SocketType::Datagram,
+                SocketProtocol::Udp,
+            )
+            .expect("datagram socket");
+        let stream = table
+            .create_socket(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+            .expect("stream socket");
+
+        assert_eq!(
+            table
+                .listen(datagram, 1)
+                .expect_err("datagrams cannot listen")
+                .linux_errno(),
+            LinuxErrno::OperationNotSupported
+        );
+        assert_eq!(
+            table
+                .listen(stream, 1)
+                .expect_err("unbound stream cannot listen")
+                .linux_errno(),
+            LinuxErrno::InvalidArgument
+        );
+        assert_eq!(
+            table
+                .shutdown(stream, ShutdownHow::Read)
+                .expect_err("unconnected stream cannot shutdown")
+                .linux_errno(),
+            LinuxErrno::NotConnected
+        );
+        assert_eq!(
+            table
+                .bind(stream, SocketAddress::inet6([0; 16], 80, 0, 0))
+                .expect_err("address family mismatch")
+                .linux_errno(),
+            LinuxErrno::AddressFamilyNotSupported
+        );
+
+        let address = SocketAddress::inet([127, 0, 0, 1], 8080);
+        table.bind(stream, address).expect("bind");
+        table.listen(stream, 1).expect("listen");
+        assert_eq!(
+            table
+                .accept_placeholder(stream)
+                .expect_err("accept placeholder would block")
+                .linux_errno(),
+            LinuxErrno::OperationWouldBlock
+        );
+        assert_eq!(
+            table
+                .connect(stream, address)
+                .expect_err("listening socket cannot connect")
+                .linux_errno(),
+            LinuxErrno::InvalidArgument
+        );
+
+        table.close(stream).expect("close");
+        assert_eq!(
+            table
+                .bind(stream, address)
+                .expect_err("closed socket is bad")
                 .linux_errno(),
             LinuxErrno::BadFileDescriptor
         );
