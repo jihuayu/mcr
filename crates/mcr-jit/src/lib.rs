@@ -237,7 +237,10 @@ pub struct GuestRegisters {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GuestFlags {
+    carry: bool,
     zero: bool,
+    sign: bool,
+    overflow: bool,
 }
 
 impl GuestRegisters {
@@ -540,7 +543,7 @@ fn execute_simple_instruction(
             let rhs = read_reg64(registers, instruction.op1_register())?;
             let result = lhs.wrapping_add(rhs);
             write_reg64(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_add_result(lhs, rhs, result, 64);
         }
         Code::Add_rm32_r32 | Code::Add_r32_rm32
             if instruction.op0_kind() == OpKind::Register
@@ -550,7 +553,7 @@ fn execute_simple_instruction(
             let rhs = read_reg32(registers, instruction.op1_register())?;
             let result = lhs.wrapping_add(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Add_rm64_imm32 | Code::Add_rm64_imm8
             if instruction.op0_kind() == OpKind::Register =>
@@ -559,7 +562,7 @@ fn execute_simple_instruction(
             let rhs = immediate_as_u64(&instruction)?;
             let result = lhs.wrapping_add(rhs);
             write_reg64(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_add_result(lhs, rhs, result, 64);
         }
         Code::Add_rm32_imm32 | Code::Add_rm32_imm8
             if instruction.op0_kind() == OpKind::Register =>
@@ -568,7 +571,7 @@ fn execute_simple_instruction(
             let rhs = immediate_as_u32(&instruction)?;
             let result = lhs.wrapping_add(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Sub_rm64_r64 | Code::Sub_r64_rm64
             if instruction.op0_kind() == OpKind::Register
@@ -578,7 +581,7 @@ fn execute_simple_instruction(
             let rhs = read_reg64(registers, instruction.op1_register())?;
             let result = lhs.wrapping_sub(rhs);
             write_reg64(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_sub_result(lhs, rhs, result, 64);
         }
         Code::Sub_rm32_r32 | Code::Sub_r32_rm32
             if instruction.op0_kind() == OpKind::Register
@@ -588,7 +591,7 @@ fn execute_simple_instruction(
             let rhs = read_reg32(registers, instruction.op1_register())?;
             let result = lhs.wrapping_sub(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Sub_rm64_imm32 | Code::Sub_rm64_imm8
             if instruction.op0_kind() == OpKind::Register =>
@@ -597,7 +600,7 @@ fn execute_simple_instruction(
             let rhs = immediate_as_u64(&instruction)?;
             let result = lhs.wrapping_sub(rhs);
             write_reg64(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_sub_result(lhs, rhs, result, 64);
         }
         Code::Sub_rm32_imm32 | Code::Sub_rm32_imm8
             if instruction.op0_kind() == OpKind::Register =>
@@ -606,7 +609,7 @@ fn execute_simple_instruction(
             let rhs = immediate_as_u32(&instruction)?;
             let result = lhs.wrapping_sub(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
-            flags.zero = result == 0;
+            flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
@@ -614,7 +617,7 @@ fn execute_simple_instruction(
         {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = read_reg64(registers, instruction.op1_register())?;
-            flags.zero = lhs.wrapping_sub(rhs) == 0;
+            flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
         }
         Code::Cmp_rm32_r32 | Code::Cmp_r32_rm32
             if instruction.op0_kind() == OpKind::Register
@@ -622,28 +625,38 @@ fn execute_simple_instruction(
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = read_reg32(registers, instruction.op1_register())?;
-            flags.zero = lhs.wrapping_sub(rhs) == 0;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                32,
+            );
         }
         Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8
             if instruction.op0_kind() == OpKind::Register =>
         {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = immediate_as_u64(&instruction)?;
-            flags.zero = lhs.wrapping_sub(rhs) == 0;
+            flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
         }
         Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8
             if instruction.op0_kind() == OpKind::Register =>
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = immediate_as_u32(&instruction)?;
-            flags.zero = lhs.wrapping_sub(rhs) == 0;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                32,
+            );
         }
         Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32
             if instruction.op1_kind() == OpKind::Register
                 && instruction.op0_register() == instruction.op1_register() =>
         {
             write_reg64(registers, instruction.op0_register(), 0)?;
-            flags.zero = true;
+            flags.set_logic_result(0, 64);
         }
         Code::Test_rm32_r32
             if instruction.op0_kind() == OpKind::Register
@@ -651,7 +664,7 @@ fn execute_simple_instruction(
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = read_reg32(registers, instruction.op1_register())?;
-            flags.zero = lhs & rhs == 0;
+            flags.set_logic_result(u64::from(lhs & rhs), 32);
         }
         Code::Test_rm64_r64
             if instruction.op0_kind() == OpKind::Register
@@ -659,7 +672,7 @@ fn execute_simple_instruction(
         {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = read_reg64(registers, instruction.op1_register())?;
-            flags.zero = lhs & rhs == 0;
+            flags.set_logic_result(lhs & rhs, 64);
         }
         Code::Nopd | Code::Nopq => {}
         _ => {
@@ -676,13 +689,68 @@ fn execute_simple_instruction(
 }
 
 impl GuestFlags {
+    const RFLAGS_CARRY: u64 = 1;
     const RFLAGS_ZERO: u64 = 1 << 6;
+    const RFLAGS_SIGN: u64 = 1 << 7;
+    const RFLAGS_OVERFLOW: u64 = 1 << 11;
 
     const fn from_registers(registers: &GuestRegisters) -> Self {
         Self {
+            carry: registers.rflags & Self::RFLAGS_CARRY != 0,
             zero: registers.rflags & Self::RFLAGS_ZERO != 0,
+            sign: registers.rflags & Self::RFLAGS_SIGN != 0,
+            overflow: registers.rflags & Self::RFLAGS_OVERFLOW != 0,
         }
     }
+
+    fn set_add_result(&mut self, lhs: u64, rhs: u64, result: u64, bits: u32) {
+        let lhs = mask_to_width(lhs, bits);
+        let rhs = mask_to_width(rhs, bits);
+        let result = mask_to_width(result, bits);
+        let sign_bit = sign_bit(bits);
+
+        self.set_zero_sign(result, bits);
+        self.carry = u128::from(lhs) + u128::from(rhs) > u128::from(mask_for_width(bits));
+        self.overflow = (lhs ^ result) & (rhs ^ result) & sign_bit != 0;
+    }
+
+    fn set_sub_result(&mut self, lhs: u64, rhs: u64, result: u64, bits: u32) {
+        let lhs = mask_to_width(lhs, bits);
+        let rhs = mask_to_width(rhs, bits);
+        let result = mask_to_width(result, bits);
+        let sign_bit = sign_bit(bits);
+
+        self.set_zero_sign(result, bits);
+        self.carry = lhs < rhs;
+        self.overflow = (lhs ^ rhs) & (lhs ^ result) & sign_bit != 0;
+    }
+
+    fn set_logic_result(&mut self, result: u64, bits: u32) {
+        self.set_zero_sign(mask_to_width(result, bits), bits);
+        self.carry = false;
+        self.overflow = false;
+    }
+
+    fn set_zero_sign(&mut self, result: u64, bits: u32) {
+        self.zero = result == 0;
+        self.sign = result & sign_bit(bits) != 0;
+    }
+}
+
+const fn mask_for_width(bits: u32) -> u64 {
+    if bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    }
+}
+
+const fn mask_to_width(value: u64, bits: u32) -> u64 {
+    value & mask_for_width(bits)
+}
+
+const fn sign_bit(bits: u32) -> u64 {
+    1_u64 << (bits - 1)
 }
 
 fn block_from_rip(block: GuestBlock<'_>, rip: u64) -> Result<GuestBlock<'_>, ExecutionError> {
@@ -768,6 +836,16 @@ fn branch_taken(instruction: &Instruction, flags: GuestFlags) -> Result<bool, Ex
         Code::Jmp_rel8_64 | Code::Jmp_rel32_64 => Ok(true),
         Code::Je_rel8_64 | Code::Je_rel32_64 => Ok(flags.zero),
         Code::Jne_rel8_64 | Code::Jne_rel32_64 => Ok(!flags.zero),
+        Code::Js_rel8_64 | Code::Js_rel32_64 => Ok(flags.sign),
+        Code::Jns_rel8_64 | Code::Jns_rel32_64 => Ok(!flags.sign),
+        Code::Jl_rel8_64 | Code::Jl_rel32_64 => Ok(flags.sign != flags.overflow),
+        Code::Jge_rel8_64 | Code::Jge_rel32_64 => Ok(flags.sign == flags.overflow),
+        Code::Jg_rel8_64 | Code::Jg_rel32_64 => Ok(!flags.zero && flags.sign == flags.overflow),
+        Code::Jle_rel8_64 | Code::Jle_rel32_64 => Ok(flags.zero || flags.sign != flags.overflow),
+        Code::Jb_rel8_64 | Code::Jb_rel32_64 => Ok(flags.carry),
+        Code::Jae_rel8_64 | Code::Jae_rel32_64 => Ok(!flags.carry),
+        Code::Ja_rel8_64 | Code::Ja_rel32_64 => Ok(!flags.carry && !flags.zero),
+        Code::Jbe_rel8_64 | Code::Jbe_rel32_64 => Ok(flags.carry || flags.zero),
         _ => Err(ExecutionError::MissingSyscall {
             terminator: BlockTerminator::ControlFlow {
                 rip: instruction.ip(),
@@ -1312,6 +1390,149 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x47101a);
+    }
+
+    #[test]
+    fn execution_core_branches_on_negative_errno_with_test64_sign_flag() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // mov rax,-2
+                0x48, 0x85, 0xc0, // test rax,rax
+                0x78, 0x07, // js +7
+                0xb8, 0x27, 0x00, 0x00, 0x00, // skipped mov eax,39
+                0x90, 0x90, // skipped nops
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,60
+                0x0f, 0x05, // syscall
+            ],
+            0x471100,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x202,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(0).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute error syscall behind test64/js");
+
+        assert_eq!(captured_number, Some(Syscall::EXIT));
+        assert_eq!(registers.rip, 0x47111d);
+    }
+
+    #[test]
+    fn execution_core_uses_cmp32_signed_flags_for_jl_and_jge() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0xff, 0xff, 0xff, 0xff, // mov eax,-1
+                0x83, 0xf8, 0x01, // cmp eax,1
+                0x7c, 0x09, // jl +9
+                0xb8, 0x03, 0x00, 0x00, 0x00, // skipped mov eax,3
+                0x0f, 0x05, // skipped syscall
+                0x90, 0x90, // skipped nops
+                0x83, 0xf8, 0x3c, // cmp eax,60
+                0x7d, 0x07, // jge +7
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+            ],
+            0x471200,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x202,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind cmp32/jl/jge");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x47121f);
+    }
+
+    #[test]
+    fn execution_core_uses_cmp32_unsigned_flags_for_jb_and_jae() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+                0x83, 0xf8, 0x02, // cmp eax,2
+                0x72, 0x09, // jb +9
+                0xb8, 0x03, 0x00, 0x00, 0x00, // skipped mov eax,3
+                0x0f, 0x05, // skipped syscall
+                0x90, 0x90, // skipped nops
+                0x83, 0xf8, 0x27, // cmp eax,39
+                0x73, 0x07, // jae +7
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+            ],
+            0x471300,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x202,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind cmp32/jb/jae");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x47131f);
+    }
+
+    #[test]
+    fn execution_core_uses_initial_rflags_for_direct_condition_jump() {
+        let block = GuestBlock::new(
+            &[
+                0x78, 0x07, // js +7
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x90, 0x90, // skipped nops
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x471400,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x282,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind initial-rflags/js");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x471410);
     }
 
     #[test]
