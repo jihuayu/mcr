@@ -6930,6 +6930,28 @@ mod tests {
     }
 
     #[test]
+    fn guest_execution_follows_call_ret_before_syscall() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0xe8, 0x07, 0x00, 0x00, 0x00, // call 0x40100c
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x0f, 0x05, // syscall
+                0x48, 0xc7, 0xc7, 0x21, 0x00, 0x00, 0x00, // mov rdi,33
+                0xc3, // ret
+            ],
+        ))
+        .unwrap();
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("call/ret feeds exit_group syscall");
+
+        assert_eq!(step.task_state(), TaskState::Exited { status: 33 });
+    }
+
+    #[test]
     fn guest_execution_surfaces_guest_memory_operand_fault() {
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",

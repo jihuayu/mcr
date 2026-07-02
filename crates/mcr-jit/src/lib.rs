@@ -589,7 +589,9 @@ impl SameIsaExecutionCore {
                 return Ok(SyscallTrap::new(decoded, site, registers));
             }
 
-            if let Some(target) = control_flow_target(block, &decoded, flags)? {
+            if let Some(target) =
+                control_flow_target(block, &decoded, flags, &mut registers, memory)?
+            {
                 current_rip = target;
                 registers.rip = target;
                 continue;
@@ -972,20 +974,19 @@ fn block_offset(block: GuestBlock<'_>, rip: u64) -> Result<usize, ExecutionError
     Ok(offset)
 }
 
-fn control_flow_target(
+fn control_flow_target<M>(
     block: GuestBlock<'_>,
     decoded: &DecodedBlock,
     flags: GuestFlags,
-) -> Result<Option<u64>, ExecutionError> {
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+) -> Result<Option<u64>, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
     let BlockTerminator::ControlFlow { flow, .. } = decoded.terminator() else {
         return Ok(None);
     };
-    if !matches!(
-        flow,
-        DecodedFlowControl::UnconditionalBranch | DecodedFlowControl::ConditionalBranch
-    ) {
-        return Ok(None);
-    }
     let Some(instruction) = decoded.instructions().last() else {
         return Err(ExecutionError::MissingSyscall {
             terminator: *decoded.terminator(),
@@ -1006,20 +1007,45 @@ fn control_flow_target(
         DecoderOptions::NONE,
     );
     let instruction = decoder.decode();
-    if !branch_taken(&instruction, flags)? {
-        return Ok(Some(instruction.next_ip()));
+
+    match flow {
+        DecodedFlowControl::UnconditionalBranch | DecodedFlowControl::ConditionalBranch => {
+            if !branch_taken(&instruction, flags)? {
+                return Ok(Some(instruction.next_ip()));
+            }
+            if !matches!(
+                instruction.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            ) {
+                return Err(ExecutionError::MissingSyscall {
+                    terminator: *decoded.terminator(),
+                });
+            }
+            let target = instruction.near_branch_target();
+            block_offset(block, target)?;
+            Ok(Some(target))
+        }
+        DecodedFlowControl::Call if instruction.code() == Code::Call_rel32_64 => {
+            let target = instruction.near_branch_target();
+            block_offset(block, target)?;
+            let next_rsp = registers.rsp.wrapping_sub(8);
+            write_memory_u64(memory, instruction.ip(), next_rsp, instruction.next_ip())?;
+            registers.rsp = next_rsp;
+            Ok(Some(target))
+        }
+        DecodedFlowControl::Return if instruction.code() == Code::Retnq => {
+            let target = read_memory_u64(memory, instruction.ip(), registers.rsp)?;
+            block_offset(block, target)?;
+            registers.rsp = registers.rsp.wrapping_add(8);
+            Ok(Some(target))
+        }
+        DecodedFlowControl::IndirectBranch
+        | DecodedFlowControl::Call
+        | DecodedFlowControl::Return
+        | DecodedFlowControl::Interrupt
+        | DecodedFlowControl::Exception
+        | DecodedFlowControl::XbeginXabortXend => Ok(None),
     }
-    if !matches!(
-        instruction.op0_kind(),
-        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-    ) {
-        return Err(ExecutionError::MissingSyscall {
-            terminator: *decoded.terminator(),
-        });
-    }
-    let target = instruction.near_branch_target();
-    block_offset(block, target)?;
-    Ok(Some(target))
 }
 
 fn branch_taken(instruction: &Instruction, flags: GuestFlags) -> Result<bool, ExecutionError> {
@@ -1855,6 +1881,67 @@ mod tests {
             ExecutionError::MemoryOperand {
                 rip: 0x461290,
                 address: 0x740000,
+                access: super::GuestMemoryOperandAccessKind::Write,
+                error: GuestMemoryOperandError::AccessDenied,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_core_follows_direct_call_and_return_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0xe8, 0x08, 0x00, 0x00, 0x00, // call 0x461405
+                0x0f, 0x05, // syscall after ret
+                0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // padding
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0xc3, // ret
+            ],
+            0x461400,
+        );
+        let registers = GuestRegisters {
+            rsp: 0x750008,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x750000, &[0; 16]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute call/ret before syscall");
+
+        assert_eq!(trap.site().rip, 0x461405);
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.registers().rsp, 0x750008);
+        assert_eq!(memory.read_u64(0x750000), 0x461405);
+    }
+
+    #[test]
+    fn execution_core_call_stack_fault_stops_before_target() {
+        let block = GuestBlock::new(
+            &[
+                0xe8, 0x01, 0x00, 0x00, 0x00, // call 0x461506
+                0x0f, 0x05, // skipped
+                0xc3, // ret
+            ],
+            0x461500,
+        );
+        let registers = GuestRegisters {
+            rsp: 0x760008,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let error = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect_err("unmapped call stack push should stop before target");
+
+        assert_eq!(
+            error,
+            ExecutionError::MemoryOperand {
+                rip: 0x461500,
+                address: 0x760000,
                 access: super::GuestMemoryOperandAccessKind::Write,
                 error: GuestMemoryOperandError::AccessDenied,
             }
