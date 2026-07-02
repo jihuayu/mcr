@@ -10,7 +10,10 @@ pub type InodeId = u64;
 
 pub const AT_FDCWD: Fd = -100;
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+pub const AT_REMOVEDIR: u32 = 0x200;
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+pub const DEFAULT_UMASK: u32 = 0o022;
 pub const DT_UNKNOWN: u8 = 0;
 pub const DT_FIFO: u8 = 1;
 pub const DT_CHR: u8 = 2;
@@ -50,6 +53,10 @@ pub const TIOCGPGRP: u64 = 0x540f;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const R_OK: u32 = 4;
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+pub const SUPPORTED_RENAME_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE;
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFDIR: u32 = 0o040000;
@@ -74,9 +81,11 @@ pub enum VfsError {
     Loop,
     NameTooLong,
     NoEntry,
+    NotEmpty,
     NoSpace,
     NotSeekable,
     NotDirectory,
+    NotPermitted,
     PermissionDenied,
     WouldBlock,
 }
@@ -91,9 +100,11 @@ impl VfsError {
             Self::Loop => 40,
             Self::NameTooLong => 36,
             Self::NoEntry => 2,
+            Self::NotEmpty => 39,
             Self::NoSpace => 28,
             Self::NotSeekable => 29,
             Self::NotDirectory => 20,
+            Self::NotPermitted => 1,
             Self::PermissionDenied => 13,
             Self::WouldBlock => 11,
         }
@@ -110,9 +121,11 @@ impl fmt::Display for VfsError {
             Self::Loop => "too many symbolic links",
             Self::NameTooLong => "path name is too long",
             Self::NoEntry => "no such file or directory",
+            Self::NotEmpty => "directory not empty",
             Self::NoSpace => "no space left on device",
             Self::NotSeekable => "illegal seek",
             Self::NotDirectory => "not a directory",
+            Self::NotPermitted => "operation not permitted",
             Self::PermissionDenied => "permission denied",
             Self::WouldBlock => "resource temporarily unavailable",
         };
@@ -233,6 +246,17 @@ impl Rootfs {
         }
     }
 
+    pub fn visible_path(&self, path: &GuestPath) -> VfsResult<String> {
+        if !path.starts_with(&self.root) {
+            return Err(VfsError::NoEntry);
+        }
+        let suffix = &path.components[self.root.components.len()..];
+        if suffix.is_empty() {
+            return Ok("/".to_owned());
+        }
+        Ok(format!("/{}", suffix.join("/")))
+    }
+
     pub fn resolve_path(&self, path: impl AsRef<str>, tree: &PathTree) -> VfsResult<ResolvedPath> {
         let resolved = PathResolver::new(self, tree).resolve(path.as_ref())?;
         let inode = tree.lookup_path(&resolved).map(|node| node.inode_id);
@@ -295,16 +319,20 @@ impl ResolvedPath {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathTree {
-    nodes: BTreeMap<GuestPath, PathNode>,
+    nodes: BTreeMap<GuestPath, InodeId>,
+    inodes: BTreeMap<InodeId, PathNode>,
     next_inode_id: InodeId,
 }
 
 impl PathTree {
     pub fn new() -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert(GuestPath::root(), PathNode::directory(ROOT_INODE_ID));
+        let mut inodes = BTreeMap::new();
+        nodes.insert(GuestPath::root(), ROOT_INODE_ID);
+        inodes.insert(ROOT_INODE_ID, PathNode::directory(ROOT_INODE_ID));
         Self {
             nodes,
+            inodes,
             next_inode_id: ROOT_INODE_ID + 1,
         }
     }
@@ -312,13 +340,13 @@ impl PathTree {
     pub fn create_dir(&mut self, path: impl AsRef<str>) -> VfsResult<InodeId> {
         let path = parse_absolute_path(path.as_ref())?;
         self.ensure_parent_dir(&path)?;
-        self.insert_node(path, PathNodeKind::Directory)
+        self.insert_node(path, PathNodeKind::Directory, 0o755)
     }
 
     pub fn create_file(&mut self, path: impl AsRef<str>) -> VfsResult<InodeId> {
         let path = parse_absolute_path(path.as_ref())?;
         self.ensure_parent_dir(&path)?;
-        self.insert_node(path, PathNodeKind::File)
+        self.insert_node(path, PathNodeKind::File, 0o644)
     }
 
     pub fn create_file_with_content(
@@ -337,7 +365,7 @@ impl PathTree {
             PathNode {
                 inode_id,
                 kind: PathNodeKind::File,
-                attr,
+                metadata: MetadataSidecar::new(attr),
                 data,
             },
         )?;
@@ -351,15 +379,31 @@ impl PathTree {
     ) -> VfsResult<InodeId> {
         let path = parse_absolute_path(path.as_ref())?;
         self.ensure_parent_dir(&path)?;
-        self.insert_node(path, PathNodeKind::Symlink(target.into()))
+        self.insert_node(path, PathNodeKind::Symlink(target.into()), 0o777)
     }
 
     pub fn lookup_path(&self, path: &GuestPath) -> Option<&PathNode> {
-        self.nodes.get(path)
+        let inode_id = self.nodes.get(path)?;
+        self.inodes.get(inode_id)
     }
 
     pub fn lookup_path_mut(&mut self, path: &GuestPath) -> Option<&mut PathNode> {
-        self.nodes.get_mut(path)
+        let inode_id = *self.nodes.get(path)?;
+        self.inodes.get_mut(&inode_id)
+    }
+
+    pub fn lookup_inode(&self, inode_id: InodeId) -> Option<&PathNode> {
+        self.inodes.get(&inode_id)
+    }
+
+    pub fn lookup_inode_mut(&mut self, inode_id: InodeId) -> Option<&mut PathNode> {
+        self.inodes.get_mut(&inode_id)
+    }
+
+    pub fn first_path_for_inode(&self, inode_id: InodeId) -> Option<&GuestPath> {
+        self.nodes
+            .iter()
+            .find_map(|(path, node_inode)| (*node_inode == inode_id).then_some(path))
     }
 
     pub fn children(&self, path: &GuestPath) -> VfsResult<Vec<DirectoryChild>> {
@@ -370,20 +414,21 @@ impl PathTree {
 
         let parent_len = path.components.len();
         let mut children = Vec::new();
-        for (child_path, child_node) in &self.nodes {
+        for (child_path, child_inode) in &self.nodes {
             if child_path.components.len() != parent_len + 1 {
                 continue;
             }
             if !child_path.starts_with(path) {
                 continue;
             }
+            let child_node = self.inodes.get(child_inode).ok_or(VfsError::InvalidPath)?;
             let Some(name) = child_path.file_name() else {
                 continue;
             };
             children.push(DirectoryChild {
                 name: name.to_owned(),
                 inode: child_node.inode_id,
-                file_type: child_node.attr.dirent_type(),
+                file_type: child_node.attr().dirent_type(),
             });
         }
         Ok(children)
@@ -431,26 +476,31 @@ impl PathTree {
         }
     }
 
-    fn insert_node(&mut self, path: GuestPath, kind: PathNodeKind) -> VfsResult<InodeId> {
+    fn insert_node(
+        &mut self,
+        path: GuestPath,
+        kind: PathNodeKind,
+        mode: u32,
+    ) -> VfsResult<InodeId> {
         if self.nodes.contains_key(&path) {
             return Err(VfsError::AlreadyExists);
         }
 
         let inode_id = self.allocate_inode_id();
         let attr = match &kind {
-            PathNodeKind::Directory => LinuxFileAttr::directory(inode_id),
-            PathNodeKind::File => LinuxFileAttr::regular(inode_id, 0o644, 0),
+            PathNodeKind::Directory => LinuxFileAttr::directory_with_mode(inode_id, mode),
+            PathNodeKind::File => LinuxFileAttr::regular(inode_id, mode, 0),
             PathNodeKind::Symlink(target) => LinuxFileAttr::symlink(inode_id, target.len() as u64),
         };
-        self.nodes.insert(
+        self.insert_path_node(
             path,
             PathNode {
                 inode_id,
                 kind,
-                attr,
+                metadata: MetadataSidecar::new(attr),
                 data: Vec::new(),
             },
-        );
+        )?;
         Ok(inode_id)
     }
 
@@ -458,8 +508,57 @@ impl PathTree {
         if self.nodes.contains_key(&path) {
             return Err(VfsError::AlreadyExists);
         }
-        self.nodes.insert(path, node);
+        let inode_id = node.inode_id;
+        self.inodes.insert(inode_id, node);
+        self.nodes.insert(path, inode_id);
         Ok(())
+    }
+
+    fn insert_link(&mut self, path: GuestPath, inode_id: InodeId) -> VfsResult<()> {
+        if self.nodes.contains_key(&path) {
+            return Err(VfsError::AlreadyExists);
+        }
+        if !self.inodes.contains_key(&inode_id) {
+            return Err(VfsError::NoEntry);
+        }
+        self.nodes.insert(path, inode_id);
+        Ok(())
+    }
+
+    fn remove_path_link(&mut self, path: &GuestPath) -> VfsResult<InodeId> {
+        self.nodes.remove(path).ok_or(VfsError::NoEntry)
+    }
+
+    fn is_empty_directory(&self, path: &GuestPath) -> bool {
+        let child_len = path.components.len() + 1;
+        !self.nodes.keys().any(|child_path| {
+            child_path.components.len() == child_len && child_path.starts_with(path)
+        })
+    }
+
+    fn paths_under_prefix(&self, prefix: &GuestPath) -> Vec<GuestPath> {
+        self.nodes
+            .keys()
+            .filter(|path| path.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    fn link_count(&self, inode_id: InodeId) -> usize {
+        self.nodes
+            .values()
+            .filter(|node_inode| **node_inode == inode_id)
+            .count()
+    }
+
+    fn replace_prefix(
+        path: &GuestPath,
+        old_prefix: &GuestPath,
+        new_prefix: &GuestPath,
+    ) -> GuestPath {
+        let mut components = new_prefix.components.clone();
+        components.extend_from_slice(&path.components[old_prefix.components.len()..]);
+        GuestPath::from_components(components)
     }
 
     fn allocate_inode_id(&mut self) -> InodeId {
@@ -479,7 +578,7 @@ impl Default for PathTree {
 pub struct PathNode {
     inode_id: InodeId,
     kind: PathNodeKind,
-    attr: LinuxFileAttr,
+    metadata: MetadataSidecar,
     data: Vec<u8>,
 }
 
@@ -488,7 +587,7 @@ impl PathNode {
         Self {
             inode_id,
             kind: PathNodeKind::Directory,
-            attr: LinuxFileAttr::directory(inode_id),
+            metadata: MetadataSidecar::new(LinuxFileAttr::directory(inode_id)),
             data: Vec::new(),
         }
     }
@@ -506,7 +605,11 @@ impl PathNode {
     }
 
     pub fn attr(&self) -> LinuxFileAttr {
-        self.attr
+        self.metadata.attr()
+    }
+
+    pub fn metadata(&self) -> MetadataSidecar {
+        self.metadata
     }
 
     pub fn data(&self) -> &[u8] {
@@ -514,16 +617,20 @@ impl PathNode {
     }
 
     pub fn set_mode(&mut self, mode: u32) {
-        self.attr.mode = (self.attr.mode & S_IFMT) | (mode & 0o7777);
+        self.metadata.set_mode(mode);
     }
 
     fn truncate(&mut self) -> VfsResult<()> {
+        self.set_len(0)
+    }
+
+    fn set_len(&mut self, length: u64) -> VfsResult<()> {
         if !matches!(self.kind, PathNodeKind::File) {
             return Err(VfsError::InvalidPath);
         }
-        self.data.clear();
-        self.attr.size = 0;
-        self.attr.blocks = 0;
+        let length = usize::try_from(length).map_err(|_| VfsError::NoSpace)?;
+        self.data.resize(length, 0);
+        self.metadata.set_size(length as u64);
         Ok(())
     }
 
@@ -540,9 +647,16 @@ impl PathNode {
             self.data.resize(end, 0);
         }
         self.data[offset..end].copy_from_slice(data);
-        self.attr.size = self.data.len() as u64;
-        self.attr.blocks = self.attr.size.div_ceil(512);
+        self.metadata.set_size(self.data.len() as u64);
         Ok(data.len())
+    }
+
+    fn increment_link_count(&mut self) -> VfsResult<()> {
+        self.metadata.increment_link_count()
+    }
+
+    fn decrement_link_count(&mut self) {
+        self.metadata.decrement_link_count();
     }
 }
 
@@ -593,6 +707,52 @@ fn align_up(value: usize, alignment: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetadataSidecar {
+    attr: LinuxFileAttr,
+}
+
+impl MetadataSidecar {
+    pub fn new(attr: LinuxFileAttr) -> Self {
+        Self { attr }
+    }
+
+    pub fn attr(self) -> LinuxFileAttr {
+        self.attr
+    }
+
+    pub fn set_mode(&mut self, mode: u32) {
+        self.attr.mode = (self.attr.mode & S_IFMT) | (mode & 0o7777);
+        self.touch_ctime();
+    }
+
+    pub fn set_size(&mut self, size: u64) {
+        self.attr.size = size;
+        self.attr.blocks = size.div_ceil(512);
+        self.touch_mtime();
+        self.touch_ctime();
+    }
+
+    pub fn increment_link_count(&mut self) -> VfsResult<()> {
+        self.attr.nlink = self.attr.nlink.checked_add(1).ok_or(VfsError::NoSpace)?;
+        self.touch_ctime();
+        Ok(())
+    }
+
+    pub fn decrement_link_count(&mut self) {
+        self.attr.nlink = self.attr.nlink.saturating_sub(1);
+        self.touch_ctime();
+    }
+
+    fn touch_mtime(&mut self) {
+        self.attr.mtime_nsec = self.attr.mtime_nsec.saturating_add(1);
+    }
+
+    fn touch_ctime(&mut self) {
+        self.attr.ctime_nsec = self.attr.ctime_nsec.saturating_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinuxFileAttr {
     pub inode: InodeId,
     pub mode: u32,
@@ -612,7 +772,11 @@ pub struct LinuxFileAttr {
 
 impl LinuxFileAttr {
     pub fn directory(inode: InodeId) -> Self {
-        Self::new(inode, S_IFDIR | 0o755, 0)
+        Self::directory_with_mode(inode, 0o755)
+    }
+
+    pub fn directory_with_mode(inode: InodeId, mode: u32) -> Self {
+        Self::new(inode, S_IFDIR | (mode & 0o7777), 0)
     }
 
     pub fn regular(inode: InodeId, mode: u32, size: u64) -> Self {
@@ -1192,6 +1356,20 @@ impl FdEntry {
     pub fn path(&self) -> Option<&GuestPath> {
         self.path.as_ref()
     }
+
+    fn inode_id(&self) -> InodeId {
+        self.file.inode().id()
+    }
+
+    fn rebind_path(&mut self, old_path: &GuestPath, new_path: &GuestPath) {
+        let Some(path) = self.path.as_mut() else {
+            return;
+        };
+        if !path.starts_with(old_path) {
+            return;
+        }
+        *path = PathTree::replace_prefix(path, old_path, new_path);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1337,6 +1515,19 @@ impl FdTable {
         Ok(entry.file)
     }
 
+    fn open_count(&self, inode_id: InodeId) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.inode_id() == inode_id)
+            .count()
+    }
+
+    fn rebind_paths(&mut self, old_path: &GuestPath, new_path: &GuestPath) {
+        for entry in self.entries.values_mut() {
+            entry.rebind_path(old_path, new_path);
+        }
+    }
+
     pub fn set_cloexec(&mut self, fd: Fd, cloexec: bool) -> VfsResult<()> {
         if !self.entries.contains_key(&fd) {
             return Err(VfsError::BadFd);
@@ -1373,9 +1564,10 @@ impl FdTable {
 
         match entry.file.kind {
             FileKind::Regular | FileKind::Symlink => {
-                let path = entry.path.as_ref().ok_or(VfsError::BadFd)?;
-                let node = tree.lookup_path(path).ok_or(VfsError::NoEntry)?;
-                if node.attr.is_directory() {
+                let node = tree
+                    .lookup_inode(entry.inode_id())
+                    .ok_or(VfsError::NoEntry)?;
+                if node.attr().is_directory() {
                     return Err(VfsError::IsDirectory);
                 }
                 let offset = usize::try_from(entry.offset).map_err(|_| VfsError::InvalidPath)?;
@@ -1400,6 +1592,20 @@ impl FdTable {
         }
     }
 
+    pub fn readlink_open(&self, tree: &PathTree, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
+        let entry = self.get(fd)?;
+        let node = tree
+            .lookup_inode(entry.inode_id())
+            .ok_or(VfsError::NoEntry)?;
+        let PathNodeKind::Symlink(target) = node.kind() else {
+            return Err(VfsError::InvalidPath);
+        };
+        let bytes = target.as_bytes();
+        let count = bytes.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+
     pub fn write(&mut self, tree: &mut PathTree, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
         let entry = self.get_mut(fd)?;
         if !entry.flags.can_write() {
@@ -1408,10 +1614,10 @@ impl FdTable {
 
         match entry.file.kind {
             FileKind::Regular => {
-                let path = entry.path.as_ref().ok_or(VfsError::BadFd)?;
-                let node = tree.lookup_path_mut(path).ok_or(VfsError::NoEntry)?;
+                let inode_id = entry.inode_id();
+                let node = tree.lookup_inode_mut(inode_id).ok_or(VfsError::NoEntry)?;
                 let offset = if entry.flags.append() {
-                    node.attr.size
+                    node.attr().size
                 } else {
                     entry.offset
                 };
@@ -1448,8 +1654,10 @@ impl FdTable {
 
         let size = match entry.file.kind {
             FileKind::Regular | FileKind::Symlink => {
-                let path = entry.path.as_ref().ok_or(VfsError::BadFd)?;
-                tree.lookup_path(path).ok_or(VfsError::NoEntry)?.attr.size
+                tree.lookup_inode(entry.inode_id())
+                    .ok_or(VfsError::NoEntry)?
+                    .attr()
+                    .size
             }
             FileKind::Directory => 0,
             FileKind::PipeRead | FileKind::PipeWrite => unreachable!(),
@@ -1563,6 +1771,7 @@ pub struct VirtualFileSystem {
     rootfs: Rootfs,
     tree: PathTree,
     fds: FdTable,
+    umask: u32,
 }
 
 impl VirtualFileSystem {
@@ -1571,11 +1780,17 @@ impl VirtualFileSystem {
             rootfs: Rootfs::new(host_root),
             tree: PathTree::new(),
             fds: FdTable::with_stdio(),
+            umask: DEFAULT_UMASK,
         }
     }
 
     pub fn from_parts(rootfs: Rootfs, tree: PathTree, fds: FdTable) -> Self {
-        Self { rootfs, tree, fds }
+        Self {
+            rootfs,
+            tree,
+            fds,
+            umask: DEFAULT_UMASK,
+        }
     }
 
     pub fn rootfs(&self) -> &Rootfs {
@@ -1598,6 +1813,29 @@ impl VirtualFileSystem {
         &mut self.fds
     }
 
+    pub fn getcwd(&self) -> VfsResult<String> {
+        self.rootfs.visible_path(self.rootfs.cwd())
+    }
+
+    pub fn chdir(&mut self, path: &str) -> VfsResult<()> {
+        let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
+        let node = self
+            .tree
+            .lookup_path(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?;
+        if !node.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+        node.attr().check_access(X_OK)?;
+        self.rootfs.set_cwd(resolved.guest_path().clone())
+    }
+
+    pub fn umask(&mut self, mask: u32) -> u32 {
+        let old = self.umask;
+        self.umask = mask & 0o777;
+        old
+    }
+
     pub fn openat(&mut self, dirfd: Fd, path: &str, flags: OpenFlags, mode: u32) -> VfsResult<Fd> {
         let resolved = self.resolve_at(
             dirfd,
@@ -1616,22 +1854,23 @@ impl VirtualFileSystem {
             if !flags.create() {
                 return Err(VfsError::NoEntry);
             }
-            self.create_resolved_file(path.clone(), mode)?;
+            self.tree.ensure_parent_dir(&path)?;
+            self.check_parent_write_permissions(&path)?;
+            self.create_resolved_file(path.clone(), mode & !self.umask)?;
         } else if flags.create() && flags.exclusive() {
             return Err(VfsError::AlreadyExists);
         }
 
         let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
-        if flags.directory() && !node.attr.is_directory() {
+        if flags.directory() && !node.attr().is_directory() {
             return Err(VfsError::NotDirectory);
         }
-        if node.attr.is_symlink() && flags.nofollow() {
+        if node.attr().is_symlink() && flags.nofollow() {
             return Err(VfsError::Loop);
         }
-        if node.attr.is_directory() && flags.can_write() {
+        if node.attr().is_directory() && flags.can_write() {
             return Err(VfsError::IsDirectory);
         }
-
         let mut access_mode = F_OK;
         if flags.can_read() {
             access_mode |= R_OK;
@@ -1639,7 +1878,7 @@ impl VirtualFileSystem {
         if flags.can_write() {
             access_mode |= W_OK;
         }
-        node.attr.check_access(access_mode)?;
+        node.attr().check_access(access_mode)?;
         if flags.truncate() && flags.can_write() {
             self.tree
                 .lookup_path_mut(&path)
@@ -1667,7 +1906,11 @@ impl VirtualFileSystem {
     }
 
     pub fn close(&mut self, fd: Fd) -> VfsResult<()> {
-        self.fds.close(fd)?;
+        let file = self.fds.close(fd)?;
+        let inode_id = file.inode().id();
+        if self.tree.link_count(inode_id) == 0 {
+            self.tree.inodes.remove(&inode_id);
+        }
         Ok(())
     }
 
@@ -1685,8 +1928,8 @@ impl VirtualFileSystem {
 
     pub fn fstat(&self, fd: Fd) -> VfsResult<LinuxFileAttr> {
         let entry = self.fds.get(fd)?;
-        if let Some(path) = entry.path() {
-            return self.stat_path(path);
+        if let Some(node) = self.tree.lookup_inode(entry.inode_id()) {
+            return Ok(node.attr());
         }
 
         Ok(anonymous_attr(entry.file()))
@@ -1742,8 +1985,226 @@ impl VirtualFileSystem {
         Ok(count)
     }
 
+    pub fn readlinkat(&self, dirfd: Fd, path: &str, buffer: &mut [u8]) -> VfsResult<usize> {
+        if path.is_empty() {
+            return self.fds.readlink_open(&self.tree, dirfd, buffer);
+        }
+        let resolved = self.resolve_at(dirfd, path, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        let node = self
+            .tree
+            .lookup_path(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?;
+        let PathNodeKind::Symlink(target) = node.kind() else {
+            return Err(VfsError::InvalidPath);
+        };
+        let bytes = target.as_bytes();
+        let count = bytes.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+
     pub fn getdents64(&mut self, fd: Fd, max_bytes: usize) -> VfsResult<Vec<DirectoryEntry>> {
         self.fds.getdents64(&self.tree, fd, max_bytes)
+    }
+
+    pub fn mkdirat(&mut self, dirfd: Fd, path: &str, mode: u32) -> VfsResult<()> {
+        let resolved = self.resolve_at(dirfd, path, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        if resolved.inode().is_some() {
+            return Err(VfsError::AlreadyExists);
+        }
+        self.tree.ensure_parent_dir(resolved.guest_path())?;
+        self.check_parent_write_permissions(resolved.guest_path())?;
+        let inode_id = self.tree.allocate_inode_id();
+        self.tree.insert_path_node(
+            resolved.guest_path().clone(),
+            PathNode {
+                inode_id,
+                kind: PathNodeKind::Directory,
+                metadata: MetadataSidecar::new(LinuxFileAttr::directory_with_mode(
+                    inode_id,
+                    mode & !self.umask,
+                )),
+                data: Vec::new(),
+            },
+        )
+    }
+
+    pub fn unlinkat(&mut self, dirfd: Fd, path: &str, flags: u32) -> VfsResult<()> {
+        if flags & !AT_REMOVEDIR != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        let remove_dir = flags & AT_REMOVEDIR != 0;
+        let resolved = self.resolve_at(dirfd, path, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        let target = resolved.guest_path().clone();
+        if target.is_root() {
+            return Err(VfsError::PermissionDenied);
+        }
+        let node = self.tree.lookup_path(&target).ok_or(VfsError::NoEntry)?;
+        if remove_dir {
+            if !node.is_directory() {
+                return Err(VfsError::NotDirectory);
+            }
+            if !self.tree.is_empty_directory(&target) {
+                return Err(VfsError::NotEmpty);
+            }
+        } else if node.is_directory() {
+            return Err(VfsError::IsDirectory);
+        }
+        self.check_parent_write_permissions(&target)?;
+        let inode_id = self.tree.remove_path_link(&target)?;
+        self.drop_link(inode_id);
+        Ok(())
+    }
+
+    pub fn symlinkat(&mut self, target: &str, newdirfd: Fd, linkpath: &str) -> VfsResult<()> {
+        if target.is_empty() || target.as_bytes().contains(&0) {
+            return Err(VfsError::InvalidPath);
+        }
+        let resolved =
+            self.resolve_at(newdirfd, linkpath, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        if resolved.inode().is_some() {
+            return Err(VfsError::AlreadyExists);
+        }
+        self.tree.ensure_parent_dir(resolved.guest_path())?;
+        self.check_parent_write_permissions(resolved.guest_path())?;
+        let inode_id = self.tree.allocate_inode_id();
+        self.tree.insert_path_node(
+            resolved.guest_path().clone(),
+            PathNode {
+                inode_id,
+                kind: PathNodeKind::Symlink(target.to_owned()),
+                metadata: MetadataSidecar::new(LinuxFileAttr::symlink(
+                    inode_id,
+                    target.len() as u64,
+                )),
+                data: Vec::new(),
+            },
+        )
+    }
+
+    pub fn linkat(
+        &mut self,
+        olddirfd: Fd,
+        oldpath: &str,
+        newdirfd: Fd,
+        newpath: &str,
+        flags: u32,
+    ) -> VfsResult<()> {
+        if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        if oldpath.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return Err(VfsError::NoEntry);
+        }
+        let old_resolved = if oldpath.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            let entry = self.fds.get(olddirfd)?;
+            let path = entry.path().ok_or(VfsError::NoEntry)?;
+            ResolvedPath {
+                guest_path: path.clone(),
+                inode: Some(entry.inode_id()),
+            }
+        } else {
+            self.resolve_at(
+                olddirfd,
+                oldpath,
+                if flags & AT_SYMLINK_FOLLOW != 0 {
+                    ResolveOptions::FOLLOW
+                } else {
+                    ResolveOptions::NOFOLLOW_FINAL
+                },
+                false,
+            )?
+        };
+        let old_inode = old_resolved.inode().ok_or(VfsError::NoEntry)?;
+        let old_node = self.tree.lookup_inode(old_inode).ok_or(VfsError::NoEntry)?;
+        if old_node.is_directory() {
+            return Err(VfsError::NotPermitted);
+        }
+
+        let new_resolved =
+            self.resolve_at(newdirfd, newpath, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        if new_resolved.inode().is_some() {
+            return Err(VfsError::AlreadyExists);
+        }
+        self.tree.ensure_parent_dir(new_resolved.guest_path())?;
+        self.check_parent_write_permissions(new_resolved.guest_path())?;
+        self.tree
+            .lookup_inode_mut(old_inode)
+            .ok_or(VfsError::NoEntry)?
+            .increment_link_count()?;
+        self.tree
+            .insert_link(new_resolved.guest_path().clone(), old_inode)
+    }
+
+    pub fn renameat2(
+        &mut self,
+        olddirfd: Fd,
+        oldpath: &str,
+        newdirfd: Fd,
+        newpath: &str,
+        flags: u32,
+    ) -> VfsResult<()> {
+        if flags & !SUPPORTED_RENAME_FLAGS != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let old_resolved =
+            self.resolve_at(olddirfd, oldpath, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        let new_resolved =
+            self.resolve_at(newdirfd, newpath, ResolveOptions::NOFOLLOW_FINAL, false)?;
+        let old_path = old_resolved.guest_path().clone();
+        let new_path = new_resolved.guest_path().clone();
+        if old_path.is_root() || new_path.is_root() {
+            return Err(VfsError::PermissionDenied);
+        }
+        let old_inode = old_resolved.inode().ok_or(VfsError::NoEntry)?;
+        if old_path == new_path {
+            return Ok(());
+        }
+        let old_node = self.tree.lookup_inode(old_inode).ok_or(VfsError::NoEntry)?;
+        let new_inode = new_resolved.inode();
+        if flags & RENAME_NOREPLACE != 0 && new_inode.is_some() {
+            return Err(VfsError::AlreadyExists);
+        }
+        if old_node.is_directory()
+            && new_path.starts_with(&old_path)
+            && flags & RENAME_EXCHANGE == 0
+        {
+            return Err(VfsError::InvalidPath);
+        }
+        self.tree.ensure_parent_dir(&new_path)?;
+        self.check_parent_write_permissions(&old_path)?;
+        self.check_parent_write_permissions(&new_path)?;
+
+        if flags & RENAME_EXCHANGE != 0 {
+            let new_inode = new_inode.ok_or(VfsError::NoEntry)?;
+            self.exchange_paths(&old_path, old_inode, &new_path, new_inode)?;
+            return Ok(());
+        }
+
+        if let Some(target_inode) = new_inode {
+            self.validate_rename_replacement(old_inode, target_inode, &new_path)?;
+            self.remove_existing_rename_target(&new_path, target_inode)?;
+        }
+        self.move_path(&old_path, &new_path)
+    }
+
+    pub fn ftruncate(&mut self, fd: Fd, length: u64) -> VfsResult<()> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_write() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Err(VfsError::InvalidPath);
+        }
+        let inode_id = entry.inode_id();
+        self.tree
+            .lookup_inode_mut(inode_id)
+            .ok_or(VfsError::NoEntry)?
+            .set_len(length)
     }
 
     fn resolve_at(
@@ -1771,7 +2232,7 @@ impl VirtualFileSystem {
             return Err(VfsError::NotDirectory);
         }
         if require_directory_base {
-            base_node.attr.check_access(X_OK)?;
+            base_node.attr().check_access(X_OK)?;
         }
 
         let mut scoped_rootfs = self.rootfs.clone();
@@ -1789,10 +2250,135 @@ impl VirtualFileSystem {
             PathNode {
                 inode_id,
                 kind: PathNodeKind::File,
-                attr: LinuxFileAttr::regular(inode_id, mode, 0),
+                metadata: MetadataSidecar::new(LinuxFileAttr::regular(inode_id, mode, 0)),
                 data: Vec::new(),
             },
         )
+    }
+
+    fn validate_rename_replacement(
+        &self,
+        old_inode: InodeId,
+        target_inode: InodeId,
+        target_path: &GuestPath,
+    ) -> VfsResult<()> {
+        let old_node = self.tree.lookup_inode(old_inode).ok_or(VfsError::NoEntry)?;
+        let target_node = self
+            .tree
+            .lookup_inode(target_inode)
+            .ok_or(VfsError::NoEntry)?;
+        match (old_node.is_directory(), target_node.is_directory()) {
+            (true, false) => Err(VfsError::NotDirectory),
+            (false, true) => Err(VfsError::IsDirectory),
+            (true, true) if !self.tree.is_empty_directory(target_path) => Err(VfsError::NotEmpty),
+            _ => Ok(()),
+        }
+    }
+
+    fn remove_existing_rename_target(
+        &mut self,
+        target_path: &GuestPath,
+        target_inode: InodeId,
+    ) -> VfsResult<()> {
+        let target_node = self
+            .tree
+            .lookup_inode(target_inode)
+            .ok_or(VfsError::NoEntry)?;
+        if target_node.is_directory() {
+            if !self.tree.is_empty_directory(target_path) {
+                return Err(VfsError::NotEmpty);
+            }
+            self.tree.remove_path_link(target_path)?;
+            self.drop_link(target_inode);
+            return Ok(());
+        }
+
+        self.tree.remove_path_link(target_path)?;
+        self.drop_link(target_inode);
+        Ok(())
+    }
+
+    fn move_path(&mut self, old_path: &GuestPath, new_path: &GuestPath) -> VfsResult<()> {
+        let moving_paths = self.tree.paths_under_prefix(old_path);
+        let mut updates = Vec::with_capacity(moving_paths.len());
+        for path in moving_paths {
+            let inode_id = self.tree.remove_path_link(&path)?;
+            updates.push((
+                PathTree::replace_prefix(&path, old_path, new_path),
+                inode_id,
+            ));
+        }
+        for (path, inode_id) in updates {
+            self.tree.insert_link(path, inode_id)?;
+        }
+        self.fds.rebind_paths(old_path, new_path);
+        Ok(())
+    }
+
+    fn exchange_paths(
+        &mut self,
+        old_path: &GuestPath,
+        old_inode: InodeId,
+        new_path: &GuestPath,
+        new_inode: InodeId,
+    ) -> VfsResult<()> {
+        let old_is_dir = self
+            .tree
+            .lookup_inode(old_inode)
+            .ok_or(VfsError::NoEntry)?
+            .is_directory();
+        let new_is_dir = self
+            .tree
+            .lookup_inode(new_inode)
+            .ok_or(VfsError::NoEntry)?
+            .is_directory();
+        if old_is_dir && new_path.starts_with(old_path) {
+            return Err(VfsError::InvalidPath);
+        }
+        if new_is_dir && old_path.starts_with(new_path) {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let old_paths = if old_is_dir {
+            self.tree.paths_under_prefix(old_path)
+        } else {
+            vec![old_path.clone()]
+        };
+        let new_paths = if new_is_dir {
+            self.tree.paths_under_prefix(new_path)
+        } else {
+            vec![new_path.clone()]
+        };
+        let mut updates = Vec::with_capacity(old_paths.len() + new_paths.len());
+        for path in old_paths {
+            let inode_id = self.tree.remove_path_link(&path)?;
+            updates.push((
+                PathTree::replace_prefix(&path, old_path, new_path),
+                inode_id,
+            ));
+        }
+        for path in new_paths {
+            let inode_id = self.tree.remove_path_link(&path)?;
+            updates.push((
+                PathTree::replace_prefix(&path, new_path, old_path),
+                inode_id,
+            ));
+        }
+        for (path, inode_id) in updates {
+            self.tree.insert_link(path, inode_id)?;
+        }
+        self.fds.rebind_paths(old_path, new_path);
+        self.fds.rebind_paths(new_path, old_path);
+        Ok(())
+    }
+
+    fn drop_link(&mut self, inode_id: InodeId) {
+        if let Some(node) = self.tree.lookup_inode_mut(inode_id) {
+            node.decrement_link_count();
+        }
+        if self.tree.link_count(inode_id) == 0 && self.fds.open_count(inode_id) == 0 {
+            self.tree.inodes.remove(&inode_id);
+        }
     }
 
     fn stat_path(&self, path: &GuestPath) -> VfsResult<LinuxFileAttr> {
@@ -1810,11 +2396,20 @@ impl VirtualFileSystem {
             let Some(node) = self.tree.lookup_path(&ancestor) else {
                 break;
             };
-            if node.attr.is_directory() {
-                node.attr.check_access(X_OK)?;
+            if node.attr().is_directory() {
+                node.attr().check_access(X_OK)?;
             }
         }
         Ok(())
+    }
+
+    fn check_parent_write_permissions(&self, path: &GuestPath) -> VfsResult<()> {
+        let parent = path.parent().ok_or(VfsError::InvalidPath)?;
+        let node = self.tree.lookup_path(&parent).ok_or(VfsError::NoEntry)?;
+        if !node.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+        node.attr().check_access(W_OK | X_OK)
     }
 
     fn host_path(&self, path: &GuestPath) -> PathBuf {
@@ -2080,6 +2675,26 @@ mod tests {
             vfs.access("/private/secret", R_OK).unwrap_err(),
             VfsError::PermissionDenied
         );
+        vfs.tree_mut().create_dir("/readonly").unwrap();
+        vfs.tree_mut()
+            .lookup_path_mut(&guest_path("/readonly"))
+            .unwrap()
+            .set_mode(0o500);
+        assert_eq!(
+            vfs.openat(
+                AT_FDCWD,
+                "/readonly/created",
+                OpenFlags::new(O_CREAT | O_WRONLY),
+                0o600,
+            )
+            .unwrap_err(),
+            VfsError::PermissionDenied
+        );
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/readonly/created", 0)
+                .unwrap_err(),
+            VfsError::NoEntry
+        );
         assert_eq!(VfsError::PermissionDenied.linux_errno(), 13);
         assert_eq!(VfsError::NotDirectory.linux_errno(), 20);
         assert_eq!(VfsError::NoEntry.linux_errno(), 2);
@@ -2141,6 +2756,132 @@ mod tests {
         assert_eq!(entries.last().unwrap().file_type, DT_REG);
         vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
         assert_eq!(vfs.getdents64(fd, 1).unwrap_err(), VfsError::InvalidPath);
+    }
+
+    #[test]
+    fn writable_mutations_cover_mkdir_links_rename_and_metadata() {
+        let mut vfs = sample_vfs();
+
+        vfs.mkdirat(AT_FDCWD, "/tmp/pkg", 0o777).unwrap();
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/tmp/pkg", 0).unwrap().mode & 0o777,
+            0o755
+        );
+        assert_eq!(vfs.chdir("/tmp/pkg"), Ok(()));
+        assert_eq!(vfs.getcwd().unwrap(), "/tmp/pkg");
+        assert_eq!(vfs.umask(0o077), 0o022);
+
+        vfs.symlinkat("../file", AT_FDCWD, "file-link").unwrap();
+        let mut target = [0; 16];
+        let count = vfs
+            .readlinkat(AT_FDCWD, "/tmp/pkg/file-link", &mut target)
+            .unwrap();
+        assert_eq!(&target[..count], b"../file");
+
+        vfs.linkat(AT_FDCWD, "/tmp/file", AT_FDCWD, "hard", 0)
+            .unwrap();
+        let original = vfs.newfstatat(AT_FDCWD, "/tmp/file", 0).unwrap();
+        let linked = vfs.newfstatat(AT_FDCWD, "hard", 0).unwrap();
+        assert_eq!(original.inode, linked.inode);
+        assert_eq!(linked.nlink, 2);
+
+        vfs.renameat2(AT_FDCWD, "hard", AT_FDCWD, "renamed", 0)
+            .unwrap();
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "hard", 0).unwrap_err(),
+            VfsError::NoEntry
+        );
+        assert_eq!(
+            vfs.renameat2(AT_FDCWD, "renamed", AT_FDCWD, "/tmp/file", RENAME_NOREPLACE,)
+                .unwrap_err(),
+            VfsError::AlreadyExists
+        );
+
+        let before = vfs.newfstatat(AT_FDCWD, "renamed", 0).unwrap();
+        let fd = vfs
+            .openat(AT_FDCWD, "renamed", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+        vfs.ftruncate(fd, 9).unwrap();
+        let after = vfs.fstat(fd).unwrap();
+        assert_eq!(after.size, 9);
+        assert!(after.ctime_nsec > before.ctime_nsec);
+        assert!(after.mtime_nsec > before.mtime_nsec);
+        vfs.close(fd).unwrap();
+    }
+
+    #[test]
+    fn rename_over_existing_and_exchange_follow_linux_shapes() {
+        let mut vfs = sample_vfs();
+        vfs.mkdirat(AT_FDCWD, "/tmp/a", 0o755).unwrap();
+        vfs.mkdirat(AT_FDCWD, "/tmp/b", 0o755).unwrap();
+        vfs.openat(
+            AT_FDCWD,
+            "/tmp/a/file",
+            OpenFlags::new(O_CREAT | O_WRONLY),
+            0o644,
+        )
+        .unwrap();
+        vfs.openat(
+            AT_FDCWD,
+            "/tmp/b/file",
+            OpenFlags::new(O_CREAT | O_WRONLY),
+            0o644,
+        )
+        .unwrap();
+
+        vfs.renameat2(AT_FDCWD, "/tmp/a/file", AT_FDCWD, "/tmp/b/file", 0)
+            .unwrap();
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/tmp/a/file", 0).unwrap_err(),
+            VfsError::NoEntry
+        );
+        assert!(vfs.newfstatat(AT_FDCWD, "/tmp/b/file", 0).is_ok());
+        assert_eq!(
+            vfs.renameat2(AT_FDCWD, "/tmp/a", AT_FDCWD, "/tmp/b", 0)
+                .unwrap_err(),
+            VfsError::NotEmpty
+        );
+
+        vfs.openat(
+            AT_FDCWD,
+            "/tmp/a/other",
+            OpenFlags::new(O_CREAT | O_WRONLY),
+            0o644,
+        )
+        .unwrap();
+        vfs.renameat2(
+            AT_FDCWD,
+            "/tmp/a/other",
+            AT_FDCWD,
+            "/tmp/b/file",
+            RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert!(vfs.newfstatat(AT_FDCWD, "/tmp/a/other", 0).is_ok());
+        assert!(vfs.newfstatat(AT_FDCWD, "/tmp/b/file", 0).is_ok());
+    }
+
+    #[test]
+    fn delayed_unlink_keeps_open_inode_until_close() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+        vfs.unlinkat(AT_FDCWD, "/tmp/file", 0).unwrap();
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/tmp/file", 0).unwrap_err(),
+            VfsError::NoEntry
+        );
+
+        vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
+        let mut buffer = [0; 5];
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 5);
+        assert_eq!(&buffer, b"hello");
+        assert_eq!(vfs.fstat(fd).unwrap().nlink, 0);
+
+        let inode = vfs.fstat(fd).unwrap().inode;
+        vfs.close(fd).unwrap();
+        assert!(vfs.tree().lookup_inode(inode).is_none());
     }
 
     fn guest_path(path: &str) -> GuestPath {
