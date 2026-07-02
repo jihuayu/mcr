@@ -2,12 +2,11 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mcr_elf::ElfValidationError;
-use mcr_sys::{GuestContext, Syscall, SyscallRegisters};
-use mcr_task::{GuestExecutable, GuestProgram, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
+use mcr_sys::{GuestContext, LinuxErrno, Syscall, SyscallRegisters};
+use mcr_task::{INITIAL_GUEST_PID, INITIAL_GUEST_TID};
 use mcr_vfs::{AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, Rootfs, VirtualFileSystem};
 
-use crate::RuntimeWithTracer;
+use crate::RuntimeFileSystem;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRootfsConfig {
@@ -119,7 +118,7 @@ pub enum RunRootfsError {
         source: std::io::Error,
     },
     Vfs(mcr_vfs::VfsError),
-    Elf(ElfValidationError),
+    Linux(LinuxErrno),
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -150,7 +149,7 @@ impl fmt::Display for RunRootfsError {
             }
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Vfs(error) => write!(formatter, "{error}"),
-            Self::Elf(error) => write!(formatter, "{error}"),
+            Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
             }
@@ -169,7 +168,7 @@ impl std::error::Error for RunRootfsError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Vfs(error) => Some(error),
-            Self::Elf(error) => Some(error),
+            Self::Linux(_) => None,
             Self::InvalidGuestPath(_)
             | Self::InvalidUtf8(_)
             | Self::MissingRootfs(_)
@@ -187,10 +186,8 @@ impl From<mcr_vfs::VfsError> for RunRootfsError {
     }
 }
 
-impl From<ElfValidationError> for RunRootfsError {
-    fn from(value: ElfValidationError) -> Self {
-        Self::Elf(value)
-    }
+fn run_rootfs_linux_errno(errno: LinuxErrno) -> RunRootfsError {
+    RunRootfsError::Linux(errno)
 }
 
 pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsError> {
@@ -198,17 +195,19 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         return Err(RunRootfsError::MissingRootfs(config.rootfs));
     }
 
-    let executable = read_guest_executable(&config)?;
-    let mut program = GuestProgram::new(GuestExecutable::new(
-        config.program.clone(),
-        executable.bytes,
-    ))
-    .with_args(config.args.clone())
-    .with_env(config.env.clone());
-    if let Some(interpreter) = executable.interpreter {
-        program = program.with_interpreter(interpreter);
-    }
-    let mut runtime = RuntimeWithTracer::with_diagnostics(program)?;
+    let mut vfs = load_rootfs(&config.rootfs)?;
+    let program = RuntimeFileSystem::new(vfs.clone(), ())
+        .load_guest_program(
+            config.program.clone(),
+            config.args.clone(),
+            config.env.clone(),
+        )
+        .map_err(run_rootfs_linux_errno)?;
+    let mut runtime = crate::Runtime::with_tracer_and_vfs(
+        program,
+        vfs.clone(),
+        crate::RuntimeDiagnosticsTracer::new(),
+    )?;
     runtime.dispatch_syscall(GuestContext::new(
         INITIAL_GUEST_PID,
         INITIAL_GUEST_TID,
@@ -224,7 +223,6 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         },
     ));
 
-    let mut vfs = load_rootfs(&config.rootfs)?;
     let output = dispatch_mvp_program(&mut vfs, &config.program, &config.args)?;
     let status = output.status();
     runtime.dispatch_syscall(GuestContext::new(
@@ -244,47 +242,6 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
     ));
 
     Ok(output)
-}
-
-#[derive(Debug)]
-struct LoadedGuestExecutable {
-    bytes: Vec<u8>,
-    interpreter: Option<GuestExecutable>,
-}
-
-fn read_guest_executable(
-    config: &RunRootfsConfig,
-) -> Result<LoadedGuestExecutable, RunRootfsError> {
-    let path = host_path_for_guest(&config.rootfs, &config.program)?;
-    if !path.is_file() {
-        return Err(RunRootfsError::MissingExecutable(path));
-    }
-    let bytes = fs::read(&path).map_err(|source| RunRootfsError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let load_plan = mcr_elf::parse_load_plan(&bytes)?;
-    let interpreter = load_plan
-        .interpreter()
-        .map(|interpreter| read_guest_interpreter(config, interpreter.as_bytes()))
-        .transpose()?;
-    Ok(LoadedGuestExecutable { bytes, interpreter })
-}
-
-fn read_guest_interpreter(
-    config: &RunRootfsConfig,
-    interpreter_path: &[u8],
-) -> Result<GuestExecutable, RunRootfsError> {
-    let path = host_path_for_guest(&config.rootfs, interpreter_path)?;
-    if !path.is_file() {
-        return Err(RunRootfsError::MissingExecutable(path));
-    }
-    let bytes = fs::read(&path).map_err(|source| RunRootfsError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    mcr_elf::parse_load_plan(&bytes)?;
-    Ok(GuestExecutable::new(interpreter_path.to_vec(), bytes))
 }
 
 fn dispatch_mvp_program(
@@ -753,22 +710,6 @@ fn collect_rootfs_entries(
         }
     }
     Ok(())
-}
-
-fn host_path_for_guest(rootfs: &Path, guest_path: &[u8]) -> Result<PathBuf, RunRootfsError> {
-    let guest_path = guest_arg_to_string(guest_path)?;
-    if !guest_path.starts_with('/') || guest_path.as_bytes().contains(&0) {
-        return Err(RunRootfsError::InvalidGuestPath(guest_path.into_bytes()));
-    }
-
-    let mut host = rootfs.to_path_buf();
-    for component in guest_path.split('/').filter(|part| !part.is_empty()) {
-        if matches!(component, "." | "..") {
-            return Err(RunRootfsError::InvalidGuestPath(guest_path.into_bytes()));
-        }
-        host.push(component);
-    }
-    Ok(host)
 }
 
 fn guest_arg_to_string(bytes: &[u8]) -> Result<String, RunRootfsError> {

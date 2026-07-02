@@ -485,10 +485,70 @@ where
     }
 }
 
+impl<M> RuntimeFileSystem<M> {
+    pub fn load_guest_program(
+        &mut self,
+        filename: impl Into<Vec<u8>>,
+        argv: impl IntoIterator<Item = Vec<u8>>,
+        envp: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<GuestProgram, LinuxErrno> {
+        let filename = filename.into();
+        let executable = self.load_guest_executable(&filename)?;
+        let load_plan =
+            mcr_elf::parse_load_plan(executable.bytes()).map_err(|_| LinuxErrno::ENOEXEC)?;
+        let mut program = GuestProgram::new(executable).with_args(argv).with_env(envp);
+        if let Some(interpreter_path) = load_plan.interpreter() {
+            let interpreter = self.load_guest_executable(interpreter_path.as_bytes())?;
+            mcr_elf::parse_load_plan(interpreter.bytes()).map_err(|_| LinuxErrno::ENOEXEC)?;
+            program = program.with_interpreter(interpreter);
+        }
+        Ok(program)
+    }
+
+    fn load_guest_executable(&mut self, path: &[u8]) -> Result<GuestExecutable, LinuxErrno> {
+        let path = guest_bytes_to_path(path)?;
+        let fd = self
+            .vfs
+            .openat(
+                mcr_vfs::AT_FDCWD,
+                &path,
+                OpenFlags::new(mcr_vfs::O_RDONLY),
+                0,
+            )
+            .map_err(vfs_errno)?;
+        let mut bytes = Vec::new();
+        let read_result = read_vfs_file_to_end(&mut self.vfs, fd, &mut bytes);
+        let close_result = self.vfs.close(fd).map_err(vfs_errno);
+        read_result?;
+        close_result?;
+        Ok(GuestExecutable::new(path.into_bytes(), bytes))
+    }
+}
+
 impl<M> RuntimeFileSystem<M>
 where
     M: GuestMemoryAccess,
 {
+    fn read_guest_vector(&self, vector_addr: u64) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+        const MAX_VECTOR_ITEMS: usize = 4096;
+        if vector_addr == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut values = Vec::new();
+        for index in 0..MAX_VECTOR_ITEMS {
+            let item_addr = vector_addr
+                .checked_add((index * 8) as u64)
+                .ok_or(LinuxErrno::EFAULT)?;
+            let ptr = read_guest_u64(&self.memory, item_addr)?;
+            if ptr == 0 {
+                return Ok(values);
+            }
+            values.push(read_guest_c_bytes(&self.memory, ptr)?);
+        }
+        Err(LinuxErrno::E2BIG)
+    }
+
     fn sys_socket(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let args = SocketSyscallArgs::new(
             arg_u32(request, 0),
@@ -1458,12 +1518,39 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
                 arg(request, 4),
                 arg_u32(request, 5),
             )),
+            mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             _ => self.tasks.dispatch_for_current_task(request),
         }
     }
 }
 
 impl RuntimeSubsystems {
+    fn dispatch_execve(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.execve(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    fn execve(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let filename = read_guest_c_bytes(self.files.memory(), arg(request, 0))?;
+        let argv = self.files.read_guest_vector(arg(request, 1))?;
+        let envp = self.files.read_guest_vector(arg(request, 2))?;
+        let program = self.files.load_guest_program(filename, argv, envp)?;
+        self.tasks
+            .exec_task(request.context.tid, program)
+            .map_err(|error| error.linux_errno())?;
+        self.files.vfs_mut().fds_mut().close_on_exec();
+        self.replace_memory_from_current_image()
+    }
+
+    fn replace_memory_from_current_image(&mut self) -> Result<(), LinuxErrno> {
+        let memory =
+            GuestMemory::from_image(self.current_image()).map_err(|error| error.errno())?;
+        *self.files.memory_mut() = memory;
+        Ok(())
+    }
+
     fn dispatch_futex(&mut self, args: FutexSyscallArgs) -> SyscallOutcome {
         outcome(self.futex(args))
     }
@@ -1517,6 +1604,56 @@ fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, Lin
         .read_bytes(addr, &mut bytes)
         .map_err(|_| LinuxErrno::EFAULT)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_guest_u64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u64, LinuxErrno> {
+    let mut bytes = [0; 8];
+    memory
+        .read_bytes(addr, &mut bytes)
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_guest_c_bytes(memory: &impl GuestMemoryAccess, addr: u64) -> Result<Vec<u8>, LinuxErrno> {
+    const MAX_C_STRING_LEN: usize = 4096;
+    let mut bytes = Vec::new();
+    for offset in 0..MAX_C_STRING_LEN {
+        let mut byte = [0];
+        memory
+            .read_bytes(
+                addr.checked_add(offset as u64).ok_or(LinuxErrno::EFAULT)?,
+                &mut byte,
+            )
+            .map_err(|_| LinuxErrno::EFAULT)?;
+        if byte[0] == 0 {
+            return Ok(bytes);
+        }
+        bytes.push(byte[0]);
+    }
+    Err(LinuxErrno::ENAMETOOLONG)
+}
+
+fn guest_bytes_to_path(bytes: &[u8]) -> Result<String, LinuxErrno> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(LinuxErrno::ENOENT);
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|_| LinuxErrno::ENOENT)
+}
+
+fn read_vfs_file_to_end(
+    vfs: &mut VirtualFileSystem,
+    fd: Fd,
+    output: &mut Vec<u8>,
+) -> Result<(), LinuxErrno> {
+    let mut buffer = [0; 8192];
+    loop {
+        let count = vfs.read(fd, &mut buffer).map_err(vfs_errno)?;
+        if count == 0 {
+            return Ok(());
+        }
+        output.len().checked_add(count).ok_or(LinuxErrno::EFBIG)?;
+        output.extend_from_slice(&buffer[..count]);
+    }
 }
 
 #[derive(Debug)]
@@ -2857,6 +2994,14 @@ mod tests {
         )
     }
 
+    fn runtime_from_program_and_tree(program: GuestProgram, tree: PathTree) -> Runtime {
+        Runtime::with_vfs(
+            program,
+            VirtualFileSystem::from_parts(Rootfs::new("/host/root"), tree, FdTable::with_stdio()),
+        )
+        .unwrap()
+    }
+
     fn runtime_with_socket(domain: u32) -> RuntimeFileSystem<TestMemory> {
         let mut runtime = runtime_with_sample_vfs();
         assert_eq!(
@@ -3038,6 +3183,141 @@ mod tests {
     }
 
     #[test]
+    fn runtime_execve_reads_filename_argv_envp_from_guest_memory_and_vfs() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/new",
+            test_program_bytes_with_marker(0x501000, 0x5a),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+        runtime.memory_mut().write(0x402120, b"/bin/new\0").unwrap();
+        runtime.memory_mut().write(0x402140, b"--flag\0").unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402160, b"PATH=/bin\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0x402120u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402008, &0x402140u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402010, &0u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402040, &0x402160u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402048, &0u64.to_le_bytes())
+            .unwrap();
+
+        let exec = runtime.dispatch_syscall(context(
+            Syscall::Execve,
+            [0x402100, 0x402000, 0x402040, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        let process = runtime.kernel().process(INITIAL_GUEST_PID).unwrap();
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(process.image().executable().path(), b"/bin/new");
+        assert_eq!(
+            process.image().argv(),
+            &[b"/bin/new".to_vec(), b"--flag".to_vec()]
+        );
+        assert_eq!(process.image().envp(), &[b"PATH=/bin".to_vec()]);
+        assert_eq!(task.regs().rip(), 0x501000);
+        let mut loaded_text = [0; 4];
+        runtime.memory().read(0x501200, &mut loaded_text).unwrap();
+        assert_eq!(loaded_text, [0x5a; 4]);
+    }
+
+    #[test]
+    fn runtime_execve_loads_interpreter_from_vfs() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_dir("/lib").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/dynamic",
+            dynamic_program_bytes("/lib/ld-musl-x86_64.so.1"),
+            0o755,
+        )
+        .unwrap();
+        tree.create_file_with_content("/lib/ld-musl-x86_64.so.1", interpreter_bytes(), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/bin/dynamic\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402120, b"/bin/dynamic\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0x402120u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402008, &0u64.to_le_bytes())
+            .unwrap();
+
+        let exec =
+            runtime.dispatch_syscall(context(Syscall::Execve, [0x402100, 0x402000, 0, 0, 0, 0]));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        let process = runtime.kernel().process(INITIAL_GUEST_PID).unwrap();
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(process.image().executable().path(), b"/bin/dynamic");
+        assert_eq!(
+            process.image().interpreter().unwrap().path(),
+            b"/lib/ld-musl-x86_64.so.1"
+        );
+        assert_eq!(
+            task.regs().rip(),
+            mcr_elf::DEFAULT_INTERPRETER_LOAD_BASE + 0x400
+        );
+    }
+
+    #[test]
+    fn runtime_execve_missing_vfs_target_keeps_current_image() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/bin/missing\0")
+            .unwrap();
+
+        let exec = runtime.dispatch_syscall(context(Syscall::Execve, [0x402100, 0, 0, 0, 0, 0]));
+
+        assert_eq!(exec.result, SyscallReturn::Errno(LinuxErrno::ENOENT));
+        let process = runtime.kernel().process(INITIAL_GUEST_PID).unwrap();
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(process.image().executable().path(), b"/bin/old");
+        assert_eq!(task.regs().rip(), 0x401000);
+    }
+
+    #[test]
     fn runtime_tracer_records_task_syscall_events() {
         let mut runtime = Runtime::with_tracer(
             test_program("/bin/app", 0x401000),
@@ -3166,7 +3446,18 @@ mod tests {
     }
 
     fn test_program(path: &str, entrypoint: u64) -> GuestProgram {
-        let elf = Elf64Builder::new()
+        GuestProgram::new(GuestExecutable::new(
+            path.as_bytes().to_vec(),
+            test_program_bytes(entrypoint),
+        ))
+    }
+
+    fn test_program_bytes(entrypoint: u64) -> Vec<u8> {
+        test_program_bytes_with_marker(entrypoint, 0x90)
+    }
+
+    fn test_program_bytes_with_marker(entrypoint: u64, marker: u8) -> Vec<u8> {
+        Elf64Builder::new()
             .entrypoint(entrypoint)
             .program_header(Elf64ProgramHeader::load(
                 PF_R | PF_X,
@@ -3182,11 +3473,39 @@ mod tests {
                 0x08,
                 0x100,
             ))
-            .data_at(0x200, vec![0x90; 0x20])
+            .data_at(0x200, vec![marker; 0x20])
             .data_at(0x2000, vec![0; 0x08])
-            .build();
+            .build()
+    }
 
-        GuestProgram::new(GuestExecutable::new(path.as_bytes().to_vec(), elf))
+    fn dynamic_program_bytes(interpreter: &str) -> Vec<u8> {
+        let mut interpreter_path = interpreter.as_bytes().to_vec();
+        interpreter_path.push(0);
+        Elf64Builder::new()
+            .object_type(mcr_testkit::elf::ET_DYN)
+            .entrypoint(0x1010)
+            .program_header(Elf64ProgramHeader::new(
+                mcr_testkit::elf::PT_INTERP,
+                PF_R,
+                0x300,
+                0,
+                interpreter_path.len() as u64,
+                interpreter_path.len() as u64,
+                1,
+            ))
+            .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x2000))
+            .data_at(0x300, interpreter_path)
+            .data_at(0x400, vec![0x90; 4])
+            .build()
+    }
+
+    fn interpreter_bytes() -> Vec<u8> {
+        Elf64Builder::new()
+            .object_type(mcr_testkit::elf::ET_DYN)
+            .entrypoint(0x400)
+            .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x1000))
+            .data_at(0x400, vec![0x90; 4])
+            .build()
     }
 
     fn test_program_with_args<const A: usize, const E: usize>(
