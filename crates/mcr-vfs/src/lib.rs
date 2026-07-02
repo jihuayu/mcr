@@ -1854,6 +1854,8 @@ impl VirtualFileSystem {
             if !flags.create() {
                 return Err(VfsError::NoEntry);
             }
+            self.tree.ensure_parent_dir(&path)?;
+            self.check_parent_write_permissions(&path)?;
             self.create_resolved_file(path.clone(), mode & !self.umask)?;
         } else if flags.create() && flags.exclusive() {
             return Err(VfsError::AlreadyExists);
@@ -1869,10 +1871,6 @@ impl VirtualFileSystem {
         if node.attr().is_directory() && flags.can_write() {
             return Err(VfsError::IsDirectory);
         }
-        if node_missing {
-            self.check_parent_write_permissions(&path)?;
-        }
-
         let mut access_mode = F_OK;
         if flags.can_read() {
             access_mode |= R_OK;
@@ -2676,6 +2674,26 @@ mod tests {
         assert_eq!(
             vfs.access("/private/secret", R_OK).unwrap_err(),
             VfsError::PermissionDenied
+        );
+        vfs.tree_mut().create_dir("/readonly").unwrap();
+        vfs.tree_mut()
+            .lookup_path_mut(&guest_path("/readonly"))
+            .unwrap()
+            .set_mode(0o500);
+        assert_eq!(
+            vfs.openat(
+                AT_FDCWD,
+                "/readonly/created",
+                OpenFlags::new(O_CREAT | O_WRONLY),
+                0o600,
+            )
+            .unwrap_err(),
+            VfsError::PermissionDenied
+        );
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/readonly/created", 0)
+                .unwrap_err(),
+            VfsError::NoEntry
         );
         assert_eq!(VfsError::PermissionDenied.linux_errno(), 13);
         assert_eq!(VfsError::NotDirectory.linux_errno(), 20);
