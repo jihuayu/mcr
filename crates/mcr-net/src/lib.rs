@@ -19,6 +19,20 @@ pub const LINUX_IPPROTO_IP: u32 = 0;
 pub const LINUX_IPPROTO_TCP: u32 = 6;
 pub const LINUX_IPPROTO_UDP: u32 = 17;
 
+pub const LINUX_SOL_SOCKET: u32 = 1;
+pub const LINUX_IPPROTO_TCP_LEVEL: u32 = 6;
+
+pub const LINUX_SO_REUSEADDR: u32 = 2;
+pub const LINUX_SO_TYPE: u32 = 3;
+pub const LINUX_SO_ERROR: u32 = 4;
+pub const LINUX_SO_KEEPALIVE: u32 = 9;
+pub const LINUX_SO_SNDBUF: u32 = 7;
+pub const LINUX_SO_RCVBUF: u32 = 8;
+
+pub const LINUX_TCP_NODELAY: u32 = 1;
+
+const DEFAULT_SOCKET_BUFFER_SIZE: u32 = 212_992;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SocketId(u64);
 
@@ -208,6 +222,8 @@ pub struct GuestSocket {
     socket_type: SocketType,
     protocol: SocketProtocol,
     state: SocketState,
+    options: SocketOptions,
+    last_error: Option<LinuxErrno>,
 }
 
 impl GuestSocket {
@@ -218,6 +234,8 @@ impl GuestSocket {
             socket_type: spec.socket_type,
             protocol: spec.protocol,
             state: SocketState::Created,
+            options: SocketOptions::default(),
+            last_error: None,
         }
     }
 
@@ -253,6 +271,77 @@ impl GuestSocket {
     #[must_use]
     pub const fn state(&self) -> SocketState {
         self.state
+    }
+
+    #[must_use]
+    pub const fn options(&self) -> SocketOptions {
+        self.options
+    }
+
+    #[must_use]
+    pub const fn last_error(&self) -> Option<LinuxErrno> {
+        self.last_error
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketOptions {
+    pub reuse_addr: bool,
+    pub keep_alive: bool,
+    pub send_buffer_size: u32,
+    pub receive_buffer_size: u32,
+    pub tcp_no_delay: bool,
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self {
+            reuse_addr: false,
+            keep_alive: false,
+            send_buffer_size: DEFAULT_SOCKET_BUFFER_SIZE,
+            receive_buffer_size: DEFAULT_SOCKET_BUFFER_SIZE,
+            tcp_no_delay: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketOptionName {
+    SocketType,
+    SocketError,
+    ReuseAddr,
+    KeepAlive,
+    SendBuffer,
+    ReceiveBuffer,
+    TcpNoDelay,
+}
+
+impl SocketOptionName {
+    pub fn from_linux(level: u32, option: u32) -> Result<Self, SocketError> {
+        match (level, option) {
+            (LINUX_SOL_SOCKET, LINUX_SO_TYPE) => Ok(Self::SocketType),
+            (LINUX_SOL_SOCKET, LINUX_SO_ERROR) => Ok(Self::SocketError),
+            (LINUX_SOL_SOCKET, LINUX_SO_REUSEADDR) => Ok(Self::ReuseAddr),
+            (LINUX_SOL_SOCKET, LINUX_SO_KEEPALIVE) => Ok(Self::KeepAlive),
+            (LINUX_SOL_SOCKET, LINUX_SO_SNDBUF) => Ok(Self::SendBuffer),
+            (LINUX_SOL_SOCKET, LINUX_SO_RCVBUF) => Ok(Self::ReceiveBuffer),
+            (LINUX_IPPROTO_TCP_LEVEL, LINUX_TCP_NODELAY) => Ok(Self::TcpNoDelay),
+            (LINUX_SOL_SOCKET, _) | (LINUX_IPPROTO_TCP_LEVEL, _) => Err(SocketError::unsupported(
+                SocketOperation::GetSocketOption,
+                LinuxErrno::ProtocolNotAvailable,
+                "socket option is not supported",
+            )),
+            _ => Err(SocketError::unsupported(
+                SocketOperation::GetSocketOption,
+                LinuxErrno::ProtocolNotAvailable,
+                "socket option level is not supported",
+            )),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::SocketType | Self::SocketError)
     }
 }
 
@@ -292,6 +381,72 @@ impl GuestSocketTable {
         self.sockets.get(&id).ok_or(SocketError::BadSocket { id })
     }
 
+    pub fn socket_mut(&mut self, id: SocketId) -> Result<&mut GuestSocket, SocketError> {
+        self.sockets
+            .get_mut(&id)
+            .ok_or(SocketError::BadSocket { id })
+    }
+
+    pub fn get_option(
+        &mut self,
+        id: SocketId,
+        option: SocketOptionName,
+    ) -> Result<u32, SocketError> {
+        let socket = self.socket_mut(id)?;
+        let value = match option {
+            SocketOptionName::SocketType => socket.socket_type.to_linux(),
+            SocketOptionName::SocketError => socket
+                .last_error
+                .take()
+                .map_or(0, |errno| errno.code() as u32),
+            SocketOptionName::ReuseAddr => bool_to_socket_option(socket.options.reuse_addr),
+            SocketOptionName::KeepAlive => bool_to_socket_option(socket.options.keep_alive),
+            SocketOptionName::SendBuffer => socket.options.send_buffer_size,
+            SocketOptionName::ReceiveBuffer => socket.options.receive_buffer_size,
+            SocketOptionName::TcpNoDelay => bool_to_socket_option(socket.options.tcp_no_delay),
+        };
+        Ok(value)
+    }
+
+    pub fn set_option(
+        &mut self,
+        id: SocketId,
+        option: SocketOptionName,
+        value: u32,
+    ) -> Result<(), SocketError> {
+        if option.is_read_only() {
+            return Err(SocketError::invalid_input(
+                SocketOperation::SetSocketOption,
+                LinuxErrno::InvalidArgument,
+                "socket option is read-only",
+            ));
+        }
+
+        let socket = self.socket_mut(id)?;
+        match option {
+            SocketOptionName::ReuseAddr => socket.options.reuse_addr = socket_option_to_bool(value),
+            SocketOptionName::KeepAlive => socket.options.keep_alive = socket_option_to_bool(value),
+            SocketOptionName::SendBuffer => {
+                socket.options.send_buffer_size = validate_buffer_size(value)?
+            }
+            SocketOptionName::ReceiveBuffer => {
+                socket.options.receive_buffer_size = validate_buffer_size(value)?
+            }
+            SocketOptionName::TcpNoDelay => {
+                if socket.effective_protocol() != SocketProtocol::Tcp {
+                    return Err(SocketError::invalid_input(
+                        SocketOperation::SetSocketOption,
+                        LinuxErrno::InvalidArgument,
+                        "TCP_NODELAY is only valid for TCP sockets",
+                    ));
+                }
+                socket.options.tcp_no_delay = socket_option_to_bool(value);
+            }
+            SocketOptionName::SocketType | SocketOptionName::SocketError => unreachable!(),
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.sockets.len()
@@ -319,6 +474,8 @@ impl GuestSocketTable {
 pub enum SocketOperation {
     AllocateSocketId,
     CreateSocket,
+    GetSocketOption,
+    SetSocketOption,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,6 +483,7 @@ pub enum LinuxErrno {
     BadFileDescriptor,
     InvalidArgument,
     AddressFamilyNotSupported,
+    ProtocolNotAvailable,
     ProtocolNotSupported,
     ProtocolWrongTypeForSocket,
     SocketTypeNotSupported,
@@ -338,6 +496,7 @@ impl LinuxErrno {
             Self::BadFileDescriptor => 9,
             Self::InvalidArgument => 22,
             Self::ProtocolWrongTypeForSocket => 91,
+            Self::ProtocolNotAvailable => 92,
             Self::ProtocolNotSupported => 93,
             Self::SocketTypeNotSupported => 94,
             Self::AddressFamilyNotSupported => 97,
@@ -404,6 +563,16 @@ impl fmt::Display for SocketError {
 
 impl std::error::Error for SocketError {}
 
+impl SocketType {
+    #[must_use]
+    pub const fn to_linux(self) -> u32 {
+        match self {
+            Self::Stream => LINUX_SOCK_STREAM,
+            Self::Datagram => LINUX_SOCK_DGRAM,
+        }
+    }
+}
+
 fn validate_socket_protocol(
     socket_type: SocketType,
     protocol: SocketProtocol,
@@ -418,6 +587,26 @@ fn validate_socket_protocol(
                 "socket protocol does not match socket type",
             ))
         }
+    }
+}
+
+const fn bool_to_socket_option(value: bool) -> u32 {
+    if value { 1 } else { 0 }
+}
+
+const fn socket_option_to_bool(value: u32) -> bool {
+    value != 0
+}
+
+fn validate_buffer_size(value: u32) -> Result<u32, SocketError> {
+    if value == 0 {
+        Err(SocketError::invalid_input(
+            SocketOperation::SetSocketOption,
+            LinuxErrno::InvalidArgument,
+            "socket buffer size must be greater than zero",
+        ))
+    } else {
+        Ok(value)
     }
 }
 
@@ -511,6 +700,137 @@ mod tests {
             .expect_err("unknown flags are invalid")
             .linux_errno(),
             LinuxErrno::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn gets_and_sets_supported_socket_options() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket(
+                SocketDomain::Inet,
+                SocketType::Stream,
+                SocketProtocol::Default,
+            )
+            .expect("stream socket");
+
+        assert_eq!(
+            SocketOptionName::from_linux(LINUX_SOL_SOCKET, LINUX_SO_TYPE).expect("SO_TYPE option"),
+            SocketOptionName::SocketType
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketType)
+                .expect("SO_TYPE"),
+            LINUX_SOCK_STREAM
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            0
+        );
+
+        table
+            .set_option(stream, SocketOptionName::ReuseAddr, 1)
+            .expect("enable reuseaddr");
+        table
+            .set_option(stream, SocketOptionName::KeepAlive, 1)
+            .expect("enable keepalive");
+        table
+            .set_option(stream, SocketOptionName::SendBuffer, 65_536)
+            .expect("send buffer");
+        table
+            .set_option(stream, SocketOptionName::ReceiveBuffer, 131_072)
+            .expect("receive buffer");
+        table
+            .set_option(stream, SocketOptionName::TcpNoDelay, 1)
+            .expect("enable nodelay");
+
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::ReuseAddr)
+                .expect("SO_REUSEADDR"),
+            1
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::KeepAlive)
+                .expect("SO_KEEPALIVE"),
+            1
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SendBuffer)
+                .expect("SO_SNDBUF"),
+            65_536
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::ReceiveBuffer)
+                .expect("SO_RCVBUF"),
+            131_072
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::TcpNoDelay)
+                .expect("TCP_NODELAY"),
+            1
+        );
+
+        let options = table.socket(stream).expect("socket").options();
+        assert!(options.reuse_addr);
+        assert!(options.keep_alive);
+        assert!(options.tcp_no_delay);
+    }
+
+    #[test]
+    fn rejects_invalid_socket_options() {
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket(
+                SocketDomain::Inet,
+                SocketType::Datagram,
+                SocketProtocol::Default,
+            )
+            .expect("datagram socket");
+
+        assert_eq!(
+            SocketOptionName::from_linux(LINUX_SOL_SOCKET, 0xfeed)
+                .expect_err("unknown option")
+                .linux_errno(),
+            LinuxErrno::ProtocolNotAvailable
+        );
+        assert_eq!(
+            table
+                .set_option(datagram, SocketOptionName::SocketType, LINUX_SOCK_STREAM)
+                .expect_err("SO_TYPE is readonly")
+                .linux_errno(),
+            LinuxErrno::InvalidArgument
+        );
+        assert_eq!(
+            table
+                .set_option(datagram, SocketOptionName::SendBuffer, 0)
+                .expect_err("zero buffer size")
+                .linux_errno(),
+            LinuxErrno::InvalidArgument
+        );
+        assert_eq!(
+            table
+                .set_option(datagram, SocketOptionName::TcpNoDelay, 1)
+                .expect_err("TCP_NODELAY requires TCP")
+                .linux_errno(),
+            LinuxErrno::InvalidArgument
+        );
+        assert_eq!(
+            table
+                .get_option(
+                    SocketId::new(404).expect("socket id"),
+                    SocketOptionName::SocketType
+                )
+                .expect_err("unknown socket")
+                .linux_errno(),
+            LinuxErrno::BadFileDescriptor
         );
     }
 }
