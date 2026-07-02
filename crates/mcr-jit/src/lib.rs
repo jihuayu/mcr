@@ -712,6 +712,16 @@ where
             let value = read_reg32(registers, instruction.op1_register())?;
             write_memory_u32(memory, rip, address, value)?;
         }
+        Code::Push_r64 if instruction.op0_kind() == OpKind::Register => {
+            let value = read_reg64(registers, instruction.op0_register())?;
+            registers.rsp = registers.rsp.wrapping_sub(8);
+            write_memory_u64(memory, rip, registers.rsp, value)?;
+        }
+        Code::Pop_r64 if instruction.op0_kind() == OpKind::Register => {
+            let value = read_memory_u64(memory, rip, registers.rsp)?;
+            registers.rsp = registers.rsp.wrapping_add(8);
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
         Code::Lea_r64_m if instruction.op1_kind() == OpKind::Memory => {
             let value = effective_address(registers, &instruction)?;
             write_reg64(registers, instruction.op0_register(), value)?;
@@ -1790,6 +1800,65 @@ mod tests {
 
         assert_eq!(trap.registers().rax, 0x8877_6655_4433_2211);
         assert_eq!(memory.read_u64(0x720018), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn execution_core_pushes_and_pops_64_bit_register_values() {
+        let block = GuestBlock::new(
+            &[
+                0x53, // push rbx
+                0x58, // pop rax
+                0x0f, 0x05, // syscall
+            ],
+            0x461280,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x8877_6655_4433_2211,
+            rsp: 0x730008,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x730000, &[0; 16]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute push and pop before syscall");
+
+        assert_eq!(trap.registers().rax, 0x8877_6655_4433_2211);
+        assert_eq!(trap.registers().rsp, 0x730008);
+        assert_eq!(memory.read_u64(0x730000), 0x8877_6655_4433_2211);
+    }
+
+    #[test]
+    fn execution_core_push_write_fault_stops_before_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0x50, // push rax
+                0x0f, 0x05, // syscall
+            ],
+            0x461290,
+        );
+        let registers = GuestRegisters {
+            rax: 0x1234,
+            rsp: 0x740008,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let error = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect_err("write-denied stack push should stop before syscall");
+
+        assert_eq!(
+            error,
+            ExecutionError::MemoryOperand {
+                rip: 0x461290,
+                address: 0x740000,
+                access: super::GuestMemoryOperandAccessKind::Write,
+                error: GuestMemoryOperandError::AccessDenied,
+            }
+        );
     }
 
     #[test]
