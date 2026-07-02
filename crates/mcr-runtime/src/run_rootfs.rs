@@ -776,7 +776,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mcr_sys::{LinuxErrno, Syscall};
+    use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
@@ -958,6 +958,20 @@ mod tests {
 
         assert_eq!(output.status(), 0);
         assert_eq!(output.stdout(), b"child exec\n");
+        assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
+    fn run_rootfs_guest_clone_vfork_exec_wait4_without_mvp_emulator() {
+        let rootfs = TestRootfs::new("guest-clone-vfork-exec-wait4");
+        rootfs.write_guest_clone_vfork_exec_parent_elf("/bin/parent", "/bin/child");
+        rootfs.write_guest_syscall_elf("/bin/child", b"child clone exec\n", 23);
+
+        let output =
+            run_rootfs(RunRootfsConfig::new(rootfs.path(), b"/bin/parent".to_vec())).unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"child clone exec\n");
         assert_eq!(output.stderr(), b"");
     }
 
@@ -1156,6 +1170,71 @@ mod tests {
             self.write_file(guest_path, &elf);
         }
 
+        fn write_guest_clone_vfork_exec_parent_elf(&self, guest_path: &str, child_path: &str) {
+            let mut child_path_bytes = child_path.as_bytes().to_vec();
+            child_path_bytes.push(0);
+
+            let mut data = vec![0; 0x200];
+            data[..child_path_bytes.len()].copy_from_slice(&child_path_bytes);
+
+            let clone_flags = (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK) as u32;
+            let mut code = Vec::new();
+            push_mov_r32_imm32(&mut code, 0, Syscall::Clone.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, clone_flags);
+            push_mov_r32_imm32(&mut code, 6, 0);
+            push_mov_r32_imm32(&mut code, 2, 0);
+            push_mov_r32_imm32(&mut code, 10, 0);
+            push_mov_r32_imm32(&mut code, 8, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0x85, 0xc0]); // test eax,eax
+            let child_exec_jump_byte = code.len() + 1;
+            code.extend_from_slice(&[0x74, 0x00]); // je child_exec
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Wait4.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, u32::MAX);
+            push_mov_r32_imm32(&mut code, 6, 0x402100);
+            push_mov_r32_imm32(&mut code, 2, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            push_mov_r32_imm32(&mut code, 0, Syscall::ExitGroup.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            let child_exec_offset = code.len();
+            let jump_offset = child_exec_offset
+                .checked_sub(child_exec_jump_byte + 1)
+                .and_then(|offset| i8::try_from(offset).ok())
+                .unwrap();
+            code[child_exec_jump_byte] = jump_offset as u8;
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Execve.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 0x402000);
+            push_mov_r32_imm32(&mut code, 6, 0);
+            push_mov_r32_imm32(&mut code, 2, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            let elf = Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x2000,
+                    0x402000,
+                    data.len() as u64,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x403000, 0x100, 0x100))
+                .data_at(0x1000, code)
+                .data_at(0x2000, data)
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
         fn write_dynamic_elf(&self, guest_path: &str, interpreter: &str) {
             let mut interpreter_path = interpreter.as_bytes().to_vec();
             interpreter_path.push(0);
@@ -1207,8 +1286,11 @@ mod tests {
     }
 
     fn push_mov_r32_imm32(code: &mut Vec<u8>, register: u8, value: u32) {
-        assert!(register < 8);
-        code.push(0xb8 + register);
+        assert!(register < 16);
+        if register >= 8 {
+            code.push(0x41);
+        }
+        code.push(0xb8 + (register & 0x07));
         code.extend_from_slice(&value.to_le_bytes());
     }
 }
