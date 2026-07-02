@@ -17,6 +17,7 @@ pub const INITIAL_GUEST_PID: GuestPid = 1;
 pub const INITIAL_GUEST_TID: GuestTid = 1;
 pub const DEFAULT_STACK_TOP: GuestAddress = 0x8000_0000;
 pub const DEFAULT_STACK_SIZE: u64 = 0x20_0000;
+const X86_64_SYSCALL_INSTRUCTION_LEN: GuestAddress = 2;
 
 pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
@@ -241,6 +242,11 @@ impl GprState {
             r8: args[4],
             r9: args[5],
         }
+    }
+
+    #[must_use]
+    pub const fn with_syscall_return(self, rip: GuestAddress, rax: u64) -> Self {
+        Self { rip, rax, ..self }
     }
 
     #[must_use]
@@ -689,9 +695,9 @@ impl GuestKernel {
         match request.syscall {
             Syscall::Getpid => SyscallOutcome::success(u64::from(task.pid)),
             Syscall::Gettid => SyscallOutcome::success(u64::from(task.tid)),
-            Syscall::Fork => self.fork_current(tid),
-            Syscall::Vfork => self.vfork_current(tid),
-            Syscall::Clone => self.clone_current(
+            Syscall::Fork => self.fork_like_current(tid, "fork", child_return_rip(request)),
+            Syscall::Vfork => self.fork_like_current(tid, "vfork", child_return_rip(request)),
+            Syscall::Clone => self.clone_current_with_return(
                 tid,
                 CloneSyscallArgs::new(
                     arg(request, 0),
@@ -700,6 +706,7 @@ impl GuestKernel {
                     arg(request, 3),
                     arg(request, 4),
                 ),
+                child_return_rip(request),
             ),
             Syscall::Exit => self.exit_task(tid, low_exit_status(arg(request, 0))),
             Syscall::ExitGroup => self.exit_group(task.pid, low_exit_status(arg(request, 0))),
@@ -762,23 +769,38 @@ impl GuestKernel {
     }
 
     pub fn fork_current(&mut self, tid: GuestTid) -> SyscallOutcome {
-        self.fork_like_current(tid, "fork")
+        self.fork_like_current(tid, "fork", current_syscall_return_rip(self, tid))
     }
 
     pub fn vfork_current(&mut self, tid: GuestTid) -> SyscallOutcome {
-        self.fork_like_current(tid, "vfork")
+        self.fork_like_current(tid, "vfork", current_syscall_return_rip(self, tid))
     }
 
     pub fn clone_current(&mut self, tid: GuestTid, args: CloneSyscallArgs) -> SyscallOutcome {
+        self.clone_current_with_return(tid, args, current_syscall_return_rip(self, tid))
+    }
+
+    fn clone_current_with_return(
+        &mut self,
+        tid: GuestTid,
+        args: CloneSyscallArgs,
+        child_return_rip: GuestAddress,
+    ) -> SyscallOutcome {
         if !is_supported_fork_like_clone(args.flags) {
             return TaskError::InvalidCloneFlags(args.flags).into_outcome();
         }
 
-        self.fork_like_current(tid, "clone")
+        self.fork_like_current(tid, "clone", child_return_rip)
             .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
     }
 
     pub fn fork_child(&mut self, tid: GuestTid) -> Result<GuestPid, TaskError> {
+        let (child_pid, _) = self.fork_child_task(tid)?;
+
+        Ok(child_pid)
+    }
+
+    fn fork_child_task(&mut self, tid: GuestTid) -> Result<(GuestPid, GuestTid), TaskError> {
         let parent_task = self.task(tid).cloned().ok_or(TaskError::UnknownTid(tid))?;
         let parent_pid = parent_task.pid;
         let parent = self
@@ -816,7 +838,7 @@ impl GuestKernel {
             .children
             .insert(child_pid);
 
-        Ok(child_pid)
+        Ok((child_pid, child_tid))
     }
 
     pub fn wait4_child(
@@ -1144,11 +1166,21 @@ impl GuestKernel {
         Ok(tid)
     }
 
-    fn fork_like_current(&mut self, tid: GuestTid, syscall: &'static str) -> SyscallOutcome {
-        match self.fork_child(tid) {
-            Ok(child_pid) => SyscallOutcome::success(u64::from(child_pid))
-                .with_decoded_field("guest_pid", child_pid.to_string())
-                .with_decoded_field("fork_kind", syscall),
+    fn fork_like_current(
+        &mut self,
+        tid: GuestTid,
+        syscall: &'static str,
+        child_return_rip: GuestAddress,
+    ) -> SyscallOutcome {
+        match self.fork_child_task(tid) {
+            Ok((child_pid, child_tid)) => {
+                if let Some(child_task) = self.task_mut(child_tid) {
+                    child_task.regs = child_task.regs.with_syscall_return(child_return_rip, 0);
+                }
+                SyscallOutcome::success(u64::from(child_pid))
+                    .with_decoded_field("guest_pid", child_pid.to_string())
+                    .with_decoded_field("fork_kind", syscall)
+            }
             Err(error) => error.into_outcome(),
         }
     }
@@ -1360,6 +1392,21 @@ fn arg(request: &SyscallRequest, index: usize) -> u64 {
     request.arg(index).unwrap_or_default()
 }
 
+const fn child_return_rip(request: &SyscallRequest) -> GuestAddress {
+    request
+        .context
+        .rip
+        .saturating_add(X86_64_SYSCALL_INSTRUCTION_LEN)
+}
+
+fn current_syscall_return_rip(kernel: &GuestKernel, tid: GuestTid) -> GuestAddress {
+    kernel.task(tid).map_or(0, |task| {
+        task.regs()
+            .rip()
+            .saturating_add(X86_64_SYSCALL_INSTRUCTION_LEN)
+    })
+}
+
 fn low_exit_status(raw: u64) -> i32 {
     (raw & 0xff) as i32
 }
@@ -1552,6 +1599,20 @@ mod tests {
     }
 
     #[test]
+    fn fork_syscall_prepares_child_zero_return_after_syscall() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Fork, [0; 6]),
+            SyscallReturn::Success(2)
+        );
+
+        let child_task = kernel.task(2).unwrap();
+        assert_eq!(child_task.regs().rax(), 0);
+        assert_eq!(child_task.regs().rip(), 0x401236);
+    }
+
+    #[test]
     fn clone_accepts_vfork_exec_shape_and_rejects_thread_flags() {
         let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
 
@@ -1571,6 +1632,8 @@ mod tests {
             SyscallReturn::Success(2)
         );
         assert_eq!(kernel.process(2).unwrap().parent(), Some(INITIAL_GUEST_PID));
+        assert_eq!(kernel.task(2).unwrap().regs().rax(), 0);
+        assert_eq!(kernel.task(2).unwrap().regs().rip(), 0x401236);
 
         assert_eq!(
             dispatch_task_syscall(
