@@ -45,6 +45,7 @@ name = "mcr-runtime"
 version = "0.1.0"
 dependencies = [
  "mcr-elf",
+ "mcr-jit",
  "mcr-sys",
  "mcr-task",
  "mcr-testkit",

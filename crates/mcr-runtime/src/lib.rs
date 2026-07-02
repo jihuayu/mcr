@@ -1,8 +1,10 @@
-use mcr_elf::GuestMemoryImage;
+use mcr_elf::{GuestMemoryImage, GuestVma, GuestVmaKind, SegmentPermissions};
+use mcr_jit::GuestRegisters;
 use mcr_sys::{
     EventSyscalls, FileSyscalls, GuestContext, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
     LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, SyscallDispatchResult,
-    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallTracer, TimeSyscalls,
+    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
+    SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
@@ -36,6 +38,287 @@ pub trait GuestMemory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMemoryError {
     Fault,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeDiagnostics {
+    executable_path: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    vmas: Vec<DiagnosticVma>,
+    last_syscall: Option<DiagnosticSyscall>,
+}
+
+impl RuntimeDiagnostics {
+    #[must_use]
+    pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
+        let process = kernel
+            .process(mcr_task::INITIAL_GUEST_PID)
+            .expect("runtime always starts with an initial process");
+        let image = process.image();
+
+        Self {
+            executable_path: image.executable().path().to_vec(),
+            argv: image.argv().to_vec(),
+            envp: image.envp().to_vec(),
+            vmas: image
+                .memory()
+                .vmas()
+                .iter()
+                .map(DiagnosticVma::from_guest_vma)
+                .collect(),
+            last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
+        }
+    }
+
+    #[must_use]
+    pub fn executable_path(&self) -> &[u8] {
+        &self.executable_path
+    }
+
+    #[must_use]
+    pub fn argv(&self) -> &[Vec<u8>] {
+        &self.argv
+    }
+
+    #[must_use]
+    pub fn envp(&self) -> &[Vec<u8>] {
+        &self.envp
+    }
+
+    #[must_use]
+    pub fn vmas(&self) -> &[DiagnosticVma] {
+        &self.vmas
+    }
+
+    #[must_use]
+    pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.last_syscall.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticVma {
+    start: u64,
+    end: u64,
+    permissions: DiagnosticPermissions,
+    kind: DiagnosticVmaKind,
+}
+
+impl DiagnosticVma {
+    #[must_use]
+    pub fn from_guest_vma(vma: &GuestVma) -> Self {
+        Self {
+            start: vma.start(),
+            end: vma.end(),
+            permissions: DiagnosticPermissions::from_segment(vma.permissions()),
+            kind: DiagnosticVmaKind::from_guest_kind(vma.kind()),
+        }
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn permissions(&self) -> DiagnosticPermissions {
+        self.permissions
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &DiagnosticVmaKind {
+        &self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticPermissions {
+    read: bool,
+    write: bool,
+    execute: bool,
+}
+
+impl DiagnosticPermissions {
+    #[must_use]
+    pub const fn new(read: bool, write: bool, execute: bool) -> Self {
+        Self {
+            read,
+            write,
+            execute,
+        }
+    }
+
+    #[must_use]
+    pub fn from_segment(permissions: SegmentPermissions) -> Self {
+        Self::new(
+            permissions.read(),
+            permissions.write(),
+            permissions.execute(),
+        )
+    }
+
+    #[must_use]
+    pub const fn read(self) -> bool {
+        self.read
+    }
+
+    #[must_use]
+    pub const fn write(self) -> bool {
+        self.write
+    }
+
+    #[must_use]
+    pub const fn execute(self) -> bool {
+        self.execute
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiagnosticVmaKind {
+    ElfLoad {
+        program_header_index: u16,
+        file_offset: u64,
+        file_size: u64,
+    },
+    Stack,
+}
+
+impl DiagnosticVmaKind {
+    #[must_use]
+    pub const fn from_guest_kind(kind: &GuestVmaKind) -> Self {
+        match kind {
+            GuestVmaKind::ElfLoad {
+                program_header_index,
+                file_offset,
+                file_size,
+            } => Self::ElfLoad {
+                program_header_index: *program_header_index,
+                file_offset: *file_offset,
+                file_size: *file_size,
+            },
+            GuestVmaKind::Stack => Self::Stack,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticSyscall {
+    name: String,
+    number: u64,
+    args: [u64; 6],
+    result: Option<SyscallReturn>,
+    rip: u64,
+}
+
+impl DiagnosticSyscall {
+    #[must_use]
+    pub fn from_event(event: &SyscallTraceEvent) -> Option<Self> {
+        match event {
+            SyscallTraceEvent::Enter(_) => None,
+            SyscallTraceEvent::Exit(event) => Some(Self {
+                name: event.syscall.name().to_owned(),
+                number: event.syscall.number().raw(),
+                args: event.args.raw(),
+                result: Some(event.result),
+                rip: event.context.rip,
+            }),
+            SyscallTraceEvent::Unsupported(event) => Some(Self {
+                name: event.syscall.name().to_owned(),
+                number: event.number.raw(),
+                args: event.args.raw(),
+                result: Some(event.result),
+                rip: event.context.rip,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn number(&self) -> u64 {
+        self.number
+    }
+
+    #[must_use]
+    pub const fn args(&self) -> [u64; 6] {
+        self.args
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> Option<SyscallReturn> {
+        self.result
+    }
+
+    #[must_use]
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashReport {
+    reason: String,
+    registers: GuestRegisters,
+    diagnostics: RuntimeDiagnostics,
+}
+
+impl CrashReport {
+    #[must_use]
+    pub fn new(
+        reason: impl Into<String>,
+        registers: GuestRegisters,
+        diagnostics: RuntimeDiagnostics,
+    ) -> Self {
+        Self {
+            reason: reason.into(),
+            registers,
+            diagnostics,
+        }
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub const fn registers(&self) -> GuestRegisters {
+        self.registers
+    }
+
+    #[must_use]
+    pub const fn diagnostics(&self) -> &RuntimeDiagnostics {
+        &self.diagnostics
+    }
+}
+
+impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
+    pub fn with_diagnostics(program: GuestProgram) -> Result<Self, RuntimeError> {
+        Runtime::with_tracer(program, RuntimeDiagnosticsTracer::new())
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> RuntimeDiagnostics {
+        RuntimeDiagnostics::capture(self.kernel(), self.tracer().events())
+    }
+
+    #[must_use]
+    pub fn crash_report(
+        &self,
+        reason: impl Into<String>,
+        registers: GuestRegisters,
+    ) -> CrashReport {
+        CrashReport::new(reason, registers, self.diagnostics())
+    }
 }
 
 pub struct RuntimeFileSystem<M> {
@@ -579,6 +862,42 @@ impl From<Runtime> for SyscallDispatcher<RuntimeSubsystems, NoopSyscallTracer> {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeDiagnosticsTracer {
+    events: Vec<SyscallTraceEvent>,
+}
+
+impl RuntimeDiagnosticsTracer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[SyscallTraceEvent] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn last_syscall(&self) -> Option<DiagnosticSyscall> {
+        self.events
+            .iter()
+            .rev()
+            .find_map(DiagnosticSyscall::from_event)
+    }
+
+    #[must_use]
+    pub fn into_events(self) -> Vec<SyscallTraceEvent> {
+        self.events
+    }
+}
+
+impl SyscallTracer for RuntimeDiagnosticsTracer {
+    fn record(&mut self, event: SyscallTraceEvent) {
+        self.events.push(event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -986,6 +1305,78 @@ mod tests {
         assert_eq!(task.regs().rip(), 0x501000);
     }
 
+    #[test]
+    fn diagnostics_capture_image_vmas_and_last_syscall() {
+        let mut runtime = RuntimeWithTracer::with_diagnostics(test_program_with_args(
+            "/bin/app",
+            0x401000,
+            ["/bin/app", "--flag"],
+            ["A=B"],
+        ))
+        .unwrap();
+
+        let result = runtime.dispatch_syscall(context(Syscall::Getpid, [0; 6]));
+        assert_eq!(result.result, SyscallReturn::Success(1));
+
+        let diagnostics = runtime.diagnostics();
+        let last = diagnostics.last_syscall().unwrap();
+
+        assert_eq!(diagnostics.executable_path(), b"/bin/app");
+        assert_eq!(
+            diagnostics.argv(),
+            &[b"/bin/app".to_vec(), b"--flag".to_vec()]
+        );
+        assert_eq!(diagnostics.envp(), &[b"A=B".to_vec()]);
+        assert!(diagnostics.vmas().iter().any(|vma| {
+            vma.start() <= 0x401000
+                && 0x401000 < vma.end()
+                && vma.permissions().execute()
+                && matches!(
+                    vma.kind(),
+                    DiagnosticVmaKind::ElfLoad {
+                        program_header_index: 0,
+                        ..
+                    }
+                )
+        }));
+        assert!(diagnostics.vmas().iter().any(|vma| {
+            matches!(vma.kind(), DiagnosticVmaKind::Stack) && vma.permissions().write()
+        }));
+        assert_eq!(last.name(), "getpid");
+        assert_eq!(last.number(), Syscall::GETPID.raw());
+        assert_eq!(last.args(), [0; 6]);
+        assert_eq!(last.result(), Some(SyscallReturn::Success(1)));
+        assert_eq!(last.rip(), 0x401234);
+    }
+
+    #[test]
+    fn crash_report_includes_registers_and_runtime_diagnostics() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.dispatch_syscall(context(Syscall::Gettid, [0; 6]));
+
+        let registers = GuestRegisters {
+            rax: Syscall::Gettid.number().raw(),
+            rip: 0x401234,
+            rsp: runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .regs()
+                .rsp(),
+            ..GuestRegisters::default()
+        };
+        let report = runtime.crash_report("invalid instruction", registers);
+
+        assert_eq!(report.reason(), "invalid instruction");
+        assert_eq!(report.registers(), registers);
+        assert_eq!(report.diagnostics().executable_path(), b"/bin/app");
+        assert_eq!(
+            report.diagnostics().last_syscall().unwrap().name(),
+            "gettid"
+        );
+    }
+
     fn context(syscall: Syscall, args: [u64; 6]) -> GuestContext {
         GuestContext::new(
             INITIAL_GUEST_PID,
@@ -1025,5 +1416,16 @@ mod tests {
             .build();
 
         GuestProgram::new(GuestExecutable::new(path.as_bytes().to_vec(), elf))
+    }
+
+    fn test_program_with_args<const A: usize, const E: usize>(
+        path: &str,
+        entrypoint: u64,
+        argv: [&str; A],
+        envp: [&str; E],
+    ) -> GuestProgram {
+        test_program(path, entrypoint)
+            .with_args(argv.map(|value| value.as_bytes().to_vec()))
+            .with_env(envp.map(|value| value.as_bytes().to_vec()))
     }
 }
