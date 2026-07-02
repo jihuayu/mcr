@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use mcr_net::WinHostSocketTransport;
 use mcr_sys::LinuxErrno;
 use mcr_vfs::{
-    AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, ProcSelfData, Rootfs, VirtualFileSystem,
+    AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, ProcSelfData, Rootfs, VfsError,
+    VirtualFileSystem,
 };
 
 use crate::RuntimeFileSystem;
@@ -649,6 +650,7 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
 
     tree.mount_minimal_devfs()?;
     tree.mount_minimal_procfs()?;
+    materialize_minimal_dns_config(&mut tree)?;
 
     Ok(VirtualFileSystem::from_parts(
         Rootfs::new(rootfs),
@@ -698,6 +700,43 @@ fn collect_rootfs_entries(
         }
     }
     Ok(())
+}
+
+fn materialize_minimal_dns_config(tree: &mut PathTree) -> Result<(), RunRootfsError> {
+    create_dir_if_missing(tree, "/etc")?;
+    create_file_if_missing(
+        tree,
+        "/etc/hosts",
+        b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+        0o644,
+    )?;
+    create_file_if_missing(tree, "/etc/resolv.conf", b"nameserver 1.1.1.1\n", 0o644)?;
+    create_file_if_missing(
+        tree,
+        "/etc/nsswitch.conf",
+        b"hosts: files dns\npasswd: files\ngroup: files\n",
+        0o644,
+    )?;
+    Ok(())
+}
+
+fn create_dir_if_missing(tree: &mut PathTree, path: &str) -> Result<(), RunRootfsError> {
+    match tree.create_dir(path) {
+        Ok(_) | Err(VfsError::AlreadyExists) => Ok(()),
+        Err(error) => Err(RunRootfsError::Vfs(error)),
+    }
+}
+
+fn create_file_if_missing(
+    tree: &mut PathTree,
+    path: &str,
+    content: &'static [u8],
+    mode: u32,
+) -> Result<(), RunRootfsError> {
+    match tree.create_file_with_content(path, content, mode) {
+        Ok(_) | Err(VfsError::AlreadyExists) => Ok(()),
+        Err(error) => Err(RunRootfsError::Vfs(error)),
+    }
 }
 
 fn guest_arg_to_string(bytes: &[u8]) -> Result<String, RunRootfsError> {
@@ -804,6 +843,48 @@ mod tests {
         .unwrap();
         assert_eq!(proc_self.status(), 0);
         assert_eq!(proc_self.stdout(), b"cmdline\nenviron\nexe\nfd\n");
+    }
+
+    #[test]
+    fn run_rootfs_materializes_minimal_dns_config() {
+        let rootfs = TestRootfs::new("dns-config");
+        rootfs.write_static_elf("/bin/busybox");
+
+        let output = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"cat".to_vec(),
+                b"/etc/hosts".to_vec(),
+                b"/etc/resolv.conf".to_vec(),
+                b"/etc/nsswitch.conf".to_vec(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(
+            output.stdout(),
+            b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\nnameserver 1.1.1.1\nhosts: files dns\npasswd: files\ngroup: files\n"
+        );
+    }
+
+    #[test]
+    fn run_rootfs_keeps_existing_dns_config() {
+        let rootfs = TestRootfs::new("dns-config-existing");
+        rootfs.write_static_elf("/bin/busybox");
+        rootfs.write_file("/etc/resolv.conf", b"nameserver 9.9.9.9\n");
+
+        let output = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"cat".to_vec(),
+                b"/etc/resolv.conf".to_vec(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"nameserver 9.9.9.9\n");
     }
 
     #[test]
