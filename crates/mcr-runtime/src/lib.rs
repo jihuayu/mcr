@@ -1970,6 +1970,7 @@ impl GuestExecutionStep {
 #[derive(Debug)]
 pub enum GuestExecutionError {
     MissingInitialTask,
+    MissingTask(mcr_sys::GuestTid),
     TaskExited {
         tid: mcr_sys::GuestTid,
         state: TaskState,
@@ -1982,6 +1983,7 @@ impl fmt::Display for GuestExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingInitialTask => write!(formatter, "initial guest task is missing"),
+            Self::MissingTask(tid) => write!(formatter, "guest task {tid} is missing"),
             Self::TaskExited { tid, state } => {
                 write!(formatter, "guest task {tid} is not runnable: {state:?}")
             }
@@ -2050,7 +2052,9 @@ impl GuestExecutionError {
     #[must_use]
     pub const fn linux_errno(&self) -> LinuxErrno {
         match self {
-            Self::MissingInitialTask | Self::TaskExited { .. } => LinuxErrno::ESRCH,
+            Self::MissingInitialTask | Self::MissingTask(_) | Self::TaskExited { .. } => {
+                LinuxErrno::ESRCH
+            }
             Self::Memory(error) => error.errno(),
             Self::Execution(_) => LinuxErrno::ENOEXEC,
         }
@@ -2110,15 +2114,25 @@ fn dispatch_guest_execution_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
+    let tid = INITIAL_GUEST_TID;
+    dispatch_guest_task_with_dispatcher(dispatcher, tid)
+}
+
+fn dispatch_guest_task_with_dispatcher<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
     const MAX_GUEST_BLOCK_BYTES: usize = 4096;
 
     let task = dispatcher
         .subsystems()
         .tasks
-        .task(INITIAL_GUEST_TID)
-        .ok_or(GuestExecutionError::MissingInitialTask)?;
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
     let pid = task.pid();
-    let tid = task.tid();
     let gpr = task.regs();
     if !matches!(task.state(), TaskState::Runnable) {
         return Err(GuestExecutionError::TaskExited {
@@ -5693,6 +5707,45 @@ mod tests {
                 .unwrap()
                 .children()
                 .contains(&2)
+        );
+    }
+
+    #[test]
+    fn guest_execution_can_dispatch_forked_child_task() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(&mut runtime, 0x401000, Syscall::Fork, [0; 6]);
+
+        let parent_step = runtime
+            .dispatch_guest_execution()
+            .expect("parent fork syscall executes");
+        assert_eq!(parent_step.tid(), INITIAL_GUEST_TID);
+        assert_eq!(parent_step.encoded_rax(), 2);
+
+        runtime
+            .kernel_mut()
+            .task_mut(2)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                0x401000,
+                0x8000_0000,
+                Syscall::ExitGroup.number().raw(),
+                [17, 0, 0, 0, 0, 0],
+            ));
+
+        let child_step = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, 2)
+            .expect("child exit syscall executes");
+        assert_eq!(child_step.tid(), 2);
+        assert_eq!(child_step.task_state(), TaskState::Exited { status: 17 });
+        assert_eq!(
+            runtime.kernel().process(2).unwrap().exit_state(),
+            ExitState::Exited { status: 17 }
         );
     }
 
