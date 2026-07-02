@@ -778,6 +778,7 @@ mod tests {
 
     use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
+    use mcr_vfs::{AT_FDCWD, O_RDONLY};
 
     use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
 
@@ -972,6 +973,20 @@ mod tests {
 
         assert_eq!(output.status(), 0);
         assert_eq!(output.stdout(), b"child clone exec\n");
+        assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
+    fn run_rootfs_child_exec_proc_self_cmdline_reports_child_image() {
+        let rootfs = TestRootfs::new("guest-child-exec-proc-self");
+        rootfs.write_guest_fork_exec_parent_with_argv_elf("/bin/parent", "/bin/proc-reader");
+        rootfs.write_guest_proc_self_cmdline_reader_elf("/bin/proc-reader");
+
+        let output =
+            run_rootfs(RunRootfsConfig::new(rootfs.path(), b"/bin/parent".to_vec())).unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"/bin/proc-reader\0--child\0");
         assert_eq!(output.stderr(), b"");
     }
 
@@ -1210,6 +1225,123 @@ mod tests {
             push_mov_r32_imm32(&mut code, 7, 0x402000);
             push_mov_r32_imm32(&mut code, 6, 0);
             push_mov_r32_imm32(&mut code, 2, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            let elf = Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x2000,
+                    0x402000,
+                    data.len() as u64,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x403000, 0x100, 0x100))
+                .data_at(0x1000, code)
+                .data_at(0x2000, data)
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
+        fn write_guest_fork_exec_parent_with_argv_elf(&self, guest_path: &str, child_path: &str) {
+            let mut child_path_bytes = child_path.as_bytes().to_vec();
+            child_path_bytes.push(0);
+            let child_arg = b"--child\0";
+
+            let mut data = vec![0; 0x200];
+            data[..child_path_bytes.len()].copy_from_slice(&child_path_bytes);
+            data[0x40..0x40 + child_path_bytes.len()].copy_from_slice(&child_path_bytes);
+            data[0x80..0x80 + child_arg.len()].copy_from_slice(child_arg);
+            data[0x100..0x108].copy_from_slice(&0x402040u64.to_le_bytes());
+            data[0x108..0x110].copy_from_slice(&0x402080u64.to_le_bytes());
+            data[0x110..0x118].copy_from_slice(&0u64.to_le_bytes());
+
+            let mut code = Vec::new();
+            push_mov_r32_imm32(&mut code, 0, Syscall::Fork.number().raw() as u32);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0x85, 0xc0]); // test eax,eax
+            let child_exec_jump_byte = code.len() + 1;
+            code.extend_from_slice(&[0x74, 0x00]); // je child_exec
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Wait4.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, u32::MAX);
+            push_mov_r32_imm32(&mut code, 6, 0x402180);
+            push_mov_r32_imm32(&mut code, 2, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            push_mov_r32_imm32(&mut code, 0, Syscall::ExitGroup.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            let child_exec_offset = code.len();
+            let jump_offset = child_exec_offset
+                .checked_sub(child_exec_jump_byte + 1)
+                .and_then(|offset| i8::try_from(offset).ok())
+                .unwrap();
+            code[child_exec_jump_byte] = jump_offset as u8;
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Execve.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 0x402000);
+            push_mov_r32_imm32(&mut code, 6, 0x402100);
+            push_mov_r32_imm32(&mut code, 2, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            let elf = Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x2000,
+                    0x402000,
+                    data.len() as u64,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x403000, 0x100, 0x100))
+                .data_at(0x1000, code)
+                .data_at(0x2000, data)
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
+        fn write_guest_proc_self_cmdline_reader_elf(&self, guest_path: &str) {
+            let proc_cmdline = b"/proc/self/cmdline\0";
+            let mut data = vec![0; 0x200];
+            data[..proc_cmdline.len()].copy_from_slice(proc_cmdline);
+
+            let mut code = Vec::new();
+            push_mov_r32_imm32(&mut code, 0, Syscall::Openat.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, AT_FDCWD as u32);
+            push_mov_r32_imm32(&mut code, 6, 0x402000);
+            push_mov_r32_imm32(&mut code, 2, O_RDONLY);
+            push_mov_r32_imm32(&mut code, 10, 0);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0x89, 0xc7]); // mov edi,eax
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Read.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 6, 0x402100);
+            push_mov_r32_imm32(&mut code, 2, 0x40);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0x89, 0xc2]); // mov edx,eax
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::Write.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 1);
+            push_mov_r32_imm32(&mut code, 6, 0x402100);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+            push_mov_r32_imm32(&mut code, 0, Syscall::ExitGroup.number().raw() as u32);
+            push_mov_r32_imm32(&mut code, 7, 0);
             code.extend_from_slice(&[0x0f, 0x05]); // syscall
 
             let elf = Elf64Builder::new()

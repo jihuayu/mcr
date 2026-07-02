@@ -1567,8 +1567,8 @@ fn net_errno(error: mcr_net::SocketError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno().code() as u16).unwrap_or(LinuxErrno::EINVAL)
 }
 
-fn sync_proc_self(vfs: &mut VirtualFileSystem, kernel: &GuestKernel) {
-    if let Some(process) = kernel.process(mcr_task::INITIAL_GUEST_PID) {
+fn sync_proc_self(vfs: &mut VirtualFileSystem, kernel: &GuestKernel, pid: mcr_sys::GuestPid) {
+    if let Some(process) = kernel.process(pid) {
         let image = process.image();
         vfs.set_proc_self(ProcSelfData::new(
             image.executable().path().to_vec(),
@@ -2422,7 +2422,7 @@ impl RuntimeSubsystems {
                 .image()
                 .memory(),
         )?;
-        sync_proc_self(&mut vfs, &tasks);
+        sync_proc_self(&mut vfs, &tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
@@ -2448,7 +2448,7 @@ impl RuntimeSubsystems {
                 .image()
                 .memory(),
         )?;
-        sync_proc_self(&mut vfs, &tasks);
+        sync_proc_self(&mut vfs, &tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
@@ -2763,7 +2763,9 @@ impl RuntimeSubsystems {
 
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
-        self.select_fds_for_process(pid)
+        self.select_fds_for_process(pid)?;
+        sync_proc_self(self.files.vfs_mut(), &self.tasks, pid);
+        Ok(())
     }
 
     fn select_memory_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -3135,7 +3137,7 @@ impl RuntimeSubsystems {
                 self.epolls.close(epoll_id);
             }
         }
-        sync_proc_self(self.files.vfs_mut(), &self.tasks);
+        sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
         self.replace_memory_from_image(request.context.pid)?;
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
