@@ -1,7 +1,7 @@
 ---
 id: boot-001
 scope: bootstrap
-status: in-progress
+status: done
 depends-on: []
 ---
 
