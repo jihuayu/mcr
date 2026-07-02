@@ -2514,7 +2514,18 @@ impl MemorySyscalls for RuntimeSubsystems {
         if let Err(errno) = self.select_memory_for_process(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let outcome = self.files.memory_mut().dispatch_memory(request);
+        let outcome = if matches!(request.syscall, mcr_sys::Syscall::Mmap) {
+            outcome(self.mmap(
+                arg(request, 0),
+                arg(request, 1),
+                arg_u32(request, 2),
+                arg_u32(request, 3),
+                arg_i32(request, 4),
+                arg(request, 5) as i64,
+            ))
+        } else {
+            self.files.memory_mut().dispatch_memory(request)
+        };
         if matches!(outcome.result, SyscallReturn::Success(_))
             && let Err(errno) = self.store_selected_process_memory(pid)
         {
@@ -2569,6 +2580,75 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
 }
 
 impl RuntimeSubsystems {
+    fn mmap(
+        &mut self,
+        addr: u64,
+        length: u64,
+        prot: u32,
+        flags: u32,
+        fd: Fd,
+        offset: i64,
+    ) -> Result<u64, LinuxErrno> {
+        let args = mcr_sys::MmapSyscallArgs {
+            addr,
+            length,
+            prot,
+            flags,
+            fd,
+            offset,
+        };
+        let mapped = self
+            .files
+            .memory_mut()
+            .mmap(args)
+            .map_err(|error| error.errno())?;
+        if !args.is_anonymous() {
+            self.populate_file_backed_mmap(mapped, length, prot, fd, offset)?;
+        }
+        Ok(mapped)
+    }
+
+    fn populate_file_backed_mmap(
+        &mut self,
+        mapped: u64,
+        length: u64,
+        prot: u32,
+        fd: Fd,
+        offset: i64,
+    ) -> Result<(), LinuxErrno> {
+        if offset < 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
+        let mut bytes = vec![0; len];
+        let count = self
+            .files
+            .vfs()
+            .pread(fd, offset as u64, &mut bytes)
+            .map_err(vfs_errno)?;
+        let writable = mcr_sys::MprotectSyscallArgs {
+            addr: mapped,
+            length,
+            prot: mcr_sys::LINUX_PROT_READ | mcr_sys::LINUX_PROT_WRITE,
+        };
+        self.files
+            .memory_mut()
+            .mprotect(writable)
+            .map_err(|error| error.errno())?;
+        let write_result = self.files.memory_mut().write(mapped, &bytes[..count]);
+        let restore_result = self
+            .files
+            .memory_mut()
+            .mprotect(mcr_sys::MprotectSyscallArgs {
+                addr: mapped,
+                length,
+                prot,
+            });
+        write_result.map_err(|error| error.errno())?;
+        restore_result.map_err(|error| error.errno())?;
+        Ok(())
+    }
+
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
         self.select_fds_for_process(pid)
@@ -3754,6 +3834,54 @@ mod tests {
         assert_eq!(
             runtime.kernel().process(INITIAL_GUEST_PID).unwrap().pid(),
             1
+        );
+    }
+
+    #[test]
+    fn runtime_file_backed_mmap_populates_private_mapping_from_vfs_fd() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Lseek, [3, 2, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(2)
+        );
+
+        let mapped = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                0x7000_0000,
+                GUEST_PAGE_SIZE,
+                u64::from(mcr_sys::LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                0,
+            ],
+        ));
+
+        assert_eq!(mapped.result, SyscallReturn::Success(0x7000_0000));
+        let mut bytes = [0; 8];
+        runtime.memory().read(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes[..5], b"hello");
+        assert_eq!(&bytes[5..], &[0, 0, 0]);
+        assert_eq!(runtime.vfs().fds().get(3).unwrap().offset(), 2);
+        assert_eq!(
+            runtime.memory_mut().write(0x7000_0000, b"x"),
+            Err(GuestMemoryError::AccessDenied)
         );
     }
 
