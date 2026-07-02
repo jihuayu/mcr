@@ -3827,6 +3827,99 @@ mod tests {
     }
 
     #[test]
+    fn runtime_nonblocking_connect_completes_after_poll_writable() {
+        let transport = runtime_socket_transport();
+        transport.set_connect_would_block_once();
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402300, &4u32.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINPROGRESS)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getsockopt,
+                    [
+                        3,
+                        u64::from(LINUX_SOL_SOCKET),
+                        u64::from(LINUX_SO_ERROR),
+                        0x402200,
+                        0x402300,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402200),
+            u32::from(LinuxErrno::EINPROGRESS.raw())
+        );
+
+        write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLOUT);
+        let ready = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLOUT);
+
+        runtime
+            .memory_mut()
+            .write(0x402300, &4u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getsockopt,
+                    [
+                        3,
+                        u64::from(LINUX_SOL_SOCKET),
+                        u64::from(LINUX_SO_ERROR),
+                        0x402200,
+                        0x402300,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402200), 0);
+    }
+
+    #[test]
     fn ppoll_reads_timespec_and_rejects_signal_masks() {
         let mut runtime =
             Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
@@ -5036,6 +5129,10 @@ mod tests {
         fn push_incoming(&self, bytes: &[u8]) {
             self.state.borrow_mut().incoming.extend_from_slice(bytes);
         }
+
+        fn set_connect_would_block_once(&self) {
+            self.state.borrow_mut().connect_would_block_once = true;
+        }
     }
 
     #[derive(Debug, Default)]
@@ -5043,6 +5140,7 @@ mod tests {
         sent: Vec<u8>,
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
+        connect_would_block_once: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -5072,7 +5170,15 @@ mod tests {
             &mut self,
             address: SocketAddress,
         ) -> Result<SocketAddress, mcr_net::HostIoError> {
-            self.state.borrow_mut().connected = Some(address);
+            let mut state = self.state.borrow_mut();
+            if state.connect_would_block_once {
+                state.connect_would_block_once = false;
+                return Err(mcr_net::HostIoError::new(
+                    mcr_net::LinuxErrno::OperationWouldBlock,
+                    "connect would block",
+                ));
+            }
+            state.connected = Some(address);
             Ok(address)
         }
 
@@ -5277,6 +5383,12 @@ mod tests {
         let mut bytes = [0; 4];
         memory.read(addr, &mut bytes).unwrap();
         i32::from_le_bytes(bytes)
+    }
+
+    fn u32_from_guest(memory: &GuestMemory, addr: u64) -> u32 {
+        let mut bytes = [0; 4];
+        memory.read(addr, &mut bytes).unwrap();
+        u32::from_le_bytes(bytes)
     }
 
     fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {

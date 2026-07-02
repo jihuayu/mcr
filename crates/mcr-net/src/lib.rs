@@ -228,6 +228,7 @@ impl SocketSpec {
 pub enum SocketState {
     Created,
     Bound(SocketAddress),
+    Connecting(SocketAddress),
     Listening(SocketAddress),
     Connected(SocketAddress),
     Closed,
@@ -238,7 +239,7 @@ impl SocketState {
     pub const fn local_address(self) -> Option<SocketAddress> {
         match self {
             Self::Bound(address) | Self::Listening(address) => Some(address),
-            Self::Created | Self::Connected(_) | Self::Closed => None,
+            Self::Created | Self::Connecting(_) | Self::Connected(_) | Self::Closed => None,
         }
     }
 
@@ -246,7 +247,11 @@ impl SocketState {
     pub const fn peer_address(self) -> Option<SocketAddress> {
         match self {
             Self::Connected(address) => Some(address),
-            Self::Created | Self::Bound(_) | Self::Listening(_) | Self::Closed => None,
+            Self::Created
+            | Self::Bound(_)
+            | Self::Connecting(_)
+            | Self::Listening(_)
+            | Self::Closed => None,
         }
     }
 }
@@ -812,10 +817,16 @@ impl GuestSocketTable {
         let socket = self.socket_mut(id)?;
         let value = match option {
             SocketOptionName::SocketType => socket.socket_type.to_linux(),
-            SocketOptionName::SocketError => socket
-                .last_error
-                .take()
-                .map_or(0, |errno| errno.code() as u32),
+            SocketOptionName::SocketError => {
+                if matches!(socket.state, SocketState::Connecting(_)) {
+                    LinuxErrno::OperationInProgress.code() as u32
+                } else {
+                    socket
+                        .last_error
+                        .take()
+                        .map_or(0, |errno| errno.code() as u32)
+                }
+            }
             SocketOptionName::ReuseAddr => bool_to_socket_option(socket.options.reuse_addr),
             SocketOptionName::KeepAlive => bool_to_socket_option(socket.options.keep_alive),
             SocketOptionName::SendBuffer => socket.options.send_buffer_size,
@@ -878,6 +889,11 @@ impl GuestSocketTable {
                 LinuxErrno::InvalidArgument,
                 "socket is already bound",
             )),
+            SocketState::Connecting(_) => Err(SocketError::invalid_state(
+                SocketOperation::Bind,
+                LinuxErrno::InvalidArgument,
+                "connecting socket cannot be bound",
+            )),
             SocketState::Connected(_) => Err(SocketError::invalid_state(
                 SocketOperation::Bind,
                 LinuxErrno::InvalidArgument,
@@ -908,6 +924,11 @@ impl GuestSocketTable {
                 Ok(())
             }
             SocketState::Listening(_) => Ok(()),
+            SocketState::Connecting(_) => Err(SocketError::invalid_state(
+                SocketOperation::Listen,
+                LinuxErrno::InvalidArgument,
+                "connecting socket cannot listen",
+            )),
             SocketState::Connected(_) => Err(SocketError::invalid_state(
                 SocketOperation::Listen,
                 LinuxErrno::InvalidArgument,
@@ -925,8 +946,20 @@ impl GuestSocketTable {
         }
 
         if self.transport.is_some() || self.host_handles.contains_key(&id) {
-            let connected = self.connect_host_socket(id, address)?;
-            self.socket_mut(id)?.state = SocketState::Connected(connected);
+            match self.connect_host_socket(id, address) {
+                Ok(connected) => self.socket_mut(id)?.state = SocketState::Connected(connected),
+                Err(error) if error.linux_errno() == LinuxErrno::OperationWouldBlock => {
+                    let socket = self.socket_mut(id)?;
+                    socket.state = SocketState::Connecting(address);
+                    socket.last_error = Some(LinuxErrno::OperationInProgress);
+                    return Err(SocketError::would_block(
+                        SocketOperation::Connect,
+                        "nonblocking connect is in progress",
+                    )
+                    .with_errno(LinuxErrno::OperationInProgress));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             self.socket_mut(id)?.state = SocketState::Connected(address);
         }
@@ -940,13 +973,14 @@ impl GuestSocketTable {
                 SocketOperation::Accept,
                 "no pending guest socket connection is available",
             )),
-            SocketState::Created | SocketState::Bound(_) | SocketState::Connected(_) => {
-                Err(SocketError::invalid_state(
-                    SocketOperation::Accept,
-                    LinuxErrno::InvalidArgument,
-                    "socket is not listening",
-                ))
-            }
+            SocketState::Created
+            | SocketState::Bound(_)
+            | SocketState::Connecting(_)
+            | SocketState::Connected(_) => Err(SocketError::invalid_state(
+                SocketOperation::Accept,
+                LinuxErrno::InvalidArgument,
+                "socket is not listening",
+            )),
             SocketState::Closed => Err(SocketError::BadSocket { id }),
         }
     }
@@ -956,7 +990,10 @@ impl GuestSocketTable {
             let socket = self.socket(id)?;
             match socket.state {
                 SocketState::Connected(_) => {}
-                SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
+                SocketState::Created
+                | SocketState::Bound(_)
+                | SocketState::Connecting(_)
+                | SocketState::Listening(_) => {
                     return Err(SocketError::invalid_state(
                         SocketOperation::Shutdown,
                         LinuxErrno::NotConnected,
@@ -1070,16 +1107,19 @@ impl GuestSocketTable {
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, SocketError> {
-        let socket = self.socket(id)?;
-        if matches!(socket.state, SocketState::Closed) {
+        if matches!(self.socket(id)?.state, SocketState::Closed) {
             return Err(SocketError::BadSocket { id });
         }
 
         let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
-        entry
+        let readiness = entry
             .handle
             .poll(interest, timeout)
-            .map_err(SocketError::from_host)
+            .map_err(SocketError::from_host)?;
+        if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+            self.finish_nonblocking_connect(id)?;
+        }
+        Ok(readiness)
     }
 
     pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {
@@ -1160,6 +1200,16 @@ impl GuestSocketTable {
             .map_err(SocketError::from_host)
     }
 
+    fn finish_nonblocking_connect(&mut self, id: SocketId) -> Result<(), SocketError> {
+        let SocketState::Connecting(address) = self.socket(id)?.state else {
+            return Ok(());
+        };
+        let socket = self.socket_mut(id)?;
+        socket.state = SocketState::Connected(address);
+        socket.last_error = None;
+        Ok(())
+    }
+
     fn socket_spec(&self, id: SocketId) -> Result<SocketSpec, SocketError> {
         let socket = self.socket(id)?;
         SocketSpec::with_flags(
@@ -1176,6 +1226,7 @@ impl GuestSocketTable {
             SocketState::Closed => Err(SocketError::BadSocket { id }),
             SocketState::Created
             | SocketState::Bound(_)
+            | SocketState::Connecting(_)
             | SocketState::Listening(_)
             | SocketState::Connected(_) => {
                 socket.state = SocketState::Closed;
@@ -1241,6 +1292,8 @@ pub enum LinuxErrno {
     FunctionNotImplemented,
     InvalidArgument,
     NotConnected,
+    OperationAlreadyInProgress,
+    OperationInProgress,
     OperationWouldBlock,
     OperationNotSupported,
     AddressFamilyNotSupported,
@@ -1265,6 +1318,8 @@ impl LinuxErrno {
             Self::InvalidArgument => 22,
             Self::OperationNotSupported => 95,
             Self::NotConnected => 107,
+            Self::OperationAlreadyInProgress => 114,
+            Self::OperationInProgress => 115,
             Self::OperationWouldBlock => 11,
             Self::ProtocolWrongTypeForSocket => 91,
             Self::ProtocolNotAvailable => 92,
@@ -1341,6 +1396,18 @@ impl SocketError {
         }
     }
 
+    fn with_errno(mut self, errno: LinuxErrno) -> Self {
+        match &mut self {
+            Self::InvalidInput { errno: current, .. }
+            | Self::Unsupported { errno: current, .. }
+            | Self::InvalidState { errno: current, .. }
+            | Self::WouldBlock { errno: current, .. }
+            | Self::HostIo { errno: current, .. } => *current = errno,
+            Self::BadSocket { .. } => {}
+        }
+        self
+    }
+
     fn from_host(error: HostIoError) -> Self {
         Self::HostIo {
             errno: error.linux_errno(),
@@ -1414,6 +1481,11 @@ fn validate_socket_protocol(
 fn validate_connect(socket: &GuestSocket, id: SocketId) -> Result<(), SocketError> {
     match socket.state {
         SocketState::Created | SocketState::Bound(_) => Ok(()),
+        SocketState::Connecting(_) => Err(SocketError::invalid_state(
+            SocketOperation::Connect,
+            LinuxErrno::OperationAlreadyInProgress,
+            "socket connect is already in progress",
+        )),
         SocketState::Connected(_) => Err(SocketError::invalid_state(
             SocketOperation::Connect,
             LinuxErrno::AlreadyConnected,
@@ -1444,13 +1516,14 @@ fn validate_connected_stream_io(
 
     match socket.state {
         SocketState::Connected(_) => Ok(()),
-        SocketState::Created | SocketState::Bound(_) | SocketState::Listening(_) => {
-            Err(SocketError::invalid_state(
-                operation,
-                LinuxErrno::NotConnected,
-                "socket is not connected",
-            ))
-        }
+        SocketState::Created
+        | SocketState::Bound(_)
+        | SocketState::Connecting(_)
+        | SocketState::Listening(_) => Err(SocketError::invalid_state(
+            operation,
+            LinuxErrno::NotConnected,
+            "socket is not connected",
+        )),
         SocketState::Closed => Err(SocketError::BadSocket { id: socket.id }),
     }
 }
@@ -1470,7 +1543,10 @@ fn validate_datagram_io(
     }
 
     match socket.state {
-        SocketState::Created | SocketState::Bound(_) | SocketState::Connected(_) => Ok(()),
+        SocketState::Created
+        | SocketState::Bound(_)
+        | SocketState::Connecting(_)
+        | SocketState::Connected(_) => Ok(()),
         SocketState::Listening(_) => Err(SocketError::invalid_state(
             operation,
             LinuxErrno::InvalidArgument,
@@ -1581,6 +1657,7 @@ mod tests {
         sent: Vec<u8>,
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
+        connect_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
     }
 
@@ -1598,10 +1675,20 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn with_connect_error(error: HostIoError) -> Self {
+            Self {
+                connect_error: Some(error),
+                ..Self::default()
+            }
+        }
     }
 
     impl HostSocketHandle for FakeHostSocketHandle {
         fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+            if let Some(error) = self.connect_error.take() {
+                return Err(error);
+            }
             self.connected = Some(address);
             Ok(address)
         }
@@ -2011,6 +2098,70 @@ mod tests {
                 .expect_err("host send failure")
                 .linux_errno(),
             LinuxErrno::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn nonblocking_connect_completes_after_writable_poll() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_connect_error(HostIoError::new(
+                    LinuxErrno::OperationWouldBlock,
+                    "connect would block",
+                ))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("connect should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connecting(peer)
+        );
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("second connect should already be pending")
+                .linux_errno(),
+            LinuxErrno::OperationAlreadyInProgress
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            LinuxErrno::OperationInProgress.code() as u32
+        );
+
+        let readiness = table
+            .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+            .expect("poll writable");
+        assert!(readiness.writable);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected(peer)
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            0
         );
     }
 
