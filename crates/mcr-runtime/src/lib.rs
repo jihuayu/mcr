@@ -1728,6 +1728,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dispatches_fork_child_exit_and_wait4() {
+        let mut runtime = Runtime::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime.kernel().process(2).unwrap().parent(),
+            Some(INITIAL_GUEST_PID)
+        );
+
+        let child_exit =
+            runtime.dispatch_syscall(context_for(2, 2, Syscall::ExitGroup, [23, 0, 0, 0, 0, 0]));
+        assert_eq!(child_exit.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime.kernel().process(2).unwrap().exit_state(),
+            ExitState::Exited { status: 23 }
+        );
+
+        let wait = runtime.dispatch_syscall(context(Syscall::Wait4, [-1i64 as u64, 0, 0, 0, 0, 0]));
+        assert_eq!(wait.result, SyscallReturn::Success(2));
+        assert!(runtime.kernel().process(2).is_none());
+        assert!(runtime.kernel().task(2).is_none());
+        assert!(
+            !runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .children()
+                .contains(&2)
+        );
+    }
+
+    #[test]
     fn runtime_tracer_records_task_syscall_events() {
         let mut runtime = Runtime::with_tracer(
             test_program("/bin/app", 0x401000),
@@ -1835,9 +1868,13 @@ mod tests {
     }
 
     fn context(syscall: Syscall, args: [u64; 6]) -> GuestContext {
+        context_for(INITIAL_GUEST_PID, INITIAL_GUEST_TID, syscall, args)
+    }
+
+    fn context_for(pid: u32, tid: u32, syscall: Syscall, args: [u64; 6]) -> GuestContext {
         GuestContext::new(
-            INITIAL_GUEST_PID,
-            INITIAL_GUEST_TID,
+            pid,
+            tid,
             SyscallRegisters {
                 rax: syscall.number().raw(),
                 rdi: args[0],

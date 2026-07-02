@@ -5,6 +5,7 @@ pub mod fd;
 pub mod memory;
 pub mod return_value;
 pub mod syscall;
+pub mod task;
 pub mod trace;
 
 pub use abi::{
@@ -39,6 +40,10 @@ pub use memory::{
 };
 pub use return_value::{LINUX_MAX_ERRNO, SyscallReturn};
 pub use syscall::{Syscall, SyscallNumber};
+pub use task::{
+    CloneSyscallArgs, LINUX_CLONE_EXIT_SIGNAL_MASK, LINUX_CLONE_VFORK, LINUX_CLONE_VM,
+    LINUX_SIGCHLD, LINUX_WAIT_SUPPORTED_OPTIONS, LINUX_WNOHANG, Wait4SyscallArgs,
+};
 pub use trace::{
     HostErrorTrace, SyscallEnterEvent, SyscallExitEvent, SyscallTraceEvent, TraceContext,
     TraceField, UnsupportedSyscallEvent,

@@ -3,8 +3,9 @@ use std::fmt;
 
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};
 use mcr_sys::{
-    GuestAddress, GuestPid, GuestTid, LinuxErrno, LinuxUtsname, Syscall, SyscallOutcome,
-    SyscallRequest, TaskSyscalls,
+    CloneSyscallArgs, GuestAddress, GuestPid, GuestTid, LINUX_CLONE_EXIT_SIGNAL_MASK,
+    LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, LinuxUtsname, Syscall,
+    SyscallOutcome, SyscallRequest, TaskSyscalls, Wait4SyscallArgs,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -292,6 +293,39 @@ pub enum ExitState {
     Exited { status: i32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitedChild {
+    pid: GuestPid,
+    status: i32,
+    wait_status: u32,
+}
+
+impl WaitedChild {
+    #[must_use]
+    pub const fn new(pid: GuestPid, status: i32) -> Self {
+        Self {
+            pid,
+            status,
+            wait_status: linux_wait_exit_status(status),
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(self) -> GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn status(self) -> i32 {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn wait_status(self) -> u32 {
+        self.wait_status
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestFdTable {
     entries: BTreeMap<i32, GuestFdEntry>,
@@ -515,8 +549,29 @@ impl GuestKernel {
         match request.syscall {
             Syscall::Getpid => SyscallOutcome::success(u64::from(task.pid)),
             Syscall::Gettid => SyscallOutcome::success(u64::from(task.tid)),
+            Syscall::Fork => self.fork_current(tid),
+            Syscall::Vfork => self.vfork_current(tid),
+            Syscall::Clone => self.clone_current(
+                tid,
+                CloneSyscallArgs::new(
+                    arg(request, 0),
+                    arg(request, 1),
+                    arg(request, 2),
+                    arg(request, 3),
+                    arg(request, 4),
+                ),
+            ),
             Syscall::Exit => self.exit_task(tid, low_exit_status(arg(request, 0))),
             Syscall::ExitGroup => self.exit_group(task.pid, low_exit_status(arg(request, 0))),
+            Syscall::Wait4 => self.wait4_current(
+                tid,
+                Wait4SyscallArgs::new(
+                    arg(request, 0) as i32,
+                    arg(request, 1),
+                    arg(request, 2) as u32,
+                    arg(request, 3),
+                ),
+            ),
             Syscall::Uname => self.uname(arg(request, 0)),
             Syscall::ArchPrctl => self.arch_prctl(tid, arg(request, 0), arg(request, 1)),
             Syscall::Execve => {
@@ -528,6 +583,81 @@ impl GuestKernel {
                 self.execve_current(tid, program)
             }
             _ => SyscallOutcome::unsupported(),
+        }
+    }
+
+    pub fn fork_current(&mut self, tid: GuestTid) -> SyscallOutcome {
+        self.fork_like_current(tid, "fork")
+    }
+
+    pub fn vfork_current(&mut self, tid: GuestTid) -> SyscallOutcome {
+        self.fork_like_current(tid, "vfork")
+    }
+
+    pub fn clone_current(&mut self, tid: GuestTid, args: CloneSyscallArgs) -> SyscallOutcome {
+        if !is_supported_fork_like_clone(args.flags) {
+            return TaskError::InvalidCloneFlags(args.flags).into_outcome();
+        }
+
+        self.fork_like_current(tid, "clone")
+            .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
+    }
+
+    pub fn fork_child(&mut self, tid: GuestTid) -> Result<GuestPid, TaskError> {
+        let parent_task = self.task(tid).cloned().ok_or(TaskError::UnknownTid(tid))?;
+        let parent_pid = parent_task.pid;
+        let parent = self
+            .process(parent_pid)
+            .cloned()
+            .ok_or(TaskError::UnknownPid(parent_pid))?;
+        if !matches!(parent.exit_state, ExitState::Running) {
+            return Err(TaskError::UnknownPid(parent_pid));
+        }
+
+        let child_pid = self.allocate_pid()?;
+        let child_tid = self.allocate_tid()?;
+        let mut child_task = parent_task;
+        child_task.pid = child_pid;
+        child_task.tid = child_tid;
+        child_task.state = TaskState::Runnable;
+
+        self.processes.insert(
+            child_pid,
+            GuestProcess {
+                pid: child_pid,
+                parent: Some(parent_pid),
+                pgid: parent.pgid,
+                sid: parent.sid,
+                image: parent.image,
+                files: parent.files,
+                children: BTreeSet::new(),
+                exit_state: ExitState::Running,
+            },
+        );
+        self.tasks.insert(child_tid, child_task);
+        self.process_mut(parent_pid)
+            .ok_or(TaskError::UnknownPid(parent_pid))?
+            .children
+            .insert(child_pid);
+
+        Ok(child_pid)
+    }
+
+    pub fn wait4_child(
+        &mut self,
+        parent_pid: GuestPid,
+        args: Wait4SyscallArgs,
+    ) -> Result<Option<WaitedChild>, TaskError> {
+        if args.has_unsupported_options() {
+            return Err(TaskError::InvalidWaitOptions(args.options));
+        }
+
+        let child_pid = self.exited_waitable_child(parent_pid, args.pid)?;
+        match child_pid {
+            Some(child_pid) => self.reap_child(parent_pid, child_pid).map(Some),
+            None if self.has_waitable_child(parent_pid, args.pid)? && args.no_hang() => Ok(None),
+            None if self.has_waitable_child(parent_pid, args.pid)? => Err(TaskError::WouldBlock),
+            None => Err(TaskError::NoChild),
         }
     }
 
@@ -609,6 +739,21 @@ impl GuestKernel {
         SyscallOutcome::success(0)
             .with_decoded_field("guest_pid", pid.to_string())
             .with_decoded_field("exit_status", status.to_string())
+    }
+
+    pub fn wait4_current(&mut self, tid: GuestTid, args: Wait4SyscallArgs) -> SyscallOutcome {
+        let Some(parent_pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+
+        match self.wait4_child(parent_pid, args) {
+            Ok(Some(waited)) => SyscallOutcome::success(u64::from(waited.pid()))
+                .with_decoded_field("guest_pid", waited.pid().to_string())
+                .with_decoded_field("exit_status", waited.status().to_string())
+                .with_decoded_field("wait_status", format!("{:#x}", waited.wait_status())),
+            Ok(None) => SyscallOutcome::success(0),
+            Err(error) => error.into_outcome(),
+        }
     }
 
     pub fn arch_prctl(
@@ -699,6 +844,89 @@ impl GuestKernel {
             .ok_or(TaskError::TidExhausted)?;
         Ok(tid)
     }
+
+    fn fork_like_current(&mut self, tid: GuestTid, syscall: &'static str) -> SyscallOutcome {
+        match self.fork_child(tid) {
+            Ok(child_pid) => SyscallOutcome::success(u64::from(child_pid))
+                .with_decoded_field("guest_pid", child_pid.to_string())
+                .with_decoded_field("fork_kind", syscall),
+            Err(error) => error.into_outcome(),
+        }
+    }
+
+    fn exited_waitable_child(
+        &self,
+        parent_pid: GuestPid,
+        selector: i32,
+    ) -> Result<Option<GuestPid>, TaskError> {
+        Ok(self
+            .matching_children(parent_pid, selector)?
+            .into_iter()
+            .find(|pid| {
+                matches!(
+                    self.process(*pid).map(GuestProcess::exit_state),
+                    Some(ExitState::Exited { .. })
+                )
+            }))
+    }
+
+    fn has_waitable_child(&self, parent_pid: GuestPid, selector: i32) -> Result<bool, TaskError> {
+        Ok(!self.matching_children(parent_pid, selector)?.is_empty())
+    }
+
+    fn matching_children(
+        &self,
+        parent_pid: GuestPid,
+        selector: i32,
+    ) -> Result<Vec<GuestPid>, TaskError> {
+        let parent = self
+            .process(parent_pid)
+            .ok_or(TaskError::UnknownPid(parent_pid))?;
+        let children = parent
+            .children
+            .iter()
+            .copied()
+            .filter(|child_pid| self.child_matches(parent, *child_pid, selector))
+            .collect();
+        Ok(children)
+    }
+
+    fn child_matches(&self, parent: &GuestProcess, child_pid: GuestPid, selector: i32) -> bool {
+        let Some(child) = self.process(child_pid) else {
+            return false;
+        };
+
+        match selector {
+            -1 => true,
+            0 => child.pgid == parent.pgid,
+            value if value > 0 => child_pid == value as GuestPid,
+            value => child.pgid == value.unsigned_abs(),
+        }
+    }
+
+    fn reap_child(
+        &mut self,
+        parent_pid: GuestPid,
+        child_pid: GuestPid,
+    ) -> Result<WaitedChild, TaskError> {
+        let status = match self
+            .process(child_pid)
+            .ok_or(TaskError::UnknownPid(child_pid))?
+            .exit_state()
+        {
+            ExitState::Exited { status } => status,
+            ExitState::Running => return Err(TaskError::WouldBlock),
+        };
+
+        self.tasks.retain(|_, task| task.pid != child_pid);
+        self.processes.remove(&child_pid);
+        self.process_mut(parent_pid)
+            .ok_or(TaskError::UnknownPid(parent_pid))?
+            .children
+            .remove(&child_pid);
+
+        Ok(WaitedChild::new(child_pid, status))
+    }
 }
 
 impl TaskSyscalls for GuestKernel {
@@ -710,10 +938,14 @@ impl TaskSyscalls for GuestKernel {
 #[derive(Debug)]
 pub enum TaskError {
     BadFd(i32),
+    InvalidCloneFlags(u64),
+    InvalidWaitOptions(u32),
+    NoChild,
     PidExhausted,
     TidExhausted,
     UnknownPid(GuestPid),
     UnknownTid(GuestTid),
+    WouldBlock,
     Elf(mcr_elf::ElfValidationError),
     Image(GuestImageError),
 }
@@ -723,8 +955,11 @@ impl TaskError {
     pub const fn linux_errno(&self) -> LinuxErrno {
         match self {
             Self::BadFd(_) => LinuxErrno::EBADF,
+            Self::InvalidCloneFlags(_) | Self::InvalidWaitOptions(_) => LinuxErrno::EINVAL,
+            Self::NoChild => LinuxErrno::ECHILD,
             Self::PidExhausted | Self::TidExhausted => LinuxErrno::EAGAIN,
             Self::UnknownPid(_) | Self::UnknownTid(_) => LinuxErrno::ESRCH,
+            Self::WouldBlock => LinuxErrno::EAGAIN,
             Self::Elf(_) | Self::Image(_) => LinuxErrno::ENOEXEC,
         }
     }
@@ -739,10 +974,18 @@ impl fmt::Display for TaskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadFd(fd) => write!(formatter, "bad guest fd {fd}"),
+            Self::InvalidCloneFlags(flags) => {
+                write!(formatter, "unsupported clone flags {flags:#x}")
+            }
+            Self::InvalidWaitOptions(options) => {
+                write!(formatter, "unsupported wait4 options {options:#x}")
+            }
+            Self::NoChild => write!(formatter, "no waitable child process"),
             Self::PidExhausted => write!(formatter, "guest PID namespace exhausted"),
             Self::TidExhausted => write!(formatter, "guest TID namespace exhausted"),
             Self::UnknownPid(pid) => write!(formatter, "unknown guest pid {pid}"),
             Self::UnknownTid(tid) => write!(formatter, "unknown guest tid {tid}"),
+            Self::WouldBlock => write!(formatter, "waitable child has not exited"),
             Self::Elf(error) => write!(formatter, "{error}"),
             Self::Image(error) => write!(formatter, "{error}"),
         }
@@ -802,6 +1045,18 @@ fn low_exit_status(raw: u64) -> i32 {
     (raw & 0xff) as i32
 }
 
+const fn linux_wait_exit_status(status: i32) -> u32 {
+    ((status as u32) & 0xff) << 8
+}
+
+const fn is_supported_fork_like_clone(flags: u64) -> bool {
+    let semantic_flags = flags & !LINUX_CLONE_EXIT_SIGNAL_MASK;
+    let exit_signal = flags & LINUX_CLONE_EXIT_SIGNAL_MASK;
+    (exit_signal == 0 || exit_signal == LINUX_SIGCHLD)
+        && (semantic_flags == 0 || semantic_flags == (LINUX_CLONE_VM | LINUX_CLONE_VFORK))
+        && flags & !(LINUX_CLONE_EXIT_SIGNAL_MASK | LINUX_CLONE_VM | LINUX_CLONE_VFORK) == 0
+}
+
 fn linux_utsname() -> LinuxUtsname {
     let mut uts = LinuxUtsname::default();
     write_uts_field(&mut uts.sysname, b"Linux");
@@ -820,7 +1075,7 @@ fn write_uts_field(field: &mut [u8], value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use mcr_sys::{Syscall, SyscallRegisters, SyscallReturn};
+    use mcr_sys::{LINUX_WNOHANG, Syscall, SyscallRegisters, SyscallReturn};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::*;
@@ -918,6 +1173,132 @@ mod tests {
         assert_eq!(
             kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
             ExitState::Exited { status: 7 }
+        );
+    }
+
+    #[test]
+    fn fork_creates_child_process_with_inherited_files() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+        kernel
+            .process_mut(INITIAL_GUEST_PID)
+            .unwrap()
+            .files_mut()
+            .insert_exact(3, GuestFdEntry::new("pipe-read"), true)
+            .unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Fork, [0; 6]),
+            SyscallReturn::Success(2)
+        );
+
+        let parent = kernel.process(INITIAL_GUEST_PID).unwrap();
+        let child = kernel.process(2).unwrap();
+        let child_task = kernel.task(2).unwrap();
+
+        assert!(parent.children().contains(&2));
+        assert_eq!(child.parent(), Some(INITIAL_GUEST_PID));
+        assert_eq!(child.pgid(), parent.pgid());
+        assert_eq!(child.sid(), parent.sid());
+        assert_eq!(child.image().executable().path(), b"/bin/parent");
+        assert_eq!(child.files().get(3).unwrap().description(), "pipe-read");
+        assert!(child.files().get(3).unwrap().cloexec());
+        assert_eq!(child_task.pid(), 2);
+        assert_eq!(child_task.tid(), 2);
+        assert_eq!(kernel.next_pid(), 3);
+        assert_eq!(kernel.next_tid(), 3);
+    }
+
+    #[test]
+    fn clone_accepts_vfork_exec_shape_and_rejects_thread_flags() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Clone,
+                [
+                    LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(kernel.process(2).unwrap().parent(), Some(INITIAL_GUEST_PID));
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Clone,
+                [LINUX_CLONE_VM | 0x0001_0000, 0, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn wait4_reaps_exited_child_and_reports_linux_status() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+        let child_pid = kernel.fork_child(INITIAL_GUEST_TID).unwrap();
+
+        assert!(
+            kernel
+                .wait4_child(
+                    INITIAL_GUEST_PID,
+                    Wait4SyscallArgs::new(-1, 0x1000, LINUX_WNOHANG, 0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            kernel.exit_group(child_pid, 42).result,
+            SyscallReturn::Success(0)
+        );
+
+        let waited = kernel
+            .wait4_child(
+                INITIAL_GUEST_PID,
+                Wait4SyscallArgs::new(child_pid as i32, 0x1000, 0, 0),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(waited.pid(), child_pid);
+        assert_eq!(waited.status(), 42);
+        assert_eq!(waited.wait_status(), 42 << 8);
+        assert!(
+            !kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .children()
+                .contains(&child_pid)
+        );
+        assert!(kernel.process(child_pid).is_none());
+        assert!(kernel.task(child_pid).is_none());
+    }
+
+    #[test]
+    fn wait4_reports_no_child_and_unsupported_options() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Wait4, [-1i64 as u64, 0, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::ECHILD)
+        );
+
+        let child_pid = kernel.fork_child(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(
+            kernel
+                .wait4_child(
+                    INITIAL_GUEST_PID,
+                    Wait4SyscallArgs::new(child_pid as i32, 0, 0x8000_0000, 0),
+                )
+                .unwrap_err()
+                .linux_errno(),
+            LinuxErrno::EINVAL
         );
     }
 
