@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 pub use memory::{
@@ -32,11 +32,11 @@ use mcr_sys::{
     LINUX_FUTEX_WAKE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP,
     LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LinuxEpollEvent, LinuxErrno,
     LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx, LinuxStatxTimestamp,
-    MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs,
-    SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs,
-    SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher,
-    SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
-    TraceField,
+    LinuxTimespec, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
+    PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs,
+    SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult,
+    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
+    SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
@@ -49,6 +49,17 @@ use mcr_vfs::{
 use mcr_win::SocketEvents;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+const LINUX_CLOCK_REALTIME: u64 = 0;
+const LINUX_CLOCK_MONOTONIC: u64 = 1;
+const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
+const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
+const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
+const LINUX_CLOCK_BOOTTIME: u64 = 7;
+
+const LINUX_GRND_NONBLOCK: u64 = 0x0001;
+const LINUX_GRND_RANDOM: u64 = 0x0002;
+const LINUX_GRND_SUPPORTED_FLAGS: u64 = LINUX_GRND_NONBLOCK | LINUX_GRND_RANDOM;
 
 pub trait GuestMemoryAccess {
     fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryAccessError>;
@@ -1538,6 +1549,10 @@ fn memory_errno(_error: GuestMemoryAccessError) -> LinuxErrno {
     LinuxErrno::EFAULT
 }
 
+fn time_errno(error: mcr_win::HostError) -> LinuxErrno {
+    host_sync_errno(error.kind())
+}
+
 fn validate_socket_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
     if flags & !(LINUX_MSG_NOSIGNAL | LINUX_MSG_DONTWAIT) == 0 {
         Ok(())
@@ -2534,7 +2549,32 @@ impl MemorySyscalls for RuntimeSubsystems {
         outcome
     }
 }
-impl TimeSyscalls for RuntimeSubsystems {}
+impl TimeSyscalls for RuntimeSubsystems {
+    fn dispatch_time(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = match request.syscall {
+            mcr_sys::Syscall::ClockGettime => {
+                outcome(self.clock_gettime(arg(request, 0), arg(request, 1)))
+            }
+            mcr_sys::Syscall::Nanosleep => {
+                outcome(self.nanosleep(arg(request, 0), arg(request, 1)))
+            }
+            mcr_sys::Syscall::Getrandom => {
+                outcome(self.getrandom(arg(request, 0), arg(request, 1), arg(request, 2)))
+            }
+            _ => SyscallOutcome::unsupported(),
+        };
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+}
 impl NetworkSyscalls for RuntimeSubsystems {
     fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
@@ -2580,6 +2620,58 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
 }
 
 impl RuntimeSubsystems {
+    fn clock_gettime(&mut self, clock_id: u64, timespec_addr: u64) -> Result<u64, LinuxErrno> {
+        if timespec_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+
+        let timespec = match clock_id {
+            LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_COARSE => {
+                linux_timespec_from_system_time(mcr_win::system_time().map_err(time_errno)?)
+            }
+            LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_MONOTONIC_RAW
+            | LINUX_CLOCK_MONOTONIC_COARSE
+            | LINUX_CLOCK_BOOTTIME => {
+                linux_timespec_from_duration(mcr_win::monotonic_time().map_err(time_errno)?)?
+            }
+            _ => return Err(LinuxErrno::EINVAL),
+        };
+        write_guest_timespec(self.files.memory_mut(), timespec_addr, timespec)?;
+        Ok(0)
+    }
+
+    fn nanosleep(&mut self, req_addr: u64, _rem_addr: u64) -> Result<u64, LinuxErrno> {
+        if req_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+
+        let duration = read_required_timespec_duration(self.files.memory(), req_addr)?;
+        mcr_win::sleep_for(duration).map_err(time_errno)?;
+        Ok(0)
+    }
+
+    fn getrandom(&mut self, buf_addr: u64, buflen: u64, flags: u64) -> Result<u64, LinuxErrno> {
+        if flags & !LINUX_GRND_SUPPORTED_FLAGS != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let buflen = usize::try_from(buflen).map_err(|_| LinuxErrno::EINVAL)?;
+        if buflen == 0 {
+            return Ok(0);
+        }
+        if buf_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+
+        let mut bytes = vec![0; buflen];
+        mcr_win::fill_random(&mut bytes).map_err(time_errno)?;
+        self.files
+            .memory_mut()
+            .write_bytes(buf_addr, &bytes)
+            .map_err(memory_errno)?;
+        Ok(buflen as u64)
+    }
+
     fn mmap(
         &mut self,
         addr: u64,
@@ -3390,6 +3482,62 @@ fn poll_timeout(raw: u64) -> Result<Option<Duration>, LinuxErrno> {
     Ok(Some(Duration::from_millis(timeout_ms as u64)))
 }
 
+fn linux_timespec_from_system_time(time: std::time::SystemTime) -> LinuxTimespec {
+    let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    LinuxTimespec {
+        tv_sec: duration.as_secs().min(i64::MAX as u64) as i64,
+        tv_nsec: i64::from(duration.subsec_nanos()),
+    }
+}
+
+fn linux_timespec_from_duration(duration: Duration) -> Result<LinuxTimespec, LinuxErrno> {
+    let tv_sec = i64::try_from(duration.as_secs()).map_err(|_| LinuxErrno::EOVERFLOW)?;
+    Ok(LinuxTimespec {
+        tv_sec,
+        tv_nsec: i64::from(duration.subsec_nanos()),
+    })
+}
+
+fn read_required_timespec_duration(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<Duration, LinuxErrno> {
+    let timespec = read_guest_timespec(memory, addr)?;
+    if timespec.tv_sec < 0 || !(0..1_000_000_000).contains(&timespec.tv_nsec) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(Duration::new(
+        timespec.tv_sec as u64,
+        timespec.tv_nsec as u32,
+    ))
+}
+
+fn read_guest_timespec(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<LinuxTimespec, LinuxErrno> {
+    Ok(LinuxTimespec {
+        tv_sec: read_guest_i64(memory, addr)?,
+        tv_nsec: read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?,
+    })
+}
+
+fn write_guest_timespec(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    timespec: LinuxTimespec,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &timespec.tv_sec.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?,
+            &timespec.tv_nsec.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
 fn read_pollfd(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxPollfd, LinuxErrno> {
     let mut bytes = [0; POLLFD_SIZE];
     memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
@@ -4049,6 +4197,133 @@ mod tests {
 
         assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
         assert_eq!(wake.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn clock_gettime_writes_linux_timespec_for_supported_clocks() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let realtime = runtime.dispatch_syscall(context(
+            Syscall::ClockGettime,
+            [LINUX_CLOCK_REALTIME, 0x402000, 0, 0, 0, 0],
+        ));
+        let monotonic = runtime.dispatch_syscall(context(
+            Syscall::ClockGettime,
+            [LINUX_CLOCK_MONOTONIC, 0x402020, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(realtime.result, SyscallReturn::Success(0));
+        assert_eq!(monotonic.result, SyscallReturn::Success(0));
+        let realtime = timespec_from_memory(runtime.memory(), 0x402000);
+        let monotonic = timespec_from_memory(runtime.memory(), 0x402020);
+        assert!(realtime.tv_sec > 0);
+        assert!((0..1_000_000_000).contains(&realtime.tv_nsec));
+        assert!(monotonic.tv_sec >= 0);
+        assert!((0..1_000_000_000).contains(&monotonic.tv_nsec));
+    }
+
+    #[test]
+    fn clock_gettime_rejects_invalid_clock_and_null_timespec() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let invalid_clock =
+            runtime.dispatch_syscall(context(Syscall::ClockGettime, [99, 0x402000, 0, 0, 0, 0]));
+        let null_timespec = runtime.dispatch_syscall(context(
+            Syscall::ClockGettime,
+            [LINUX_CLOCK_REALTIME, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(
+            invalid_clock.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            null_timespec.result,
+            SyscallReturn::Errno(LinuxErrno::EFAULT)
+        );
+    }
+
+    #[test]
+    fn nanosleep_accepts_zero_duration_and_ignores_rem_on_success() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_timespec(runtime.memory_mut(), 0x402000, 0, 0);
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Nanosleep,
+            [0x402000, 0x7000_0000, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn nanosleep_rejects_null_and_invalid_timespecs() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_timespec(runtime.memory_mut(), 0x402000, 0, 1_000_000_000);
+        write_timespec(runtime.memory_mut(), 0x402020, -1, 0);
+
+        let null_req = runtime.dispatch_syscall(context(Syscall::Nanosleep, [0, 0, 0, 0, 0, 0]));
+        let invalid_nsec =
+            runtime.dispatch_syscall(context(Syscall::Nanosleep, [0x402000, 0, 0, 0, 0, 0]));
+        let negative_sec =
+            runtime.dispatch_syscall(context(Syscall::Nanosleep, [0x402020, 0, 0, 0, 0, 0]));
+
+        assert_eq!(null_req.result, SyscallReturn::Errno(LinuxErrno::EFAULT));
+        assert_eq!(
+            invalid_nsec.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            negative_sec.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn getrandom_fills_guest_buffer_and_accepts_linux_flags() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.memory_mut().write(0x402000, &[0xaa; 32]).unwrap();
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Getrandom,
+            [
+                0x402000,
+                32,
+                LINUX_GRND_NONBLOCK | LINUX_GRND_RANDOM,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        let mut bytes = [0; 32];
+        runtime.memory().read(0x402000, &mut bytes).unwrap();
+        assert_eq!(result.result, SyscallReturn::Success(32));
+        assert_ne!(bytes, [0xaa; 32]);
+    }
+
+    #[test]
+    fn getrandom_accepts_empty_buffer_without_touching_pointer() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let result = runtime.dispatch_syscall(context(Syscall::Getrandom, [0, 0, 0, 0, 0, 0]));
+
+        assert_eq!(result.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn getrandom_rejects_unknown_flags_and_null_non_empty_buffer() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let invalid_flags =
+            runtime.dispatch_syscall(context(Syscall::Getrandom, [0x402000, 8, 0x4, 0, 0, 0]));
+        let null_buffer = runtime.dispatch_syscall(context(Syscall::Getrandom, [0, 8, 0, 0, 0, 0]));
+
+        assert_eq!(
+            invalid_flags.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(null_buffer.result, SyscallReturn::Errno(LinuxErrno::EFAULT));
     }
 
     #[test]
@@ -6371,6 +6646,17 @@ mod tests {
     fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {
         memory.write(addr, &sec.to_le_bytes()).unwrap();
         memory.write(addr + 8, &nsec.to_le_bytes()).unwrap();
+    }
+
+    fn timespec_from_memory(memory: &GuestMemory, addr: u64) -> LinuxTimespec {
+        let mut sec = [0; 8];
+        let mut nsec = [0; 8];
+        memory.read(addr, &mut sec).unwrap();
+        memory.read(addr + 8, &mut nsec).unwrap();
+        LinuxTimespec {
+            tv_sec: i64::from_le_bytes(sec),
+            tv_nsec: i64::from_le_bytes(nsec),
+        }
     }
 
     fn write_epoll_event_for_test(memory: &mut GuestMemory, addr: u64, events: u32, data: u64) {
