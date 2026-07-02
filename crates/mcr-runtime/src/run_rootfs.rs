@@ -416,6 +416,9 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
         }
     }
 
+    tree.mount_minimal_devfs()?;
+    tree.mount_minimal_procfs()?;
+
     Ok(VirtualFileSystem::from_parts(
         Rootfs::new(rootfs),
         tree,
@@ -544,7 +547,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ls.status(), 0);
-        assert_eq!(ls.stdout(), b"bin\netc\nhello.txt\n");
+        assert_eq!(ls.stdout(), b"bin\ndev\netc\nhello.txt\nproc\n");
 
         let cat = run_rootfs(
             RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
@@ -556,6 +559,34 @@ mod tests {
         .unwrap();
         assert_eq!(cat.status(), 0);
         assert_eq!(cat.stdout(), b"NAME=Alpine\n");
+    }
+
+    #[test]
+    fn run_rootfs_mounts_minimal_procfs_and_devfs() {
+        let rootfs = TestRootfs::new("proc-dev");
+        rootfs.write_static_elf("/bin/busybox");
+
+        let dev = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"ls".to_vec(),
+                b"/dev".to_vec(),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(dev.status(), 0);
+        assert_eq!(dev.stdout(), b"null\nurandom\nzero\n");
+
+        let proc_self = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"ls".to_vec(),
+                b"/proc/self".to_vec(),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(proc_self.status(), 0);
+        assert_eq!(proc_self.stdout(), b"cmdline\nenviron\nexe\nfd\n");
     }
 
     #[test]

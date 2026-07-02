@@ -37,7 +37,7 @@ fn cli_runs_mvp_busybox_smokes() {
         .run()
         .unwrap();
     assert_eq!(ls.status().code(), Some(0));
-    assert_eq!(ls.stdout(), b"bin\netc\nhello.txt\n");
+    assert_eq!(ls.stdout(), b"bin\ndev\netc\nhello.txt\nproc\n");
     assert_eq!(ls.stderr(), b"");
 
     let cat = SmokeCommand::new(mcr)
