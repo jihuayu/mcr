@@ -66,6 +66,9 @@ dependencies = [
 [[package]]
 name = "mcr-net"
 version = "0.1.0"
+dependencies = [
+ "mcr-win",
+]
 
 [[package]]
 name = "mcr-runtime"

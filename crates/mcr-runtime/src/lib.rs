@@ -12,17 +12,19 @@ pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootf
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
 use mcr_jit::GuestRegisters;
 use mcr_net::{
-    GuestSocketTable, ShutdownHow, SocketAddress, SocketId, SocketOptionName, SocketSpec,
+    GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
+    SocketOptionName, SocketSpec,
 };
 use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
     FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext, IoctlSyscallArgs,
     LINUX_AF_INET, LINUX_AF_INET6, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
-    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
-    LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
-    PipeSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
-    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
-    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
+    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_MSG_NOSIGNAL, LinuxErrno, LinuxIovec, LinuxMsghdr,
+    LinuxStat, LinuxStatx, LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer,
+    Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs,
+    ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs,
+    SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn,
+    SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
@@ -59,7 +61,7 @@ pub enum GuestMemoryAccessError {
     Fault,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeDiagnostics {
     executable_path: Vec<u8>,
     argv: Vec<Vec<u8>>,
@@ -373,6 +375,18 @@ impl<M> RuntimeFileSystem<M> {
         }
     }
 
+    pub fn with_socket_transport(
+        vfs: VirtualFileSystem,
+        memory: M,
+        transport: impl HostSocketTransport + 'static,
+    ) -> Self {
+        Self {
+            vfs,
+            memory,
+            sockets: GuestSocketTable::with_transport(transport),
+        }
+    }
+
     pub fn vfs(&self) -> &VirtualFileSystem {
         &self.vfs
     }
@@ -464,6 +478,10 @@ where
             mcr_sys::Syscall::Connect => self.sys_connect(request),
             mcr_sys::Syscall::Listen => self.sys_listen(request),
             mcr_sys::Syscall::Shutdown => self.sys_shutdown(request),
+            mcr_sys::Syscall::Sendto => self.sys_sendto(request),
+            mcr_sys::Syscall::Recvfrom => self.sys_recvfrom(request),
+            mcr_sys::Syscall::Sendmsg => self.sys_sendmsg(request),
+            mcr_sys::Syscall::Recvmsg => self.sys_recvmsg(request),
             mcr_sys::Syscall::Getsockopt => self.sys_getsockopt(request),
             mcr_sys::Syscall::Setsockopt => self.sys_setsockopt(request),
             mcr_sys::Syscall::Accept | mcr_sys::Syscall::Accept4 => self.sys_accept(request),
@@ -609,6 +627,140 @@ where
         let how = ShutdownHow::from_linux(args.how).map_err(net_errno)?;
         self.sockets.shutdown(socket_id, how).map_err(net_errno)?;
         Ok(0)
+    }
+
+    fn sys_sendto(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = SendRecvFromSyscallArgs::new(
+            arg_i32(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+            arg_u32(request, 3),
+            arg(request, 4),
+            arg(request, 5),
+        );
+        let socket_id = self.socket_id_for_fd(args.fd)?;
+        if args.sockaddr != 0 || args.addrlen != 0 {
+            return Err(net_errno(GuestSocketTable::unsupported_datagram_io(
+                SocketOperation::Send,
+            )));
+        }
+        validate_socket_message_flags(args.flags, SocketOperation::Send)?;
+        let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
+        let mut buffer = vec![0; len];
+        self.memory
+            .read_bytes(args.buf, &mut buffer)
+            .map_err(memory_errno)?;
+        self.sockets
+            .send_connected(socket_id, &buffer)
+            .map(|count| count as u64)
+            .map_err(net_errno)
+    }
+
+    fn sys_recvfrom(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = SendRecvFromSyscallArgs::new(
+            arg_i32(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+            arg_u32(request, 3),
+            arg(request, 4),
+            arg(request, 5),
+        );
+        let socket_id = self.socket_id_for_fd(args.fd)?;
+        if args.sockaddr != 0 || args.addrlen != 0 {
+            return Err(net_errno(GuestSocketTable::unsupported_datagram_io(
+                SocketOperation::Recv,
+            )));
+        }
+        validate_socket_message_flags(args.flags, SocketOperation::Recv)?;
+        let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
+        let mut buffer = vec![0; len];
+        let count = self
+            .sockets
+            .recv_connected(socket_id, &mut buffer)
+            .map_err(net_errno)?;
+        self.memory
+            .write_bytes(args.buf, &buffer[..count])
+            .map_err(memory_errno)?;
+        Ok(count as u64)
+    }
+
+    fn sys_sendmsg(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args =
+            SendRecvMsgSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg_u32(request, 2));
+        let socket_id = self.socket_id_for_fd(args.fd)?;
+        validate_socket_message_flags(args.flags, SocketOperation::SendMsg)?;
+        let message = read_msghdr(&self.memory, args.msg)?;
+        if message.msg_name != 0
+            || message.msg_namelen != 0
+            || message.msg_control != 0
+            || message.msg_controllen != 0
+        {
+            return Err(net_errno(GuestSocketTable::unsupported_socket_io(
+                SocketOperation::SendMsg,
+            )));
+        }
+        let iovecs = self.read_iovecs(
+            message.msg_iov,
+            usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
+        )?;
+        let mut total = 0u64;
+        for iovec in iovecs {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let mut buffer = vec![0; len];
+            self.memory
+                .read_bytes(iovec.iov_base, &mut buffer)
+                .map_err(memory_errno)?;
+            let count = self
+                .sockets
+                .send_connected(socket_id, &buffer)
+                .map_err(net_errno)?;
+            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+            if count < len {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn sys_recvmsg(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args =
+            SendRecvMsgSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg_u32(request, 2));
+        let socket_id = self.socket_id_for_fd(args.fd)?;
+        validate_socket_message_flags(args.flags, SocketOperation::RecvMsg)?;
+        let message = read_msghdr(&self.memory, args.msg)?;
+        if message.msg_name != 0
+            || message.msg_namelen != 0
+            || message.msg_control != 0
+            || message.msg_controllen != 0
+        {
+            return Err(net_errno(GuestSocketTable::unsupported_socket_io(
+                SocketOperation::RecvMsg,
+            )));
+        }
+        let iovecs = self.read_iovecs(
+            message.msg_iov,
+            usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
+        )?;
+        let mut total = 0u64;
+        for iovec in iovecs {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let mut buffer = vec![0; len];
+            let count = self
+                .sockets
+                .recv_connected(socket_id, &mut buffer)
+                .map_err(net_errno)?;
+            self.memory
+                .write_bytes(iovec.iov_base, &buffer[..count])
+                .map_err(memory_errno)?;
+            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+            if count < len {
+                break;
+            }
+        }
+        self.memory
+            .write_bytes(args.msg + 48, &0u32.to_le_bytes())
+            .map_err(memory_errno)?;
+        Ok(total)
     }
 
     fn sys_setsockopt(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1104,8 +1256,34 @@ fn memory_errno(_error: GuestMemoryAccessError) -> LinuxErrno {
     LinuxErrno::EFAULT
 }
 
+fn validate_socket_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
+    if flags & !LINUX_MSG_NOSIGNAL == 0 {
+        Ok(())
+    } else {
+        Err(net_errno(GuestSocketTable::unsupported_socket_flags(
+            operation,
+        )))
+    }
+}
+
 fn net_errno(error: mcr_net::SocketError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno().code() as u16).unwrap_or(LinuxErrno::EINVAL)
+}
+
+fn read_msghdr(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxMsghdr, LinuxErrno> {
+    let mut bytes = [0; 56];
+    memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
+    Ok(LinuxMsghdr {
+        msg_name: u64::from_le_bytes(bytes[0..8].try_into().expect("msg_name")),
+        msg_namelen: u32::from_le_bytes(bytes[8..12].try_into().expect("msg_namelen")),
+        __pad1: u32::from_le_bytes(bytes[12..16].try_into().expect("pad1")),
+        msg_iov: u64::from_le_bytes(bytes[16..24].try_into().expect("msg_iov")),
+        msg_iovlen: u64::from_le_bytes(bytes[24..32].try_into().expect("msg_iovlen")),
+        msg_control: u64::from_le_bytes(bytes[32..40].try_into().expect("msg_control")),
+        msg_controllen: u64::from_le_bytes(bytes[40..48].try_into().expect("msg_controllen")),
+        msg_flags: u32::from_le_bytes(bytes[48..52].try_into().expect("msg_flags")),
+        __pad2: u32::from_le_bytes(bytes[52..56].try_into().expect("pad2")),
+    })
 }
 
 fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, LinuxErrno> {
@@ -1729,7 +1907,7 @@ impl SyscallTracer for RuntimeDiagnosticsTracer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     use mcr_sys::{
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP,
@@ -2218,15 +2396,112 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dispatch_keeps_unsupported_network_io_unsupported() {
-        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    fn connected_socket_sendto_and_recvfrom_move_guest_buffers() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write(0x2000, b"ping");
 
         assert_eq!(
-            runtime
-                .dispatch_syscall(context(Syscall::Sendto, [0; 6]))
-                .result,
-            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
         );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Sendto,
+                [3, 0x2000, 4, u64::from(LINUX_MSG_NOSIGNAL), 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_bytes(), b"ping");
+
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Recvfrom, [3, 0x2100, 8, 0, 0, 0],),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 4), b"pong");
+    }
+
+    #[test]
+    fn connected_socket_sendmsg_and_recvmsg_move_iovecs() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"abcdef");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write(0x2000, b"ab");
+        runtime.memory_mut().write(0x2010, b"cd");
+        runtime.memory_mut().write_iovec(0x3000, 0x2000, 2);
+        runtime.memory_mut().write_iovec(0x3010, 0x2010, 2);
+        runtime.memory_mut().write_msghdr(0x4000, 0, 0, 0x3000, 2);
+        runtime.memory_mut().write_iovec(0x5000, 0x6000, 3);
+        runtime.memory_mut().write_iovec(0x5010, 0x6010, 3);
+        runtime.memory_mut().write_msghdr(0x5100, 0, 0, 0x5000, 2);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Sendmsg, [3, 0x4000, 0, 0, 0, 0],),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_bytes(), b"abcd");
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Recvmsg, [3, 0x5100, 0, 0, 0, 0],),
+            SyscallReturn::Success(6)
+        );
+        assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
+        assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
     }
 
     #[test]
@@ -2954,6 +3229,18 @@ mod tests {
             self.write(addr + 8, &len.to_le_bytes());
         }
 
+        fn write_msghdr(&mut self, addr: u64, name: u64, namelen: u32, iov: u64, iovlen: u64) {
+            self.write(addr, &name.to_le_bytes());
+            self.write(addr + 8, &namelen.to_le_bytes());
+            self.write(addr + 12, &0u32.to_le_bytes());
+            self.write(addr + 16, &iov.to_le_bytes());
+            self.write(addr + 24, &iovlen.to_le_bytes());
+            self.write(addr + 32, &0u64.to_le_bytes());
+            self.write(addr + 40, &0u64.to_le_bytes());
+            self.write(addr + 48, &0u32.to_le_bytes());
+            self.write(addr + 52, &0u32.to_le_bytes());
+        }
+
         fn read(&self, addr: u64, len: usize) -> Vec<u8> {
             let mut bytes = vec![0; len];
             self.read_bytes(addr, &mut bytes).unwrap();
@@ -2978,7 +3265,88 @@ mod tests {
         }
     }
 
-    fn runtime_with_sample_vfs() -> RuntimeFileSystem<TestMemory> {
+    #[derive(Clone, Debug, Default)]
+    struct TestSocketTransport {
+        state: Rc<RefCell<TestSocketState>>,
+    }
+
+    impl TestSocketTransport {
+        fn handle(&self) -> TestSocketTransportHandle {
+            TestSocketTransportHandle {
+                state: self.state.clone(),
+            }
+        }
+
+        fn sent_bytes(&self) -> Vec<u8> {
+            self.state.borrow().sent.clone()
+        }
+
+        fn push_incoming(&self, bytes: &[u8]) {
+            self.state.borrow_mut().incoming.extend_from_slice(bytes);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestSocketState {
+        sent: Vec<u8>,
+        incoming: Vec<u8>,
+        connected: Option<SocketAddress>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestSocketTransportHandle {
+        state: Rc<RefCell<TestSocketState>>,
+    }
+
+    impl HostSocketTransport for TestSocketTransportHandle {
+        fn open_socket(
+            &self,
+            _spec: SocketSpec,
+            _options: mcr_net::SocketOptions,
+        ) -> Result<Box<dyn mcr_net::HostSocketHandle>, mcr_net::HostIoError> {
+            Ok(Box::new(TestSocketHandle {
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestSocketHandle {
+        state: Rc<RefCell<TestSocketState>>,
+    }
+
+    impl mcr_net::HostSocketHandle for TestSocketHandle {
+        fn connect(
+            &mut self,
+            address: SocketAddress,
+        ) -> Result<SocketAddress, mcr_net::HostIoError> {
+            self.state.borrow_mut().connected = Some(address);
+            Ok(address)
+        }
+
+        fn send(&mut self, buffer: &[u8]) -> Result<usize, mcr_net::HostIoError> {
+            self.state.borrow_mut().sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, mcr_net::HostIoError> {
+            let mut state = self.state.borrow_mut();
+            let count = buffer.len().min(state.incoming.len());
+            buffer[..count].copy_from_slice(&state.incoming[..count]);
+            state.incoming.drain(..count);
+            Ok(count)
+        }
+
+        fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), mcr_net::HostIoError> {
+            Ok(())
+        }
+    }
+
+    fn runtime_socket_transport() -> TestSocketTransport {
+        TestSocketTransport::default()
+    }
+
+    fn sample_vfs() -> VirtualFileSystem {
         let rootfs = Rootfs::new("/host/root");
         let mut tree = PathTree::new();
         tree.create_dir("/tmp").unwrap();
@@ -2988,10 +3356,11 @@ mod tests {
         tree.create_file_with_content("/private/secret", b"secret", 0o600)
             .unwrap();
         tree.create_symlink("/link", "/tmp/file").unwrap();
-        RuntimeFileSystem::new(
-            VirtualFileSystem::from_parts(rootfs, tree, FdTable::with_stdio()),
-            TestMemory::default(),
-        )
+        VirtualFileSystem::from_parts(rootfs, tree, FdTable::with_stdio())
+    }
+
+    fn runtime_with_sample_vfs() -> RuntimeFileSystem<TestMemory> {
+        RuntimeFileSystem::new(sample_vfs(), TestMemory::default())
     }
 
     fn runtime_from_program_and_tree(program: GuestProgram, tree: PathTree) -> Runtime {
