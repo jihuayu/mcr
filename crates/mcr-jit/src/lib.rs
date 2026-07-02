@@ -412,24 +412,45 @@ impl SameIsaExecutionCore {
     where
         T: GuestSyscallDispatcher,
     {
-        let decoded = self.decode_block(block)?;
-        let syscall_site = decoded.syscall_site();
-        for instruction in decoded.instructions() {
-            if Some(instruction.rip) == syscall_site.map(|site| site.rip) {
-                break;
+        const MAX_CONTROL_FLOW_STEPS: usize = 32;
+
+        let mut current_rip = block.rip();
+        for _ in 0..MAX_CONTROL_FLOW_STEPS {
+            let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
+            let syscall_site = decoded.syscall_site();
+            for instruction in decoded.instructions() {
+                if Some(instruction.rip) == syscall_site.map(|site| site.rip) {
+                    break;
+                }
+                if matches!(
+                    decoded.terminator(),
+                    BlockTerminator::ControlFlow { rip, .. } if *rip == instruction.rip
+                ) {
+                    break;
+                }
+                execute_simple_instruction(block, registers, instruction.rip, instruction.len)?;
             }
-            execute_simple_instruction(block, registers, instruction.rip, instruction.len)?;
-        }
-        let Some(site) = decoded.syscall_site() else {
+
+            if let Some(site) = decoded.syscall_site() {
+                registers.rip = site.rip;
+                trampoline.enter_syscall(registers, site);
+                return Ok(decoded);
+            }
+
+            if let Some(target) = direct_unconditional_branch_target(block, &decoded)? {
+                current_rip = target;
+                registers.rip = target;
+                continue;
+            }
+
             return Err(ExecutionError::MissingSyscall {
                 terminator: *decoded.terminator(),
             });
-        };
+        }
 
-        registers.rip = site.rip;
-        trampoline.enter_syscall(registers, site);
-
-        Ok(decoded)
+        Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip: current_rip },
+        })
     }
 }
 
@@ -498,6 +519,78 @@ fn execute_simple_instruction(
     }
     registers.rip = rip + len as u64;
     Ok(())
+}
+
+fn block_from_rip(block: GuestBlock<'_>, rip: u64) -> Result<GuestBlock<'_>, ExecutionError> {
+    let offset = block_offset(block, rip)?;
+    let bytes = block
+        .bytes()
+        .get(offset..)
+        .ok_or(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip },
+        })?;
+    Ok(GuestBlock::new(bytes, rip))
+}
+
+fn block_offset(block: GuestBlock<'_>, rip: u64) -> Result<usize, ExecutionError> {
+    let offset = rip
+        .checked_sub(block.rip())
+        .ok_or(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip },
+        })?;
+    let offset = usize::try_from(offset).map_err(|_| ExecutionError::MissingSyscall {
+        terminator: BlockTerminator::Invalid { rip },
+    })?;
+    if offset >= block.bytes().len() {
+        return Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip },
+        });
+    }
+    Ok(offset)
+}
+
+fn direct_unconditional_branch_target(
+    block: GuestBlock<'_>,
+    decoded: &DecodedBlock,
+) -> Result<Option<u64>, ExecutionError> {
+    let BlockTerminator::ControlFlow {
+        flow: DecodedFlowControl::UnconditionalBranch,
+        ..
+    } = decoded.terminator()
+    else {
+        return Ok(None);
+    };
+    let Some(instruction) = decoded.instructions().last() else {
+        return Err(ExecutionError::MissingSyscall {
+            terminator: *decoded.terminator(),
+        });
+    };
+    let offset = block_offset(block, instruction.rip)?;
+    let instruction_bytes = block.bytes().get(offset..offset + instruction.len).ok_or(
+        ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.rip,
+            },
+        },
+    )?;
+    let mut decoder = Decoder::with_ip(
+        X86_64_BITNESS,
+        instruction_bytes,
+        instruction.rip,
+        DecoderOptions::NONE,
+    );
+    let instruction = decoder.decode();
+    if !matches!(
+        instruction.op0_kind(),
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+    ) {
+        return Err(ExecutionError::MissingSyscall {
+            terminator: *decoded.terminator(),
+        });
+    }
+    let target = instruction.near_branch_target();
+    block_offset(block, target)?;
+    Ok(Some(target))
 }
 
 fn write_reg32(
@@ -722,6 +815,37 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x410009);
+    }
+
+    #[test]
+    fn execution_core_follows_direct_jump_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0xeb, 0x07, // jmp +7
+                0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00, // skipped mov rax,0
+                0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // mov rax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x430000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind jump");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x430012);
     }
 
     #[test]
