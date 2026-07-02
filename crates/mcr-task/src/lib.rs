@@ -208,12 +208,39 @@ impl Default for TlsState {
 pub struct GprState {
     rip: GuestAddress,
     rsp: GuestAddress,
+    rax: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    r10: u64,
+    r8: u64,
+    r9: u64,
 }
 
 impl GprState {
     #[must_use]
     pub const fn new(rip: GuestAddress, rsp: GuestAddress) -> Self {
-        Self { rip, rsp }
+        Self::with_syscall_registers(rip, rsp, 0, [0; 6])
+    }
+
+    #[must_use]
+    pub const fn with_syscall_registers(
+        rip: GuestAddress,
+        rsp: GuestAddress,
+        rax: u64,
+        args: [u64; 6],
+    ) -> Self {
+        Self {
+            rip,
+            rsp,
+            rax,
+            rdi: args[0],
+            rsi: args[1],
+            rdx: args[2],
+            r10: args[3],
+            r8: args[4],
+            r9: args[5],
+        }
     }
 
     #[must_use]
@@ -224,6 +251,41 @@ impl GprState {
     #[must_use]
     pub const fn rsp(self) -> GuestAddress {
         self.rsp
+    }
+
+    #[must_use]
+    pub const fn rax(self) -> u64 {
+        self.rax
+    }
+
+    #[must_use]
+    pub const fn rdi(self) -> u64 {
+        self.rdi
+    }
+
+    #[must_use]
+    pub const fn rsi(self) -> u64 {
+        self.rsi
+    }
+
+    #[must_use]
+    pub const fn rdx(self) -> u64 {
+        self.rdx
+    }
+
+    #[must_use]
+    pub const fn r10(self) -> u64 {
+        self.r10
+    }
+
+    #[must_use]
+    pub const fn r8(self) -> u64 {
+        self.r8
+    }
+
+    #[must_use]
+    pub const fn r9(self) -> u64 {
+        self.r9
     }
 }
 
@@ -270,6 +332,10 @@ impl GuestTask {
     #[must_use]
     pub const fn regs(&self) -> GprState {
         self.regs
+    }
+
+    pub fn set_regs(&mut self, regs: GprState) {
+        self.regs = regs;
     }
 
     #[must_use]
