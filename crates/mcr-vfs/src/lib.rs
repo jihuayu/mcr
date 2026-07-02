@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -19,6 +19,15 @@ pub const DT_BLK: u8 = 6;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
 pub const DT_SOCK: u8 = 12;
+pub const F_DUPFD: u32 = 0;
+pub const F_GETFD: u32 = 1;
+pub const F_SETFD: u32 = 2;
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
+pub const F_DUPFD_CLOEXEC: u32 = 1030;
+pub const F_SETPIPE_SZ: u32 = 1031;
+pub const F_GETPIPE_SZ: u32 = 1032;
+pub const FD_CLOEXEC: u32 = 1;
 pub const F_OK: u32 = 0;
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_RDONLY: u32 = 0;
@@ -28,11 +37,21 @@ pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+pub const FIONREAD: u64 = 0x541b;
+pub const TCGETS: u64 = 0x5401;
+pub const TCSETS: u64 = 0x5402;
+pub const TCSETSW: u64 = 0x5403;
+pub const TCSETSF: u64 = 0x5404;
+pub const TIOCGPGRP: u64 = 0x540f;
+pub const TIOCSPGRP: u64 = 0x5410;
+pub const TIOCGWINSZ: u64 = 0x5413;
 pub const R_OK: u32 = 4;
 pub const S_IFMT: u32 = 0o170000;
+pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
@@ -40,7 +59,10 @@ pub const W_OK: u32 = 2;
 pub const X_OK: u32 = 1;
 
 const FIRST_USER_FD: Fd = 3;
+const FIRST_PIPE_INODE_ID: InodeId = 1 << 62;
+const DEFAULT_PIPE_CAPACITY: usize = 65_536;
 const ROOT_INODE_ID: InodeId = 1;
+const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +78,7 @@ pub enum VfsError {
     NotSeekable,
     NotDirectory,
     PermissionDenied,
+    WouldBlock,
 }
 
 impl VfsError {
@@ -72,6 +95,7 @@ impl VfsError {
             Self::NotSeekable => 29,
             Self::NotDirectory => 20,
             Self::PermissionDenied => 13,
+            Self::WouldBlock => 11,
         }
     }
 }
@@ -90,6 +114,7 @@ impl fmt::Display for VfsError {
             Self::NotSeekable => "illegal seek",
             Self::NotDirectory => "not a directory",
             Self::PermissionDenied => "permission denied",
+            Self::WouldBlock => "resource temporarily unavailable",
         };
         f.write_str(message)
     }
@@ -617,12 +642,20 @@ impl LinuxFileAttr {
         }
     }
 
+    pub fn fifo(inode: InodeId) -> Self {
+        Self::new(inode, S_IFIFO | 0o600, 0)
+    }
+
     pub fn kind_bits(self) -> u32 {
         self.mode & S_IFMT
     }
 
     pub fn is_directory(self) -> bool {
         self.kind_bits() == S_IFDIR
+    }
+
+    pub fn is_fifo(self) -> bool {
+        self.kind_bits() == S_IFIFO
     }
 
     pub fn is_regular(self) -> bool {
@@ -889,18 +922,75 @@ impl DevNode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PipeNode {
     id: u64,
+    state: Arc<Mutex<PipeState>>,
 }
+
+impl PartialEq for PipeNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PipeNode {}
 
 impl PipeNode {
     pub fn new(id: u64) -> Self {
-        Self { id }
+        Self {
+            id,
+            state: Arc::new(Mutex::new(PipeState::new(DEFAULT_PIPE_CAPACITY))),
+        }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    fn state(&self) -> MutexGuard<'_, PipeState> {
+        self.state.lock().expect("pipe mutex poisoned")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PipeState {
+    buffer: VecDeque<u8>,
+    capacity: usize,
+}
+
+impl PipeState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> usize {
+        let count = self.buffer.len().min(buffer.len());
+        for item in buffer.iter_mut().take(count) {
+            *item = self
+                .buffer
+                .pop_front()
+                .expect("pipe buffer length was checked");
+        }
+        count
+    }
+
+    fn write(&mut self, buffer: &[u8]) -> VfsResult<usize> {
+        let available = self.capacity.saturating_sub(self.buffer.len());
+        if available == 0 && !buffer.is_empty() {
+            return Err(VfsError::WouldBlock);
+        }
+
+        let count = available.min(buffer.len());
+        self.buffer.extend(buffer[..count].iter().copied());
+        Ok(count)
     }
 }
 
@@ -959,6 +1049,8 @@ pub enum FileKind {
     Regular,
     Directory,
     Symlink,
+    PipeRead,
+    PipeWrite,
     Stdio(StdioKind),
 }
 
@@ -1026,12 +1118,22 @@ impl OpenFlags {
         self.raw & O_APPEND != 0
     }
 
+    pub const fn nonblock(self) -> bool {
+        self.raw & O_NONBLOCK != 0
+    }
+
     pub const fn directory(self) -> bool {
         self.raw & O_DIRECTORY != 0
     }
 
     pub const fn nofollow(self) -> bool {
         self.raw & O_NOFOLLOW != 0
+    }
+
+    pub const fn with_status_flags(self, status_flags: u32) -> Self {
+        Self {
+            raw: (self.raw & !SETFL_MUTABLE_FLAGS) | (status_flags & SETFL_MUTABLE_FLAGS),
+        }
     }
 }
 
@@ -1067,6 +1169,10 @@ impl FdEntry {
         &self.file
     }
 
+    pub fn file_mut(&mut self) -> &mut FileRef {
+        &mut self.file
+    }
+
     pub fn cloexec(&self) -> bool {
         self.cloexec
     }
@@ -1079,6 +1185,10 @@ impl FdEntry {
         self.flags
     }
 
+    pub fn set_flags(&mut self, flags: OpenFlags) {
+        self.flags = flags;
+    }
+
     pub fn path(&self) -> Option<&GuestPath> {
         self.path.as_ref()
     }
@@ -1088,6 +1198,7 @@ impl FdEntry {
 pub struct FdTable {
     entries: BTreeMap<Fd, FdEntry>,
     cloexec: HashSet<Fd>,
+    next_pipe_id: u64,
 }
 
 impl FdTable {
@@ -1095,6 +1206,7 @@ impl FdTable {
         Self {
             entries: BTreeMap::new(),
             cloexec: HashSet::new(),
+            next_pipe_id: 1,
         }
     }
 
@@ -1126,6 +1238,43 @@ impl FdTable {
     ) -> VfsResult<Fd> {
         let fd = self.next_fd_from(FIRST_USER_FD)?;
         self.insert_entry(fd, file, flags.cloexec(), flags, path)
+    }
+
+    pub fn pipe(&mut self, flags: OpenFlags) -> VfsResult<[Fd; 2]> {
+        if flags.raw() & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let read_fd = self.next_fd_from(FIRST_USER_FD)?;
+        let write_fd = self.next_fd_from(read_fd.checked_add(1).ok_or(VfsError::BadFd)?)?;
+        let pipe_id = self.allocate_pipe_id()?;
+        let pipe_inode = Arc::new(Inode::new(
+            FIRST_PIPE_INODE_ID
+                .checked_add(pipe_id)
+                .ok_or(VfsError::BadFd)?,
+            InodeBackend::Pipe(PipeNode::new(pipe_id)),
+        ));
+        let cloexec = flags.cloexec();
+
+        self.insert_entry(
+            read_fd,
+            FileRef::new(pipe_inode.clone(), FileKind::PipeRead),
+            cloexec,
+            OpenFlags::new(O_RDONLY | (flags.raw() & O_NONBLOCK)),
+            None,
+        )?;
+        if let Err(error) = self.insert_entry(
+            write_fd,
+            FileRef::new(pipe_inode, FileKind::PipeWrite),
+            cloexec,
+            OpenFlags::new(O_WRONLY | (flags.raw() & O_NONBLOCK)),
+            None,
+        ) {
+            let _ = self.close(read_fd);
+            return Err(error);
+        }
+
+        Ok([read_fd, write_fd])
     }
 
     pub fn insert_at_or_above(
@@ -1236,6 +1385,15 @@ impl FdTable {
                 entry.offset += count as u64;
                 Ok(count)
             }
+            FileKind::PipeRead => {
+                let pipe = pipe_node(&entry.file)?;
+                let mut state = pipe.state();
+                if state.available() == 0 && entry.flags.nonblock() && !buffer.is_empty() {
+                    return Err(VfsError::WouldBlock);
+                }
+                Ok(state.read(buffer))
+            }
+            FileKind::PipeWrite => Err(VfsError::BadFd),
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Stdio(StdioKind::Stdin) => Ok(0),
             FileKind::Stdio(_) => Err(VfsError::BadFd),
@@ -1263,6 +1421,11 @@ impl FdTable {
             }
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Symlink => Err(VfsError::InvalidPath),
+            FileKind::PipeRead => Err(VfsError::BadFd),
+            FileKind::PipeWrite => {
+                let pipe = pipe_node(&entry.file)?;
+                pipe.state().write(buffer)
+            }
             FileKind::Stdio(StdioKind::Stdout | StdioKind::Stderr) => Ok(buffer.len()),
             FileKind::Stdio(StdioKind::Stdin) => Err(VfsError::BadFd),
         }
@@ -1276,7 +1439,10 @@ impl FdTable {
         whence: SeekWhence,
     ) -> VfsResult<u64> {
         let entry = self.get_mut(fd)?;
-        if matches!(entry.file.kind, FileKind::Stdio(_)) {
+        if matches!(
+            entry.file.kind,
+            FileKind::PipeRead | FileKind::PipeWrite | FileKind::Stdio(_)
+        ) {
             return Err(VfsError::NotSeekable);
         }
 
@@ -1286,6 +1452,7 @@ impl FdTable {
                 tree.lookup_path(path).ok_or(VfsError::NoEntry)?.attr.size
             }
             FileKind::Directory => 0,
+            FileKind::PipeRead | FileKind::PipeWrite => unreachable!(),
             FileKind::Stdio(_) => unreachable!(),
         };
         let base = match whence {
@@ -1376,6 +1543,12 @@ impl FdTable {
             }
             fd = fd.checked_add(1).ok_or(VfsError::BadFd)?;
         }
+    }
+
+    fn allocate_pipe_id(&mut self) -> VfsResult<u64> {
+        let id = self.next_pipe_id;
+        self.next_pipe_id = self.next_pipe_id.checked_add(1).ok_or(VfsError::BadFd)?;
+        Ok(id)
     }
 }
 
@@ -1516,7 +1689,7 @@ impl VirtualFileSystem {
             return self.stat_path(path);
         }
 
-        Ok(stdio_attr(entry.file().kind()))
+        Ok(anonymous_attr(entry.file()))
     }
 
     pub fn newfstatat(&self, dirfd: Fd, path: &str, flags: u32) -> VfsResult<LinuxFileAttr> {
@@ -1653,14 +1826,22 @@ impl VirtualFileSystem {
     }
 }
 
-fn stdio_attr(kind: FileKind) -> LinuxFileAttr {
-    match kind {
+fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
+    match file.kind() {
         FileKind::Stdio(StdioKind::Stdin | StdioKind::Stdout | StdioKind::Stderr) => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
         }
+        FileKind::PipeRead | FileKind::PipeWrite => LinuxFileAttr::fifo(file.inode().id()),
         FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
         }
+    }
+}
+
+fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
+    match file.inode().backend() {
+        InodeBackend::Pipe(pipe) => Ok(pipe),
+        _ => Err(VfsError::BadFd),
     }
 }
 
