@@ -1589,6 +1589,14 @@ pub enum FileKind {
     Stdio(StdioKind),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FdReadiness {
+    pub readable: bool,
+    pub writable: bool,
+    pub hang_up: bool,
+    pub error: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeekWhence {
     Set,
@@ -2114,6 +2122,54 @@ impl FdTable {
             FileKind::Socket => Ok(0),
             FileKind::Stdio(_) => Ok(0),
         }
+    }
+
+    pub fn poll_readiness(&self, _tree: &PathTree, fd: Fd) -> VfsResult<FdReadiness> {
+        let entry = self.get(fd)?;
+        Ok(match entry.file().kind() {
+            FileKind::Regular | FileKind::Symlink | FileKind::Directory => FdReadiness {
+                readable: true,
+                writable: entry.flags().can_write(),
+                hang_up: false,
+                error: false,
+            },
+            FileKind::Dev(DevNodeKind::Null | DevNodeKind::Zero | DevNodeKind::Urandom) => {
+                FdReadiness {
+                    readable: entry.flags().can_read(),
+                    writable: entry.flags().can_write(),
+                    hang_up: false,
+                    error: false,
+                }
+            }
+            FileKind::Dev(DevNodeKind::Stdin | DevNodeKind::Stdout | DevNodeKind::Stderr)
+            | FileKind::Stdio(_) => FdReadiness {
+                readable: false,
+                writable: entry.flags().can_write(),
+                hang_up: false,
+                error: false,
+            },
+            FileKind::PipeRead | FileKind::PipeWrite => {
+                let state = pipe_node(entry.file())?.state();
+                FdReadiness {
+                    readable: matches!(entry.file().kind(), FileKind::PipeRead)
+                        && (state.available() > 0 || state.writers == 0),
+                    writable: matches!(entry.file().kind(), FileKind::PipeWrite)
+                        && state.readers > 0
+                        && state.available() < state.capacity,
+                    hang_up: (matches!(entry.file().kind(), FileKind::PipeRead)
+                        && state.writers == 0)
+                        || (matches!(entry.file().kind(), FileKind::PipeWrite)
+                            && state.readers == 0),
+                    error: false,
+                }
+            }
+            FileKind::Socket => FdReadiness {
+                readable: false,
+                writable: false,
+                hang_up: false,
+                error: false,
+            },
+        })
     }
 
     fn open_count(&self, inode_id: InodeId) -> usize {
@@ -2651,6 +2707,10 @@ impl VirtualFileSystem {
 
     pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
         self.fds.socket_id_for_fd(fd)
+    }
+
+    pub fn poll_readiness(&self, fd: Fd) -> VfsResult<FdReadiness> {
+        self.fds.poll_readiness(&self.tree, fd)
     }
 
     pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {

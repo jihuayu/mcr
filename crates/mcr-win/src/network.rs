@@ -232,6 +232,17 @@ impl HostSocket {
         recv_from_platform(self, buffer)
     }
 
+    /// Polls this socket for readiness.
+    pub fn poll(
+        &self,
+        interest: SocketEvents,
+        timeout: Option<Duration>,
+    ) -> HostResult<SocketEvents> {
+        let mut entry = [SocketPoll::new(self, interest)];
+        let _ = poll_platform(&mut entry, timeout)?;
+        Ok(entry[0].readiness)
+    }
+
     /// Sets host nonblocking mode.
     pub fn set_nonblocking(&self, nonblocking: bool) -> HostResult<()> {
         set_nonblocking_platform(self, nonblocking)

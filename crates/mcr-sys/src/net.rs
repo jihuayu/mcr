@@ -39,6 +39,13 @@ pub const LINUX_MSG_DONTWAIT: u32 = 0x40;
 pub const LINUX_MSG_NOSIGNAL: u32 = 0x4000;
 pub const LINUX_MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 
+pub const LINUX_POLLIN: i16 = 0x0001;
+pub const LINUX_POLLPRI: i16 = 0x0002;
+pub const LINUX_POLLOUT: i16 = 0x0004;
+pub const LINUX_POLLERR: i16 = 0x0008;
+pub const LINUX_POLLHUP: i16 = 0x0010;
+pub const LINUX_POLLNVAL: i16 = 0x0020;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinuxSockaddr {
@@ -123,6 +130,14 @@ pub struct LinuxCmsghdr {
     pub cmsg_len: u64,
     pub cmsg_level: i32,
     pub cmsg_type: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxPollfd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,12 +290,13 @@ mod tests {
 
     use super::{
         Accept4SyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_MSG_CMSG_CLOEXEC,
-        LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_SHUT_RD, LINUX_SHUT_RDWR, LINUX_SHUT_WR,
-        LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM,
-        LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, LinuxCmsghdr, LinuxMsghdr, LinuxSockaddr,
-        LinuxSockaddrIn, LinuxSockaddrIn6, LinuxSockaddrStorage, LinuxSockaddrUn,
-        SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs,
-        SocketSyscallArgs, SockoptSyscallArgs,
+        LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN,
+        LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_SHUT_RD, LINUX_SHUT_RDWR,
+        LINUX_SHUT_WR, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
+        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, LinuxCmsghdr, LinuxMsghdr,
+        LinuxPollfd, LinuxSockaddr, LinuxSockaddrIn, LinuxSockaddrIn6, LinuxSockaddrStorage,
+        LinuxSockaddrUn, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs,
+        SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs,
     };
 
     #[test]
@@ -300,6 +316,12 @@ mod tests {
         assert_eq!(LINUX_MSG_DONTWAIT, 0x40);
         assert_eq!(LINUX_MSG_NOSIGNAL, 0x4000);
         assert_eq!(LINUX_MSG_CMSG_CLOEXEC, 0x4000_0000);
+        assert_eq!(LINUX_POLLIN, 0x0001);
+        assert_eq!(LINUX_POLLPRI, 0x0002);
+        assert_eq!(LINUX_POLLOUT, 0x0004);
+        assert_eq!(LINUX_POLLERR, 0x0008);
+        assert_eq!(LINUX_POLLHUP, 0x0010);
+        assert_eq!(LINUX_POLLNVAL, 0x0020);
     }
 
     #[test]
@@ -311,7 +333,9 @@ mod tests {
         assert_eq!(size_of::<LinuxSockaddrStorage>(), 128);
         assert_eq!(size_of::<LinuxMsghdr>(), 56);
         assert_eq!(size_of::<LinuxCmsghdr>(), 16);
+        assert_eq!(size_of::<LinuxPollfd>(), 8);
         assert_eq!(align_of::<LinuxMsghdr>(), 8);
+        assert_eq!(align_of::<LinuxPollfd>(), 4);
     }
 
     #[test]

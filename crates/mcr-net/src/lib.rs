@@ -2,11 +2,13 @@ use std::fmt;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    time::Duration,
 };
 
 use mcr_win::{
     AddressFamily, HostError, HostErrorKind, HostShutdown, HostSocket, HostSocketOptionName,
-    HostSocketOptionValue, NetworkStack, SocketKind, SocketProtocol as HostSocketProtocol,
+    HostSocketOptionValue, NetworkStack, SocketEvents, SocketKind,
+    SocketProtocol as HostSocketProtocol,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -466,6 +468,11 @@ pub trait HostSocketHandle: fmt::Debug {
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
     fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError>;
+    fn poll(
+        &mut self,
+        interest: SocketEvents,
+        timeout: Option<Duration>,
+    ) -> Result<SocketEvents, HostIoError>;
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
 }
 
@@ -538,6 +545,16 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket
             .recv_from(buffer)
             .map(|(count, address)| (count, SocketAddress::from(address)))
+            .map_err(HostIoError::from)
+    }
+
+    fn poll(
+        &mut self,
+        interest: SocketEvents,
+        timeout: Option<Duration>,
+    ) -> Result<SocketEvents, HostIoError> {
+        self.socket
+            .poll(interest, timeout)
             .map_err(HostIoError::from)
     }
 
@@ -1047,6 +1064,24 @@ impl GuestSocketTable {
             .map_err(SocketError::from_host)
     }
 
+    pub fn poll(
+        &mut self,
+        id: SocketId,
+        interest: SocketEvents,
+        timeout: Option<Duration>,
+    ) -> Result<SocketEvents, SocketError> {
+        let socket = self.socket(id)?;
+        if matches!(socket.state, SocketState::Closed) {
+            return Err(SocketError::BadSocket { id });
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
+        entry
+            .handle
+            .poll(interest, timeout)
+            .map_err(SocketError::from_host)
+    }
+
     pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {
         let socket = self.socket(id)?;
         validate_connected_stream_io(socket, SocketOperation::Send)
@@ -1187,6 +1222,7 @@ pub enum SocketOperation {
     CreateSocket,
     GetSocketOption,
     Listen,
+    Poll,
     Recv,
     RecvMsg,
     Send,
@@ -1596,6 +1632,21 @@ mod tests {
                 .connected
                 .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
             Ok((count, address))
+        }
+
+        fn poll(
+            &mut self,
+            interest: SocketEvents,
+            _timeout: Option<Duration>,
+        ) -> Result<SocketEvents, HostIoError> {
+            Ok(SocketEvents {
+                readable: interest.readable && !self.incoming.is_empty(),
+                writable: interest.writable,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            })
         }
 
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {

@@ -27,21 +27,23 @@ use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
     FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext, IoctlSyscallArgs,
     LINUX_AF_INET, LINUX_AF_INET6, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
-    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LinuxErrno,
-    LinuxIovec, LinuxMsghdr, LinuxStat, LinuxStatx, LinuxStatxTimestamp, MemorySyscalls,
-    NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
-    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
-    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
-    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
+    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR,
+    LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LinuxErrno,
+    LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx, LinuxStatxTimestamp,
+    MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs,
+    SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs,
+    SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher,
+    SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{
     ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_PID,
     INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, ProcSelfData,
-    SeekWhence, VfsError, VirtualFileSystem,
+    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, LinuxFileAttr, OpenFlags,
+    ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
+use mcr_win::SocketEvents;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -2274,7 +2276,15 @@ impl NetworkSyscalls for RuntimeSubsystems {
         self.files.dispatch_network(request)
     }
 }
-impl EventSyscalls for RuntimeSubsystems {}
+impl EventSyscalls for RuntimeSubsystems {
+    fn dispatch_event(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match request.syscall {
+            mcr_sys::Syscall::Poll => self.dispatch_poll(request),
+            mcr_sys::Syscall::Ppoll => self.dispatch_ppoll(request),
+            _ => SyscallOutcome::unsupported(),
+        }
+    }
+}
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
     fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -2358,6 +2368,174 @@ impl RuntimeSubsystems {
     fn futex_wake(&mut self, args: FutexSyscallArgs) -> u64 {
         self.futexes.wake(args.uaddr, args.val)
     }
+
+    fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let nfds = match usize_arg(request, 1) {
+            Ok(nfds) => nfds,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match poll_timeout(arg(request, 2)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        outcome(self.poll_fds(arg(request, 0), nfds, timeout))
+    }
+
+    fn dispatch_ppoll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        if arg(request, 3) != 0 || arg(request, 4) != 0 {
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
+        }
+        let nfds = match usize_arg(request, 1) {
+            Ok(nfds) => nfds,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match read_futex_timeout(self.files.memory(), arg(request, 2)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        outcome(self.poll_fds(arg(request, 0), nfds, timeout))
+    }
+
+    fn poll_fds(
+        &mut self,
+        fds_addr: u64,
+        nfds: usize,
+        timeout: Option<Duration>,
+    ) -> Result<u64, LinuxErrno> {
+        const MAX_POLL_FDS: usize = 4096;
+        if nfds > MAX_POLL_FDS {
+            return Err(LinuxErrno::EINVAL);
+        }
+
+        let mut ready = 0u64;
+        for index in 0..nfds {
+            let pollfd_addr = fds_addr
+                .checked_add((index * POLLFD_SIZE) as u64)
+                .ok_or(LinuxErrno::EFAULT)?;
+            let mut pollfd = read_pollfd(self.files.memory(), pollfd_addr)?;
+            pollfd.revents = self.poll_fd_revents(pollfd.fd, pollfd.events, timeout)?;
+            write_pollfd_revents(self.files.memory_mut(), pollfd_addr, pollfd.revents)?;
+            if pollfd.revents != 0 {
+                ready = ready.checked_add(1).ok_or(LinuxErrno::EINVAL)?;
+            }
+        }
+        Ok(ready)
+    }
+
+    fn poll_fd_revents(
+        &mut self,
+        fd: Fd,
+        events: i16,
+        timeout: Option<Duration>,
+    ) -> Result<i16, LinuxErrno> {
+        if fd < 0 {
+            return Ok(0);
+        }
+
+        let mut revents = match self.files.vfs().poll_readiness(fd) {
+            Ok(readiness) => poll_revents_from_vfs(readiness, events),
+            Err(VfsError::BadFd) => return Ok(LINUX_POLLNVAL),
+            Err(error) => return Err(vfs_errno(error)),
+        };
+
+        if self.files.vfs().socket_id_for_fd(fd).is_ok() {
+            let socket_id = self.files.socket_id_for_fd(fd)?;
+            let socket_events = poll_interest_to_socket_events(events);
+            if !socket_events.is_empty() {
+                let readiness = self
+                    .files
+                    .sockets_mut()
+                    .poll(socket_id, socket_events, timeout)
+                    .map_err(net_errno)?;
+                revents |= poll_revents_from_socket_events(readiness, events);
+            }
+        }
+        Ok(revents)
+    }
+}
+
+const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
+
+fn poll_timeout(raw: u64) -> Result<Option<Duration>, LinuxErrno> {
+    let timeout_ms = raw as i32;
+    if timeout_ms < 0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_millis(timeout_ms as u64)))
+}
+
+fn read_pollfd(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxPollfd, LinuxErrno> {
+    let mut bytes = [0; POLLFD_SIZE];
+    memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
+    Ok(LinuxPollfd {
+        fd: i32::from_le_bytes(bytes[0..4].try_into().expect("pollfd fd")),
+        events: i16::from_le_bytes(bytes[4..6].try_into().expect("pollfd events")),
+        revents: i16::from_le_bytes(bytes[6..8].try_into().expect("pollfd revents")),
+    })
+}
+
+fn write_pollfd_revents(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    revents: i16,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(
+            addr.checked_add(6).ok_or(LinuxErrno::EFAULT)?,
+            &revents.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
+    let mut revents = 0;
+    if readiness.readable && events & (LINUX_POLLIN | LINUX_POLLPRI) != 0 {
+        revents |= LINUX_POLLIN;
+    }
+    if readiness.writable && events & LINUX_POLLOUT != 0 {
+        revents |= LINUX_POLLOUT;
+    }
+    if readiness.error {
+        revents |= LINUX_POLLERR;
+    }
+    if readiness.hang_up {
+        revents |= LINUX_POLLHUP;
+    }
+    revents
+}
+
+fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
+    SocketEvents {
+        readable: events & LINUX_POLLIN != 0,
+        writable: events & LINUX_POLLOUT != 0,
+        priority: events & LINUX_POLLPRI != 0,
+        error: false,
+        hang_up: false,
+        invalid: false,
+    }
+}
+
+fn poll_revents_from_socket_events(readiness: SocketEvents, events: i16) -> i16 {
+    let mut revents = 0;
+    if readiness.readable && events & LINUX_POLLIN != 0 {
+        revents |= LINUX_POLLIN;
+    }
+    if readiness.writable && events & LINUX_POLLOUT != 0 {
+        revents |= LINUX_POLLOUT;
+    }
+    if readiness.priority && events & LINUX_POLLPRI != 0 {
+        revents |= LINUX_POLLPRI;
+    }
+    if readiness.error {
+        revents |= LINUX_POLLERR;
+    }
+    if readiness.hang_up {
+        revents |= LINUX_POLLHUP;
+    }
+    if readiness.invalid {
+        revents |= LINUX_POLLNVAL;
+    }
+    revents
 }
 
 fn read_futex_timeout(
@@ -2527,8 +2705,9 @@ mod tests {
     use mcr_net::SocketState;
     use mcr_sys::{
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP,
-        LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR,
-        LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
+        LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL,
+        LINUX_POLLOUT, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR,
+        LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
         LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
         LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
     };
@@ -3218,6 +3397,195 @@ mod tests {
         let mut opt = [0; 4];
         runtime.memory().read(0x402700, &mut opt).unwrap();
         assert_eq!(u32::from_le_bytes(opt), 1);
+    }
+
+    #[test]
+    fn poll_reports_regular_file_readiness_and_invalid_fds() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        write_pollfd(
+            runtime.memory_mut(),
+            0x402100,
+            3,
+            LINUX_POLLIN | LINUX_POLLOUT,
+        );
+        write_pollfd(runtime.memory_mut(), 0x402108, 99, LINUX_POLLIN);
+
+        let result = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 2, 0, 0, 0, 0]));
+
+        assert_eq!(result.result, SyscallReturn::Success(2));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLIN);
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402108), LINUX_POLLNVAL);
+
+        write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLIN);
+        let infinite_timeout =
+            runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, u64::MAX, 0, 0, 0]));
+        assert_eq!(infinite_timeout.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLIN);
+    }
+
+    #[test]
+    fn poll_reports_pipe_buffer_state_and_hangup() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        let write_fd = i32_from_memory(runtime.memory(), 0x402004);
+        write_pollfd(runtime.memory_mut(), 0x402100, read_fd, LINUX_POLLIN);
+
+        let empty = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(empty.result, SyscallReturn::Success(0));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), 0);
+
+        runtime.memory_mut().write(0x402200, b"x").unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Write,
+                    [write_fd as u64, 0x402200, 1, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(1)
+        );
+        write_pollfd(runtime.memory_mut(), 0x402100, read_fd, LINUX_POLLIN);
+        let readable = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(readable.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLIN);
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Read,
+                    [read_fd as u64, 0x402300, 1, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(1)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Close, [write_fd as u64, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_pollfd(runtime.memory_mut(), 0x402100, read_fd, LINUX_POLLIN);
+        let hangup = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(hangup.result, SyscallReturn::Success(1));
+        assert_eq!(
+            pollfd_revents(runtime.memory(), 0x402100),
+            LINUX_POLLIN | LINUX_POLLHUP
+        );
+    }
+
+    #[test]
+    fn poll_reports_socket_transport_readiness() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_pollfd(
+            runtime.memory_mut(),
+            0x402100,
+            3,
+            LINUX_POLLIN | LINUX_POLLOUT,
+        );
+
+        let result = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+
+        assert_eq!(result.result, SyscallReturn::Success(1));
+        assert_eq!(
+            pollfd_revents(runtime.memory(), 0x402100),
+            LINUX_POLLIN | LINUX_POLLOUT
+        );
+    }
+
+    #[test]
+    fn ppoll_reads_timespec_and_rejects_signal_masks() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLIN);
+        write_timespec(runtime.memory_mut(), 0x402200, 0, 0);
+
+        let ready =
+            runtime.dispatch_syscall(context(Syscall::Ppoll, [0x402100, 1, 0x402200, 0, 0, 0]));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLIN);
+
+        write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLIN);
+        write_timespec(runtime.memory_mut(), 0x402200, 0, 1_000_000_000);
+        let invalid_timespec =
+            runtime.dispatch_syscall(context(Syscall::Ppoll, [0x402100, 1, 0x402200, 0, 0, 0]));
+        assert_eq!(
+            invalid_timespec.result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        let sigmask =
+            runtime.dispatch_syscall(context(Syscall::Ppoll, [0x402100, 1, 0x402200, 1, 8, 0]));
+        assert_eq!(sigmask.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
     }
 
     #[test]
@@ -4248,6 +4616,22 @@ mod tests {
             Ok((count, address))
         }
 
+        fn poll(
+            &mut self,
+            interest: SocketEvents,
+            _timeout: Option<Duration>,
+        ) -> Result<SocketEvents, mcr_net::HostIoError> {
+            let state = self.state.borrow();
+            Ok(SocketEvents {
+                readable: interest.readable && !state.incoming.is_empty(),
+                writable: interest.writable,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            })
+        }
+
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), mcr_net::HostIoError> {
             Ok(())
         }
@@ -4392,6 +4776,29 @@ mod tests {
 
     fn i32_at(memory: &TestMemory, addr: u64) -> i32 {
         i32::from_le_bytes(memory.read(addr, 4).try_into().expect("slice len"))
+    }
+
+    fn i32_from_memory(memory: &GuestMemory, addr: u64) -> i32 {
+        let mut bytes = [0; 4];
+        memory.read(addr, &mut bytes).unwrap();
+        i32::from_le_bytes(bytes)
+    }
+
+    fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {
+        memory.write(addr, &fd.to_le_bytes()).unwrap();
+        memory.write(addr + 4, &events.to_le_bytes()).unwrap();
+        memory.write(addr + 6, &0i16.to_le_bytes()).unwrap();
+    }
+
+    fn pollfd_revents(memory: &GuestMemory, addr: u64) -> i16 {
+        let mut bytes = [0; 2];
+        memory.read(addr + 6, &mut bytes).unwrap();
+        i16::from_le_bytes(bytes)
+    }
+
+    fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {
+        memory.write(addr, &sec.to_le_bytes()).unwrap();
+        memory.write(addr + 8, &nsec.to_le_bytes()).unwrap();
     }
 
     fn u16_at(memory: &TestMemory, addr: u64) -> u16 {
