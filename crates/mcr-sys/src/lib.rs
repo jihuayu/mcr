@@ -40,7 +40,9 @@ pub use memory::{
     MunmapSyscallArgs,
 };
 pub use net::{
-    Accept4SyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_IPPROTO_IP,
+    Accept4SyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_EPOLL_CLOEXEC,
+    LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLET,
+    LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_IPPROTO_IP,
     LINUX_IPPROTO_TCP, LINUX_IPPROTO_UDP, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_CTRUNC,
     LINUX_MSG_DONTROUTE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_MSG_OOB, LINUX_MSG_PEEK,
     LINUX_MSG_TRUNC, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
@@ -48,10 +50,10 @@ pub use net::{
     LINUX_SO_KEEPALIVE, LINUX_SO_RCVBUF, LINUX_SO_REUSEADDR, LINUX_SO_REUSEPORT, LINUX_SO_SNDBUF,
     LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_FLAG_MASK, LINUX_SOCK_NONBLOCK,
     LINUX_SOCK_RAW, LINUX_SOCK_STREAM, LINUX_SOCK_TYPE_MASK, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY,
-    LinuxCmsghdr, LinuxIn6Addr, LinuxMsghdr, LinuxPollfd, LinuxSockaddr, LinuxSockaddrIn,
-    LinuxSockaddrIn6, LinuxSockaddrStorage, LinuxSockaddrUn, SendRecvFromSyscallArgs,
-    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
-    SockoptSyscallArgs,
+    LinuxCmsghdr, LinuxEpollEvent, LinuxIn6Addr, LinuxMsghdr, LinuxPollfd, LinuxSockaddr,
+    LinuxSockaddrIn, LinuxSockaddrIn6, LinuxSockaddrStorage, LinuxSockaddrUn,
+    SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs,
+    SocketSyscallArgs, SockoptSyscallArgs,
 };
 pub use return_value::{LINUX_MAX_ERRNO, SyscallReturn};
 pub use syscall::{Syscall, SyscallNumber};

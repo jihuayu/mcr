@@ -84,6 +84,7 @@ const DEFAULT_PIPE_CAPACITY: usize = 65_536;
 const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
 const FIRST_SOCKET_INODE_ID: InodeId = 1 << 59;
+const FIRST_EPOLL_INODE_ID: InodeId = (1 << 59) + (1 << 58);
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
 
@@ -1304,6 +1305,7 @@ pub enum InodeBackend {
     DevVirtual(DevNode),
     Pipe(PipeNode),
     Socket(SocketNode),
+    Epoll(EpollNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1543,6 +1545,21 @@ impl SocketNode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpollNode {
+    id: u64,
+}
+
+impl EpollNode {
+    pub fn new(id: u64) -> Self {
+        Self { id }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRef {
     inode: Arc<Inode>,
     kind: FileKind,
@@ -1586,6 +1603,7 @@ pub enum FileKind {
     PipeRead,
     PipeWrite,
     Socket,
+    Epoll,
     Stdio(StdioKind),
 }
 
@@ -1953,10 +1971,37 @@ impl FdTable {
         )
     }
 
+    pub fn insert_epoll(&mut self, epoll_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        let access_mode = flags.access_mode();
+        if flags.raw() & !(O_ACCMODE | O_CLOEXEC) != 0 || access_mode != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let inode = Arc::new(Inode::new(
+            epoll_inode_id(epoll_id)?,
+            InodeBackend::Epoll(EpollNode::new(epoll_id)),
+        ));
+        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        self.insert_entry(
+            fd,
+            FileRef::new(inode, FileKind::Epoll),
+            flags.cloexec(),
+            OpenFlags::new(O_RDONLY | (flags.raw() & O_CLOEXEC)),
+            None,
+        )
+    }
+
     pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
         match self.get(fd)?.file().inode().backend() {
             InodeBackend::Socket(socket) => Ok(socket.id()),
             _ => Err(VfsError::NotSocket),
+        }
+    }
+
+    pub fn epoll_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
+        match self.get(fd)?.file().inode().backend() {
+            InodeBackend::Epoll(epoll) => Ok(epoll.id()),
+            _ => Err(VfsError::BadFd),
         }
     }
 
@@ -2119,7 +2164,7 @@ impl FdTable {
             FileKind::PipeRead | FileKind::PipeWrite => {
                 Ok(pipe_node(entry.file())?.state().available())
             }
-            FileKind::Socket => Ok(0),
+            FileKind::Socket | FileKind::Epoll => Ok(0),
             FileKind::Stdio(_) => Ok(0),
         }
     }
@@ -2164,6 +2209,12 @@ impl FdTable {
                 }
             }
             FileKind::Socket => FdReadiness {
+                readable: false,
+                writable: false,
+                hang_up: false,
+                error: false,
+            },
+            FileKind::Epoll => FdReadiness {
                 readable: false,
                 writable: false,
                 hang_up: false,
@@ -2264,6 +2315,7 @@ impl FdTable {
             FileKind::PipeRead => pipe_read(entry, buffer),
             FileKind::PipeWrite => Err(VfsError::BadFd),
             FileKind::Socket => Err(VfsError::BadFd),
+            FileKind::Epoll => Err(VfsError::BadFd),
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Stdio(StdioKind::Stdin) => Ok(0),
             FileKind::Stdio(_) => Err(VfsError::BadFd),
@@ -2318,6 +2370,7 @@ impl FdTable {
             FileKind::PipeRead => Err(VfsError::BadFd),
             FileKind::PipeWrite => pipe_write(entry, buffer),
             FileKind::Socket => Err(VfsError::BadFd),
+            FileKind::Epoll => Err(VfsError::BadFd),
             FileKind::Stdio(kind) => stdio.write(kind, buffer),
         }
     }
@@ -2336,6 +2389,7 @@ impl FdTable {
                 | FileKind::PipeRead
                 | FileKind::PipeWrite
                 | FileKind::Socket
+                | FileKind::Epoll
                 | FileKind::Stdio(_)
         ) {
             return Err(VfsError::NotSeekable);
@@ -2352,6 +2406,7 @@ impl FdTable {
             FileKind::Dev(_) => unreachable!(),
             FileKind::PipeRead | FileKind::PipeWrite => unreachable!(),
             FileKind::Socket => unreachable!(),
+            FileKind::Epoll => unreachable!(),
             FileKind::Stdio(_) => unreachable!(),
         };
         let base = match whence {
@@ -2705,8 +2760,16 @@ impl VirtualFileSystem {
         self.fds.insert_socket(socket_id, flags)
     }
 
+    pub fn insert_epoll(&mut self, epoll_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        self.fds.insert_epoll(epoll_id, flags)
+    }
+
     pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
         self.fds.socket_id_for_fd(fd)
+    }
+
+    pub fn epoll_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
+        self.fds.epoll_id_for_fd(fd)
     }
 
     pub fn poll_readiness(&self, fd: Fd) -> VfsResult<FdReadiness> {
@@ -3249,6 +3312,10 @@ impl VirtualFileSystem {
                 Ok(Cow::Owned(format!("pipe:[{}]", entry.inode_id())))
             }
             FileKind::Socket => Ok(Cow::Owned(format!("socket:[{}]", entry.inode_id()))),
+            FileKind::Epoll => Ok(Cow::Owned(format!(
+                "anon_inode:[eventpoll:{}]",
+                entry.inode_id()
+            ))),
             FileKind::Stdio(kind) => Ok(Cow::Owned(format!("/dev/{}", kind.name()))),
         }
     }
@@ -3293,6 +3360,7 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
         }
         FileKind::PipeRead | FileKind::PipeWrite => LinuxFileAttr::fifo(file.inode().id()),
         FileKind::Socket => LinuxFileAttr::socket(file.inode().id()),
+        FileKind::Epoll => LinuxFileAttr::regular(file.inode().id(), 0o600, 0),
         FileKind::Dev(_) => LinuxFileAttr::character_device(file.inode().id(), 0o666),
         FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
@@ -3397,6 +3465,12 @@ fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
 fn socket_inode_id(socket_id: u64) -> VfsResult<InodeId> {
     FIRST_SOCKET_INODE_ID
         .checked_add(socket_id)
+        .ok_or(VfsError::BadFd)
+}
+
+fn epoll_inode_id(epoll_id: u64) -> VfsResult<InodeId> {
+    FIRST_EPOLL_INODE_ID
+        .checked_add(epoll_id)
         .ok_or(VfsError::BadFd)
 }
 
@@ -3751,6 +3825,40 @@ mod tests {
             VfsError::NotSocket
         );
         assert_eq!(vfs.socket_id_for_fd(99).unwrap_err(), VfsError::BadFd);
+    }
+
+    #[test]
+    fn epoll_fds_have_anonymous_metadata_and_cloexec() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_procfs().unwrap();
+        let fd = vfs.insert_epoll(7, OpenFlags::new(O_CLOEXEC)).unwrap();
+        let mut buffer = [0; 64];
+
+        assert_eq!(fd, 3);
+        assert_eq!(vfs.epoll_id_for_fd(fd).unwrap(), 7);
+        assert_eq!(vfs.socket_id_for_fd(fd).unwrap_err(), VfsError::NotSocket);
+        assert!(vfs.fds().cloexec(fd).unwrap());
+        assert_eq!(vfs.fcntl(fd, F_GETFD, 0).unwrap(), u64::from(FD_CLOEXEC));
+
+        let stat = vfs.fstat(fd).unwrap();
+        assert!(stat.is_regular());
+        assert_eq!(stat.mode & 0o777, 0o600);
+        assert_eq!(stat.inode, epoll_inode_id(7).unwrap());
+        assert_eq!(
+            vfs.lseek(fd, 0, SeekWhence::Set).unwrap_err(),
+            VfsError::NotSeekable
+        );
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap_err(), VfsError::BadFd);
+        assert_eq!(vfs.write(fd, b"ignored").unwrap_err(), VfsError::BadFd);
+
+        let count = vfs.readlink("/proc/self/fd/3", &mut buffer).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buffer[..count]).unwrap(),
+            format!("anon_inode:[eventpoll:{}]", epoll_inode_id(7).unwrap())
+        );
+
+        vfs.close(fd).unwrap();
+        assert_eq!(vfs.epoll_id_for_fd(fd).unwrap_err(), VfsError::BadFd);
     }
 
     #[test]
