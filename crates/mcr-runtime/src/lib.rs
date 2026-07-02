@@ -198,18 +198,35 @@ pub enum DiagnosticVmaKind {
         file_offset: u64,
         file_size: u64,
     },
+    InterpreterLoad {
+        path: Vec<u8>,
+        program_header_index: u16,
+        file_offset: u64,
+        file_size: u64,
+    },
     Stack,
 }
 
 impl DiagnosticVmaKind {
     #[must_use]
-    pub const fn from_guest_kind(kind: &ElfGuestVmaKind) -> Self {
+    pub fn from_guest_kind(kind: &ElfGuestVmaKind) -> Self {
         match kind {
             ElfGuestVmaKind::ElfLoad {
                 program_header_index,
                 file_offset,
                 file_size,
             } => Self::ElfLoad {
+                program_header_index: *program_header_index,
+                file_offset: *file_offset,
+                file_size: *file_size,
+            },
+            ElfGuestVmaKind::InterpreterLoad {
+                path,
+                program_header_index,
+                file_offset,
+                file_size,
+            } => Self::InterpreterLoad {
+                path: path.clone(),
                 program_header_index: *program_header_index,
                 file_offset: *file_offset,
                 file_size: *file_size,
