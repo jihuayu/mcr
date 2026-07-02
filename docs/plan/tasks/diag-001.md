@@ -1,7 +1,7 @@
 ---
 id: diag-001
 scope: diagnostics
-status: pending
+status: in-progress
 depends-on: [sys-001, elf-002, jit-001]
 ---
 
