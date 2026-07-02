@@ -235,6 +235,11 @@ pub struct GuestRegisters {
     pub rflags: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestFlags {
+    zero: bool,
+}
+
 impl GuestRegisters {
     #[must_use]
     pub const fn syscall_registers(self) -> SyscallRegisters {
@@ -415,6 +420,7 @@ impl SameIsaExecutionCore {
         const MAX_CONTROL_FLOW_STEPS: usize = 32;
 
         let mut current_rip = block.rip();
+        let mut flags = GuestFlags::from_registers(registers);
         for _ in 0..MAX_CONTROL_FLOW_STEPS {
             let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
             let syscall_site = decoded.syscall_site();
@@ -428,7 +434,13 @@ impl SameIsaExecutionCore {
                 ) {
                     break;
                 }
-                execute_simple_instruction(block, registers, instruction.rip, instruction.len)?;
+                execute_simple_instruction(
+                    block,
+                    registers,
+                    &mut flags,
+                    instruction.rip,
+                    instruction.len,
+                )?;
             }
 
             if let Some(site) = decoded.syscall_site() {
@@ -437,7 +449,7 @@ impl SameIsaExecutionCore {
                 return Ok(decoded);
             }
 
-            if let Some(target) = direct_unconditional_branch_target(block, &decoded)? {
+            if let Some(target) = control_flow_target(block, &decoded, flags)? {
                 current_rip = target;
                 registers.rip = target;
                 continue;
@@ -463,6 +475,7 @@ impl Default for SameIsaExecutionCore {
 fn execute_simple_instruction(
     block: GuestBlock<'_>,
     registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
     rip: u64,
     len: usize,
 ) -> Result<(), ExecutionError> {
@@ -501,11 +514,20 @@ fn execute_simple_instruction(
                 instruction.immediate32(),
             )?;
         }
-        Code::Xor_r64_rm64 | Code::Xor_r32_rm32
+        Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32
             if instruction.op1_kind() == OpKind::Register
                 && instruction.op0_register() == instruction.op1_register() =>
         {
             write_reg64(registers, instruction.op0_register(), 0)?;
+            flags.zero = true;
+        }
+        Code::Test_rm32_r32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            flags.zero = lhs & rhs == 0;
         }
         Code::Nopd | Code::Nopq => {}
         _ => {
@@ -519,6 +541,16 @@ fn execute_simple_instruction(
     }
     registers.rip = rip + len as u64;
     Ok(())
+}
+
+impl GuestFlags {
+    const RFLAGS_ZERO: u64 = 1 << 6;
+
+    const fn from_registers(registers: &GuestRegisters) -> Self {
+        Self {
+            zero: registers.rflags & Self::RFLAGS_ZERO != 0,
+        }
+    }
 }
 
 fn block_from_rip(block: GuestBlock<'_>, rip: u64) -> Result<GuestBlock<'_>, ExecutionError> {
@@ -549,17 +581,20 @@ fn block_offset(block: GuestBlock<'_>, rip: u64) -> Result<usize, ExecutionError
     Ok(offset)
 }
 
-fn direct_unconditional_branch_target(
+fn control_flow_target(
     block: GuestBlock<'_>,
     decoded: &DecodedBlock,
+    flags: GuestFlags,
 ) -> Result<Option<u64>, ExecutionError> {
-    let BlockTerminator::ControlFlow {
-        flow: DecodedFlowControl::UnconditionalBranch,
-        ..
-    } = decoded.terminator()
-    else {
+    let BlockTerminator::ControlFlow { flow, .. } = decoded.terminator() else {
         return Ok(None);
     };
+    if !matches!(
+        flow,
+        DecodedFlowControl::UnconditionalBranch | DecodedFlowControl::ConditionalBranch
+    ) {
+        return Ok(None);
+    }
     let Some(instruction) = decoded.instructions().last() else {
         return Err(ExecutionError::MissingSyscall {
             terminator: *decoded.terminator(),
@@ -580,6 +615,9 @@ fn direct_unconditional_branch_target(
         DecoderOptions::NONE,
     );
     let instruction = decoder.decode();
+    if !branch_taken(&instruction, flags)? {
+        return Ok(Some(instruction.next_ip()));
+    }
     if !matches!(
         instruction.op0_kind(),
         OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
@@ -591,6 +629,48 @@ fn direct_unconditional_branch_target(
     let target = instruction.near_branch_target();
     block_offset(block, target)?;
     Ok(Some(target))
+}
+
+fn branch_taken(instruction: &Instruction, flags: GuestFlags) -> Result<bool, ExecutionError> {
+    match instruction.code() {
+        Code::Jmp_rel8_64 | Code::Jmp_rel32_64 => Ok(true),
+        Code::Je_rel8_64 | Code::Je_rel32_64 => Ok(flags.zero),
+        Code::Jne_rel8_64 | Code::Jne_rel32_64 => Ok(!flags.zero),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::ControlFlow {
+                rip: instruction.ip(),
+                flow: decoded_flow_control(instruction.flow_control())
+                    .unwrap_or(DecodedFlowControl::Exception),
+            },
+        }),
+    }
+}
+
+fn read_reg32(registers: &GuestRegisters, register: Register) -> Result<u32, ExecutionError> {
+    let value = match register {
+        Register::RAX | Register::EAX => registers.rax,
+        Register::RBX | Register::EBX => registers.rbx,
+        Register::RCX | Register::ECX => registers.rcx,
+        Register::RDX | Register::EDX => registers.rdx,
+        Register::RSI | Register::ESI => registers.rsi,
+        Register::RDI | Register::EDI => registers.rdi,
+        Register::RBP | Register::EBP => registers.rbp,
+        Register::RSP | Register::ESP => registers.rsp,
+        Register::R8 | Register::R8D => registers.r8,
+        Register::R9 | Register::R9D => registers.r9,
+        Register::R10 | Register::R10D => registers.r10,
+        Register::R11 | Register::R11D => registers.r11,
+        Register::R12 | Register::R12D => registers.r12,
+        Register::R13 | Register::R13D => registers.r13,
+        Register::R14 | Register::R14D => registers.r14,
+        Register::R15 | Register::R15D => registers.r15,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    };
+    Ok(value as u32)
 }
 
 fn write_reg32(
@@ -846,6 +926,74 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x430012);
+    }
+
+    #[test]
+    fn execution_core_follows_zero_flag_conditional_branch_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0x31, 0xc0, // xor eax,eax
+                0x85, 0xc0, // test eax,eax
+                0x74, 0x07, // je +7
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x90, 0x90, // skipped nops
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x440000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind conditional jump");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x440014);
+    }
+
+    #[test]
+    fn execution_core_falls_through_untaken_conditional_branch_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+                0x85, 0xc0, // test eax,eax
+                0x74, 0x07, // je +7, not taken
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // syscall
+            ],
+            0x450000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall after untaken conditional jump");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x450010);
     }
 
     #[test]
