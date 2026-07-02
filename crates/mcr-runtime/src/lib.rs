@@ -2227,6 +2227,7 @@ fn gpr_from_registers(value: GuestRegisters) -> GprState {
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
     files: RuntimeFileSystem<GuestMemory>,
+    process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
     futexes: FutexRegistry,
     epolls: EpollRegistry,
 }
@@ -2252,6 +2253,7 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
+            process_memory: BTreeMap::new(),
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
         })
@@ -2274,6 +2276,7 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
+            process_memory: BTreeMap::new(),
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
         })
@@ -2306,6 +2309,24 @@ impl RuntimeSubsystems {
     #[must_use]
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
         self.files.memory_mut()
+    }
+
+    #[must_use]
+    pub fn memory_for_process(&self, pid: mcr_sys::GuestPid) -> Option<&GuestMemory> {
+        if pid == mcr_task::INITIAL_GUEST_PID {
+            Some(self.files.memory())
+        } else {
+            self.process_memory.get(&pid)
+        }
+    }
+
+    #[must_use]
+    pub fn memory_for_process_mut(&mut self, pid: mcr_sys::GuestPid) -> Option<&mut GuestMemory> {
+        if pid == mcr_task::INITIAL_GUEST_PID {
+            Some(self.files.memory_mut())
+        } else {
+            self.process_memory.get_mut(&pid)
+        }
     }
 
     #[must_use]
@@ -2397,13 +2418,18 @@ impl RuntimeSubsystems {
             .map_err(|error| error.linux_errno())?;
         self.files.vfs_mut().fds_mut().close_on_exec();
         sync_proc_self(self.files.vfs_mut(), &self.tasks);
-        self.replace_memory_from_current_image()
+        self.replace_memory_from_image(request.context.pid)
     }
 
-    fn replace_memory_from_current_image(&mut self) -> Result<(), LinuxErrno> {
-        let memory =
-            GuestMemory::from_image(self.current_image()).map_err(|error| error.errno())?;
-        *self.files.memory_mut() = memory;
+    fn replace_memory_from_image(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        let image = self
+            .tasks
+            .process(pid)
+            .ok_or(LinuxErrno::ESRCH)?
+            .image()
+            .memory();
+        let memory = GuestMemory::from_image(image).map_err(|error| error.errno())?;
+        *self.memory_for_process_mut(pid).ok_or(LinuxErrno::ESRCH)? = memory;
         Ok(())
     }
 
