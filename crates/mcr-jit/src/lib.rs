@@ -1,6 +1,8 @@
 use core::fmt;
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 use mcr_sys::{
     GuestContext, GuestPid, GuestTid, SyscallDispatcher, SyscallRegisters, SyscallSubsystems,
     SyscallTracer,
@@ -411,6 +413,13 @@ impl SameIsaExecutionCore {
         T: GuestSyscallDispatcher,
     {
         let decoded = self.decode_block(block)?;
+        let syscall_site = decoded.syscall_site();
+        for instruction in decoded.instructions() {
+            if Some(instruction.rip) == syscall_site.map(|site| site.rip) {
+                break;
+            }
+            execute_simple_instruction(block, registers, instruction.rip, instruction.len)?;
+        }
         let Some(site) = decoded.syscall_site() else {
             return Err(ExecutionError::MissingSyscall {
                 terminator: *decoded.terminator(),
@@ -428,6 +437,106 @@ impl Default for SameIsaExecutionCore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn execute_simple_instruction(
+    block: GuestBlock<'_>,
+    registers: &mut GuestRegisters,
+    rip: u64,
+    len: usize,
+) -> Result<(), ExecutionError> {
+    let offset = usize::try_from(rip.saturating_sub(block.rip())).map_err(|_| {
+        ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip },
+        }
+    })?;
+    let bytes = block
+        .bytes()
+        .get(offset..offset + len)
+        .ok_or(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip },
+        })?;
+    let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    match instruction.code() {
+        Code::Mov_r64_imm64 => {
+            write_reg64(
+                registers,
+                instruction.op0_register(),
+                instruction.immediate64(),
+            )?;
+        }
+        Code::Mov_rm64_imm32 if instruction.op0_kind() == OpKind::Register => {
+            write_reg64(
+                registers,
+                instruction.op0_register(),
+                instruction.immediate32to64() as u64,
+            )?;
+        }
+        Code::Mov_r32_imm32 => {
+            write_reg32(
+                registers,
+                instruction.op0_register(),
+                instruction.immediate32(),
+            )?;
+        }
+        Code::Xor_r64_rm64 | Code::Xor_r32_rm32
+            if instruction.op1_kind() == OpKind::Register
+                && instruction.op0_register() == instruction.op1_register() =>
+        {
+            write_reg64(registers, instruction.op0_register(), 0)?;
+        }
+        Code::Nopd | Code::Nopq => {}
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::ControlFlow {
+                    rip,
+                    flow: DecodedFlowControl::Exception,
+                },
+            });
+        }
+    }
+    registers.rip = rip + len as u64;
+    Ok(())
+}
+
+fn write_reg32(
+    registers: &mut GuestRegisters,
+    register: Register,
+    value: u32,
+) -> Result<(), ExecutionError> {
+    write_reg64(registers, register, u64::from(value))
+}
+
+fn write_reg64(
+    registers: &mut GuestRegisters,
+    register: Register,
+    value: u64,
+) -> Result<(), ExecutionError> {
+    match register {
+        Register::RAX | Register::EAX => registers.rax = value,
+        Register::RBX | Register::EBX => registers.rbx = value,
+        Register::RCX | Register::ECX => registers.rcx = value,
+        Register::RDX | Register::EDX => registers.rdx = value,
+        Register::RSI | Register::ESI => registers.rsi = value,
+        Register::RDI | Register::EDI => registers.rdi = value,
+        Register::RBP | Register::EBP => registers.rbp = value,
+        Register::RSP | Register::ESP => registers.rsp = value,
+        Register::R8 | Register::R8D => registers.r8 = value,
+        Register::R9 | Register::R9D => registers.r9 = value,
+        Register::R10 | Register::R10D => registers.r10 = value,
+        Register::R11 | Register::R11D => registers.r11 = value,
+        Register::R12 | Register::R12D => registers.r12 = value,
+        Register::R13 | Register::R13D => registers.r13 = value,
+        Register::R14 | Register::R14D => registers.r14 = value,
+        Register::R15 | Register::R15D => registers.r15 = value,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

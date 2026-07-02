@@ -35,7 +35,8 @@ use mcr_sys::{
     SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{
-    GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_TID, TaskError, TaskState,
+    ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_PID,
+    INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, ProcSelfData,
@@ -1729,6 +1730,10 @@ impl Runtime {
         dispatch_guest_execution_with_dispatcher(&mut self.dispatcher)
     }
 
+    pub fn run_guest_until_exit(&mut self) -> Result<i32, GuestRunError> {
+        run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
+    }
+
     pub fn into_kernel(self) -> GuestKernel {
         self.dispatcher.into_parts().0.tasks
     }
@@ -1778,6 +1783,10 @@ where
 
     pub fn dispatch_guest_execution(&mut self) -> Result<GuestExecutionStep, GuestExecutionError> {
         dispatch_guest_execution_with_dispatcher(&mut self.dispatcher)
+    }
+
+    pub fn run_guest_until_exit(&mut self) -> Result<i32, GuestRunError> {
+        run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
     }
 
     pub fn into_parts(self) -> (GuestKernel, T) {
@@ -1874,6 +1883,105 @@ impl From<GuestMemoryError> for GuestExecutionError {
 impl From<ExecutionError> for GuestExecutionError {
     fn from(value: ExecutionError) -> Self {
         Self::Execution(value)
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestRunError {
+    MissingInitialProcess,
+    MissingInitialTask,
+    InitialTaskNotRunnable {
+        tid: mcr_sys::GuestTid,
+        state: TaskState,
+    },
+    GuestExecution(GuestExecutionError),
+}
+
+impl GuestRunError {
+    #[must_use]
+    pub const fn linux_errno(&self) -> LinuxErrno {
+        match self {
+            Self::MissingInitialProcess
+            | Self::MissingInitialTask
+            | Self::InitialTaskNotRunnable { .. } => LinuxErrno::ESRCH,
+            Self::GuestExecution(error) => error.linux_errno(),
+        }
+    }
+}
+
+impl fmt::Display for GuestRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingInitialProcess => write!(formatter, "initial guest process is missing"),
+            Self::MissingInitialTask => write!(formatter, "initial guest task is missing"),
+            Self::InitialTaskNotRunnable { tid, state } => {
+                write!(
+                    formatter,
+                    "initial guest task {tid} is not runnable: {state:?}"
+                )
+            }
+            Self::GuestExecution(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for GuestRunError {}
+
+impl GuestExecutionError {
+    #[must_use]
+    pub const fn linux_errno(&self) -> LinuxErrno {
+        match self {
+            Self::MissingInitialTask | Self::TaskExited { .. } => LinuxErrno::ESRCH,
+            Self::Memory(error) => error.errno(),
+            Self::Execution(_) => LinuxErrno::ENOEXEC,
+        }
+    }
+}
+
+impl From<GuestExecutionError> for GuestRunError {
+    fn from(value: GuestExecutionError) -> Self {
+        Self::GuestExecution(value)
+    }
+}
+
+fn run_guest_until_exit_with_dispatcher<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+) -> Result<i32, GuestRunError>
+where
+    T: SyscallTracer,
+{
+    loop {
+        if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
+            return Ok(status);
+        }
+        ensure_initial_task_runnable(&dispatcher.subsystems().tasks)?;
+        dispatch_guest_execution_with_dispatcher(dispatcher)?;
+    }
+}
+
+fn initial_process_exit_status(kernel: &GuestKernel) -> Result<Option<i32>, GuestRunError> {
+    let process = kernel
+        .process(INITIAL_GUEST_PID)
+        .ok_or(GuestRunError::MissingInitialProcess)?;
+    match process.exit_state() {
+        ExitState::Running => Ok(None),
+        ExitState::Exited { status } => Ok(Some(status)),
+    }
+}
+
+fn ensure_initial_task_runnable(kernel: &GuestKernel) -> Result<(), GuestRunError> {
+    let task = kernel
+        .task(INITIAL_GUEST_TID)
+        .ok_or(GuestRunError::MissingInitialTask)?;
+    if task.pid() != INITIAL_GUEST_PID {
+        return Err(GuestRunError::MissingInitialTask);
+    }
+    match task.state() {
+        TaskState::Runnable => Ok(()),
+        state => Err(GuestRunError::InitialTaskNotRunnable {
+            tid: task.tid(),
+            state,
+        }),
     }
 }
 
@@ -4136,6 +4244,158 @@ mod tests {
     }
 
     #[test]
+    fn guest_run_loop_returns_exit_group_status() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(
+            &mut runtime,
+            0x401000,
+            Syscall::ExitGroup,
+            [42, 0, 0, 0, 0, 0],
+        );
+
+        let status = runtime
+            .run_guest_until_exit()
+            .expect("guest run exits through exit_group");
+
+        assert_eq!(status, 42);
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .exit_state(),
+            ExitState::Exited { status: 42 }
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .regs()
+                .rip(),
+            0x401002
+        );
+    }
+
+    #[test]
+    fn guest_run_loop_returns_exit_status_from_exit_syscall() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(&mut runtime, 0x401000, Syscall::Exit, [300, 0, 0, 0, 0, 0]);
+
+        let status = runtime
+            .run_guest_until_exit()
+            .expect("guest run exits through exit");
+
+        assert_eq!(status, 44);
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Exited { status: 44 }
+        );
+    }
+
+    #[test]
+    fn guest_run_loop_returns_existing_exit_status() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let exit = runtime.dispatch_syscall(context(Syscall::ExitGroup, [9, 0, 0, 0, 0, 0]));
+        assert_eq!(exit.result, SyscallReturn::Success(0));
+
+        let status = runtime
+            .run_guest_until_exit()
+            .expect("guest run returns already exited process status");
+
+        assert_eq!(status, 9);
+    }
+
+    #[test]
+    fn guest_run_loop_surfaces_guest_execution_error() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0xc3, // ret
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(&mut runtime, 0x401000, Syscall::ExitGroup, [0; 6]);
+
+        let error = runtime
+            .run_guest_until_exit()
+            .expect_err("guest run should stop on a block without syscall");
+
+        assert_eq!(error.linux_errno(), LinuxErrno::ENOEXEC);
+        assert!(matches!(
+            error,
+            GuestRunError::GuestExecution(GuestExecutionError::Execution(
+                ExecutionError::MissingSyscall { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn guest_run_errors_expose_linux_errno_shapes() {
+        assert_eq!(
+            GuestRunError::MissingInitialProcess.linux_errno(),
+            LinuxErrno::ESRCH
+        );
+        assert_eq!(
+            GuestRunError::MissingInitialTask.linux_errno(),
+            LinuxErrno::ESRCH
+        );
+        assert_eq!(
+            GuestRunError::InitialTaskNotRunnable {
+                tid: INITIAL_GUEST_TID,
+                state: TaskState::Exited { status: 1 },
+            }
+            .linux_errno(),
+            LinuxErrno::ESRCH
+        );
+        assert_eq!(
+            GuestRunError::GuestExecution(GuestExecutionError::Memory(GuestMemoryError::NotMapped))
+                .linux_errno(),
+            LinuxErrno::ENOMEM
+        );
+    }
+
+    #[test]
+    fn guest_run_loop_surfaces_guest_memory_error() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(&mut runtime, 0x402000, Syscall::ExitGroup, [0; 6]);
+
+        let error = runtime
+            .run_guest_until_exit()
+            .expect_err("guest run should stop on non-executable rip");
+
+        assert_eq!(error.linux_errno(), LinuxErrno::EACCES);
+        assert!(matches!(
+            error,
+            GuestRunError::GuestExecution(GuestExecutionError::Memory(
+                GuestMemoryError::AccessDenied
+            ))
+        ));
+    }
+
+    #[test]
     fn runtime_dispatches_fork_child_exit_and_wait4() {
         let mut runtime = Runtime::new(test_program("/bin/parent", 0x401000)).unwrap();
 
@@ -4491,6 +4751,25 @@ mod tests {
                 rip: 0x401234,
             },
         )
+    }
+
+    fn set_initial_syscall_regs(runtime: &mut Runtime, rip: u64, syscall: Syscall, args: [u64; 6]) {
+        let rsp = runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .regs()
+            .rsp();
+        runtime
+            .kernel_mut()
+            .task_mut(INITIAL_GUEST_TID)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                rip,
+                rsp,
+                syscall.number().raw(),
+                args,
+            ));
     }
 
     fn test_program(path: &str, entrypoint: u64) -> GuestProgram {
