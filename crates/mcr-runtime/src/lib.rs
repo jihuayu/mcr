@@ -43,8 +43,8 @@ use mcr_task::{
     INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, LinuxFileAttr, OpenFlags,
-    ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
+    LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -1191,16 +1191,24 @@ where
 
     fn sys_close(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let fd = arg_i32(request, 0);
-        let socket_id = match self.vfs.socket_id_for_fd(fd) {
-            Ok(raw) => SocketId::new(raw),
-            Err(VfsError::NotSocket) => None,
-            Err(error) => return Err(vfs_errno(error)),
-        };
-        self.vfs.close_with_file(fd).map_err(vfs_errno)?;
-        if let Some(socket_id) = socket_id {
-            self.sockets.close(socket_id).map_err(net_errno)?;
-        }
+        let file = self.vfs.close_with_file(fd).map_err(vfs_errno)?;
+        self.close_unshared_file_resources(&file)?;
         Ok(0)
+    }
+
+    fn close_unshared_file_resources(&mut self, file: &FileRef) -> Result<(), LinuxErrno> {
+        if file.kind() == FileKind::Socket {
+            let socket_id = match file.inode().backend() {
+                mcr_vfs::InodeBackend::Socket(socket) => SocketId::new(socket.id()),
+                _ => None,
+            };
+            if let Some(socket_id) = socket_id
+                && self.vfs.socket_fd_count(socket_id.get()) == 0
+            {
+                self.sockets.close(socket_id).map_err(net_errno)?;
+            }
+        }
+        Ok(())
     }
 
     fn sys_lseek(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -2346,6 +2354,8 @@ pub struct RuntimeSubsystems {
     files: RuntimeFileSystem<GuestMemory>,
     process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
     selected_memory_pid: mcr_sys::GuestPid,
+    process_fds: BTreeMap<mcr_sys::GuestPid, FdTable>,
+    selected_fds_pid: mcr_sys::GuestPid,
     futexes: FutexRegistry,
     epolls: EpollRegistry,
 }
@@ -2373,6 +2383,8 @@ impl RuntimeSubsystems {
             files: RuntimeFileSystem::new(vfs, memory),
             process_memory: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
+            process_fds: BTreeMap::new(),
+            selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
         })
@@ -2397,6 +2409,8 @@ impl RuntimeSubsystems {
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
             process_memory: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
+            process_fds: BTreeMap::new(),
+            selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
         })
@@ -2465,22 +2479,17 @@ impl RuntimeSubsystems {
 impl FileSyscalls for RuntimeSubsystems {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let epoll_id = if matches!(request.syscall, mcr_sys::Syscall::Close) {
-            match self.files.vfs().epoll_id_for_fd(arg_i32(request, 0)) {
-                Ok(id) => Some(id),
-                Err(VfsError::BadFd) => None,
-                Err(_) => None,
-            }
+        let outcome = if matches!(request.syscall, mcr_sys::Syscall::Close) {
+            outcome(self.close_process_fd(arg_i32(request, 0)))
         } else {
-            None
+            self.files.dispatch_file(request)
         };
-        let outcome = self.files.dispatch_file(request);
         if matches!(outcome.result, SyscallReturn::Success(_)) {
-            if let Some(epoll_id) = epoll_id {
-                self.epolls.close(epoll_id);
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
             }
             if let Err(errno) = self.store_selected_process_memory(pid) {
                 return SyscallOutcome::errno(errno);
@@ -2508,14 +2517,17 @@ impl TimeSyscalls for RuntimeSubsystems {}
 impl NetworkSyscalls for RuntimeSubsystems {
     fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         let outcome = self.files.dispatch_network(request);
-        if matches!(outcome.result, SyscallReturn::Success(_))
-            && let Err(errno) = self.store_selected_process_memory(pid)
-        {
-            return SyscallOutcome::errno(errno);
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
         }
         outcome
     }
@@ -2547,6 +2559,11 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
 }
 
 impl RuntimeSubsystems {
+    fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        self.select_memory_for_process(pid)?;
+        self.select_fds_for_process(pid)
+    }
+
     fn select_memory_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         if pid == self.selected_memory_pid {
             return Ok(());
@@ -2576,6 +2593,183 @@ impl RuntimeSubsystems {
         Ok(())
     }
 
+    fn select_fds_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        if pid == self.selected_fds_pid {
+            return Ok(());
+        }
+        if self.tasks.process(self.selected_fds_pid).is_some() {
+            let selected = self.files.vfs().fds().clone();
+            self.process_fds.insert(self.selected_fds_pid, selected);
+        }
+        let fds = self.process_fds.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+        self.files.vfs_mut().replace_fds(fds);
+        self.selected_fds_pid = pid;
+        Ok(())
+    }
+
+    fn store_selected_process_fds(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        if pid != self.selected_fds_pid {
+            return Err(LinuxErrno::ESRCH);
+        }
+        if self.tasks.process(pid).is_none() {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn drop_process_fds(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        if pid == self.selected_fds_pid {
+            if pid != mcr_task::INITIAL_GUEST_PID {
+                let fds = self
+                    .process_fds
+                    .remove(&mcr_task::INITIAL_GUEST_PID)
+                    .ok_or(LinuxErrno::ESRCH)?;
+                self.files.vfs_mut().replace_fds(fds);
+                self.selected_fds_pid = mcr_task::INITIAL_GUEST_PID;
+            }
+        } else {
+            self.process_fds.remove(&pid);
+        }
+        Ok(())
+    }
+
+    fn drop_process_resources(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        self.close_unshared_process_sockets(pid)?;
+        self.drop_process_memory(pid)?;
+        self.drop_process_fds(pid)
+    }
+
+    fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        let Some((socket_ids, epoll_ids)) = self.fd_table_for_process(pid).map(|fds| {
+            (
+                fds.socket_ids()
+                    .filter_map(SocketId::new)
+                    .collect::<Vec<_>>(),
+                fds.epoll_ids().collect::<Vec<_>>(),
+            )
+        }) else {
+            return Ok(());
+        };
+        for socket_id in socket_ids {
+            if self.socket_fd_ref_count_excluding_current(pid, socket_id) == 0 {
+                self.files
+                    .sockets_mut()
+                    .close(socket_id)
+                    .map_err(net_errno)?;
+            }
+        }
+        for epoll_id in epoll_ids {
+            if self.epoll_fd_ref_count_excluding_current(pid, epoll_id) == 0 {
+                self.epolls.close(epoll_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_process_fd(&mut self, fd: Fd) -> Result<u64, LinuxErrno> {
+        let file = self
+            .files
+            .vfs_mut()
+            .close_with_file(fd)
+            .map_err(vfs_errno)?;
+        self.close_unshared_process_file_resources(&file)?;
+        Ok(0)
+    }
+
+    fn close_unshared_process_file_resources(&mut self, file: &FileRef) -> Result<(), LinuxErrno> {
+        match file.kind() {
+            FileKind::Socket => {
+                let socket_id = match file.inode().backend() {
+                    mcr_vfs::InodeBackend::Socket(socket) => SocketId::new(socket.id()),
+                    _ => None,
+                };
+                if let Some(socket_id) = socket_id
+                    && self.socket_fd_ref_count_excluding_current(self.selected_fds_pid, socket_id)
+                        + self.files.vfs().socket_fd_count(socket_id.get())
+                        == 0
+                {
+                    self.files
+                        .sockets_mut()
+                        .close(socket_id)
+                        .map_err(net_errno)?;
+                }
+            }
+            FileKind::Epoll => {
+                let epoll_id = match file.inode().backend() {
+                    mcr_vfs::InodeBackend::Epoll(epoll) => Some(epoll.id()),
+                    _ => None,
+                };
+                if let Some(epoll_id) = epoll_id
+                    && self.epoll_fd_ref_count_excluding_current(self.selected_fds_pid, epoll_id)
+                        + self.files.vfs().epoll_fd_count(epoll_id)
+                        == 0
+                {
+                    self.epolls.close(epoll_id);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn fd_table_for_process(&self, pid: mcr_sys::GuestPid) -> Option<&FdTable> {
+        if pid == self.selected_fds_pid {
+            Some(self.files.vfs().fds())
+        } else {
+            self.process_fds.get(&pid)
+        }
+    }
+
+    fn socket_fd_ref_count_excluding_current(
+        &self,
+        excluded_pid: mcr_sys::GuestPid,
+        socket_id: SocketId,
+    ) -> usize {
+        let selected_count = if self.selected_fds_pid != excluded_pid {
+            self.files
+                .vfs()
+                .socket_ids()
+                .filter(|raw| *raw == socket_id.get())
+                .count()
+        } else {
+            0
+        };
+        selected_count
+            + self
+                .process_fds
+                .iter()
+                .filter(|(pid, _)| **pid != excluded_pid)
+                .map(|(_, fds)| {
+                    fds.socket_ids()
+                        .filter(|raw| *raw == socket_id.get())
+                        .count()
+                })
+                .sum::<usize>()
+    }
+
+    fn epoll_fd_ref_count_excluding_current(
+        &self,
+        excluded_pid: mcr_sys::GuestPid,
+        epoll_id: u64,
+    ) -> usize {
+        let selected_count = if self.selected_fds_pid != excluded_pid {
+            self.files
+                .vfs()
+                .epoll_ids()
+                .filter(|raw| *raw == epoll_id)
+                .count()
+        } else {
+            0
+        };
+        selected_count
+            + self
+                .process_fds
+                .iter()
+                .filter(|(pid, _)| **pid != excluded_pid)
+                .map(|(_, fds)| fds.epoll_ids().filter(|raw| *raw == epoll_id).count())
+                .sum::<usize>()
+    }
+
     fn drop_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         if pid == self.selected_memory_pid {
             if pid != mcr_task::INITIAL_GUEST_PID {
@@ -2594,7 +2788,7 @@ impl RuntimeSubsystems {
 
     fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         let outcome = self.tasks.dispatch_for_current_task(request);
@@ -2603,7 +2797,7 @@ impl RuntimeSubsystems {
         }
         match request.syscall {
             mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup => {
-                if let Err(errno) = self.drop_process_memory(pid) {
+                if let Err(errno) = self.drop_process_resources(pid) {
                     return SyscallOutcome::errno(errno);
                 }
             }
@@ -2613,7 +2807,7 @@ impl RuntimeSubsystems {
                     {
                         return SyscallOutcome::errno(errno);
                     }
-                    if let Err(errno) = self.drop_process_memory(child_pid) {
+                    if let Err(errno) = self.drop_process_resources(child_pid) {
                         return SyscallOutcome::errno(errno);
                     }
                 }
@@ -2627,7 +2821,7 @@ impl RuntimeSubsystems {
         let completed = self.tasks.resume_waiting_tasks();
         for wait in &completed {
             self.write_wait_status(*wait)?;
-            self.drop_process_memory(wait.waited().pid())?;
+            self.drop_process_resources(wait.waited().pid())?;
         }
         Ok(completed)
     }
@@ -2670,7 +2864,7 @@ impl RuntimeSubsystems {
 
     fn dispatch_fork_like(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         let outcome = self.tasks.dispatch_for_current_task(request);
@@ -2683,6 +2877,8 @@ impl RuntimeSubsystems {
         match self.files.memory().try_clone_runtime() {
             Ok(memory) => {
                 self.process_memory.insert(child_pid, memory);
+                self.process_fds
+                    .insert(child_pid, self.files.vfs().fds().clone());
                 outcome
             }
             Err(error) => {
@@ -2705,7 +2901,7 @@ impl RuntimeSubsystems {
     }
 
     fn execve(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
-        self.select_memory_for_process(request.context.pid)?;
+        self.select_process_context(request.context.pid)?;
         let filename = read_guest_c_bytes(self.files.memory(), arg(request, 0))?;
         let argv = self.files.read_guest_vector(arg(request, 1))?;
         let envp = self.files.read_guest_vector(arg(request, 2))?;
@@ -2713,9 +2909,33 @@ impl RuntimeSubsystems {
         self.tasks
             .exec_task(request.context.tid, program)
             .map_err(|error| error.linux_errno())?;
-        self.files.vfs_mut().fds_mut().close_on_exec();
+        let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
+        for socket_id in closed_fd_ids
+            .socket_ids
+            .into_iter()
+            .filter_map(SocketId::new)
+        {
+            if self.socket_fd_ref_count_excluding_current(request.context.pid, socket_id)
+                + self.files.vfs().socket_fd_count(socket_id.get())
+                == 0
+            {
+                self.files
+                    .sockets_mut()
+                    .close(socket_id)
+                    .map_err(net_errno)?;
+            }
+        }
+        for epoll_id in closed_fd_ids.epoll_ids {
+            if self.epoll_fd_ref_count_excluding_current(request.context.pid, epoll_id)
+                + self.files.vfs().epoll_fd_count(epoll_id)
+                == 0
+            {
+                self.epolls.close(epoll_id);
+            }
+        }
         sync_proc_self(self.files.vfs_mut(), &self.tasks);
         self.replace_memory_from_image(request.context.pid)?;
+        self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
     }
 
@@ -2782,7 +3002,7 @@ impl RuntimeSubsystems {
 
     fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         let nfds = match usize_arg(request, 1) {
@@ -2794,17 +3014,20 @@ impl RuntimeSubsystems {
             Err(errno) => return SyscallOutcome::errno(errno),
         };
         let outcome = outcome(self.poll_fds(arg(request, 0), nfds, timeout));
-        if matches!(outcome.result, SyscallReturn::Success(_))
-            && let Err(errno) = self.store_selected_process_memory(pid)
-        {
-            return SyscallOutcome::errno(errno);
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
         }
         outcome
     }
 
     fn dispatch_ppoll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         if arg(request, 3) != 0 || arg(request, 4) != 0 {
@@ -2819,10 +3042,13 @@ impl RuntimeSubsystems {
             Err(errno) => return SyscallOutcome::errno(errno),
         };
         let outcome = outcome(self.poll_fds(arg(request, 0), nfds, timeout));
-        if matches!(outcome.result, SyscallReturn::Success(_))
-            && let Err(errno) = self.store_selected_process_memory(pid)
-        {
-            return SyscallOutcome::errno(errno);
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
         }
         outcome
     }
@@ -2885,12 +3111,22 @@ impl RuntimeSubsystems {
     }
 
     fn dispatch_epoll_create1(&mut self, request: &SyscallRequest) -> SyscallOutcome {
-        outcome(self.epoll_create1(arg_u32(request, 0)))
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.epoll_create1(arg_u32(request, 0)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_fds(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
     }
 
     fn dispatch_epoll_ctl(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         outcome(self.epoll_ctl(
@@ -2903,7 +3139,7 @@ impl RuntimeSubsystems {
 
     fn dispatch_epoll_wait(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
         let maxevents = match usize_arg(request, 2) {
@@ -2916,10 +3152,13 @@ impl RuntimeSubsystems {
         };
         let outcome =
             outcome(self.epoll_wait(arg_i32(request, 0), arg(request, 1), maxevents, timeout));
-        if matches!(outcome.result, SyscallReturn::Success(_))
-            && let Err(errno) = self.store_selected_process_memory(pid)
-        {
-            return SyscallOutcome::errno(errno);
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
         }
         outcome
     }
@@ -6296,6 +6535,132 @@ mod tests {
             .unwrap();
         assert_eq!(&parent_bytes, b"parent");
         assert_eq!(&child_bytes, b"child!");
+    }
+
+    #[test]
+    fn runtime_fork_child_dup2_close_does_not_mutate_parent_fds() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let parent_read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        let parent_write_fd = i32_from_memory(runtime.memory(), 0x402004);
+        assert_eq!(parent_read_fd, 3);
+        assert_eq!(parent_write_fd, 4);
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context_for(
+                    2,
+                    2,
+                    Syscall::Dup2,
+                    [parent_write_fd as u64, 7, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(7)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context_for(
+                    2,
+                    2,
+                    Syscall::Close,
+                    [parent_write_fd as u64, 0, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        runtime.memory_mut().write(0x402100, b"ok").unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Write,
+                    [parent_write_fd as u64, 0x402100, 2, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Read,
+                    [parent_read_fd as u64, 0x402200, 2, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(2)
+        );
+        let mut bytes = [0; 2];
+        runtime.memory().read(0x402200, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"ok");
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Close, [7, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EBADF)
+        );
+    }
+
+    #[test]
+    fn runtime_fork_child_close_shared_socket_keeps_parent_socket_open() {
+        let transport = runtime_socket_transport();
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        runtime.memory_mut().write(0x402000, b"ping").unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402100, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402100, SOCKADDR_IN_LEN as u64, 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context_for(2, 2, Syscall::Close, [3, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sendto, [3, 0x402000, 4, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(4)
+        );
     }
 
     #[test]
