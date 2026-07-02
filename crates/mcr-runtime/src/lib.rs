@@ -27,12 +27,12 @@ use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
     FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext, IoctlSyscallArgs,
     LINUX_AF_INET, LINUX_AF_INET6, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
-    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_MSG_NOSIGNAL, LinuxErrno, LinuxIovec, LinuxMsghdr,
-    LinuxStat, LinuxStatx, LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer,
-    Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs,
-    ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs,
-    SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn,
-    SyscallTraceEvent, SyscallTracer, TimeSyscalls,
+    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LinuxErrno,
+    LinuxIovec, LinuxMsghdr, LinuxStat, LinuxStatx, LinuxStatxTimestamp, MemorySyscalls,
+    NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
+    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
+    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
+    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{
     ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_PID,
@@ -804,21 +804,21 @@ where
             arg(request, 5),
         );
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        if args.sockaddr != 0 || args.addrlen != 0 {
-            return Err(net_errno(GuestSocketTable::unsupported_datagram_io(
-                SocketOperation::Send,
-            )));
-        }
         validate_socket_message_flags(args.flags, SocketOperation::Send)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
         self.memory
             .read_bytes(args.buf, &mut buffer)
             .map_err(memory_errno)?;
-        self.sockets
-            .send_connected(socket_id, &buffer)
-            .map(|count| count as u64)
-            .map_err(net_errno)
+        let count = if args.sockaddr != 0 || args.addrlen != 0 {
+            let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
+            let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
+            self.sockets.send_to(socket_id, &buffer, address)
+        } else {
+            self.sockets.send_connected(socket_id, &buffer)
+        }
+        .map_err(net_errno)?;
+        Ok(count as u64)
     }
 
     fn sys_recvfrom(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -831,18 +831,21 @@ where
             arg(request, 5),
         );
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        if args.sockaddr != 0 || args.addrlen != 0 {
-            return Err(net_errno(GuestSocketTable::unsupported_datagram_io(
-                SocketOperation::Recv,
-            )));
-        }
         validate_socket_message_flags(args.flags, SocketOperation::Recv)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
-        let count = self
-            .sockets
-            .recv_connected(socket_id, &mut buffer)
-            .map_err(net_errno)?;
+        let count = if args.sockaddr != 0 || args.addrlen != 0 {
+            let (count, address) = self
+                .sockets
+                .recv_from(socket_id, &mut buffer)
+                .map_err(net_errno)?;
+            write_optional_socket_address(&mut self.memory, args.sockaddr, args.addrlen, address)?;
+            count
+        } else {
+            self.sockets
+                .recv_connected(socket_id, &mut buffer)
+                .map_err(net_errno)?
+        };
         self.memory
             .write_bytes(args.buf, &buffer[..count])
             .map_err(memory_errno)?;
@@ -1431,7 +1434,7 @@ fn memory_errno(_error: GuestMemoryAccessError) -> LinuxErrno {
 }
 
 fn validate_socket_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
-    if flags & !LINUX_MSG_NOSIGNAL == 0 {
+    if flags & !(LINUX_MSG_NOSIGNAL | LINUX_MSG_DONTWAIT) == 0 {
         Ok(())
     } else {
         Err(net_errno(GuestSocketTable::unsupported_socket_flags(
@@ -1546,6 +1549,21 @@ fn write_socket_address(
     memory
         .write_bytes(addrlen_addr, &actual_len.to_le_bytes())
         .map_err(memory_errno)
+}
+
+fn write_optional_socket_address(
+    memory: &mut impl GuestMemoryAccess,
+    sockaddr: u64,
+    addrlen_addr: u64,
+    address: SocketAddress,
+) -> Result<(), LinuxErrno> {
+    if sockaddr == 0 {
+        return Ok(());
+    }
+    if addrlen_addr == 0 {
+        return Err(LinuxErrno::EFAULT);
+    }
+    write_socket_address(memory, sockaddr, addrlen_addr, address)
 }
 
 fn encode_socket_address(address: SocketAddress) -> Vec<u8> {
@@ -2511,8 +2529,8 @@ mod tests {
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_IPPROTO_TCP,
         LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR,
         LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
-        LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall,
-        SyscallRegisters, SyscallReturn, SyscallTraceEvent,
+        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+        LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -3309,6 +3327,70 @@ mod tests {
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
+    }
+
+    #[test]
+    fn datagram_sendto_and_recvfrom_move_guest_buffers_and_addresses() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"dns!");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(53));
+        runtime.memory_mut().write(0x2000, b"query");
+        runtime.memory_mut().write(0x2200, &[0xaa; SOCKADDR_IN_LEN]);
+        runtime
+            .memory_mut()
+            .write(0x2300, &(SOCKADDR_IN_LEN as u32).to_le_bytes());
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_DGRAM),
+                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Sendto,
+                [
+                    3,
+                    0x2000,
+                    5,
+                    u64::from(LINUX_MSG_DONTWAIT | LINUX_MSG_NOSIGNAL),
+                    0x1000,
+                    SOCKADDR_IN_LEN as u64,
+                ],
+            ),
+            SyscallReturn::Success(5)
+        );
+        assert_eq!(transport.sent_bytes(), b"query");
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Recvfrom,
+                [3, 0x2100, 8, u64::from(LINUX_MSG_DONTWAIT), 0x2200, 0x2300],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 4), b"dns!");
+        assert_eq!(u32_at(runtime.memory(), 0x2300), SOCKADDR_IN_LEN as u32);
+        assert_eq!(
+            runtime.memory().read(0x2200, SOCKADDR_IN_LEN),
+            ipv4_sockaddr(53)
+        );
     }
 
     #[test]
@@ -4136,12 +4218,34 @@ mod tests {
             Ok(buffer.len())
         }
 
+        fn send_to(
+            &mut self,
+            buffer: &[u8],
+            address: SocketAddress,
+        ) -> Result<usize, mcr_net::HostIoError> {
+            self.state.borrow_mut().connected = Some(address);
+            self.send(buffer)
+        }
+
         fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, mcr_net::HostIoError> {
             let mut state = self.state.borrow_mut();
             let count = buffer.len().min(state.incoming.len());
             buffer[..count].copy_from_slice(&state.incoming[..count]);
             state.incoming.drain(..count);
             Ok(count)
+        }
+
+        fn recv_from(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> Result<(usize, SocketAddress), mcr_net::HostIoError> {
+            let count = self.recv(buffer)?;
+            let address = self
+                .state
+                .borrow()
+                .connected
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((count, address))
         }
 
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), mcr_net::HostIoError> {

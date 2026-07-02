@@ -463,7 +463,9 @@ pub trait HostSocketTransport {
 pub trait HostSocketHandle: fmt::Debug {
     fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
+    fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
+    fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError>;
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
 }
 
@@ -494,7 +496,7 @@ impl HostSocketTransport for WinHostSocketTransport {
                 host_protocol_from_socket_protocol(spec.effective_protocol()),
             )
             .map_err(HostIoError::from)?;
-        apply_socket_options(&socket, options)?;
+        apply_socket_options(&socket, spec, options)?;
         if spec.flags.nonblocking {
             socket.set_nonblocking(true).map_err(HostIoError::from)?;
         }
@@ -522,8 +524,21 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket.send(buffer).map_err(HostIoError::from)
     }
 
+    fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
+        self.socket
+            .send_to(buffer, SocketAddr::from(address))
+            .map_err(HostIoError::from)
+    }
+
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
         self.socket.recv(buffer).map_err(HostIoError::from)
+    }
+
+    fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
+        self.socket
+            .recv_from(buffer)
+            .map(|(count, address)| (count, SocketAddress::from(address)))
+            .map_err(HostIoError::from)
     }
 
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError> {
@@ -982,6 +997,56 @@ impl GuestSocketTable {
         entry.handle.recv(buffer).map_err(SocketError::from_host)
     }
 
+    pub fn send_to(
+        &mut self,
+        id: SocketId,
+        buffer: &[u8],
+        address: SocketAddress,
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_address_domain(socket.domain, address)?;
+            validate_datagram_io(socket, SocketOperation::Send)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::Send,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::Send)?;
+        entry
+            .handle
+            .send_to(buffer, address)
+            .map_err(SocketError::from_host)
+    }
+
+    pub fn recv_from(
+        &mut self,
+        id: SocketId,
+        buffer: &mut [u8],
+    ) -> Result<(usize, SocketAddress), SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_datagram_io(socket, SocketOperation::Recv)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::Recv,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::Recv)?;
+        entry
+            .handle
+            .recv_from(buffer)
+            .map_err(SocketError::from_host)
+    }
+
     pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {
         let socket = self.socket(id)?;
         validate_connected_stream_io(socket, SocketOperation::Send)
@@ -1025,17 +1090,17 @@ impl GuestSocketTable {
         })
     }
 
-    fn connect_host_socket(
+    fn ensure_host_entry_mut(
         &mut self,
         id: SocketId,
-        address: SocketAddress,
-    ) -> Result<SocketAddress, SocketError> {
+        operation: SocketOperation,
+    ) -> Result<&mut HostSocketEntry, SocketError> {
         if !self.host_handles.contains_key(&id) {
             let spec = self.socket_spec(id)?;
             let options = self.socket(id)?.options();
             let transport = self.transport.as_ref().ok_or_else(|| {
                 SocketError::unsupported(
-                    SocketOperation::Connect,
+                    operation,
                     LinuxErrno::FunctionNotImplemented,
                     "host socket transport is not configured",
                 )
@@ -1045,8 +1110,15 @@ impl GuestSocketTable {
                 .map_err(SocketError::from_host)?;
             self.host_handles.insert(id, HostSocketEntry { handle });
         }
+        self.host_entry_mut(id, operation)
+    }
 
-        let entry = self.host_entry_mut(id, SocketOperation::Connect)?;
+    fn connect_host_socket(
+        &mut self,
+        id: SocketId,
+        address: SocketAddress,
+    ) -> Result<SocketAddress, SocketError> {
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::Connect)?;
         entry
             .handle
             .connect(address)
@@ -1347,7 +1419,36 @@ fn validate_connected_stream_io(
     }
 }
 
-fn apply_socket_options(socket: &HostSocket, options: SocketOptions) -> Result<(), HostIoError> {
+fn validate_datagram_io(
+    socket: &GuestSocket,
+    operation: SocketOperation,
+) -> Result<(), SocketError> {
+    if socket.socket_type != SocketType::Datagram
+        || socket.effective_protocol() != SocketProtocol::Udp
+    {
+        return Err(SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "only UDP datagram socket I/O is implemented",
+        ));
+    }
+
+    match socket.state {
+        SocketState::Created | SocketState::Bound(_) | SocketState::Connected(_) => Ok(()),
+        SocketState::Listening(_) => Err(SocketError::invalid_state(
+            operation,
+            LinuxErrno::InvalidArgument,
+            "listening socket cannot use datagram I/O",
+        )),
+        SocketState::Closed => Err(SocketError::BadSocket { id: socket.id }),
+    }
+}
+
+fn apply_socket_options(
+    socket: &HostSocket,
+    spec: SocketSpec,
+    options: SocketOptions,
+) -> Result<(), HostIoError> {
     socket
         .set_option(
             HostSocketOptionName::ReuseAddress,
@@ -1372,12 +1473,15 @@ fn apply_socket_options(socket: &HostSocket, options: SocketOptions) -> Result<(
             HostSocketOptionValue::Int(options.receive_buffer_size as i32),
         )
         .map_err(HostIoError::from)?;
-    socket
-        .set_option(
-            HostSocketOptionName::TcpNoDelay,
-            HostSocketOptionValue::Bool(options.tcp_no_delay),
-        )
-        .map_err(HostIoError::from)
+    if spec.effective_protocol() == SocketProtocol::Tcp {
+        socket
+            .set_option(
+                HostSocketOptionName::TcpNoDelay,
+                HostSocketOptionValue::Bool(options.tcp_no_delay),
+            )
+            .map_err(HostIoError::from)?;
+    }
+    Ok(())
 }
 
 const fn host_error_errno(kind: HostErrorKind) -> LinuxErrno {
@@ -1474,11 +1578,24 @@ mod tests {
             Ok(buffer.len())
         }
 
+        fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
+            self.connected = Some(address);
+            self.send(buffer)
+        }
+
         fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
             let count = buffer.len().min(self.incoming.len());
             buffer[..count].copy_from_slice(&self.incoming[..count]);
             self.incoming.drain(..count);
             Ok(count)
+        }
+
+        fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
+            let count = self.recv(buffer)?;
+            let address = self
+                .connected
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((count, address))
         }
 
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {

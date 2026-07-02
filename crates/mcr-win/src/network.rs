@@ -217,9 +217,19 @@ impl HostSocket {
         send_platform(self, buffer)
     }
 
+    /// Sends bytes to a remote datagram address.
+    pub fn send_to(&self, buffer: &[u8], address: SocketAddr) -> HostResult<usize> {
+        send_to_platform(self, buffer, address)
+    }
+
     /// Receives bytes from this socket.
     pub fn recv(&self, buffer: &mut [u8]) -> HostResult<usize> {
         recv_platform(self, buffer)
+    }
+
+    /// Receives bytes and the remote datagram address.
+    pub fn recv_from(&self, buffer: &mut [u8]) -> HostResult<(usize, SocketAddr)> {
+        recv_from_platform(self, buffer)
     }
 
     /// Sets host nonblocking mode.
@@ -316,7 +326,21 @@ fn send_platform(_socket: &HostSocket, _buffer: &[u8]) -> HostResult<usize> {
 }
 
 #[cfg(not(windows))]
+fn send_to_platform(
+    _socket: &HostSocket,
+    _buffer: &[u8],
+    _address: SocketAddr,
+) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::SendSocket))
+}
+
+#[cfg(not(windows))]
 fn recv_platform(_socket: &HostSocket, _buffer: &mut [u8]) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
+fn recv_from_platform(_socket: &HostSocket, _buffer: &mut [u8]) -> HostResult<(usize, SocketAddr)> {
     Err(HostError::unsupported(HostOperation::RecvSocket))
 }
 
@@ -491,6 +515,28 @@ fn send_platform(socket: &HostSocket, buffer: &[u8]) -> HostResult<usize> {
 }
 
 #[cfg(windows)]
+fn send_to_platform(socket: &HostSocket, buffer: &[u8], address: SocketAddr) -> HostResult<usize> {
+    let len = i32::try_from(buffer.len())
+        .map_err(|_| HostError::invalid_input(HostOperation::SendSocket))?;
+    let storage = SocketAddressStorage::from_socket_addr(address);
+    // SAFETY: `buffer` points to `len` readable bytes and `storage` is a valid sockaddr.
+    let sent = unsafe {
+        sendto(
+            socket.raw,
+            buffer.as_ptr().cast(),
+            len,
+            0,
+            storage.as_sockaddr(),
+            storage.len(),
+        )
+    };
+    if sent == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::SendSocket));
+    }
+    Ok(sent as usize)
+}
+
+#[cfg(windows)]
 fn recv_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<usize> {
     let len = i32::try_from(buffer.len())
         .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
@@ -500,6 +546,29 @@ fn recv_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<usize> {
         return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
     }
     Ok(received as usize)
+}
+
+#[cfg(windows)]
+fn recv_from_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<(usize, SocketAddr)> {
+    let len = i32::try_from(buffer.len())
+        .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
+    let mut storage = SockaddrStorage::default();
+    let mut address_len = size_of_i32::<SockaddrStorage>()?;
+    // SAFETY: `buffer`, `storage`, and `address_len` point to writable storage.
+    let received = unsafe {
+        recvfrom(
+            socket.raw,
+            buffer.as_mut_ptr().cast(),
+            len,
+            0,
+            storage.as_mut_sockaddr(),
+            &mut address_len,
+        )
+    };
+    if received == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
+    }
+    Ok((received as usize, socket_addr_from_storage(&storage)?))
 }
 
 #[cfg(windows)]
@@ -1006,11 +1075,27 @@ unsafe extern "system" {
         len: i32,
         flags: i32,
     ) -> i32;
+    fn sendto(
+        socket: crate::windows::Socket,
+        buffer: *const std::ffi::c_char,
+        len: i32,
+        flags: i32,
+        to: *const Sockaddr,
+        tolen: i32,
+    ) -> i32;
     fn recv(
         socket: crate::windows::Socket,
         buffer: *mut std::ffi::c_char,
         len: i32,
         flags: i32,
+    ) -> i32;
+    fn recvfrom(
+        socket: crate::windows::Socket,
+        buffer: *mut std::ffi::c_char,
+        len: i32,
+        flags: i32,
+        from: *mut Sockaddr,
+        fromlen: *mut i32,
     ) -> i32;
     fn ioctlsocket(socket: crate::windows::Socket, cmd: i32, argp: *mut u32) -> i32;
     fn setsockopt(
