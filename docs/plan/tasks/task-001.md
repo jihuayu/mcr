@@ -1,7 +1,7 @@
 ---
 id: task-001
 scope: task
-status: pending
+status: ready
 depends-on: [elf-002, sys-001, vfs-001]
 ---
 
