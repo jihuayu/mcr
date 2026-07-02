@@ -514,6 +514,130 @@ fn execute_simple_instruction(
                 instruction.immediate32(),
             )?;
         }
+        Code::Mov_rm64_r64 | Code::Mov_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let value = read_reg64(registers, instruction.op1_register())?;
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_rm32_r32 | Code::Mov_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let value = read_reg32(registers, instruction.op1_register())?;
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Lea_r64_m if instruction.op1_kind() == OpKind::Memory => {
+            let value = effective_address(registers, &instruction)?;
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Add_rm64_r64 | Code::Add_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_add(rhs);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Add_rm32_r32 | Code::Add_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_add(rhs);
+            write_reg32(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Add_rm64_imm32 | Code::Add_rm64_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u64(&instruction)?;
+            let result = lhs.wrapping_add(rhs);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Add_rm32_imm32 | Code::Add_rm32_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u32(&instruction)?;
+            let result = lhs.wrapping_add(rhs);
+            write_reg32(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Sub_rm64_r64 | Code::Sub_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Sub_rm32_r32 | Code::Sub_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg32(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Sub_rm64_imm32 | Code::Sub_rm64_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u64(&instruction)?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Sub_rm32_imm32 | Code::Sub_rm32_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u32(&instruction)?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg32(registers, instruction.op0_register(), result)?;
+            flags.zero = result == 0;
+        }
+        Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            flags.zero = lhs.wrapping_sub(rhs) == 0;
+        }
+        Code::Cmp_rm32_r32 | Code::Cmp_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            flags.zero = lhs.wrapping_sub(rhs) == 0;
+        }
+        Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u64(&instruction)?;
+            flags.zero = lhs.wrapping_sub(rhs) == 0;
+        }
+        Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8
+            if instruction.op0_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u32(&instruction)?;
+            flags.zero = lhs.wrapping_sub(rhs) == 0;
+        }
         Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32
             if instruction.op1_kind() == OpKind::Register
                 && instruction.op0_register() == instruction.op1_register() =>
@@ -527,6 +651,14 @@ fn execute_simple_instruction(
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = read_reg32(registers, instruction.op1_register())?;
+            flags.zero = lhs & rhs == 0;
+        }
+        Code::Test_rm64_r64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
             flags.zero = lhs & rhs == 0;
         }
         Code::Nopd | Code::Nopq => {}
@@ -644,6 +776,78 @@ fn branch_taken(instruction: &Instruction, flags: GuestFlags) -> Result<bool, Ex
             },
         }),
     }
+}
+
+fn immediate_as_u64(instruction: &Instruction) -> Result<u64, ExecutionError> {
+    match instruction.op1_kind() {
+        OpKind::Immediate8to64 => Ok(instruction.immediate8to64() as u64),
+        OpKind::Immediate32to64 => Ok(instruction.immediate32to64() as u64),
+        OpKind::Immediate64 => Ok(instruction.immediate64()),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn immediate_as_u32(instruction: &Instruction) -> Result<u32, ExecutionError> {
+    match instruction.op1_kind() {
+        OpKind::Immediate8to32 => Ok(instruction.immediate8to32() as u32),
+        OpKind::Immediate32 => Ok(instruction.immediate32()),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn effective_address(
+    registers: &GuestRegisters,
+    instruction: &Instruction,
+) -> Result<u64, ExecutionError> {
+    if instruction.memory_index() != Register::None {
+        return Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::ControlFlow {
+                rip: instruction.ip(),
+                flow: DecodedFlowControl::Exception,
+            },
+        });
+    }
+
+    match instruction.memory_base() {
+        Register::None => Ok(instruction.memory_displacement64()),
+        Register::RIP | Register::EIP => Ok(instruction.ip_rel_memory_address()),
+        base => Ok(read_reg64(registers, base)?.wrapping_add(instruction.memory_displacement64())),
+    }
+}
+
+fn read_reg64(registers: &GuestRegisters, register: Register) -> Result<u64, ExecutionError> {
+    let value = match register {
+        Register::RAX => registers.rax,
+        Register::RBX => registers.rbx,
+        Register::RCX => registers.rcx,
+        Register::RDX => registers.rdx,
+        Register::RSI => registers.rsi,
+        Register::RDI => registers.rdi,
+        Register::RBP => registers.rbp,
+        Register::RSP => registers.rsp,
+        Register::R8 => registers.r8,
+        Register::R9 => registers.r9,
+        Register::R10 => registers.r10,
+        Register::R11 => registers.r11,
+        Register::R12 => registers.r12,
+        Register::R13 => registers.r13,
+        Register::R14 => registers.r14,
+        Register::R15 => registers.r15,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    };
+    Ok(value)
 }
 
 fn read_reg32(registers: &GuestRegisters, register: Register) -> Result<u32, ExecutionError> {
@@ -994,6 +1198,151 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x450010);
+    }
+
+    #[test]
+    fn execution_core_sets_syscall_registers_with_basic_register_arithmetic() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // mov rbx,-1
+                0x89, 0xdf, // mov edi,ebx
+                0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax,2
+                0x83, 0xe8, 0x01, // sub eax,1
+                0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2
+                0xb9, 0x08, 0x00, 0x00, 0x00, // mov ecx,8
+                0x01, 0xca, // add edx,ecx
+                0x83, 0xea, 0x03, // sub edx,3
+                0x48, 0x8d, 0x1d, 0x23, 0x01, 0x00, 0x00, // lea rbx,[rip+0x123]
+                0x48, 0x89, 0xde, // mov rsi,rbx
+                0x48, 0x83, 0xc6, 0x08, // add rsi,8
+                0x48, 0x83, 0xee, 0x08, // sub rsi,8
+                0x0f, 0x05, // syscall
+            ],
+            0x460000,
+        );
+        let mut registers = GuestRegisters {
+            rdi: 0xf000_0000_0000_0000,
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured = Some(context.registers);
+            SyscallReturn::success(7).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall registers built by register arithmetic");
+
+        let syscall_registers = captured.expect("dispatcher called");
+        assert_eq!(syscall_registers.rax, Syscall::Write.number().raw());
+        assert_eq!(
+            syscall_registers.args().raw(),
+            [0xffff_ffff, 0x46014d, 7, 0, 0, 0]
+        );
+        assert_eq!(registers.rax, 7);
+        assert_eq!(registers.rip, 0x460037);
+    }
+
+    #[test]
+    fn execution_core_uses_cmp_zero_flag_for_conditional_branch() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax,5
+                0x83, 0xf8, 0x05, // cmp eax,5
+                0x74, 0x07, // je +7
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x90, 0x90, // skipped nops
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x470000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x206,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind cmp/je");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x470018);
+    }
+
+    #[test]
+    fn execution_core_uses_test64_zero_flag_for_conditional_branch() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi,1
+                0x48, 0x85, 0xff, // test rdi,rdi
+                0x75, 0x07, // jne +7
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x90, 0x90, // skipped nops
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x471000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind test64/jne");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x47101a);
+    }
+
+    #[test]
+    fn execution_core_rejects_unsupported_memory_operand_before_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x8b, 0x00, // mov rax,[rax]
+                0x0f, 0x05, // syscall
+            ],
+            0x472000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut trampoline =
+            TrampolineCore::new(42, 43, |_| SyscallReturn::success(4242).encode_u64());
+
+        let error = SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect_err("memory load remains unsupported");
+
+        assert_eq!(
+            error,
+            ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::ControlFlow {
+                    rip: 0x472000,
+                    flow: DecodedFlowControl::Exception,
+                }
+            }
+        );
     }
 
     #[test]
