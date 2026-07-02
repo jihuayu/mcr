@@ -298,6 +298,7 @@ impl GprState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Runnable,
+    WaitingForChild { args: Wait4SyscallArgs },
     Exited { status: i32 },
 }
 
@@ -458,6 +459,51 @@ impl WaitedChild {
     #[must_use]
     pub const fn wait_status(self) -> u32 {
         self.wait_status
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedWait {
+    tid: GuestTid,
+    pid: GuestPid,
+    args: Wait4SyscallArgs,
+    waited: WaitedChild,
+}
+
+impl CompletedWait {
+    #[must_use]
+    pub const fn new(
+        tid: GuestTid,
+        pid: GuestPid,
+        args: Wait4SyscallArgs,
+        waited: WaitedChild,
+    ) -> Self {
+        Self {
+            tid,
+            pid,
+            args,
+            waited,
+        }
+    }
+
+    #[must_use]
+    pub const fn tid(self) -> GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn pid(self) -> GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn args(self) -> Wait4SyscallArgs {
+        self.args
+    }
+
+    #[must_use]
+    pub const fn waited(self) -> WaitedChild {
+        self.waited
     }
 }
 
@@ -710,7 +756,7 @@ impl GuestKernel {
             ),
             Syscall::Exit => self.exit_task(tid, low_exit_status(arg(request, 0))),
             Syscall::ExitGroup => self.exit_group(task.pid, low_exit_status(arg(request, 0))),
-            Syscall::Wait4 => self.wait4_current(
+            Syscall::Wait4 => self.wait4_current_with_return(
                 tid,
                 Wait4SyscallArgs::new(
                     arg(request, 0) as i32,
@@ -718,6 +764,7 @@ impl GuestKernel {
                     arg(request, 2) as u32,
                     arg(request, 3),
                 ),
+                child_return_rip(request),
             ),
             Syscall::RtSigaction => self.rt_sigaction_current(
                 tid,
@@ -940,6 +987,15 @@ impl GuestKernel {
     }
 
     pub fn wait4_current(&mut self, tid: GuestTid, args: Wait4SyscallArgs) -> SyscallOutcome {
+        self.wait4_current_with_return(tid, args, current_syscall_return_rip(self, tid))
+    }
+
+    fn wait4_current_with_return(
+        &mut self,
+        tid: GuestTid,
+        args: Wait4SyscallArgs,
+        return_rip: GuestAddress,
+    ) -> SyscallOutcome {
         let Some(parent_pid) = self.task(tid).map(|task| task.pid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
@@ -950,8 +1006,51 @@ impl GuestKernel {
                 .with_decoded_field("exit_status", waited.status().to_string())
                 .with_decoded_field("wait_status", format!("{:#x}", waited.wait_status())),
             Ok(None) => SyscallOutcome::success(0),
+            Err(TaskError::WouldBlock) => {
+                let Some(task) = self.task_mut(tid) else {
+                    return SyscallOutcome::errno(LinuxErrno::ESRCH);
+                };
+                task.regs = task.regs.with_syscall_return(return_rip, 0);
+                task.state = TaskState::WaitingForChild { args };
+                SyscallOutcome::success(0).with_decoded_field("task_blocked", "wait4")
+            }
             Err(error) => error.into_outcome(),
         }
+    }
+
+    #[must_use]
+    pub fn runnable_tids(&self) -> Vec<GuestTid> {
+        self.tasks
+            .values()
+            .filter(|task| matches!(task.state, TaskState::Runnable))
+            .map(|task| task.tid)
+            .collect()
+    }
+
+    pub fn resume_waiting_tasks(&mut self) -> Vec<CompletedWait> {
+        let waiting_tasks: Vec<(GuestTid, GuestPid, Wait4SyscallArgs)> = self
+            .tasks
+            .values()
+            .filter_map(|task| match task.state {
+                TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
+                TaskState::Runnable | TaskState::Exited { .. } => None,
+            })
+            .collect();
+        let mut completed = Vec::new();
+
+        for (tid, parent_pid, args) in waiting_tasks {
+            let Ok(Some(waited)) = self.wait4_child(parent_pid, args) else {
+                continue;
+            };
+            if let Some(task) = self.task_mut(tid) {
+                task.regs = task
+                    .regs
+                    .with_syscall_return(task.regs.rip(), u64::from(waited.pid()));
+                task.state = TaskState::Runnable;
+            }
+            completed.push(CompletedWait::new(tid, parent_pid, args, waited));
+        }
+        completed
     }
 
     pub fn rt_sigaction_current(
@@ -1682,6 +1781,42 @@ mod tests {
                 .children()
                 .contains(&child_pid)
         );
+        assert!(kernel.process(child_pid).is_none());
+        assert!(kernel.task(child_pid).is_none());
+    }
+
+    #[test]
+    fn wait4_blocks_and_resumes_when_child_exits() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+        let child_pid = kernel.fork_child(INITIAL_GUEST_TID).unwrap();
+
+        let wait = kernel.wait4_current(
+            INITIAL_GUEST_TID,
+            Wait4SyscallArgs::new(child_pid as i32, 0x1000, 0, 0),
+        );
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForChild {
+                args: Wait4SyscallArgs::new(child_pid as i32, 0x1000, 0, 0)
+            }
+        );
+
+        assert_eq!(
+            kernel.exit_group(child_pid, 37).result,
+            SyscallReturn::Success(0)
+        );
+        let completed = kernel.resume_waiting_tasks();
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].tid(), INITIAL_GUEST_TID);
+        assert_eq!(completed[0].pid(), INITIAL_GUEST_PID);
+        assert_eq!(completed[0].waited().pid(), child_pid);
+        assert_eq!(completed[0].waited().wait_status(), 37 << 8);
+        let parent = kernel.task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(parent.state(), TaskState::Runnable);
+        assert_eq!(parent.regs().rax(), u64::from(child_pid));
+        assert_eq!(parent.regs().rip(), 0x401002);
         assert!(kernel.process(child_pid).is_none());
         assert!(kernel.task(child_pid).is_none());
     }

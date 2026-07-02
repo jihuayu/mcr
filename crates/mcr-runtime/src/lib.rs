@@ -39,8 +39,8 @@ use mcr_sys::{
     TraceField,
 };
 use mcr_task::{
-    ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram, INITIAL_GUEST_PID,
-    INITIAL_GUEST_TID, TaskError, TaskState,
+    CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
+    INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, LinuxFileAttr, OpenFlags,
@@ -2036,6 +2036,10 @@ pub enum GuestRunError {
         tid: mcr_sys::GuestTid,
         state: TaskState,
     },
+    NoRunnableTasks,
+    WaitResume {
+        errno: LinuxErrno,
+    },
     GuestExecution(GuestExecutionError),
 }
 
@@ -2045,7 +2049,9 @@ impl GuestRunError {
         match self {
             Self::MissingInitialProcess
             | Self::MissingInitialTask
-            | Self::InitialTaskNotRunnable { .. } => LinuxErrno::ESRCH,
+            | Self::InitialTaskNotRunnable { .. }
+            | Self::NoRunnableTasks => LinuxErrno::ESRCH,
+            Self::WaitResume { errno } => *errno,
             Self::GuestExecution(error) => error.linux_errno(),
         }
     }
@@ -2061,6 +2067,10 @@ impl fmt::Display for GuestRunError {
                     formatter,
                     "initial guest task {tid} is not runnable: {state:?}"
                 )
+            }
+            Self::NoRunnableTasks => write!(formatter, "no runnable guest tasks remain"),
+            Self::WaitResume { errno } => {
+                write!(formatter, "failed to resume waiting guest task: {errno}")
             }
             Self::GuestExecution(error) => error.fmt(formatter),
         }
@@ -2098,8 +2108,30 @@ where
         if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
             return Ok(status);
         }
-        ensure_initial_task_runnable(&dispatcher.subsystems().tasks)?;
-        dispatch_guest_execution_with_dispatcher(dispatcher)?;
+        dispatcher
+            .subsystems_mut()
+            .resume_waiting_tasks()
+            .map_err(|errno| GuestRunError::WaitResume { errno })?;
+        let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
+        if runnable_tids.is_empty() {
+            return Err(GuestRunError::NoRunnableTasks);
+        }
+        for tid in runnable_tids {
+            if !matches!(
+                dispatcher
+                    .subsystems()
+                    .tasks
+                    .task(tid)
+                    .map(mcr_task::GuestTask::state),
+                Some(TaskState::Runnable)
+            ) {
+                continue;
+            }
+            dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+            if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
+                break;
+            }
+        }
     }
 }
 
@@ -2113,30 +2145,27 @@ fn initial_process_exit_status(kernel: &GuestKernel) -> Result<Option<i32>, Gues
     }
 }
 
-fn ensure_initial_task_runnable(kernel: &GuestKernel) -> Result<(), GuestRunError> {
-    let task = kernel
-        .task(INITIAL_GUEST_TID)
-        .ok_or(GuestRunError::MissingInitialTask)?;
-    if task.pid() != INITIAL_GUEST_PID {
-        return Err(GuestRunError::MissingInitialTask);
-    }
-    match task.state() {
-        TaskState::Runnable => Ok(()),
-        state => Err(GuestRunError::InitialTaskNotRunnable {
-            tid: task.tid(),
-            state,
-        }),
-    }
-}
-
 fn dispatch_guest_execution_with_dispatcher<T>(
     dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
 ) -> Result<GuestExecutionStep, GuestExecutionError>
 where
     T: SyscallTracer,
 {
-    let tid = INITIAL_GUEST_TID;
-    dispatch_guest_task_with_dispatcher(dispatcher, tid)
+    let task = dispatcher
+        .subsystems()
+        .tasks
+        .task(INITIAL_GUEST_TID)
+        .ok_or(GuestExecutionError::MissingInitialTask)?;
+    if task.pid() != INITIAL_GUEST_PID {
+        return Err(GuestExecutionError::MissingInitialTask);
+    }
+    if !matches!(task.state(), TaskState::Runnable) {
+        return Err(GuestExecutionError::TaskExited {
+            tid: INITIAL_GUEST_TID,
+            state: task.state(),
+        });
+    }
+    dispatch_guest_task_with_dispatcher(dispatcher, INITIAL_GUEST_TID)
 }
 
 fn dispatch_guest_task_with_dispatcher<T>(
@@ -2513,6 +2542,10 @@ impl RuntimeSubsystems {
             }
             mcr_sys::Syscall::Wait4 => {
                 if let Some(child_pid) = fork_child_pid(&outcome.decoded) {
+                    if let Err(errno) = self.write_wait_status_from_outcome(pid, request, &outcome)
+                    {
+                        return SyscallOutcome::errno(errno);
+                    }
                     if let Err(errno) = self.drop_process_memory(child_pid) {
                         return SyscallOutcome::errno(errno);
                     }
@@ -2521,6 +2554,51 @@ impl RuntimeSubsystems {
             _ => {}
         }
         outcome
+    }
+
+    fn resume_waiting_tasks(&mut self) -> Result<Vec<CompletedWait>, LinuxErrno> {
+        let completed = self.tasks.resume_waiting_tasks();
+        for wait in &completed {
+            self.write_wait_status(*wait)?;
+            self.drop_process_memory(wait.waited().pid())?;
+        }
+        Ok(completed)
+    }
+
+    fn write_wait_status_from_outcome(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        request: &SyscallRequest,
+        outcome: &SyscallOutcome,
+    ) -> Result<(), LinuxErrno> {
+        let wstatus = arg(request, 1);
+        let Some(wait_status) = wait_status_from_decoded(&outcome.decoded) else {
+            return Ok(());
+        };
+        self.write_wait_status_to_process(pid, wstatus, wait_status)
+    }
+
+    fn write_wait_status(&mut self, wait: CompletedWait) -> Result<(), LinuxErrno> {
+        self.write_wait_status_to_process(
+            wait.pid(),
+            wait.args().wstatus,
+            wait.waited().wait_status(),
+        )
+    }
+
+    fn write_wait_status_to_process(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        wstatus: u64,
+        wait_status: u32,
+    ) -> Result<(), LinuxErrno> {
+        if wstatus == 0 {
+            return Ok(());
+        }
+        self.memory_for_process_mut(pid)
+            .ok_or(LinuxErrno::ESRCH)?
+            .write(wstatus, &wait_status.to_le_bytes())
+            .map_err(|error| error.errno())
     }
 
     fn dispatch_fork_like(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -3057,6 +3135,18 @@ fn fork_child_pid(decoded: &[TraceField]) -> Option<mcr_sys::GuestPid> {
         .iter()
         .find(|field| field.name == "guest_pid")
         .and_then(|field| field.value.parse().ok())
+}
+
+fn wait_status_from_decoded(decoded: &[TraceField]) -> Option<u32> {
+    decoded
+        .iter()
+        .find(|field| field.name == "wait_status")
+        .and_then(|field| {
+            field.value.strip_prefix("0x").map_or_else(
+                || field.value.parse().ok(),
+                |hex| u32::from_str_radix(hex, 16).ok(),
+            )
+        })
 }
 
 fn read_futex_timeout(
@@ -5819,6 +5909,58 @@ mod tests {
             runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
             TaskState::Exited { status: 44 }
         );
+    }
+
+    #[test]
+    fn guest_run_loop_schedules_child_when_parent_waits() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, exit_group
+                0xbf, 0x00, 0x00, 0x00, 0x00, // mov edi, 0
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        set_initial_syscall_regs(&mut runtime, 0x401000, Syscall::Fork, [0; 6]);
+
+        let fork = runtime
+            .dispatch_guest_execution()
+            .expect("parent fork syscall executes");
+        assert_eq!(fork.encoded_rax(), 2);
+        runtime
+            .kernel_mut()
+            .task_mut(INITIAL_GUEST_TID)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                0x401000,
+                0x8000_0000,
+                Syscall::Wait4.number().raw(),
+                [-1i64 as u64, 0x402000, 0, 0, 0, 0],
+            ));
+        runtime
+            .kernel_mut()
+            .task_mut(2)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                0x401000,
+                0x8000_0000,
+                Syscall::ExitGroup.number().raw(),
+                [23, 0, 0, 0, 0, 0],
+            ));
+
+        let status = runtime
+            .run_guest_until_exit()
+            .expect("parent exits after reaping child");
+
+        assert_eq!(status, 0);
+        let parent = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(parent.state(), TaskState::Exited { status: 0 });
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402000), 23 << 8);
+        assert!(runtime.kernel().process(2).is_none());
+        assert!(runtime.memory_for_process(2).is_none());
     }
 
     #[test]
