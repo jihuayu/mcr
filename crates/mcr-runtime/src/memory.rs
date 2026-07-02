@@ -239,6 +239,33 @@ impl GuestMemory {
         Ok(memory)
     }
 
+    pub fn try_clone_runtime(&self) -> Result<Self, GuestMemoryError> {
+        let mut allocations = BTreeMap::new();
+        for (allocation_id, allocation) in &self.allocations {
+            let ranges = self.allocation_protection_ranges(*allocation_id)?;
+            let mut source_guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
+            let mut memory =
+                HostMemory::allocate(allocation.memory.len(), MemoryProtection::ReadWrite)
+                    .map_err(GuestMemoryError::Host)?;
+            memory
+                .as_mut_slice()
+                .copy_from_slice(allocation.memory.as_slice());
+            source_guard.restore()?;
+            apply_allocation_protections(&memory, &ranges)?;
+            allocations.insert(*allocation_id, GuestAllocation { memory });
+        }
+
+        Ok(Self {
+            vmas: self.vmas.clone(),
+            allocations,
+            next_allocation_id: self.next_allocation_id,
+            brk_base: self.brk_base,
+            current_brk: self.current_brk,
+            mmap_base: self.mmap_base,
+            address_space_end: self.address_space_end,
+        })
+    }
+
     #[must_use]
     pub const fn brk_base(&self) -> u64 {
         self.brk_base
@@ -741,6 +768,82 @@ impl GuestMemory {
         }
         Ok(())
     }
+
+    fn allocation_protection_ranges(
+        &self,
+        allocation_id: u64,
+    ) -> Result<Vec<AllocationProtectionRange>, GuestMemoryError> {
+        self.vmas
+            .values()
+            .filter(|vma| vma.allocation_id == allocation_id)
+            .map(|vma| {
+                Ok(AllocationProtectionRange {
+                    offset: usize::try_from(vma.allocation_offset)
+                        .map_err(|_| GuestMemoryError::RegionTooLarge)?,
+                    len: usize::try_from(vma.len())
+                        .map_err(|_| GuestMemoryError::RegionTooLarge)?,
+                    protection: vma.protection,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationProtectionRange {
+    offset: usize,
+    len: usize,
+    protection: GuestMemoryProtection,
+}
+
+struct AllocationProtectionGuard<'a> {
+    memory: &'a HostMemory,
+    ranges: &'a [AllocationProtectionRange],
+    restored: bool,
+}
+
+impl<'a> AllocationProtectionGuard<'a> {
+    fn new(
+        memory: &'a HostMemory,
+        ranges: &'a [AllocationProtectionRange],
+    ) -> Result<Self, GuestMemoryError> {
+        memory
+            .protect(MemoryProtection::ReadWrite)
+            .map_err(GuestMemoryError::Host)?;
+        Ok(Self {
+            memory,
+            ranges,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), GuestMemoryError> {
+        if !self.restored {
+            apply_allocation_protections(self.memory, self.ranges)?;
+            self.restored = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AllocationProtectionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = apply_allocation_protections(self.memory, self.ranges);
+        }
+    }
+}
+
+fn apply_allocation_protections(
+    memory: &HostMemory,
+    ranges: &[AllocationProtectionRange],
+) -> Result<(), GuestMemoryError> {
+    for range in ranges {
+        memory
+            .protect_range(range.offset, range.len, range.protection.to_host())
+            .map_err(GuestMemoryError::Host)?;
+    }
+    Ok(())
 }
 
 impl MemorySyscalls for GuestMemory {
@@ -1074,6 +1177,67 @@ mod tests {
             .read(addr + GUEST_PAGE_SIZE * 2, &mut bytes[1..])
             .unwrap();
         assert_eq!(bytes, [b'l', b'r']);
+    }
+
+    #[test]
+    fn try_clone_runtime_preserves_mappings_and_isolates_writes() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+            ))
+            .unwrap();
+        memory.write(addr, b"parent").unwrap();
+
+        let mut clone = memory.try_clone_runtime().unwrap();
+        clone.write(addr, b"child!").unwrap();
+
+        let mut parent_bytes = [0; 6];
+        memory.read(addr, &mut parent_bytes).unwrap();
+        let mut child_bytes = [0; 6];
+        clone.read(addr, &mut child_bytes).unwrap();
+
+        assert_eq!(&parent_bytes, b"parent");
+        assert_eq!(&child_bytes, b"child!");
+    }
+
+    #[test]
+    fn try_clone_runtime_preserves_split_vma_protections() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE * 3,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+            ))
+            .unwrap();
+        memory.write(addr, b"left").unwrap();
+        memory.write(addr + GUEST_PAGE_SIZE * 2, b"right").unwrap();
+        memory
+            .mprotect(MprotectSyscallArgs {
+                addr: addr + GUEST_PAGE_SIZE,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ,
+            })
+            .unwrap();
+
+        let mut clone = memory.try_clone_runtime().unwrap();
+
+        assert_eq!(clone.vmas().count(), 3);
+        assert_eq!(
+            clone.write(addr + GUEST_PAGE_SIZE, b"x"),
+            Err(GuestMemoryError::AccessDenied)
+        );
+        let mut bytes = [0; 9];
+        clone.read(addr, &mut bytes[..4]).unwrap();
+        clone
+            .read(addr + GUEST_PAGE_SIZE * 2, &mut bytes[4..])
+            .unwrap();
+        assert_eq!(&bytes, b"leftright");
     }
 
     #[test]
