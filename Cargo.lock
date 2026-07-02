@@ -22,6 +22,7 @@ name = "mcr-cli"
 version = "0.1.0"
 dependencies = [
  "mcr-runtime",
+ "mcr-testkit",
 ]
 
 [[package]]

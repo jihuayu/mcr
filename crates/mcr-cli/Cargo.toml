@@ -11,5 +11,8 @@ path = "src/main.rs"
 [dependencies]
 mcr-runtime.workspace = true
 
+[dev-dependencies]
+mcr-testkit.workspace = true
+
 [lints]
 workspace = true
