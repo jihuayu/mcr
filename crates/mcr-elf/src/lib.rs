@@ -288,15 +288,27 @@ pub mod auxv {
     pub const AT_PHNUM: u64 = 5;
     pub const AT_PAGESZ: u64 = 6;
     pub const AT_BASE: u64 = 7;
+    pub const AT_FLAGS: u64 = 8;
     pub const AT_ENTRY: u64 = 9;
+    pub const AT_UID: u64 = 11;
+    pub const AT_EUID: u64 = 12;
+    pub const AT_GID: u64 = 13;
+    pub const AT_EGID: u64 = 14;
     pub const AT_PLATFORM: u64 = 15;
+    pub const AT_HWCAP: u64 = 16;
+    pub const AT_CLKTCK: u64 = 17;
+    pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
+    pub const AT_HWCAP2: u64 = 26;
     pub const AT_EXECFN: u64 = 31;
 }
 
 pub const AT_RANDOM_BYTES: usize = 16;
 pub const INITIAL_STACK_ALIGNMENT: u64 = 16;
 pub const DEFAULT_PLATFORM: &[u8] = b"x86_64";
+pub const DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE: u64 = 0x0040_0000;
+pub const DEFAULT_INTERPRETER_LOAD_BASE: u64 = 0x7000_0000;
+pub const DEFAULT_CLOCK_TICKS_PER_SECOND: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuxiliaryVectorEntry {
@@ -329,6 +341,7 @@ pub struct InitialStackConfig {
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     random_bytes: [u8; AT_RANDOM_BYTES],
+    executable_load_bias: u64,
     interpreter_base: u64,
     platform: Vec<u8>,
 }
@@ -344,6 +357,7 @@ impl InitialStackConfig {
             executable_path,
             envp: Vec::new(),
             random_bytes: [0; AT_RANDOM_BYTES],
+            executable_load_bias: 0,
             interpreter_base: 0,
             platform: DEFAULT_PLATFORM.to_vec(),
         }
@@ -372,6 +386,12 @@ impl InitialStackConfig {
     #[must_use]
     pub const fn with_random_bytes(mut self, random_bytes: [u8; AT_RANDOM_BYTES]) -> Self {
         self.random_bytes = random_bytes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_executable_load_bias(mut self, executable_load_bias: u64) -> Self {
+        self.executable_load_bias = executable_load_bias;
         self
     }
 
@@ -415,6 +435,11 @@ impl InitialStackConfig {
     #[must_use]
     pub const fn random_bytes(&self) -> &[u8; AT_RANDOM_BYTES] {
         &self.random_bytes
+    }
+
+    #[must_use]
+    pub const fn executable_load_bias(&self) -> u64 {
+        self.executable_load_bias
     }
 
     #[must_use]
@@ -506,6 +531,7 @@ pub enum InitialStackError {
     StackRangeUnderflow { stack_top: u64, stack_size: u64 },
     StackLayoutOverflow,
     StackDataExceedsStack { needed: u64, stack_size: u64 },
+    RelocatedAddressOverflow { address: u64, load_bias: u64 },
     InteriorNul { field: &'static str, index: usize },
     EmptyPlatform,
 }
@@ -531,6 +557,10 @@ impl fmt::Display for InitialStackError {
                 formatter,
                 "initial stack needs {needed:#x} bytes but stack size is {stack_size:#x}"
             ),
+            Self::RelocatedAddressOverflow { address, load_bias } => write!(
+                formatter,
+                "initial stack relocated address overflows: address {address:#x}, load bias {load_bias:#x}"
+            ),
             Self::InteriorNul { field, index } => {
                 write!(
                     formatter,
@@ -550,10 +580,15 @@ pub fn build_initial_stack(
 ) -> Result<InitialStack, InitialStackError> {
     validate_stack_config(&config)?;
 
-    let phdr_address = load_plan
-        .program_headers()
-        .virtual_address()
-        .ok_or(InitialStackError::MissingProgramHeaderAddress)?;
+    let phdr_address = relocated_address(
+        load_plan
+            .program_headers()
+            .virtual_address()
+            .ok_or(InitialStackError::MissingProgramHeaderAddress)?,
+        config.executable_load_bias,
+    )?;
+    let entrypoint = relocated_address(load_plan.entrypoint(), config.executable_load_bias)?;
+    let interpreter_base = config.interpreter_base;
 
     let stack_base = config.stack_top.checked_sub(config.stack_size).ok_or(
         InitialStackError::StackRangeUnderflow {
@@ -593,9 +628,18 @@ pub fn build_initial_stack(
             u64::from(load_plan.program_headers().entry_count()),
         ),
         AuxiliaryVectorEntry::new(auxv::AT_PAGESZ, PAGE_SIZE),
-        AuxiliaryVectorEntry::new(auxv::AT_BASE, config.interpreter_base),
-        AuxiliaryVectorEntry::new(auxv::AT_ENTRY, load_plan.entrypoint()),
+        AuxiliaryVectorEntry::new(auxv::AT_BASE, interpreter_base),
+        AuxiliaryVectorEntry::new(auxv::AT_FLAGS, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_ENTRY, entrypoint),
+        AuxiliaryVectorEntry::new(auxv::AT_UID, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_EUID, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_GID, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_EGID, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_HWCAP, 0),
+        AuxiliaryVectorEntry::new(auxv::AT_CLKTCK, DEFAULT_CLOCK_TICKS_PER_SECOND),
+        AuxiliaryVectorEntry::new(auxv::AT_SECURE, 0),
         AuxiliaryVectorEntry::new(auxv::AT_RANDOM, random_address),
+        AuxiliaryVectorEntry::new(auxv::AT_HWCAP2, 0),
         AuxiliaryVectorEntry::new(auxv::AT_EXECFN, executable_path_address),
         AuxiliaryVectorEntry::new(auxv::AT_PLATFORM, platform_address),
         AuxiliaryVectorEntry::new(auxv::AT_NULL, 0),
@@ -686,6 +730,12 @@ fn validate_no_interior_nul(
     Ok(())
 }
 
+fn relocated_address(address: u64, load_bias: u64) -> Result<u64, InitialStackError> {
+    address
+        .checked_add(load_bias)
+        .ok_or(InitialStackError::RelocatedAddressOverflow { address, load_bias })
+}
+
 #[derive(Debug)]
 struct PlacedStackBytes {
     address: u64,
@@ -764,6 +814,8 @@ pub struct GuestMemoryImage {
     entrypoint: u64,
     initial_stack_pointer: u64,
     initial_stack: InitialStack,
+    executable_load_bias: u64,
+    interpreter: Option<LoadedInterpreter>,
     brk: u64,
     vmas: Vec<GuestVma>,
     regions: Vec<GuestMemoryRegion>,
@@ -783,6 +835,16 @@ impl GuestMemoryImage {
     #[must_use]
     pub const fn initial_stack(&self) -> &InitialStack {
         &self.initial_stack
+    }
+
+    #[must_use]
+    pub const fn executable_load_bias(&self) -> u64 {
+        self.executable_load_bias
+    }
+
+    #[must_use]
+    pub const fn interpreter(&self) -> Option<&LoadedInterpreter> {
+        self.interpreter.as_ref()
     }
 
     #[must_use]
@@ -811,6 +873,36 @@ impl GuestMemoryImage {
         let offset = usize::try_from(address - region.start).ok()?;
         let end = offset.checked_add(usize::try_from(len).ok()?)?;
         Some(&region.bytes[offset..end])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedInterpreter {
+    path: Vec<u8>,
+    load_bias: u64,
+    entrypoint: u64,
+    program_headers: ProgramHeaderTable,
+}
+
+impl LoadedInterpreter {
+    #[must_use]
+    pub fn path(&self) -> &[u8] {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn load_bias(&self) -> u64 {
+        self.load_bias
+    }
+
+    #[must_use]
+    pub const fn entrypoint(&self) -> u64 {
+        self.entrypoint
+    }
+
+    #[must_use]
+    pub const fn program_headers(&self) -> &ProgramHeaderTable {
+        &self.program_headers
     }
 }
 
@@ -866,6 +958,12 @@ pub enum GuestVmaKind {
         file_offset: u64,
         file_size: u64,
     },
+    InterpreterLoad {
+        path: Vec<u8>,
+        program_header_index: u16,
+        file_offset: u64,
+        file_size: u64,
+    },
     Stack,
 }
 
@@ -907,6 +1005,11 @@ impl GuestMemoryRegion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuestImageError {
     Stack(InitialStackError),
+    Interpreter(ElfValidationError),
+    MissingInterpreterBytes,
+    UnsupportedInterpreter {
+        path: Vec<u8>,
+    },
     SegmentFileRangeOverflow {
         index: u16,
         file_offset: u64,
@@ -931,8 +1034,8 @@ pub enum GuestImageError {
         end: u64,
     },
     VmaOverlap {
-        existing: GuestVma,
-        requested: GuestVma,
+        existing: Box<GuestVma>,
+        requested: Box<GuestVma>,
     },
 }
 
@@ -940,6 +1043,18 @@ impl fmt::Display for GuestImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stack(error) => write!(formatter, "{error}"),
+            Self::Interpreter(error) => write!(formatter, "{error}"),
+            Self::MissingInterpreterBytes => {
+                write!(
+                    formatter,
+                    "ELF interpreter bytes are required for dynamic executable"
+                )
+            }
+            Self::UnsupportedInterpreter { path } => write!(
+                formatter,
+                "unsupported ELF interpreter `{}`",
+                String::from_utf8_lossy(path)
+            ),
             Self::SegmentFileRangeOverflow {
                 index,
                 file_offset,
@@ -980,7 +1095,22 @@ impl fmt::Display for GuestImageError {
     }
 }
 
-impl std::error::Error for GuestImageError {}
+impl std::error::Error for GuestImageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Stack(error) => Some(error),
+            Self::Interpreter(error) => Some(error),
+            Self::MissingInterpreterBytes
+            | Self::UnsupportedInterpreter { .. }
+            | Self::SegmentFileRangeOverflow { .. }
+            | Self::SegmentFileRangeOutOfBounds { .. }
+            | Self::AddressRangeOverflow { .. }
+            | Self::RegionTooLarge { .. }
+            | Self::InvalidVmaRange { .. }
+            | Self::VmaOverlap { .. } => None,
+        }
+    }
+}
 
 impl From<InitialStackError> for GuestImageError {
     fn from(value: InitialStackError) -> Self {
@@ -993,11 +1123,41 @@ pub fn build_guest_memory_image(
     elf_bytes: &[u8],
     stack_config: InitialStackConfig,
 ) -> Result<GuestMemoryImage, GuestImageError> {
+    build_guest_memory_image_with_interpreter(load_plan, elf_bytes, None, stack_config)
+}
+
+pub fn build_guest_memory_image_with_interpreter(
+    load_plan: &LoadPlan,
+    elf_bytes: &[u8],
+    interpreter_bytes: Option<&[u8]>,
+    stack_config: InitialStackConfig,
+) -> Result<GuestMemoryImage, GuestImageError> {
     let mut vmas = Vec::new();
     let mut regions = Vec::new();
+    let executable_load_bias = executable_load_bias(load_plan);
+    let interpreter = if let Some(interpreter) = load_plan.interpreter() {
+        let interpreter_bytes =
+            interpreter_bytes.ok_or(GuestImageError::MissingInterpreterBytes)?;
+        let interpreter_plan =
+            parse_load_plan(interpreter_bytes).map_err(GuestImageError::Interpreter)?;
+        let interpreter_load_bias = DEFAULT_INTERPRETER_LOAD_BASE;
+        let loaded_interpreter = load_interpreter_image(
+            interpreter,
+            &interpreter_plan,
+            interpreter_bytes,
+            interpreter_load_bias,
+            &mut vmas,
+            &mut regions,
+        )?;
+        Some(loaded_interpreter)
+    } else {
+        None
+    };
 
     for segment in load_plan.segments() {
         let mapping = segment.mapping();
+        let mapping_start = relocated_image_address(mapping.start(), executable_load_bias)?;
+        let mapping_end = relocated_image_address(mapping.end(), executable_load_bias)?;
         let mapped_bytes = read_segment_mapping_bytes(
             elf_bytes,
             segment.program_header_index(),
@@ -1016,8 +1176,8 @@ pub fn build_guest_memory_image(
         register_vma(
             &mut vmas,
             GuestVma::new(
-                mapping.start(),
-                mapping.end(),
+                mapping_start,
+                mapping_end,
                 mapping.permissions(),
                 GuestVmaKind::ElfLoad {
                     program_header_index: segment.program_header_index(),
@@ -1026,9 +1186,12 @@ pub fn build_guest_memory_image(
                 },
             ),
         )?;
-        regions.push(GuestMemoryRegion::new(mapping.start(), region_bytes)?);
+        regions.push(GuestMemoryRegion::new(mapping_start, region_bytes)?);
     }
 
+    let stack_config = stack_config
+        .with_executable_load_bias(executable_load_bias)
+        .with_interpreter_base(interpreter.as_ref().map_or(0, LoadedInterpreter::load_bias));
     let initial_stack = build_initial_stack(load_plan, stack_config)?;
     let stack_size = usize::try_from(initial_stack.stack_size()).map_err(|_| {
         GuestImageError::RegionTooLarge {
@@ -1067,18 +1230,114 @@ pub fn build_guest_memory_image(
     regions.sort_by_key(|region| region.start);
 
     Ok(GuestMemoryImage {
-        entrypoint: load_plan.entrypoint(),
+        entrypoint: interpreter.as_ref().map_or(
+            relocated_image_address(load_plan.entrypoint(), executable_load_bias)?,
+            |item| item.entrypoint(),
+        ),
         initial_stack_pointer: initial_stack.stack_pointer(),
         initial_stack,
+        executable_load_bias,
+        interpreter,
         brk: load_plan
             .segments()
             .iter()
-            .map(|segment| segment.mapping().end())
+            .map(|segment| relocated_image_address(segment.mapping().end(), executable_load_bias))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .max()
             .unwrap_or(0),
         vmas,
         regions,
     })
+}
+
+fn load_interpreter_image(
+    interpreter: &Interpreter,
+    interpreter_plan: &LoadPlan,
+    interpreter_bytes: &[u8],
+    load_bias: u64,
+    vmas: &mut Vec<GuestVma>,
+    regions: &mut Vec<GuestMemoryRegion>,
+) -> Result<LoadedInterpreter, GuestImageError> {
+    if interpreter_plan.interpreter().is_some() {
+        return Err(GuestImageError::UnsupportedInterpreter {
+            path: interpreter.as_bytes().to_vec(),
+        });
+    }
+
+    for segment in interpreter_plan.segments() {
+        let mapping = segment.mapping();
+        let mapping_start = relocated_image_address(mapping.start(), load_bias)?;
+        let mapping_end = relocated_image_address(mapping.end(), load_bias)?;
+        let mapped_bytes = read_segment_mapping_bytes(
+            interpreter_bytes,
+            segment.program_header_index(),
+            mapping.file_offset(),
+            mapping.file_size(),
+        )?;
+        let region_size = usize::try_from(mapping.memory_size()).map_err(|_| {
+            GuestImageError::RegionTooLarge {
+                start: mapping_start,
+                size: mapping.memory_size(),
+            }
+        })?;
+        let mut region_bytes = vec![0; region_size];
+        region_bytes[..mapped_bytes.len()].copy_from_slice(mapped_bytes);
+
+        register_vma(
+            vmas,
+            GuestVma::new(
+                mapping_start,
+                mapping_end,
+                mapping.permissions(),
+                GuestVmaKind::InterpreterLoad {
+                    path: interpreter.as_bytes().to_vec(),
+                    program_header_index: segment.program_header_index(),
+                    file_offset: mapping.file_offset(),
+                    file_size: mapping.file_size(),
+                },
+            ),
+        )?;
+        regions.push(GuestMemoryRegion::new(mapping_start, region_bytes)?);
+    }
+
+    Ok(LoadedInterpreter {
+        path: interpreter.as_bytes().to_vec(),
+        load_bias,
+        entrypoint: relocated_image_address(interpreter_plan.entrypoint(), load_bias)?,
+        program_headers: ProgramHeaderTable {
+            file_offset: interpreter_plan.program_headers().file_offset(),
+            entry_size: interpreter_plan.program_headers().entry_size(),
+            entry_count: interpreter_plan.program_headers().entry_count(),
+            virtual_address: interpreter_plan
+                .program_headers()
+                .virtual_address()
+                .map(|address| relocated_image_address(address, load_bias))
+                .transpose()?,
+        },
+    })
+}
+
+fn executable_load_bias(load_plan: &LoadPlan) -> u64 {
+    match load_plan.object_type() {
+        ElfObjectType::Executable => 0,
+        ElfObjectType::SharedObject => {
+            if load_plan.interpreter().is_some() {
+                DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn relocated_image_address(address: u64, load_bias: u64) -> Result<u64, GuestImageError> {
+    address
+        .checked_add(load_bias)
+        .ok_or(GuestImageError::AddressRangeOverflow {
+            start: address,
+            size: load_bias,
+        })
 }
 
 fn read_segment_mapping_bytes(
@@ -1121,8 +1380,8 @@ fn register_vma(vmas: &mut Vec<GuestVma>, vma: GuestVma) -> Result<(), GuestImag
         .find(|existing| existing.start < vma.end && vma.start < existing.end)
     {
         return Err(GuestImageError::VmaOverlap {
-            existing: existing.clone(),
-            requested: vma,
+            existing: Box::new(existing.clone()),
+            requested: Box::new(vma),
         });
     }
 
@@ -1923,9 +2182,11 @@ mod tests {
     };
 
     use super::{
-        AuxiliaryVectorEntry, CRATE_NAME, ElfObjectType, ElfValidationError, GuestVma,
-        GuestVmaKind, InitialStackConfig, InitialStackError, SegmentPermissions, auxv,
-        build_guest_memory_image, build_initial_stack, is_elf64, parse_load_plan,
+        AuxiliaryVectorEntry, CRATE_NAME, DEFAULT_CLOCK_TICKS_PER_SECOND,
+        DEFAULT_INTERPRETER_LOAD_BASE, DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE, ElfObjectType,
+        ElfValidationError, GuestImageError, GuestVma, GuestVmaKind, InitialStackConfig,
+        InitialStackError, SegmentPermissions, auxv, build_guest_memory_image,
+        build_guest_memory_image_with_interpreter, build_initial_stack, is_elf64, parse_load_plan,
     };
 
     #[test]
@@ -2082,21 +2343,21 @@ mod tests {
 
         assert_eq!(stack.stack_top(), 0x8000_0000);
         assert_eq!(stack.stack_base(), 0x7fff_c000);
-        assert_eq!(stack.stack_pointer(), 0x7fff_fed0);
-        assert_eq!(stack.bytes().len(), 0x130);
+        assert_eq!(stack.stack_pointer(), 0x7fff_fe40);
+        assert_eq!(stack.bytes().len(), 0x1c0);
         assert_eq!(stack.argv_addresses(), &[0x7fff_ffcb, 0x7fff_ffd4]);
         assert_eq!(stack.envp_addresses(), &[0x7fff_ffdb, 0x7fff_ffe6]);
         assert_eq!(stack.executable_path_address(), 0x7fff_fff7);
         assert_eq!(stack.platform_address(), 0x7fff_fff0);
         assert_eq!(stack.random_address(), 0x7fff_ffbb);
 
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fed0), 2);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fed8), 0x7fff_ffcb);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fee0), 0x7fff_ffd4);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fee8), 0);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fef0), 0x7fff_ffdb);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_fef8), 0x7fff_ffe6);
-        assert_eq!(read_stack_u64(&stack, 0x7fff_ff00), 0);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe40), 2);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe48), 0x7fff_ffcb);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe50), 0x7fff_ffd4);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe58), 0);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe60), 0x7fff_ffdb);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe68), 0x7fff_ffe6);
+        assert_eq!(read_stack_u64(&stack, 0x7fff_fe70), 0);
 
         assert_eq!(
             read_stack_bytes(&stack, 0x7fff_ffbb, 16),
@@ -2141,8 +2402,17 @@ mod tests {
                 AuxiliaryVectorEntry::new(auxv::AT_PHNUM, 1),
                 AuxiliaryVectorEntry::new(auxv::AT_PAGESZ, 4096),
                 AuxiliaryVectorEntry::new(auxv::AT_BASE, 0x7000_0000),
+                AuxiliaryVectorEntry::new(auxv::AT_FLAGS, 0),
                 AuxiliaryVectorEntry::new(auxv::AT_ENTRY, 0x401000),
+                AuxiliaryVectorEntry::new(auxv::AT_UID, 0),
+                AuxiliaryVectorEntry::new(auxv::AT_EUID, 0),
+                AuxiliaryVectorEntry::new(auxv::AT_GID, 0),
+                AuxiliaryVectorEntry::new(auxv::AT_EGID, 0),
+                AuxiliaryVectorEntry::new(auxv::AT_HWCAP, 0),
+                AuxiliaryVectorEntry::new(auxv::AT_CLKTCK, DEFAULT_CLOCK_TICKS_PER_SECOND),
+                AuxiliaryVectorEntry::new(auxv::AT_SECURE, 0),
                 AuxiliaryVectorEntry::new(auxv::AT_RANDOM, stack.random_address()),
+                AuxiliaryVectorEntry::new(auxv::AT_HWCAP2, 0),
                 AuxiliaryVectorEntry::new(auxv::AT_EXECFN, stack.executable_path_address()),
                 AuxiliaryVectorEntry::new(auxv::AT_PLATFORM, stack.platform_address()),
                 AuxiliaryVectorEntry::new(auxv::AT_NULL, 0),
@@ -2242,6 +2512,169 @@ mod tests {
     }
 
     #[test]
+    fn builds_dynamic_guest_memory_image_with_musl_interpreter() {
+        let interpreter_path = b"/lib/ld-musl-x86_64.so.1\0";
+        let executable = Elf64Builder::new()
+            .object_type(TEST_ET_DYN)
+            .entrypoint(0x1010)
+            .program_header(Elf64ProgramHeader::new(
+                TEST_PT_INTERP,
+                TEST_PF_R,
+                0x300,
+                0,
+                interpreter_path.len() as u64,
+                interpreter_path.len() as u64,
+                1,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0,
+                0x1000,
+                0x2000,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_W,
+                0x3000,
+                0x3000,
+                0x20,
+                0x100,
+            ))
+            .data_at(0x300, interpreter_path.to_vec())
+            .data_at(0x400, vec![0xaa, 0xbb, 0xcc, 0xdd])
+            .data_at(0x3000, vec![0x11, 0x22])
+            .build();
+        let interpreter = Elf64Builder::new()
+            .object_type(TEST_ET_DYN)
+            .entrypoint(0x400)
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0,
+                0x1000,
+                0x1000,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_W,
+                0x2000,
+                0x2000,
+                0x10,
+                0x100,
+            ))
+            .data_at(0x400, vec![0x90; 4])
+            .data_at(0x2000, vec![0x33, 0x44])
+            .build();
+        let plan = parse_load_plan(&executable).expect("dynamic ELF should parse");
+
+        let image = build_guest_memory_image_with_interpreter(
+            &plan,
+            &executable,
+            Some(&interpreter),
+            InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/sh".to_vec()).with_argv([
+                b"/bin/sh".to_vec(),
+                b"-c".to_vec(),
+                b"echo hi".to_vec(),
+            ]),
+        )
+        .expect("dynamic guest image should build");
+
+        let loaded_interpreter = image.interpreter().expect("interpreter should load");
+        assert_eq!(image.entrypoint(), DEFAULT_INTERPRETER_LOAD_BASE + 0x400);
+        assert_eq!(
+            image.executable_load_bias(),
+            DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE
+        );
+        assert_eq!(loaded_interpreter.path(), b"/lib/ld-musl-x86_64.so.1");
+        assert_eq!(
+            loaded_interpreter.load_bias(),
+            DEFAULT_INTERPRETER_LOAD_BASE
+        );
+        assert_eq!(
+            image.read(DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE + 0x400, 4),
+            Some([0xaa, 0xbb, 0xcc, 0xdd].as_slice())
+        );
+        assert_eq!(
+            image.read(DEFAULT_INTERPRETER_LOAD_BASE + 0x400, 4),
+            Some([0x90, 0x90, 0x90, 0x90].as_slice())
+        );
+        assert!(image.vmas().iter().any(|vma| matches!(
+            vma.kind(),
+            GuestVmaKind::InterpreterLoad {
+                path,
+                program_header_index: 0,
+                ..
+            } if path == b"/lib/ld-musl-x86_64.so.1"
+        )));
+        assert!(image.vmas().iter().any(|vma| matches!(
+            vma.kind(),
+            GuestVmaKind::ElfLoad {
+                program_header_index: 1,
+                ..
+            }
+        ) && vma.start()
+            == DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE));
+
+        let auxv = image.initial_stack().auxv_entries();
+        assert_eq!(
+            auxv_value(auxv, auxv::AT_PHDR),
+            DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE + 0x40
+        );
+        assert_eq!(
+            auxv_value(auxv, auxv::AT_BASE),
+            DEFAULT_INTERPRETER_LOAD_BASE
+        );
+        assert_eq!(
+            auxv_value(auxv, auxv::AT_ENTRY),
+            DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE + 0x1010
+        );
+        assert_eq!(auxv_value(auxv, auxv::AT_SECURE), 0);
+        assert_eq!(
+            auxv_value(auxv, auxv::AT_CLKTCK),
+            DEFAULT_CLOCK_TICKS_PER_SECOND
+        );
+        assert_eq!(auxv_value(auxv, auxv::AT_UID), 0);
+        assert_eq!(auxv_value(auxv, auxv::AT_EUID), 0);
+        assert_eq!(auxv_value(auxv, auxv::AT_GID), 0);
+        assert_eq!(auxv_value(auxv, auxv::AT_EGID), 0);
+    }
+
+    #[test]
+    fn dynamic_image_requires_interpreter_bytes() {
+        let interpreter_path = b"/lib/ld-musl-x86_64.so.1\0";
+        let executable = Elf64Builder::new()
+            .object_type(TEST_ET_DYN)
+            .entrypoint(0x1010)
+            .program_header(Elf64ProgramHeader::new(
+                TEST_PT_INTERP,
+                TEST_PF_R,
+                0x300,
+                0,
+                interpreter_path.len() as u64,
+                interpreter_path.len() as u64,
+                1,
+            ))
+            .program_header(Elf64ProgramHeader::load(
+                TEST_PF_R | TEST_PF_X,
+                0,
+                0,
+                0x1000,
+                0x2000,
+            ))
+            .data_at(0x300, interpreter_path.to_vec())
+            .build();
+        let plan = parse_load_plan(&executable).expect("dynamic ELF should parse");
+
+        assert_eq!(
+            build_guest_memory_image(
+                &plan,
+                &executable,
+                InitialStackConfig::new(0x8000_0000, 0x4000, b"/bin/sh".to_vec()),
+            ),
+            Err(GuestImageError::MissingInterpreterBytes)
+        );
+    }
+
+    #[test]
     fn rejects_initial_stack_when_phdr_address_is_unavailable() {
         let elf = Elf64Builder::new()
             .entrypoint(0x401000)
@@ -2283,6 +2716,14 @@ mod tests {
             .map(|offset| start + offset)
             .expect("NUL terminator");
         &stack.bytes()[start..end]
+    }
+
+    fn auxv_value(entries: &[AuxiliaryVectorEntry], key: u64) -> u64 {
+        entries
+            .iter()
+            .find(|entry| entry.key() == key)
+            .unwrap_or_else(|| panic!("missing auxv key {key}"))
+            .value()
     }
 
     #[test]

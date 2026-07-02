@@ -194,9 +194,15 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
     }
 
     let executable = read_guest_executable(&config)?;
-    let program = GuestProgram::new(GuestExecutable::new(config.program.clone(), executable))
-        .with_args(config.args.clone())
-        .with_env(config.env.clone());
+    let mut program = GuestProgram::new(GuestExecutable::new(
+        config.program.clone(),
+        executable.bytes,
+    ))
+    .with_args(config.args.clone())
+    .with_env(config.env.clone());
+    if let Some(interpreter) = executable.interpreter {
+        program = program.with_interpreter(interpreter);
+    }
     let mut runtime = RuntimeWithTracer::with_diagnostics(program)?;
     runtime.dispatch_syscall(GuestContext::new(
         INITIAL_GUEST_PID,
@@ -235,7 +241,15 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
     Ok(output)
 }
 
-fn read_guest_executable(config: &RunRootfsConfig) -> Result<Vec<u8>, RunRootfsError> {
+#[derive(Debug)]
+struct LoadedGuestExecutable {
+    bytes: Vec<u8>,
+    interpreter: Option<GuestExecutable>,
+}
+
+fn read_guest_executable(
+    config: &RunRootfsConfig,
+) -> Result<LoadedGuestExecutable, RunRootfsError> {
     let path = host_path_for_guest(&config.rootfs, &config.program)?;
     if !path.is_file() {
         return Err(RunRootfsError::MissingExecutable(path));
@@ -244,8 +258,28 @@ fn read_guest_executable(config: &RunRootfsConfig) -> Result<Vec<u8>, RunRootfsE
         path: path.clone(),
         source,
     })?;
+    let load_plan = mcr_elf::parse_load_plan(&bytes)?;
+    let interpreter = load_plan
+        .interpreter()
+        .map(|interpreter| read_guest_interpreter(config, interpreter.as_bytes()))
+        .transpose()?;
+    Ok(LoadedGuestExecutable { bytes, interpreter })
+}
+
+fn read_guest_interpreter(
+    config: &RunRootfsConfig,
+    interpreter_path: &[u8],
+) -> Result<GuestExecutable, RunRootfsError> {
+    let path = host_path_for_guest(&config.rootfs, interpreter_path)?;
+    if !path.is_file() {
+        return Err(RunRootfsError::MissingExecutable(path));
+    }
+    let bytes = fs::read(&path).map_err(|source| RunRootfsError::Io {
+        path: path.clone(),
+        source,
+    })?;
     mcr_elf::parse_load_plan(&bytes)?;
-    Ok(bytes)
+    Ok(GuestExecutable::new(interpreter_path.to_vec(), bytes))
 }
 
 fn dispatch_mvp_program(
@@ -470,7 +504,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
+    use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::{RunRootfsConfig, run_rootfs};
 
@@ -523,6 +557,26 @@ mod tests {
         assert_eq!(cat.stdout(), b"NAME=Alpine\n");
     }
 
+    #[test]
+    fn run_rootfs_loads_dynamic_interpreter_from_rootfs() {
+        let rootfs = TestRootfs::new("dynamic");
+        rootfs.write_dynamic_elf("/bin/busybox", "/lib/ld-musl-x86_64.so.1");
+        rootfs.write_interpreter_elf("/lib/ld-musl-x86_64.so.1");
+
+        let output = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"echo".to_vec(),
+                b"dynamic".to_vec(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"dynamic\n");
+        assert_eq!(output.stderr(), b"");
+    }
+
     struct TestRootfs {
         path: PathBuf,
     }
@@ -567,6 +621,38 @@ mod tests {
                 ))
                 .data_at(0x200, vec![0x90; 0x20])
                 .data_at(0x2000, vec![0; 0x08])
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
+        fn write_dynamic_elf(&self, guest_path: &str, interpreter: &str) {
+            let mut interpreter_path = interpreter.as_bytes().to_vec();
+            interpreter_path.push(0);
+            let elf = Elf64Builder::new()
+                .object_type(ET_DYN)
+                .entrypoint(0x1010)
+                .program_header(Elf64ProgramHeader::new(
+                    PT_INTERP,
+                    PF_R,
+                    0x300,
+                    0,
+                    interpreter_path.len() as u64,
+                    interpreter_path.len() as u64,
+                    1,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x2000))
+                .data_at(0x300, interpreter_path)
+                .data_at(0x400, vec![0x90; 4])
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
+        fn write_interpreter_elf(&self, guest_path: &str) {
+            let elf = Elf64Builder::new()
+                .object_type(ET_DYN)
+                .entrypoint(0x400)
+                .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x1000))
+                .data_at(0x400, vec![0x90; 4])
                 .build();
             self.write_file(guest_path, &elf);
         }
