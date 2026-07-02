@@ -653,6 +653,24 @@ impl PathTree {
             if matches!(node.kind(), PathNodeKind::Proc(existing) if *existing == kind) {
                 return Ok(());
             }
+            if matches!(
+                (node.kind(), kind),
+                (
+                    PathNodeKind::Directory,
+                    ProcNodeKind::Directory | ProcNodeKind::FdDirectory
+                )
+            ) {
+                self.replace_path_node(
+                    path,
+                    PathNode {
+                        inode_id,
+                        kind: PathNodeKind::Proc(kind),
+                        metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
+                        data: Vec::new(),
+                    },
+                );
+                return Ok(());
+            }
             return Err(VfsError::AlreadyExists);
         }
         if !path.is_root() {
@@ -667,6 +685,13 @@ impl PathTree {
                 data: Vec::new(),
             },
         )
+    }
+
+    fn replace_path_node(&mut self, path: GuestPath, node: PathNode) {
+        if let Some(existing_inode_id) = self.nodes.insert(path, node.inode_id) {
+            self.inodes.remove(&existing_inode_id);
+        }
+        self.inodes.insert(node.inode_id, node);
     }
 
     fn remove_path_link(&mut self, path: &GuestPath) -> VfsResult<InodeId> {
@@ -3955,6 +3980,51 @@ mod tests {
         assert_eq!(
             vfs.access("/proc/self/environ", W_OK).unwrap_err(),
             VfsError::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn mount_minimal_procfs_takes_over_existing_rootfs_directories() {
+        let mut vfs = sample_vfs();
+        vfs.tree_mut().create_dir("/proc").unwrap();
+        vfs.tree_mut().create_dir("/proc/self").unwrap();
+        vfs.tree_mut().create_dir("/proc/self/fd").unwrap();
+
+        vfs.mount_minimal_procfs().unwrap();
+        vfs.mount_minimal_procfs().unwrap();
+
+        let proc_stat = vfs.newfstatat(AT_FDCWD, "/proc", 0).unwrap();
+        let self_stat = vfs.newfstatat(AT_FDCWD, "/proc/self", 0).unwrap();
+        let fd_stat = vfs.newfstatat(AT_FDCWD, "/proc/self/fd", 0).unwrap();
+        assert_eq!(proc_stat.inode, PROC_INODE_ID);
+        assert_eq!(self_stat.inode, PROC_SELF_INODE_ID);
+        assert_eq!(fd_stat.inode, PROC_SELF_FD_INODE_ID);
+        assert_eq!(proc_stat.mode & 0o777, 0o555);
+
+        let proc_fd = vfs
+            .openat(AT_FDCWD, "/proc", OpenFlags::new(O_RDONLY | O_DIRECTORY), 0)
+            .unwrap();
+        let proc_entries = vfs.getdents64(proc_fd, 4096).unwrap();
+        let proc_entries = proc_entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proc_entries,
+            vec![(".", DT_DIR), ("..", DT_DIR), ("self", DT_DIR)]
+        );
+    }
+
+    #[test]
+    fn mount_minimal_procfs_rejects_existing_non_directory_proc_path() {
+        let mut vfs = sample_vfs();
+        vfs.tree_mut()
+            .create_file_with_content("/proc", b"not a directory", 0o644)
+            .unwrap();
+
+        assert_eq!(
+            vfs.mount_minimal_procfs().unwrap_err(),
+            VfsError::AlreadyExists
         );
     }
 
