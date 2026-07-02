@@ -73,6 +73,7 @@ version = "0.1.0"
 dependencies = [
  "mcr-elf",
  "mcr-jit",
+ "mcr-net",
  "mcr-sys",
  "mcr-task",
  "mcr-testkit",
