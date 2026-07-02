@@ -5254,6 +5254,78 @@ mod tests {
     }
 
     #[test]
+    fn epoll_wait_reports_socket_transport_readiness() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        write_epoll_event_for_test(
+            runtime.memory_mut(),
+            0x402100,
+            LINUX_EPOLLIN | LINUX_EPOLLOUT,
+            0x51,
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [4, u64::from(LINUX_EPOLL_CTL_ADD), 3, 0x402100, 0, 0,],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let ready =
+            runtime.dispatch_syscall(context(Syscall::EpollWait, [4, 0x402200, 4, 0, 0, 0]));
+
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(
+            epoll_event_from_memory(runtime.memory(), 0x402200),
+            (LINUX_EPOLLIN | LINUX_EPOLLOUT, 0x51)
+        );
+    }
+
+    #[test]
     fn connected_socket_sendto_and_recvfrom_move_guest_buffers() {
         let transport = runtime_socket_transport();
         transport.push_incoming(b"pong");
