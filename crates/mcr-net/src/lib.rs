@@ -230,7 +230,10 @@ pub enum SocketState {
     Bound(SocketAddress),
     Connecting(SocketAddress),
     Listening(SocketAddress),
-    Connected(SocketAddress),
+    Connected {
+        local: SocketAddress,
+        peer: SocketAddress,
+    },
     Closed,
 }
 
@@ -239,14 +242,15 @@ impl SocketState {
     pub const fn local_address(self) -> Option<SocketAddress> {
         match self {
             Self::Bound(address) | Self::Listening(address) => Some(address),
-            Self::Created | Self::Connecting(_) | Self::Connected(_) | Self::Closed => None,
+            Self::Connected { local, .. } => Some(local),
+            Self::Created | Self::Connecting(_) | Self::Closed => None,
         }
     }
 
     #[must_use]
     pub const fn peer_address(self) -> Option<SocketAddress> {
         match self {
-            Self::Connected(address) => Some(address),
+            Self::Connected { peer, .. } => Some(peer),
             Self::Created
             | Self::Bound(_)
             | Self::Connecting(_)
@@ -291,6 +295,14 @@ impl SocketAddress {
         match self {
             Self::Inet { .. } => SocketDomain::Inet,
             Self::Inet6 { .. } => SocketDomain::Inet6,
+        }
+    }
+
+    #[must_use]
+    pub const fn unspecified_for_domain(domain: SocketDomain) -> Self {
+        match domain {
+            SocketDomain::Inet => Self::inet([0, 0, 0, 0], 0),
+            SocketDomain::Inet6 => Self::inet6([0; 16], 0, 0, 0),
         }
     }
 }
@@ -471,7 +483,9 @@ pub trait HostSocketHandle: fmt::Debug {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
-    fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
+    fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError>;
+    fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
+    fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
@@ -547,10 +561,20 @@ impl HostSocketHandle for WinHostSocketHandle {
         Ok((Box::new(Self { socket }), SocketAddress::from(peer)))
     }
 
-    fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+    fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
         self.socket
             .connect(SocketAddr::from(address))
-            .map_err(HostIoError::from)?;
+            .map_err(HostIoError::from)
+    }
+
+    fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
+        self.socket
+            .local_addr()
+            .map(SocketAddress::from)
+            .map_err(HostIoError::from)
+    }
+
+    fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
         self.socket
             .peer_addr()
             .map(SocketAddress::from)
@@ -933,7 +957,7 @@ impl GuestSocketTable {
                 LinuxErrno::InvalidArgument,
                 "connecting socket cannot be bound",
             )),
-            SocketState::Connected(_) => Err(SocketError::invalid_state(
+            SocketState::Connected { .. } => Err(SocketError::invalid_state(
                 SocketOperation::Bind,
                 LinuxErrno::InvalidArgument,
                 "connected socket cannot be bound",
@@ -979,7 +1003,7 @@ impl GuestSocketTable {
                 LinuxErrno::InvalidArgument,
                 "connecting socket cannot listen",
             )),
-            SocketState::Connected(_) => Err(SocketError::invalid_state(
+            SocketState::Connected { .. } => Err(SocketError::invalid_state(
                 SocketOperation::Listen,
                 LinuxErrno::InvalidArgument,
                 "connected socket cannot listen",
@@ -994,10 +1018,17 @@ impl GuestSocketTable {
             validate_address_domain(socket.domain, address)?;
             validate_connect(socket, id)?;
         }
+        let local = self
+            .socket(id)?
+            .state
+            .local_address()
+            .unwrap_or_else(|| SocketAddress::unspecified_for_domain(address.domain()));
 
         if self.transport.is_some() || self.host_handles.contains_key(&id) {
             match self.connect_host_socket(id, address) {
-                Ok(connected) => self.socket_mut(id)?.state = SocketState::Connected(connected),
+                Ok((local, peer)) => {
+                    self.socket_mut(id)?.state = SocketState::Connected { local, peer }
+                }
                 Err(error) if error.linux_errno() == LinuxErrno::OperationWouldBlock => {
                     let socket = self.socket_mut(id)?;
                     socket.state = SocketState::Connecting(address);
@@ -1011,7 +1042,10 @@ impl GuestSocketTable {
                 Err(error) => return Err(error),
             }
         } else {
-            self.socket_mut(id)?.state = SocketState::Connected(address);
+            self.socket_mut(id)?.state = SocketState::Connected {
+                local,
+                peer: address,
+            };
         }
         Ok(())
     }
@@ -1024,7 +1058,7 @@ impl GuestSocketTable {
             SocketState::Created
             | SocketState::Bound(_)
             | SocketState::Connecting(_)
-            | SocketState::Connected(_) => {
+            | SocketState::Connected { .. } => {
                 return Err(SocketError::invalid_state(
                     SocketOperation::Accept,
                     LinuxErrno::InvalidArgument,
@@ -1042,13 +1076,18 @@ impl GuestSocketTable {
         }
 
         let spec = self.socket_spec(id)?;
+        let local = self
+            .socket(id)?
+            .state
+            .local_address()
+            .unwrap_or_else(|| SocketAddress::unspecified_for_domain(spec.domain));
         let (handle, peer) = self
             .ensure_host_entry_mut(id, SocketOperation::Accept)?
             .handle
             .accept()
             .map_err(SocketError::from_host)?;
         let accepted = self.create_socket_with_handle(spec, handle)?;
-        self.socket_mut(accepted)?.state = SocketState::Connected(peer);
+        self.socket_mut(accepted)?.state = SocketState::Connected { local, peer };
         Ok((accepted, peer))
     }
 
@@ -1056,7 +1095,7 @@ impl GuestSocketTable {
         {
             let socket = self.socket(id)?;
             match socket.state {
-                SocketState::Connected(_) => {}
+                SocketState::Connected { .. } => {}
                 SocketState::Created
                 | SocketState::Bound(_)
                 | SocketState::Connecting(_)
@@ -1259,20 +1298,34 @@ impl GuestSocketTable {
         &mut self,
         id: SocketId,
         address: SocketAddress,
-    ) -> Result<SocketAddress, SocketError> {
+    ) -> Result<(SocketAddress, SocketAddress), SocketError> {
         let entry = self.ensure_host_entry_mut(id, SocketOperation::Connect)?;
         entry
             .handle
             .connect(address)
-            .map_err(SocketError::from_host)
+            .map_err(SocketError::from_host)?;
+        let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
+        let peer = entry.handle.peer_addr().map_err(SocketError::from_host)?;
+        Ok((local, peer))
     }
 
     fn finish_nonblocking_connect(&mut self, id: SocketId) -> Result<(), SocketError> {
         let SocketState::Connecting(address) = self.socket(id)?.state else {
             return Ok(());
         };
+        let (local, peer) = if let Some(entry) = self.host_handles.get(&id) {
+            (
+                entry.handle.local_addr().map_err(SocketError::from_host)?,
+                entry.handle.peer_addr().map_err(SocketError::from_host)?,
+            )
+        } else {
+            (
+                SocketAddress::unspecified_for_domain(address.domain()),
+                address,
+            )
+        };
         let socket = self.socket_mut(id)?;
-        socket.state = SocketState::Connected(address);
+        socket.state = SocketState::Connected { local, peer };
         socket.last_error = None;
         Ok(())
     }
@@ -1295,7 +1348,7 @@ impl GuestSocketTable {
             | SocketState::Bound(_)
             | SocketState::Connecting(_)
             | SocketState::Listening(_)
-            | SocketState::Connected(_) => {
+            | SocketState::Connected { .. } => {
                 socket.state = SocketState::Closed;
                 socket.shutdown = ShutdownFlags {
                     read: true,
@@ -1553,7 +1606,7 @@ fn validate_connect(socket: &GuestSocket, id: SocketId) -> Result<(), SocketErro
             LinuxErrno::OperationAlreadyInProgress,
             "socket connect is already in progress",
         )),
-        SocketState::Connected(_) => Err(SocketError::invalid_state(
+        SocketState::Connected { .. } => Err(SocketError::invalid_state(
             SocketOperation::Connect,
             LinuxErrno::AlreadyConnected,
             "socket is already connected",
@@ -1582,7 +1635,7 @@ fn validate_connected_stream_io(
     }
 
     match socket.state {
-        SocketState::Connected(_) => Ok(()),
+        SocketState::Connected { .. } => Ok(()),
         SocketState::Created
         | SocketState::Bound(_)
         | SocketState::Connecting(_)
@@ -1613,7 +1666,7 @@ fn validate_datagram_io(
         SocketState::Created
         | SocketState::Bound(_)
         | SocketState::Connecting(_)
-        | SocketState::Connected(_) => Ok(()),
+        | SocketState::Connected { .. } => Ok(()),
         SocketState::Listening(_) => Err(SocketError::invalid_state(
             operation,
             LinuxErrno::InvalidArgument,
@@ -1783,12 +1836,28 @@ mod tests {
             Ok((Box::new(handle), address))
         }
 
-        fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+        fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
             if let Some(error) = self.connect_error.take() {
+                if error.linux_errno() == LinuxErrno::OperationWouldBlock {
+                    self.connected = Some(address);
+                }
                 return Err(error);
             }
             self.connected = Some(address);
-            Ok(address)
+            Ok(())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
+            Ok(SocketAddress::unspecified_for_domain(
+                self.connected
+                    .map_or(SocketDomain::Inet, SocketAddress::domain),
+            ))
+        }
+
+        fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
+            self.connected.ok_or_else(|| {
+                HostIoError::new(LinuxErrno::NotConnected, "socket is not connected")
+            })
         }
 
         fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
@@ -2107,7 +2176,18 @@ mod tests {
         table.connect(stream, peer).expect("connect placeholder");
         assert_eq!(
             table.socket(stream).expect("socket").state(),
-            SocketState::Connected(peer)
+            SocketState::Connected {
+                local: SocketAddress::inet6([0; 16], 0, 0, 0),
+                peer,
+            }
+        );
+        assert_eq!(
+            table
+                .socket(stream)
+                .expect("socket")
+                .state()
+                .local_address(),
+            Some(SocketAddress::inet6([0; 16], 0, 0, 0))
         );
         assert_eq!(
             table.socket(stream).expect("socket").state().peer_address(),
@@ -2156,7 +2236,10 @@ mod tests {
         table.connect(stream, peer).expect("connect handle");
         assert_eq!(
             table.socket(stream).expect("socket").state(),
-            SocketState::Connected(peer)
+            SocketState::Connected {
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer,
+            }
         );
         assert_eq!(
             table
@@ -2253,7 +2336,10 @@ mod tests {
         assert!(readiness.writable);
         assert_eq!(
             table.socket(stream).expect("socket").state(),
-            SocketState::Connected(peer)
+            SocketState::Connected {
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer,
+            }
         );
         assert_eq!(
             table
@@ -2360,7 +2446,7 @@ mod tests {
         );
         assert_eq!(
             table.socket(accepted).expect("accepted").state(),
-            SocketState::Connected(peer)
+            SocketState::Connected { local, peer }
         );
         let mut buffer = [0; 5];
         assert_eq!(

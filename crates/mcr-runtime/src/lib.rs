@@ -6028,7 +6028,10 @@ mod tests {
                 .socket(SocketId::new(2).unwrap())
                 .unwrap()
                 .state(),
-            SocketState::Connected(peer)
+            SocketState::Connected {
+                local: SocketAddress::inet([127, 0, 0, 1], 8080),
+                peer,
+            }
         );
     }
 
@@ -6038,6 +6041,8 @@ mod tests {
         let peer_addr = 0x3000;
         let out_addr = 0x3100;
         let out_len = 0x3200;
+        let local_addr = 0x3300;
+        let local_len = 0x3400;
         let address = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         runtime
             .memory_mut()
@@ -6067,6 +6072,22 @@ mod tests {
         assert_eq!(
             runtime.memory().read(out_addr, SOCKADDR_IN6_LEN),
             ipv6_sockaddr(address, 443, 7, 2)
+        );
+        runtime
+            .memory_mut()
+            .write(local_len, &(SOCKADDR_IN6_LEN as u32).to_le_bytes());
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Getsockname,
+                [3, local_addr, local_len, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u32_at(runtime.memory(), local_len), SOCKADDR_IN6_LEN as u32);
+        assert_eq!(
+            runtime.memory().read(local_addr, SOCKADDR_IN6_LEN),
+            ipv6_sockaddr([0; 16], 0, 0, 0)
         );
         assert_eq!(
             dispatch_network(
@@ -6426,20 +6447,38 @@ mod tests {
             Ok((Box::new(TestSocketHandle { state: accepted }), peer))
         }
 
-        fn connect(
-            &mut self,
-            address: SocketAddress,
-        ) -> Result<SocketAddress, mcr_net::HostIoError> {
+        fn connect(&mut self, address: SocketAddress) -> Result<(), mcr_net::HostIoError> {
             let mut state = self.state.borrow_mut();
             if state.connect_would_block_once {
                 state.connect_would_block_once = false;
+                state.connected = Some(address);
                 return Err(mcr_net::HostIoError::new(
                     mcr_net::LinuxErrno::OperationWouldBlock,
                     "connect would block",
                 ));
             }
             state.connected = Some(address);
-            Ok(address)
+            Ok(())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddress, mcr_net::HostIoError> {
+            let state = self.state.borrow();
+            Ok(state.bound.unwrap_or_else(|| {
+                SocketAddress::unspecified_for_domain(
+                    state
+                        .connected
+                        .map_or(mcr_net::SocketDomain::Inet, SocketAddress::domain),
+                )
+            }))
+        }
+
+        fn peer_addr(&self) -> Result<SocketAddress, mcr_net::HostIoError> {
+            self.state.borrow().connected.ok_or_else(|| {
+                mcr_net::HostIoError::new(
+                    mcr_net::LinuxErrno::NotConnected,
+                    "socket is not connected",
+                )
+            })
         }
 
         fn send(&mut self, buffer: &[u8]) -> Result<usize, mcr_net::HostIoError> {
