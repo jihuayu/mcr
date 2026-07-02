@@ -1,7 +1,14 @@
 pub mod memory;
 pub mod run_rootfs;
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 pub use memory::{
     DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
@@ -53,6 +60,160 @@ pub trait GuestMemoryAccess {
             bytes.push(byte[0]);
         }
         Err(GuestMemoryAccessError::Fault)
+    }
+}
+
+#[derive(Debug)]
+struct FutexWaitEntry {
+    value: AtomicU32,
+    waiters: AtomicU64,
+}
+
+impl FutexWaitEntry {
+    fn new(value: u32) -> Self {
+        Self {
+            value: AtomicU32::new(value),
+            waiters: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FutexRegistry {
+    entries: Arc<Mutex<BTreeMap<u64, Arc<FutexWaitEntry>>>>,
+}
+
+impl FutexRegistry {
+    fn wait(
+        &mut self,
+        uaddr: u64,
+        value: u32,
+        timeout: Option<Duration>,
+        memory_changed: impl Fn() -> bool,
+    ) -> Result<u64, LinuxErrno> {
+        let entry = {
+            let mut entries = self.lock_entries();
+            entries
+                .entry(uaddr)
+                .or_insert_with(|| Arc::new(FutexWaitEntry::new(value)))
+                .clone()
+        };
+        entry.value.store(value, Ordering::SeqCst);
+        entry.waiters.fetch_add(1, Ordering::SeqCst);
+
+        if memory_changed() {
+            self.finish_wait(uaddr, &entry);
+            return Ok(0);
+        }
+        let Some(timeout) = timeout else {
+            self.finish_wait(uaddr, &entry);
+            return Err(LinuxErrno::EAGAIN);
+        };
+        let result = mcr_win::wait_on_address_u32(&entry.value, value, Some(timeout));
+        match result {
+            Ok(mcr_win::AddressWaitResult::TimedOut) => {
+                self.finish_wait(uaddr, &entry);
+                Err(LinuxErrno::ETIMEDOUT)
+            }
+            Ok(mcr_win::AddressWaitResult::ValueChanged | mcr_win::AddressWaitResult::Woken) => {
+                Ok(0)
+            }
+            Err(error) => {
+                self.finish_wait(uaddr, &entry);
+                Err(host_sync_errno(error.kind()))
+            }
+        }
+    }
+
+    fn wake(&mut self, uaddr: u64, count: u32) -> u64 {
+        if count == 0 {
+            return 0;
+        }
+
+        let Some(entry) = self.lock_entries().get(&uaddr).cloned() else {
+            return 0;
+        };
+        let woken = reserve_wake_count(&entry.waiters, u64::from(count));
+        if woken == 0 {
+            self.prune_entry(uaddr, &entry);
+            return 0;
+        }
+
+        entry.value.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..woken {
+            if mcr_win::wake_by_address_single_u32(&entry.value).is_err() {
+                break;
+            }
+        }
+        self.prune_entry(uaddr, &entry);
+        woken
+    }
+
+    fn finish_wait(&self, uaddr: u64, entry: &Arc<FutexWaitEntry>) {
+        decrement_waiter(&entry.waiters);
+        self.prune_entry(uaddr, entry);
+    }
+
+    fn prune_entry(&self, uaddr: u64, entry: &Arc<FutexWaitEntry>) {
+        if entry.waiters.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        let mut entries = self.lock_entries();
+        if entries
+            .get(&uaddr)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entries.remove(&uaddr);
+        }
+    }
+
+    fn lock_entries(&self) -> MutexGuard<'_, BTreeMap<u64, Arc<FutexWaitEntry>>> {
+        match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self, uaddr: u64) -> u64 {
+        self.lock_entries()
+            .get(&uaddr)
+            .map_or(0, |entry| entry.waiters.load(Ordering::SeqCst))
+    }
+}
+
+fn reserve_wake_count(waiters: &AtomicU64, count: u64) -> u64 {
+    let mut current = waiters.load(Ordering::SeqCst);
+    loop {
+        let woken = current.min(count);
+        if woken == 0 {
+            return 0;
+        }
+        match waiters.compare_exchange(current, current - woken, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return woken,
+            Err(updated) => current = updated,
+        }
+    }
+}
+
+fn decrement_waiter(waiters: &AtomicU64) {
+    let mut current = waiters.load(Ordering::SeqCst);
+    while current != 0 {
+        match waiters.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(updated) => current = updated,
+        }
+    }
+}
+
+fn host_sync_errno(kind: mcr_win::HostErrorKind) -> LinuxErrno {
+    match kind {
+        mcr_win::HostErrorKind::InvalidInput => LinuxErrno::EINVAL,
+        mcr_win::HostErrorKind::Interrupted => LinuxErrno::EINTR,
+        mcr_win::HostErrorKind::TimedOut => LinuxErrno::ETIMEDOUT,
+        mcr_win::HostErrorKind::OutOfMemory => LinuxErrno::ENOMEM,
+        _ => LinuxErrno::EIO,
     }
 }
 
@@ -1607,7 +1768,7 @@ where
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
     files: RuntimeFileSystem<GuestMemory>,
-    futex_waiters: BTreeMap<u64, u64>,
+    futexes: FutexRegistry,
 }
 
 impl RuntimeSubsystems {
@@ -1627,7 +1788,7 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
-            futex_waiters: BTreeMap::new(),
+            futexes: FutexRegistry::default(),
         })
     }
 
@@ -1756,24 +1917,31 @@ impl RuntimeSubsystems {
         if value != args.val {
             return Err(LinuxErrno::EAGAIN);
         }
-        if args.timeout == 0 {
-            *self.futex_waiters.entry(args.uaddr).or_default() += 1;
-            return Ok(0);
-        }
-        Err(LinuxErrno::ETIMEDOUT)
+        let timeout = read_futex_timeout(self.files.memory(), args.timeout)?;
+        let memory = self.files.memory();
+        self.futexes.wait(args.uaddr, value, timeout, || {
+            read_guest_u32(memory, args.uaddr).is_ok_and(|current| current != args.val)
+        })
     }
 
     fn futex_wake(&mut self, args: FutexSyscallArgs) -> u64 {
-        let Some(waiters) = self.futex_waiters.get_mut(&args.uaddr) else {
-            return 0;
-        };
-        let woken = (*waiters).min(u64::from(args.val));
-        *waiters -= woken;
-        if *waiters == 0 {
-            self.futex_waiters.remove(&args.uaddr);
-        }
-        woken
+        self.futexes.wake(args.uaddr, args.val)
     }
+}
+
+fn read_futex_timeout(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<Option<Duration>, LinuxErrno> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let tv_sec = read_guest_i64(memory, addr)?;
+    let tv_nsec = read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?;
+    if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(Some(Duration::new(tv_sec as u64, tv_nsec as u32)))
 }
 
 fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, LinuxErrno> {
@@ -1782,6 +1950,14 @@ fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, Lin
         .read_bytes(addr, &mut bytes)
         .map_err(|_| LinuxErrno::EFAULT)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_guest_i64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<i64, LinuxErrno> {
+    let mut bytes = [0; 8];
+    memory
+        .read_bytes(addr, &mut bytes)
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 fn read_guest_u64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u64, LinuxErrno> {
@@ -2116,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn private_futex_wait_reads_mutated_runtime_memory_and_wake_counts_waiter() {
+    fn private_futex_null_timeout_wait_does_not_return_success_or_count_fake_waiter() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime
             .memory_mut()
@@ -2146,8 +2322,8 @@ mod tests {
             ],
         ));
 
-        assert_eq!(wait.result, SyscallReturn::Success(0));
-        assert_eq!(wake.result, SyscallReturn::Success(1));
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+        assert_eq!(wake.result, SyscallReturn::Success(0));
     }
 
     #[test]
@@ -2171,6 +2347,7 @@ mod tests {
             .memory_mut()
             .write(addr, &9u32.to_le_bytes())
             .unwrap();
+        runtime.memory_mut().write(0x402000, &[0; 16]).unwrap();
 
         let wait = runtime.dispatch_syscall(context(
             Syscall::Futex,
@@ -2178,13 +2355,81 @@ mod tests {
                 addr,
                 u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
                 9,
-                1,
+                0x402000,
                 0,
                 0,
             ],
         ));
 
         assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ETIMEDOUT));
+    }
+
+    #[test]
+    fn private_futex_wait_timeout_pointer_is_validated_and_controls_timeout() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &1u32.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402100, &0i64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402108, &1_000_000_000i64.to_le_bytes())
+            .unwrap();
+
+        let invalid = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0x402100,
+                0,
+                0,
+            ],
+        ));
+        runtime
+            .memory_mut()
+            .write(0x402108, &0i64.to_le_bytes())
+            .unwrap();
+        let timed_out = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0x402100,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(invalid.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+        assert_eq!(
+            timed_out.result,
+            SyscallReturn::Errno(LinuxErrno::ETIMEDOUT)
+        );
+    }
+
+    #[test]
+    fn private_futex_registry_wake_releases_registered_waiter() {
+        let mut registry = FutexRegistry::default();
+        let waiter_registry = registry.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut registry = waiter_registry;
+            registry.wait(0x402000, 3, Some(Duration::from_secs(5)), || false)
+        });
+
+        while registry.waiter_count(0x402000) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(registry.wake(0x402000, 1), 1);
+        assert_eq!(waiter.join().unwrap(), Ok(0));
+        assert_eq!(registry.waiter_count(0x402000), 0);
     }
 
     #[test]
