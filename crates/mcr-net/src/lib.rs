@@ -468,6 +468,9 @@ pub trait HostSocketTransport {
 }
 
 pub trait HostSocketHandle: fmt::Debug {
+    fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
+    fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
+    fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
     fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
@@ -522,6 +525,28 @@ struct WinHostSocketHandle {
 }
 
 impl HostSocketHandle for WinHostSocketHandle {
+    fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+        self.socket
+            .bind(SocketAddr::from(address))
+            .map_err(HostIoError::from)?;
+        self.socket
+            .local_addr()
+            .map(SocketAddress::from)
+            .map_err(HostIoError::from)
+    }
+
+    fn listen(&mut self, backlog: u32) -> Result<(), HostIoError> {
+        let backlog = i32::try_from(backlog).map_err(|_| {
+            HostIoError::new(LinuxErrno::InvalidArgument, "listen backlog too large")
+        })?;
+        self.socket.listen(backlog).map_err(HostIoError::from)
+    }
+
+    fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+        let (socket, peer) = self.socket.accept().map_err(HostIoError::from)?;
+        Ok((Box::new(Self { socket }), SocketAddress::from(peer)))
+    }
+
     fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
         self.socket
             .connect(SocketAddr::from(address))
@@ -876,10 +901,24 @@ impl GuestSocketTable {
     }
 
     pub fn bind(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
-        let socket = self.socket_mut(id)?;
+        let socket = self.socket(id)?;
         validate_address_domain(socket.domain, address)?;
+        let state = socket.state;
 
-        match socket.state {
+        if matches!(state, SocketState::Created)
+            && (self.transport.is_some() || self.host_handles.contains_key(&id))
+        {
+            let bound = self
+                .ensure_host_entry_mut(id, SocketOperation::Bind)?
+                .handle
+                .bind(address)
+                .map_err(SocketError::from_host)?;
+            self.socket_mut(id)?.state = SocketState::Bound(bound);
+            return Ok(());
+        }
+
+        let socket = self.socket_mut(id)?;
+        match state {
             SocketState::Created => {
                 socket.state = SocketState::Bound(address);
                 Ok(())
@@ -903,8 +942,8 @@ impl GuestSocketTable {
         }
     }
 
-    pub fn listen(&mut self, id: SocketId, _backlog: u32) -> Result<(), SocketError> {
-        let socket = self.socket_mut(id)?;
+    pub fn listen(&mut self, id: SocketId, backlog: u32) -> Result<(), SocketError> {
+        let socket = self.socket(id)?;
         if socket.socket_type != SocketType::Stream {
             return Err(SocketError::invalid_state(
                 SocketOperation::Listen,
@@ -912,8 +951,19 @@ impl GuestSocketTable {
                 "only stream sockets can listen",
             ));
         }
+        let state = socket.state;
 
-        match socket.state {
+        if matches!(state, SocketState::Bound(_) | SocketState::Listening(_))
+            && (self.transport.is_some() || self.host_handles.contains_key(&id))
+        {
+            self.ensure_host_entry_mut(id, SocketOperation::Listen)?
+                .handle
+                .listen(backlog)
+                .map_err(SocketError::from_host)?;
+        }
+
+        let socket = self.socket_mut(id)?;
+        match state {
             SocketState::Created => Err(SocketError::invalid_state(
                 SocketOperation::Listen,
                 LinuxErrno::InvalidArgument,
@@ -966,23 +1016,40 @@ impl GuestSocketTable {
         Ok(())
     }
 
-    pub fn accept_placeholder(&mut self, id: SocketId) -> Result<SocketId, SocketError> {
+    pub fn accept(&mut self, id: SocketId) -> Result<(SocketId, SocketAddress), SocketError> {
         let socket = self.socket(id)?;
-        match socket.state {
-            SocketState::Listening(_) => Err(SocketError::would_block(
-                SocketOperation::Accept,
-                "no pending guest socket connection is available",
-            )),
+        let state = socket.state;
+        match state {
+            SocketState::Listening(_) => {}
             SocketState::Created
             | SocketState::Bound(_)
             | SocketState::Connecting(_)
-            | SocketState::Connected(_) => Err(SocketError::invalid_state(
-                SocketOperation::Accept,
-                LinuxErrno::InvalidArgument,
-                "socket is not listening",
-            )),
-            SocketState::Closed => Err(SocketError::BadSocket { id }),
+            | SocketState::Connected(_) => {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::Accept,
+                    LinuxErrno::InvalidArgument,
+                    "socket is not listening",
+                ));
+            }
+            SocketState::Closed => return Err(SocketError::BadSocket { id }),
         }
+
+        if self.transport.is_none() && !self.host_handles.contains_key(&id) {
+            return Err(SocketError::would_block(
+                SocketOperation::Accept,
+                "no pending guest socket connection is available",
+            ));
+        }
+
+        let spec = self.socket_spec(id)?;
+        let (handle, peer) = self
+            .ensure_host_entry_mut(id, SocketOperation::Accept)?
+            .handle
+            .accept()
+            .map_err(SocketError::from_host)?;
+        let accepted = self.create_socket_with_handle(spec, handle)?;
+        self.socket_mut(accepted)?.state = SocketState::Connected(peer);
+        Ok((accepted, peer))
     }
 
     pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
@@ -1659,6 +1726,9 @@ mod tests {
         connected: Option<SocketAddress>,
         connect_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
+        accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
+        bound: Option<SocketAddress>,
+        listened: bool,
     }
 
     impl FakeHostSocketHandle {
@@ -1682,9 +1752,37 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn with_accepted(peer: SocketAddress, incoming: &[u8]) -> Self {
+            Self {
+                accepted: vec![(Self::with_incoming(incoming), peer)],
+                ..Self::default()
+            }
+        }
     }
 
     impl HostSocketHandle for FakeHostSocketHandle {
+        fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+            self.bound = Some(address);
+            Ok(address)
+        }
+
+        fn listen(&mut self, _backlog: u32) -> Result<(), HostIoError> {
+            self.listened = true;
+            Ok(())
+        }
+
+        fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+            if self.accepted.is_empty() {
+                return Err(HostIoError::new(
+                    LinuxErrno::OperationWouldBlock,
+                    "no pending fake socket connection",
+                ));
+            }
+            let (handle, address) = self.accepted.remove(0);
+            Ok((Box::new(handle), address))
+        }
+
         fn connect(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
             if let Some(error) = self.connect_error.take() {
                 return Err(error);
@@ -2213,7 +2311,7 @@ mod tests {
         table.listen(stream, 1).expect("listen");
         assert_eq!(
             table
-                .accept_placeholder(stream)
+                .accept(stream)
                 .expect_err("accept placeholder would block")
                 .linux_errno(),
             LinuxErrno::OperationWouldBlock
@@ -2234,5 +2332,41 @@ mod tests {
                 .linux_errno(),
             LinuxErrno::BadFileDescriptor
         );
+    }
+
+    #[test]
+    fn accept_uses_host_listener_and_registers_connected_socket() {
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let listener_handle =
+            FakeHostSocketHandle::with_accepted(peer, b"server-side accepted bytes");
+        let mut table = GuestSocketTable::with_transport(NoopHostSocketTransport);
+        let listener = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .unwrap(),
+                Box::new(listener_handle),
+            )
+            .expect("listener");
+        let local = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(listener, local).expect("bind");
+        table.listen(listener, 1).expect("listen");
+        let (accepted, accepted_peer) = table.accept(listener).expect("accept");
+
+        assert_eq!(accepted_peer, peer);
+        assert_eq!(
+            table.socket(listener).expect("listener").state(),
+            SocketState::Listening(local)
+        );
+        assert_eq!(
+            table.socket(accepted).expect("accepted").state(),
+            SocketState::Connected(peer)
+        );
+        let mut buffer = [0; 5];
+        assert_eq!(
+            table.recv_connected(accepted, &mut buffer).expect("recv"),
+            5
+        );
+        assert_eq!(&buffer, b"serve");
     }
 }
