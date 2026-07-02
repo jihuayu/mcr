@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "mcr-elf"
 version = "0.1.0"
+dependencies = [
+ "mcr-testkit",
+]
 
 [[package]]
 name = "mcr-jit"
