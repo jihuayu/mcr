@@ -48,6 +48,7 @@ impl GuestExecutable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestProgram {
     executable: GuestExecutable,
+    interpreter: Option<GuestExecutable>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
 }
@@ -58,9 +59,16 @@ impl GuestProgram {
         let argv = vec![executable.path().to_vec()];
         Self {
             executable,
+            interpreter: None,
             argv,
             envp: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_interpreter(mut self, interpreter: GuestExecutable) -> Self {
+        self.interpreter = Some(interpreter);
+        self
     }
 
     #[must_use]
@@ -89,6 +97,11 @@ impl GuestProgram {
     }
 
     #[must_use]
+    pub fn interpreter(&self) -> Option<&GuestExecutable> {
+        self.interpreter.as_ref()
+    }
+
+    #[must_use]
     pub fn argv(&self) -> &[Vec<u8>] {
         &self.argv
     }
@@ -98,14 +111,28 @@ impl GuestProgram {
         &self.envp
     }
 
-    fn into_parts(self) -> (GuestExecutable, Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        (self.executable, self.argv, self.envp)
+    fn into_parts(self) -> GuestProgramParts {
+        GuestProgramParts {
+            executable: self.executable,
+            interpreter: self.interpreter,
+            argv: self.argv,
+            envp: self.envp,
+        }
     }
+}
+
+#[derive(Debug)]
+struct GuestProgramParts {
+    executable: GuestExecutable,
+    interpreter: Option<GuestExecutable>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestImageState {
     executable: GuestExecutable,
+    interpreter: Option<GuestExecutable>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     memory: GuestMemoryImage,
@@ -115,6 +142,11 @@ impl GuestImageState {
     #[must_use]
     pub fn executable(&self) -> &GuestExecutable {
         &self.executable
+    }
+
+    #[must_use]
+    pub fn interpreter(&self) -> Option<&GuestExecutable> {
+        self.interpreter.as_ref()
     }
 
     #[must_use]
@@ -487,10 +519,14 @@ impl GuestKernel {
             Syscall::ExitGroup => self.exit_group(task.pid, low_exit_status(arg(request, 0))),
             Syscall::Uname => self.uname(arg(request, 0)),
             Syscall::ArchPrctl => self.arch_prctl(tid, arg(request, 0), arg(request, 1)),
-            Syscall::Execve => self.execve_current(
-                tid,
-                GuestProgram::new(task_process(self, task.pid).image.executable.clone()),
-            ),
+            Syscall::Execve => {
+                let image = &task_process(self, task.pid).image;
+                let mut program = GuestProgram::new(image.executable.clone());
+                if let Some(interpreter) = &image.interpreter {
+                    program = program.with_interpreter(interpreter.clone());
+                }
+                self.execve_current(tid, program)
+            }
             _ => SyscallOutcome::unsupported(),
         }
     }
@@ -728,24 +764,26 @@ impl From<GuestImageError> for TaskError {
 }
 
 fn load_program(program: GuestProgram) -> Result<GuestImageState, TaskError> {
-    let (executable, argv, envp) = program.into_parts();
-    let load_plan = parse_load_plan(executable.bytes())?;
-    let memory = mcr_elf::build_guest_memory_image(
+    let parts = program.into_parts();
+    let load_plan = parse_load_plan(parts.executable.bytes())?;
+    let memory = mcr_elf::build_guest_memory_image_with_interpreter(
         &load_plan,
-        executable.bytes(),
+        parts.executable.bytes(),
+        parts.interpreter.as_ref().map(GuestExecutable::bytes),
         InitialStackConfig::new(
             DEFAULT_STACK_TOP,
             DEFAULT_STACK_SIZE,
-            executable.path().to_vec(),
+            parts.executable.path().to_vec(),
         )
-        .with_argv(argv.clone())
-        .with_envp(envp.clone()),
+        .with_argv(parts.argv.clone())
+        .with_envp(parts.envp.clone()),
     )?;
 
     Ok(GuestImageState {
-        executable,
-        argv,
-        envp,
+        executable: parts.executable,
+        interpreter: parts.interpreter,
+        argv: parts.argv,
+        envp: parts.envp,
         memory,
     })
 }
@@ -783,7 +821,7 @@ fn write_uts_field(field: &mut [u8], value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use mcr_sys::{Syscall, SyscallRegisters, SyscallReturn};
-    use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
+    use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::*;
 
@@ -817,6 +855,24 @@ mod tests {
         assert!(process.files().contains(0));
         assert!(process.files().contains(1));
         assert!(process.files().contains(2));
+    }
+
+    #[test]
+    fn dynamic_initial_process_enters_interpreter() {
+        let kernel = GuestKernel::new(dynamic_test_program("/bin/sh")).unwrap();
+        let process = kernel.process(INITIAL_GUEST_PID).unwrap();
+        let task = kernel.task(INITIAL_GUEST_TID).unwrap();
+
+        assert_eq!(process.image().executable().path(), b"/bin/sh");
+        assert_eq!(
+            process.image().interpreter().unwrap().path(),
+            b"/lib/ld-musl-x86_64.so.1"
+        );
+        assert_eq!(
+            task.regs().rip(),
+            mcr_elf::DEFAULT_INTERPRETER_LOAD_BASE + 0x400
+        );
+        assert!(process.image().memory().interpreter().is_some());
     }
 
     #[test]
@@ -1000,6 +1056,38 @@ mod tests {
             .build();
 
         GuestProgram::new(GuestExecutable::new(path.as_bytes().to_vec(), elf))
+    }
+
+    fn dynamic_test_program(path: &str) -> GuestProgram {
+        let interpreter_path = b"/lib/ld-musl-x86_64.so.1\0";
+        let executable = Elf64Builder::new()
+            .object_type(ET_DYN)
+            .entrypoint(0x1010)
+            .program_header(Elf64ProgramHeader::new(
+                PT_INTERP,
+                PF_R,
+                0x300,
+                0,
+                interpreter_path.len() as u64,
+                interpreter_path.len() as u64,
+                1,
+            ))
+            .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x2000))
+            .data_at(0x300, interpreter_path.to_vec())
+            .data_at(0x400, vec![0x90; 4])
+            .build();
+        let interpreter = Elf64Builder::new()
+            .object_type(ET_DYN)
+            .entrypoint(0x400)
+            .program_header(Elf64ProgramHeader::load(PF_R | PF_X, 0, 0, 0x1000, 0x1000))
+            .data_at(0x400, vec![0x90; 4])
+            .build();
+
+        GuestProgram::new(GuestExecutable::new(path.as_bytes().to_vec(), executable))
+            .with_interpreter(GuestExecutable::new(
+                b"/lib/ld-musl-x86_64.so.1".to_vec(),
+                interpreter,
+            ))
     }
 
     fn c_field(field: &[u8]) -> &[u8] {
