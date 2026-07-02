@@ -19,7 +19,8 @@ use mcr_sys::{
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
-    DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, SeekWhence, VfsError, VirtualFileSystem,
+    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, SeekWhence,
+    VfsError, VirtualFileSystem,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -381,7 +382,17 @@ where
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
             mcr_sys::Syscall::Readlink => self.sys_readlink(request),
+            mcr_sys::Syscall::Readlinkat => self.sys_readlinkat(request),
             mcr_sys::Syscall::Getdents64 => self.sys_getdents64(request),
+            mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
+            mcr_sys::Syscall::Unlinkat => self.sys_unlinkat(request),
+            mcr_sys::Syscall::Renameat2 => self.sys_renameat2(request),
+            mcr_sys::Syscall::Symlinkat => self.sys_symlinkat(request),
+            mcr_sys::Syscall::Linkat => self.sys_linkat(request),
+            mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
+            mcr_sys::Syscall::Chdir => self.sys_chdir(request),
+            mcr_sys::Syscall::Umask => self.sys_umask(request),
             _ => return SyscallOutcome::unsupported(),
         };
         outcome(result)
@@ -533,6 +544,20 @@ where
         Ok(count as u64)
     }
 
+    fn sys_readlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 1))?;
+        let len = usize_arg(request, 3)?;
+        let mut buffer = vec![0; len];
+        let count = self
+            .vfs
+            .readlinkat(arg_i32(request, 0), &path, &mut buffer)
+            .map_err(vfs_errno)?;
+        self.memory
+            .write_bytes(arg(request, 2), &buffer[..count])
+            .map_err(memory_errno)?;
+        Ok(count as u64)
+    }
+
     fn sys_getdents64(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let max_bytes = usize_arg(request, 2)?;
         let entries = self
@@ -547,6 +572,106 @@ where
             .write_bytes(arg(request, 1), &encoded)
             .map_err(memory_errno)?;
         Ok(encoded.len() as u64)
+    }
+
+    fn sys_mkdirat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 1))?;
+        self.vfs
+            .mkdirat(arg_i32(request, 0), &path, arg_u32(request, 2))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_unlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 1))?;
+        let flags = arg_u32(request, 2);
+        if flags & !AT_REMOVEDIR != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.vfs
+            .unlinkat(arg_i32(request, 0), &path, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_renameat2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 1))?;
+        let newpath = self.read_path(arg(request, 3))?;
+        self.vfs
+            .renameat2(
+                arg_i32(request, 0),
+                &oldpath,
+                arg_i32(request, 2),
+                &newpath,
+                arg_u32(request, 4),
+            )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_symlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let target = self.read_path(arg(request, 0))?;
+        let linkpath = self.read_path(arg(request, 2))?;
+        self.vfs
+            .symlinkat(&target, arg_i32(request, 1), &linkpath)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_linkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 1))?;
+        let newpath = self.read_path(arg(request, 3))?;
+        let flags = arg_u32(request, 4);
+        if flags & !(AT_SYMLINK_FOLLOW | mcr_vfs::AT_EMPTY_PATH) != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.vfs
+            .linkat(
+                arg_i32(request, 0),
+                &oldpath,
+                arg_i32(request, 2),
+                &newpath,
+                flags,
+            )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_ftruncate(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let length = arg(request, 1) as i64;
+        if length < 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.vfs
+            .ftruncate(arg_i32(request, 0), length as u64)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_getcwd(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let cwd = self.vfs.getcwd().map_err(vfs_errno)?;
+        let bytes = cwd.as_bytes();
+        let size = usize_arg(request, 1)?;
+        if size == 0 || bytes.len().checked_add(1).ok_or(LinuxErrno::ERANGE)? > size {
+            return Err(LinuxErrno::ERANGE);
+        }
+        self.memory
+            .write_bytes(arg(request, 0), bytes)
+            .map_err(memory_errno)?;
+        self.memory
+            .write_bytes(arg(request, 0) + bytes.len() as u64, &[0])
+            .map_err(memory_errno)?;
+        Ok(arg(request, 0))
+    }
+
+    fn sys_chdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs.chdir(&path).map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_umask(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        Ok(self.vfs.umask(arg_u32(request, 0)) as u64)
     }
 
     fn read_path(&self, addr: u64) -> Result<String, LinuxErrno> {
@@ -920,7 +1045,8 @@ mod tests {
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
     use mcr_vfs::{
-        AT_FDCWD, FdTable, O_DIRECTORY, O_RDONLY, O_RDWR, PathTree, Rootfs, VirtualFileSystem,
+        AT_FDCWD, FdTable, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_WRONLY, PathTree,
+        RENAME_NOREPLACE, Rootfs, VirtualFileSystem,
     };
 
     use super::*;
@@ -1098,6 +1224,110 @@ mod tests {
         let first_reclen = u16_at(runtime.memory(), 0x5000 + 16);
         assert_eq!(first_reclen % 8, 0);
         assert_eq!(runtime.memory().read(0x5000 + 19, 2), b".\0");
+    }
+
+    #[test]
+    fn writable_vfs_syscalls_mutate_paths_and_cwd() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/pkg");
+        runtime.memory_mut().write_cstr(0x1100, "file");
+        runtime.memory_mut().write_cstr(0x1200, "/tmp/pkg/file");
+        runtime.memory_mut().write_cstr(0x1300, "/tmp/pkg/link");
+        runtime.memory_mut().write_cstr(0x1400, "../file");
+        runtime.memory_mut().write_cstr(0x1500, "/tmp/pkg/renamed");
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Umask, [0o077, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0o022)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Mkdirat,
+                [AT_FDCWD as u64, 0x1000, 0o777, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chdir, [0x1000, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Getcwd, [0x3000, 64, 0, 0, 0, 0]),
+            SyscallReturn::Success(0x3000)
+        );
+        assert_eq!(runtime.memory().read(0x3000, 9), b"/tmp/pkg\0");
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [
+                    AT_FDCWD as u64,
+                    0x1100,
+                    u64::from(O_CREAT | O_WRONLY),
+                    0o666,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Ftruncate, [3, 7, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(runtime.vfs().fstat(3).unwrap().size, 7);
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Symlinkat,
+                [0x1400, AT_FDCWD as u64, 0x1300, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Readlinkat,
+                [AT_FDCWD as u64, 0x1300, 0x3100, 32, 0, 0],
+            ),
+            SyscallReturn::Success(7)
+        );
+        assert_eq!(runtime.memory().read(0x3100, 7), b"../file");
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Linkat,
+                [AT_FDCWD as u64, 0x1200, AT_FDCWD as u64, 0x1500, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Renameat2,
+                [
+                    AT_FDCWD as u64,
+                    0x1500,
+                    AT_FDCWD as u64,
+                    0x1200,
+                    u64::from(RENAME_NOREPLACE),
+                    0,
+                ],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EEXIST)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Unlinkat,
+                [AT_FDCWD as u64, 0x1500, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
     }
 
     #[test]
