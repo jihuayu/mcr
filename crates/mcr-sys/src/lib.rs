@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod dispatcher;
 pub mod errno;
+pub mod fd;
 pub mod memory;
 pub mod return_value;
 pub mod syscall;
@@ -19,6 +20,13 @@ pub use dispatcher::{
     syscall_descriptor, syscall_descriptor_by_number,
 };
 pub use errno::LinuxErrno;
+pub use fd::{
+    LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_GETPIPE_SZ,
+    LINUX_F_SETFD, LINUX_F_SETFL, LINUX_F_SETPIPE_SZ, LINUX_FD_CLOEXEC, LINUX_IOCTL_FIONREAD,
+    LINUX_IOCTL_TCGETS, LINUX_IOCTL_TCSETS, LINUX_IOCTL_TCSETSF, LINUX_IOCTL_TCSETSW,
+    LINUX_IOCTL_TIOCGPGRP, LINUX_IOCTL_TIOCSPGRP, LINUX_IOCTL_TIOCGWINSZ, LINUX_O_CLOEXEC,
+    LINUX_O_NONBLOCK,
+};
 pub use memory::{
     BrkSyscallArgs, LINUX_MAP_32BIT, LINUX_MAP_ANONYMOUS, LINUX_MAP_DENYWRITE,
     LINUX_MAP_EXECUTABLE, LINUX_MAP_FIXED, LINUX_MAP_FIXED_NOREPLACE, LINUX_MAP_GROWSDOWN,
