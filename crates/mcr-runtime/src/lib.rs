@@ -2299,8 +2299,17 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
     };
-    let trap = SameIsaExecutionCore::new()
-        .execute_to_syscall_trap(GuestBlock::new(&block, before_rip), registers_from_gpr(gpr))?;
+    let trap = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
+            GuestBlock::new(&block, before_rip),
+            registers_from_gpr(gpr),
+            memory,
+        )?
+    };
     let dispatch_result = dispatcher.dispatch(GuestContext::new(
         pid,
         tid,
@@ -6821,6 +6830,89 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 0x7f }
         );
+    }
+
+    #[test]
+    fn guest_execution_dispatches_syscall_after_guest_memory_load() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x8b, 0x3d, 0xfa, 0x0f, 0x00, 0x00, // mov edi,[rip+0xffa]
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &[77, 0, 0, 0])
+            .unwrap();
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("guest memory load feeds exit_group syscall");
+
+        assert_eq!(step.before_rip(), 0x401000);
+        assert_eq!(step.after_rip(), 0x40100d);
+        assert_eq!(step.task_state(), TaskState::Exited { status: 77 });
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .exit_state(),
+            ExitState::Exited { status: 77 }
+        );
+    }
+
+    #[test]
+    fn guest_execution_persists_guest_memory_store_before_syscall() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x48, 0xbb, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                0x11, // mov rbx,0x1122334455667788
+                0x48, 0x89, 0x1d, 0xef, 0x0f, 0x00, 0x00, // mov [rip+0xfef],rbx
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x31, 0xff, // xor edi,edi
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("guest memory store runs before exit_group");
+
+        assert_eq!(step.task_state(), TaskState::Exited { status: 0 });
+        let mut stored = [0; 8];
+        runtime.memory().read(0x402000, &mut stored).unwrap();
+        assert_eq!(u64::from_le_bytes(stored), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn guest_execution_surfaces_guest_memory_operand_fault() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x48, 0x8b, 0x00, // mov rax,[rax]
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+
+        let error = runtime
+            .dispatch_guest_execution()
+            .expect_err("unmapped memory load stops guest execution");
+
+        assert_eq!(error.linux_errno(), LinuxErrno::ENOEXEC);
+        assert!(matches!(
+            error,
+            GuestExecutionError::Execution(ExecutionError::MemoryOperand { .. })
+        ));
     }
 
     #[test]

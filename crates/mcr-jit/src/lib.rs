@@ -243,6 +243,53 @@ struct GuestFlags {
     overflow: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestMemoryOperandAccessKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestMemoryOperandError {
+    NotMapped,
+    AccessDenied,
+    Fault,
+}
+
+pub trait GuestMemoryOperandAccess {
+    fn read_memory_operand(
+        &self,
+        address: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), GuestMemoryOperandError>;
+
+    fn write_memory_operand(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), GuestMemoryOperandError>;
+}
+
+struct RejectingMemoryOperandAccess;
+
+impl GuestMemoryOperandAccess for RejectingMemoryOperandAccess {
+    fn read_memory_operand(
+        &self,
+        _address: u64,
+        _buffer: &mut [u8],
+    ) -> Result<(), GuestMemoryOperandError> {
+        Err(GuestMemoryOperandError::NotMapped)
+    }
+
+    fn write_memory_operand(
+        &mut self,
+        _address: u64,
+        _bytes: &[u8],
+    ) -> Result<(), GuestMemoryOperandError> {
+        Err(GuestMemoryOperandError::NotMapped)
+    }
+}
+
 impl GuestRegisters {
     #[must_use]
     pub const fn syscall_registers(self) -> SyscallRegisters {
@@ -417,7 +464,15 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionError {
     Decode(DecodeError),
-    MissingSyscall { terminator: BlockTerminator },
+    MissingSyscall {
+        terminator: BlockTerminator,
+    },
+    MemoryOperand {
+        rip: u64,
+        address: u64,
+        access: GuestMemoryOperandAccessKind,
+        error: GuestMemoryOperandError,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -430,6 +485,15 @@ impl fmt::Display for ExecutionError {
                     "guest block did not terminate at syscall: {terminator:?}"
                 )
             }
+            Self::MemoryOperand {
+                rip,
+                address,
+                access,
+                error,
+            } => write!(
+                f,
+                "guest memory {access:?} fault at rip 0x{rip:016x}, address 0x{address:016x}: {error:?}"
+            ),
         }
     }
 }
@@ -479,6 +543,19 @@ impl SameIsaExecutionCore {
         block: GuestBlock<'_>,
         registers: GuestRegisters,
     ) -> Result<SyscallTrap, ExecutionError> {
+        let mut memory = RejectingMemoryOperandAccess;
+        self.execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+    }
+
+    pub fn execute_to_syscall_trap_with_memory<M>(
+        &self,
+        block: GuestBlock<'_>,
+        registers: GuestRegisters,
+        memory: &mut M,
+    ) -> Result<SyscallTrap, ExecutionError>
+    where
+        M: GuestMemoryOperandAccess,
+    {
         const MAX_CONTROL_FLOW_STEPS: usize = 32;
 
         let mut registers = registers;
@@ -501,6 +578,7 @@ impl SameIsaExecutionCore {
                     block,
                     &mut registers,
                     &mut flags,
+                    memory,
                     instruction.rip,
                     instruction.len,
                 )?;
@@ -534,13 +612,17 @@ impl Default for SameIsaExecutionCore {
     }
 }
 
-fn execute_simple_instruction(
+fn execute_simple_instruction<M>(
     block: GuestBlock<'_>,
     registers: &mut GuestRegisters,
     flags: &mut GuestFlags,
+    memory: &mut M,
     rip: u64,
     len: usize,
-) -> Result<(), ExecutionError> {
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
     let offset = usize::try_from(rip.saturating_sub(block.rip())).map_err(|_| {
         ExecutionError::MissingSyscall {
             terminator: BlockTerminator::Invalid { rip },
@@ -569,12 +651,20 @@ fn execute_simple_instruction(
                 instruction.immediate32to64() as u64,
             )?;
         }
+        Code::Mov_rm64_imm32 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            write_memory_u64(memory, rip, address, instruction.immediate32to64() as u64)?;
+        }
         Code::Mov_r32_imm32 => {
             write_reg32(
                 registers,
                 instruction.op0_register(),
                 instruction.immediate32(),
             )?;
+        }
+        Code::Mov_rm32_imm32 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            write_memory_u32(memory, rip, address, instruction.immediate32())?;
         }
         Code::Mov_rm64_r64 | Code::Mov_r64_rm64
             if instruction.op0_kind() == OpKind::Register
@@ -583,12 +673,44 @@ fn execute_simple_instruction(
             let value = read_reg64(registers, instruction.op1_register())?;
             write_reg64(registers, instruction.op0_register(), value)?;
         }
+        Code::Mov_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_memory_u64(memory, rip, address)?;
+            write_reg64(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_rm64_r64
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_reg64(registers, instruction.op1_register())?;
+            write_memory_u64(memory, rip, address, value)?;
+        }
         Code::Mov_rm32_r32 | Code::Mov_r32_rm32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
         {
             let value = read_reg32(registers, instruction.op1_register())?;
             write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_memory_u32(memory, rip, address)?;
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_rm32_r32
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_reg32(registers, instruction.op1_register())?;
+            write_memory_u32(memory, rip, address, value)?;
         }
         Code::Lea_r64_m if instruction.op1_kind() == OpKind::Memory => {
             let value = effective_address(registers, &instruction)?;
@@ -944,20 +1066,95 @@ fn effective_address(
     registers: &GuestRegisters,
     instruction: &Instruction,
 ) -> Result<u64, ExecutionError> {
-    if instruction.memory_index() != Register::None {
-        return Err(ExecutionError::MissingSyscall {
-            terminator: BlockTerminator::ControlFlow {
-                rip: instruction.ip(),
-                flow: DecodedFlowControl::Exception,
-            },
-        });
-    }
+    let base = match instruction.memory_base() {
+        Register::None => 0,
+        Register::RIP | Register::EIP => return Ok(instruction.ip_rel_memory_address()),
+        base => read_reg64(registers, base)?,
+    };
+    let index = match instruction.memory_index() {
+        Register::None => 0,
+        index => {
+            read_reg64(registers, index)?.wrapping_mul(u64::from(instruction.memory_index_scale()))
+        }
+    };
+    Ok(base
+        .wrapping_add(index)
+        .wrapping_add(instruction.memory_displacement64()))
+}
 
-    match instruction.memory_base() {
-        Register::None => Ok(instruction.memory_displacement64()),
-        Register::RIP | Register::EIP => Ok(instruction.ip_rel_memory_address()),
-        base => Ok(read_reg64(registers, base)?.wrapping_add(instruction.memory_displacement64())),
-    }
+fn read_memory_u32<M>(memory: &mut M, rip: u64, address: u64) -> Result<u32, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let mut bytes = [0; 4];
+    memory
+        .read_memory_operand(address, &mut bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Read,
+            error,
+        })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_memory_u64<M>(memory: &mut M, rip: u64, address: u64) -> Result<u64, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let mut bytes = [0; 8];
+    memory
+        .read_memory_operand(address, &mut bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Read,
+            error,
+        })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn write_memory_u32<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    value: u32,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    write_memory_bytes(memory, rip, address, &value.to_le_bytes())
+}
+
+fn write_memory_u64<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    value: u64,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    write_memory_bytes(memory, rip, address, &value.to_le_bytes())
+}
+
+fn write_memory_bytes<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    memory
+        .write_memory_operand(address, bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Write,
+            error,
+        })
 }
 
 fn read_reg64(registers: &GuestRegisters, register: Register) -> Result<u64, ExecutionError> {
@@ -1057,9 +1254,78 @@ fn write_reg64(
 mod tests {
     use super::{
         BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError,
-        GuestBlock, GuestRegisters, SameIsaExecutionCore, TrampolineCore,
+        GuestBlock, GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters,
+        SameIsaExecutionCore, TrampolineCore,
     };
+    use std::collections::BTreeMap;
+
     use mcr_sys::{LinuxErrno, Syscall, SyscallReturn};
+
+    #[derive(Default)]
+    struct TestGuestMemory {
+        bytes: BTreeMap<u64, u8>,
+        writable: bool,
+    }
+
+    impl TestGuestMemory {
+        fn with_bytes(address: u64, bytes: &[u8]) -> Self {
+            let mut memory = Self {
+                bytes: BTreeMap::new(),
+                writable: true,
+            };
+            memory.write(address, bytes);
+            memory
+        }
+
+        fn read<const N: usize>(&self, address: u64) -> [u8; N] {
+            let mut bytes = [0; N];
+            for (offset, byte) in bytes.iter_mut().enumerate() {
+                *byte = *self
+                    .bytes
+                    .get(&(address + offset as u64))
+                    .expect("test byte should be mapped");
+            }
+            bytes
+        }
+
+        fn write(&mut self, address: u64, bytes: &[u8]) {
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                self.bytes.insert(address + offset as u64, byte);
+            }
+        }
+
+        fn read_u64(&self, address: u64) -> u64 {
+            u64::from_le_bytes(self.read(address))
+        }
+    }
+
+    impl GuestMemoryOperandAccess for TestGuestMemory {
+        fn read_memory_operand(
+            &self,
+            address: u64,
+            buffer: &mut [u8],
+        ) -> Result<(), GuestMemoryOperandError> {
+            for (offset, byte) in buffer.iter_mut().enumerate() {
+                *byte = *self
+                    .bytes
+                    .get(&(address + offset as u64))
+                    .ok_or(GuestMemoryOperandError::NotMapped)?;
+            }
+            Ok(())
+        }
+
+        fn write_memory_operand(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), GuestMemoryOperandError> {
+            if !self.writable {
+                return Err(GuestMemoryOperandError::AccessDenied);
+            }
+            self.write(address, bytes);
+            Ok(())
+        }
+    }
 
     #[test]
     fn package_name_is_stable() {
@@ -1442,6 +1708,121 @@ mod tests {
     }
 
     #[test]
+    fn execution_core_loads_and_stores_64_bit_memory_mov_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x8b, 0x43, 0x08, // mov rax,[rbx+8]
+                0x48, 0x89, 0x43, 0x10, // mov [rbx+0x10],rax
+                0x0f, 0x05, // syscall
+            ],
+            0x461000,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x700000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory =
+            TestGuestMemory::with_bytes(0x700008, &0x0708_091a_2b3c_4d5e_u64.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute memory movs before syscall");
+
+        assert_eq!(trap.registers().rax, 0x0708_091a_2b3c_4d5e);
+        assert_eq!(memory.read_u64(0x700010), 0x0708_091a_2b3c_4d5e);
+        assert_eq!(trap.site().rip, 0x461008);
+    }
+
+    #[test]
+    fn execution_core_zero_extends_32_bit_memory_load_and_writes_four_bytes() {
+        let block = GuestBlock::new(
+            &[
+                0x8b, 0x43, 0x04, // mov eax,[rbx+4]
+                0x89, 0x43, 0x0c, // mov [rbx+0xc],eax
+                0x0f, 0x05, // syscall
+            ],
+            0x461100,
+        );
+        let registers = GuestRegisters {
+            rax: 0xffff_ffff_ffff_ffff,
+            rbx: 0x710000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x710004, &0x89ab_cdef_u32.to_le_bytes());
+        memory.write(0x71000c, &[0xaa; 8]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute 32-bit memory movs before syscall");
+
+        assert_eq!(trap.registers().rax, 0x89ab_cdef);
+        assert_eq!(
+            memory.read::<8>(0x71000c),
+            [0xef, 0xcd, 0xab, 0x89, 0xaa, 0xaa, 0xaa, 0xaa]
+        );
+    }
+
+    #[test]
+    fn execution_core_resolves_rip_relative_and_scaled_index_memory_addresses() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x8b, 0x05, 0xf9, 0x01, 0x00, 0x00, // mov rax,[rip+0x1f9]
+                0x48, 0x89, 0x54, 0x73, 0x10, // mov [rbx+rsi*2+0x10],rdx
+                0x0f, 0x05, // syscall
+            ],
+            0x461200,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x720000,
+            rsi: 4,
+            rdx: 0x1122_3344_5566_7788,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory =
+            TestGuestMemory::with_bytes(0x461400, &0x8877_6655_4433_2211_u64.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute rip-relative load and scaled-index store");
+
+        assert_eq!(trap.registers().rax, 0x8877_6655_4433_2211);
+        assert_eq!(memory.read_u64(0x720018), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn execution_core_surfaces_memory_operand_fault_without_dispatching() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x8b, 0x00, // mov rax,[rax]
+                0x0f, 0x05, // syscall
+            ],
+            0x461300,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let error = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect_err("unmapped load should stop before syscall");
+
+        assert_eq!(
+            error,
+            ExecutionError::MemoryOperand {
+                rip: 0x461300,
+                address: 0,
+                access: super::GuestMemoryOperandAccessKind::Read,
+                error: GuestMemoryOperandError::NotMapped,
+            }
+        );
+    }
+
+    #[test]
     fn execution_core_uses_cmp_zero_flag_for_conditional_branch() {
         let block = GuestBlock::new(
             &[
@@ -1653,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_core_rejects_unsupported_memory_operand_before_syscall() {
+    fn execution_core_without_memory_adapter_rejects_memory_operand_before_syscall() {
         let block = GuestBlock::new(
             &[
                 0x48, 0x8b, 0x00, // mov rax,[rax]
@@ -1670,15 +2051,15 @@ mod tests {
 
         let error = SameIsaExecutionCore::new()
             .execute_until_syscall(block, &mut registers, &mut trampoline)
-            .expect_err("memory load remains unsupported");
+            .expect_err("memory load requires a guest memory adapter");
 
         assert_eq!(
             error,
-            ExecutionError::MissingSyscall {
-                terminator: BlockTerminator::ControlFlow {
-                    rip: 0x472000,
-                    flow: DecodedFlowControl::Exception,
-                }
+            ExecutionError::MemoryOperand {
+                rip: 0x472000,
+                address: 0,
+                access: super::GuestMemoryOperandAccessKind::Read,
+                error: GuestMemoryOperandError::NotMapped,
             }
         );
     }
