@@ -902,15 +902,20 @@ where
         let socket_id = self.socket_id_for_fd(args.fd)?;
         validate_socket_message_flags(args.flags, SocketOperation::SendMsg)?;
         let message = read_msghdr(&self.memory, args.msg)?;
-        if message.msg_name != 0
-            || message.msg_namelen != 0
-            || message.msg_control != 0
-            || message.msg_controllen != 0
-        {
+        if message.msg_control != 0 || message.msg_controllen != 0 {
             return Err(net_errno(GuestSocketTable::unsupported_socket_io(
                 SocketOperation::SendMsg,
             )));
         }
+        let address = if message.msg_name != 0 || message.msg_namelen != 0 {
+            Some(read_socket_address(
+                &self.memory,
+                message.msg_name,
+                message.msg_namelen,
+            )?)
+        } else {
+            None
+        };
         let iovecs = self.read_iovecs(
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
@@ -922,10 +927,15 @@ where
             self.memory
                 .read_bytes(iovec.iov_base, &mut buffer)
                 .map_err(memory_errno)?;
-            let count = self
-                .sockets
-                .send_connected(socket_id, &buffer)
-                .map_err(net_errno)?;
+            let count = if let Some(address) = address {
+                self.sockets
+                    .send_to(socket_id, &buffer, address)
+                    .map_err(net_errno)?
+            } else {
+                self.sockets
+                    .send_connected(socket_id, &buffer)
+                    .map_err(net_errno)?
+            };
             total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
             if count < len {
                 break;
@@ -940,11 +950,7 @@ where
         let socket_id = self.socket_id_for_fd(args.fd)?;
         validate_socket_message_flags(args.flags, SocketOperation::RecvMsg)?;
         let message = read_msghdr(&self.memory, args.msg)?;
-        if message.msg_name != 0
-            || message.msg_namelen != 0
-            || message.msg_control != 0
-            || message.msg_controllen != 0
-        {
+        if message.msg_control != 0 || message.msg_controllen != 0 {
             return Err(net_errno(GuestSocketTable::unsupported_socket_io(
                 SocketOperation::RecvMsg,
             )));
@@ -953,22 +959,59 @@ where
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
-        let mut total = 0u64;
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            let count = self
+
+        let total = if message.msg_name != 0 || message.msg_namelen != 0 {
+            let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
+                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                total.checked_add(len).ok_or(LinuxErrno::EINVAL)
+            })?;
+            let mut buffer = vec![0; capacity];
+            let (count, address) = self
                 .sockets
-                .recv_connected(socket_id, &mut buffer)
+                .recv_from(socket_id, &mut buffer)
                 .map_err(net_errno)?;
-            self.memory
-                .write_bytes(iovec.iov_base, &buffer[..count])
-                .map_err(memory_errno)?;
-            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-            if count < len {
-                break;
+            write_socket_address_to_msghdr_name(
+                &mut self.memory,
+                args.msg,
+                message.msg_name,
+                message.msg_namelen,
+                address,
+            )?;
+            let mut consumed = 0usize;
+            for iovec in iovecs {
+                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                let remaining = count.saturating_sub(consumed);
+                let write_len = len.min(remaining);
+                if write_len > 0 {
+                    self.memory
+                        .write_bytes(iovec.iov_base, &buffer[consumed..consumed + write_len])
+                        .map_err(memory_errno)?;
+                }
+                consumed += write_len;
+                if consumed >= count {
+                    break;
+                }
             }
-        }
+            count as u64
+        } else {
+            let mut total = 0u64;
+            for iovec in iovecs {
+                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                let mut buffer = vec![0; len];
+                let count = self
+                    .sockets
+                    .recv_connected(socket_id, &mut buffer)
+                    .map_err(net_errno)?;
+                self.memory
+                    .write_bytes(iovec.iov_base, &buffer[..count])
+                    .map_err(memory_errno)?;
+                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+                if count < len {
+                    break;
+                }
+            }
+            total
+        };
         self.memory
             .write_bytes(args.msg + 48, &0u32.to_le_bytes())
             .map_err(memory_errno)?;
@@ -1608,6 +1651,30 @@ fn write_optional_socket_address(
         return Err(LinuxErrno::EFAULT);
     }
     write_socket_address(memory, sockaddr, addrlen_addr, address)
+}
+
+fn write_socket_address_to_msghdr_name(
+    memory: &mut impl GuestMemoryAccess,
+    msghdr: u64,
+    sockaddr: u64,
+    addrlen: u32,
+    address: SocketAddress,
+) -> Result<(), LinuxErrno> {
+    if sockaddr == 0 {
+        return Ok(());
+    }
+
+    let encoded = encode_socket_address(address);
+    let write_len = (addrlen as usize).min(encoded.len());
+    if write_len > 0 {
+        memory
+            .write_bytes(sockaddr, &encoded[..write_len])
+            .map_err(memory_errno)?;
+    }
+    let actual_len = u32::try_from(encoded.len()).expect("sockaddr length fits socklen_t");
+    memory
+        .write_bytes(msghdr + 8, &actual_len.to_le_bytes())
+        .map_err(memory_errno)
 }
 
 fn encode_socket_address(address: SocketAddress) -> Vec<u8> {
@@ -4683,6 +4750,73 @@ mod tests {
             runtime.memory().read(0x2200, SOCKADDR_IN_LEN),
             ipv4_sockaddr(53)
         );
+    }
+
+    #[test]
+    fn datagram_sendmsg_and_recvmsg_move_iovecs_and_addresses() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"dns!");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(53));
+        runtime.memory_mut().write(0x2000, b"dn");
+        runtime.memory_mut().write(0x2010, b"s?");
+        runtime.memory_mut().write_iovec(0x3000, 0x2000, 2);
+        runtime.memory_mut().write_iovec(0x3010, 0x2010, 2);
+        runtime
+            .memory_mut()
+            .write_msghdr(0x4000, 0x1000, SOCKADDR_IN_LEN as u32, 0x3000, 2);
+        runtime.memory_mut().write_iovec(0x5000, 0x6000, 2);
+        runtime.memory_mut().write_iovec(0x5010, 0x6010, 2);
+        runtime.memory_mut().write(0x5200, &[0xaa; SOCKADDR_IN_LEN]);
+        runtime
+            .memory_mut()
+            .write_msghdr(0x5100, 0x5200, SOCKADDR_IN_LEN as u32, 0x5000, 2);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_DGRAM),
+                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Sendmsg,
+                [3, 0x4000, u64::from(LINUX_MSG_DONTWAIT), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_bytes(), b"dns?");
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Recvmsg,
+                [3, 0x5100, u64::from(LINUX_MSG_DONTWAIT), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x6000, 2), b"dn");
+        assert_eq!(runtime.memory().read(0x6010, 2), b"s!");
+        assert_eq!(
+            runtime.memory().read(0x5200, SOCKADDR_IN_LEN),
+            ipv4_sockaddr(53)
+        );
+        assert_eq!(u32_at(runtime.memory(), 0x5100 + 8), SOCKADDR_IN_LEN as u32);
+        assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
     }
 
     #[test]
