@@ -1,7 +1,7 @@
 ---
 id: task-003
 scope: task
-status: pending
+status: done
 depends-on: [task-002, win-001]
 ---
 
