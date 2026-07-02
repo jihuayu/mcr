@@ -1085,10 +1085,20 @@ where
             return Err(LinuxErrno::EINVAL);
         }
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        self.sockets
-            .accept_placeholder(socket_id)
-            .map_err(net_errno)
-            .map(|accepted| accepted.get())
+        let (accepted, peer) = self.sockets.accept(socket_id).map_err(net_errno)?;
+        write_optional_socket_address(&mut self.memory, args.sockaddr, args.addrlen, peer)?;
+        let mut flags = mcr_vfs::O_RDWR;
+        if args.flags & mcr_sys::LINUX_SOCK_CLOEXEC != 0 {
+            flags |= mcr_vfs::O_CLOEXEC;
+        }
+        if args.flags & mcr_sys::LINUX_SOCK_NONBLOCK != 0 {
+            flags |= mcr_vfs::O_NONBLOCK;
+        }
+        let fd = self
+            .vfs
+            .insert_socket(accepted.get(), OpenFlags::new(flags))
+            .map_err(vfs_errno)?;
+        Ok(fd as u64)
     }
 
     fn sys_getsockaddr(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -5521,6 +5531,85 @@ mod tests {
     }
 
     #[test]
+    fn accept4_creates_socket_fd_and_writes_peer_sockaddr() {
+        let transport = runtime_socket_transport();
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        transport.push_accepted(peer, b"hello");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        runtime.memory_mut().write(0x2000, &ipv4_sockaddr(8080));
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Bind,
+                [3, 0x2000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Listen, [3, 1, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        runtime.memory_mut().write(0x2100, &[0xaa; SOCKADDR_IN_LEN]);
+        runtime
+            .memory_mut()
+            .write(0x2200, &(SOCKADDR_IN_LEN as u32).to_le_bytes());
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Accept4,
+                [
+                    3,
+                    0x2100,
+                    0x2200,
+                    u64::from(LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK),
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.vfs().socket_id_for_fd(4).unwrap(), 2);
+        assert!(runtime.vfs().fds().cloexec(4).unwrap());
+        assert_eq!(
+            runtime.vfs().fds().status_flags(4).unwrap(),
+            O_RDWR | O_NONBLOCK
+        );
+        assert_eq!(u32_at(runtime.memory(), 0x2200), SOCKADDR_IN_LEN as u32);
+        assert_eq!(
+            runtime.memory().read(0x2100, SOCKADDR_IN_LEN),
+            ipv4_sockaddr(49152)
+        );
+        assert_eq!(
+            runtime
+                .sockets()
+                .socket(SocketId::new(2).unwrap())
+                .unwrap()
+                .state(),
+            SocketState::Connected(peer)
+        );
+    }
+
+    #[test]
     fn connect_getpeername_and_shutdown_round_trip_ipv6_sockaddr() {
         let mut runtime = runtime_with_socket(LINUX_AF_INET6);
         let peer_addr = 0x3000;
@@ -5842,6 +5931,17 @@ mod tests {
         fn set_connect_would_block_once(&self) {
             self.state.borrow_mut().connect_would_block_once = true;
         }
+
+        fn push_accepted(&self, peer: SocketAddress, incoming: &[u8]) {
+            self.state.borrow_mut().accepted.push((
+                Rc::new(RefCell::new(TestSocketState {
+                    incoming: incoming.to_vec(),
+                    connected: Some(peer),
+                    ..TestSocketState::default()
+                })),
+                peer,
+            ));
+        }
     }
 
     #[derive(Debug, Default)]
@@ -5850,6 +5950,9 @@ mod tests {
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
         connect_would_block_once: bool,
+        accepted: Vec<(Rc<RefCell<TestSocketState>>, SocketAddress)>,
+        bound: Option<SocketAddress>,
+        listened: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -5875,6 +5978,31 @@ mod tests {
     }
 
     impl mcr_net::HostSocketHandle for TestSocketHandle {
+        fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, mcr_net::HostIoError> {
+            self.state.borrow_mut().bound = Some(address);
+            Ok(address)
+        }
+
+        fn listen(&mut self, _backlog: u32) -> Result<(), mcr_net::HostIoError> {
+            self.state.borrow_mut().listened = true;
+            Ok(())
+        }
+
+        fn accept(
+            &mut self,
+        ) -> Result<(Box<dyn mcr_net::HostSocketHandle>, SocketAddress), mcr_net::HostIoError>
+        {
+            let mut state = self.state.borrow_mut();
+            if state.accepted.is_empty() {
+                return Err(mcr_net::HostIoError::new(
+                    mcr_net::LinuxErrno::OperationWouldBlock,
+                    "no pending test socket",
+                ));
+            }
+            let (accepted, peer) = state.accepted.remove(0);
+            Ok((Box::new(TestSocketHandle { state: accepted }), peer))
+        }
+
         fn connect(
             &mut self,
             address: SocketAddress,
