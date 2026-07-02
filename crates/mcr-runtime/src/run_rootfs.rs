@@ -828,6 +828,8 @@ mod tests {
     fn run_rootfs_mounts_minimal_procfs_and_devfs() {
         let rootfs = TestRootfs::new("proc-dev");
         rootfs.write_static_elf("/bin/busybox");
+        rootfs.create_dir("/dev");
+        rootfs.create_dir("/proc/self/fd");
 
         let dev = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
             b"/bin/busybox".to_vec(),
@@ -1040,6 +1042,10 @@ mod tests {
             let path = self.host_path(guest_path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
+        }
+
+        fn create_dir(&self, guest_path: &str) {
+            fs::create_dir_all(self.host_path(guest_path)).unwrap();
         }
 
         fn write_static_elf(&self, guest_path: &str) {
