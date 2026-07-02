@@ -5427,6 +5427,95 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dispatch_routes_datagram_socket_io_through_transport() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"dns!");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_DGRAM),
+                        u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(53))
+            .unwrap();
+        runtime.memory_mut().write(0x402100, b"query").unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402200, &[0xaa; SOCKADDR_IN_LEN])
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402300, &(SOCKADDR_IN_LEN as u32).to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Sendto,
+                    [
+                        3,
+                        0x402100,
+                        5,
+                        u64::from(LINUX_MSG_DONTWAIT | LINUX_MSG_NOSIGNAL),
+                        0x402000,
+                        SOCKADDR_IN_LEN as u64,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(5)
+        );
+        assert_eq!(transport.sent_bytes(), b"query");
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Recvfrom,
+                    [
+                        3,
+                        0x402180,
+                        8,
+                        u64::from(LINUX_MSG_DONTWAIT),
+                        0x402200,
+                        0x402300,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        let mut received = [0; 4];
+        runtime.memory().read(0x402180, &mut received).unwrap();
+        assert_eq!(&received, b"dns!");
+
+        let mut name_len = [0; 4];
+        runtime.memory().read(0x402300, &mut name_len).unwrap();
+        assert_eq!(u32::from_le_bytes(name_len), SOCKADDR_IN_LEN as u32);
+
+        let mut peer_name = [0; SOCKADDR_IN_LEN];
+        runtime.memory().read(0x402200, &mut peer_name).unwrap();
+        assert_eq!(peer_name, ipv4_sockaddr(53)[..]);
+    }
+
+    #[test]
     fn datagram_sendmsg_and_recvmsg_move_iovecs_and_addresses() {
         let transport = runtime_socket_transport();
         transport.push_incoming(b"dns!");
