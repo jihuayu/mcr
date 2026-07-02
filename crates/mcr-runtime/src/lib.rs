@@ -35,8 +35,8 @@ use mcr_sys::{
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, SeekWhence,
-    VfsError, VirtualFileSystem,
+    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, ProcSelfData,
+    SeekWhence, VfsError, VirtualFileSystem,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -1431,6 +1431,17 @@ fn net_errno(error: mcr_net::SocketError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno().code() as u16).unwrap_or(LinuxErrno::EINVAL)
 }
 
+fn sync_proc_self(vfs: &mut VirtualFileSystem, kernel: &GuestKernel) {
+    if let Some(process) = kernel.process(mcr_task::INITIAL_GUEST_PID) {
+        let image = process.image();
+        vfs.set_proc_self(ProcSelfData::new(
+            image.executable().path().to_vec(),
+            image.argv().to_vec(),
+            image.envp().to_vec(),
+        ));
+    }
+}
+
 fn read_msghdr(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxMsghdr, LinuxErrno> {
     let mut bytes = [0; 56];
     memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
@@ -1776,7 +1787,10 @@ impl RuntimeSubsystems {
         Self::with_vfs(program, Self::default_vfs())
     }
 
-    pub fn with_vfs(program: GuestProgram, vfs: VirtualFileSystem) -> Result<Self, RuntimeError> {
+    pub fn with_vfs(
+        program: GuestProgram,
+        mut vfs: VirtualFileSystem,
+    ) -> Result<Self, RuntimeError> {
         let tasks = GuestKernel::new(program)?;
         let memory = GuestMemory::from_image(
             tasks
@@ -1785,6 +1799,7 @@ impl RuntimeSubsystems {
                 .image()
                 .memory(),
         )?;
+        sync_proc_self(&mut vfs, &tasks);
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
@@ -1795,7 +1810,10 @@ impl RuntimeSubsystems {
     fn default_vfs() -> VirtualFileSystem {
         // Runtime::new has no rootfs argument yet. Keep the placeholder explicit and route
         // future rootfs-aware callers through Runtime::with_vfs after loading their VFS.
-        VirtualFileSystem::new("/")
+        let mut vfs = VirtualFileSystem::new("/");
+        vfs.mount_minimal_procfs()
+            .expect("minimal procfs nodes do not conflict in a new VFS");
+        vfs
     }
 
     #[must_use]
@@ -1880,6 +1898,7 @@ impl RuntimeSubsystems {
             .exec_task(request.context.tid, program)
             .map_err(|error| error.linux_errno())?;
         self.files.vfs_mut().fds_mut().close_on_exec();
+        sync_proc_self(self.files.vfs_mut(), &self.tasks);
         self.replace_memory_from_current_image()
     }
 
@@ -2471,6 +2490,97 @@ mod tests {
             u32::from_le_bytes(mode) & mcr_vfs::S_IFMT,
             mcr_vfs::S_IFSOCK
         );
+    }
+
+    #[test]
+    fn runtime_dispatch_reads_proc_self_from_current_process_image() {
+        let mut runtime = Runtime::new(test_program_with_args(
+            "/bin/app",
+            0x401000,
+            ["/bin/app", "--flag"],
+            ["A=B"],
+        ))
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/proc/self/cmdline\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402140, b"/proc/self/environ\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402180, b"/proc/self/exe\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x4021c0, b"/proc/self/fd/3\0")
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402100, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Read, [3, 0x402300, 64, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(16)
+        );
+        let mut cmdline = [0; 16];
+        runtime.memory().read(0x402300, &mut cmdline).unwrap();
+        assert_eq!(&cmdline, b"/bin/app\0--flag\0");
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402140, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Read, [4, 0x402320, 64, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        let mut environ = [0; 4];
+        runtime.memory().read(0x402320, &mut environ).unwrap();
+        assert_eq!(&environ, b"A=B\0");
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Readlink,
+                    [0x402180, 0x402340, 64, 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(8)
+        );
+        let mut exe = [0; 8];
+        runtime.memory().read(0x402340, &mut exe).unwrap();
+        assert_eq!(&exe, b"/bin/app");
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Readlink,
+                    [0x4021c0, 0x402360, 64, 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(18)
+        );
+        let mut fd_target = [0; 18];
+        runtime.memory().read(0x402360, &mut fd_target).unwrap();
+        assert_eq!(&fd_target, b"/proc/self/cmdline");
     }
 
     #[test]
@@ -3808,6 +3918,7 @@ mod tests {
             0o755,
         )
         .unwrap();
+        tree.mount_minimal_procfs().unwrap();
         let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
 
         runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
@@ -3856,6 +3967,67 @@ mod tests {
         let mut loaded_text = [0; 4];
         runtime.memory().read(0x501200, &mut loaded_text).unwrap();
         assert_eq!(loaded_text, [0x5a; 4]);
+
+        runtime
+            .memory_mut()
+            .write(0x502100, b"/proc/self/cmdline\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x502140, b"/proc/self/environ\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x502180, b"/proc/self/exe\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x502100, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Read, [3, 0x502300, 64, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(16)
+        );
+        let mut cmdline = [0; 16];
+        runtime.memory().read(0x502300, &mut cmdline).unwrap();
+        assert_eq!(&cmdline, b"/bin/new\0--flag\0");
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x502140, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Read, [4, 0x502320, 64, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(10)
+        );
+        let mut environ = [0; 10];
+        runtime.memory().read(0x502320, &mut environ).unwrap();
+        assert_eq!(&environ, b"PATH=/bin\0");
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Readlink,
+                    [0x502180, 0x502340, 64, 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(8)
+        );
+        let mut exe = [0; 8];
+        runtime.memory().read(0x502340, &mut exe).unwrap();
+        assert_eq!(&exe, b"/bin/new");
     }
 
     #[test]

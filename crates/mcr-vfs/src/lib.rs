@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
@@ -78,6 +79,7 @@ const PROC_SELF_EXE_INODE_ID: InodeId = PROC_INODE_ID + 2;
 const PROC_SELF_CMDLINE_INODE_ID: InodeId = PROC_INODE_ID + 3;
 const PROC_SELF_ENVIRON_INODE_ID: InodeId = PROC_INODE_ID + 4;
 const PROC_SELF_FD_INODE_ID: InodeId = PROC_INODE_ID + 5;
+const FIRST_PROC_SELF_FD_LINK_INODE_ID: InodeId = PROC_INODE_ID + 1024;
 const DEFAULT_PIPE_CAPACITY: usize = 65_536;
 const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
@@ -473,6 +475,10 @@ impl PathTree {
     }
 
     pub fn children(&self, path: &GuestPath) -> VfsResult<Vec<DirectoryChild>> {
+        self.static_children(path)
+    }
+
+    fn static_children(&self, path: &GuestPath) -> VfsResult<Vec<DirectoryChild>> {
         let node = self.lookup_path(path).ok_or(VfsError::NoEntry)?;
         if !node.is_directory() {
             return Err(VfsError::NotDirectory);
@@ -795,6 +801,63 @@ impl PathNode {
     fn decrement_link_count(&mut self) {
         self.metadata.decrement_link_count();
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProcSelfData {
+    executable_path: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+}
+
+impl ProcSelfData {
+    #[must_use]
+    pub fn new(
+        executable_path: impl Into<Vec<u8>>,
+        argv: impl IntoIterator<Item = Vec<u8>>,
+        envp: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
+        Self {
+            executable_path: executable_path.into(),
+            argv: argv.into_iter().collect(),
+            envp: envp.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn executable_path(&self) -> &[u8] {
+        &self.executable_path
+    }
+
+    #[must_use]
+    pub fn argv(&self) -> &[Vec<u8>] {
+        &self.argv
+    }
+
+    #[must_use]
+    pub fn envp(&self) -> &[Vec<u8>] {
+        &self.envp
+    }
+
+    #[must_use]
+    pub fn cmdline_bytes(&self) -> Vec<u8> {
+        nul_joined_entries(&self.argv)
+    }
+
+    #[must_use]
+    pub fn environ_bytes(&self) -> Vec<u8> {
+        nul_joined_entries(&self.envp)
+    }
+}
+
+fn nul_joined_entries(entries: &[Vec<u8>]) -> Vec<u8> {
+    let total_len = entries.iter().map(|entry| entry.len() + 1).sum();
+    let mut bytes = Vec::with_capacity(total_len);
+    for entry in entries {
+        bytes.extend_from_slice(entry);
+        bytes.push(0);
+    }
+    bytes
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1919,6 +1982,10 @@ impl FdTable {
         self.entries.get_mut(&fd).ok_or(VfsError::BadFd)
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = (Fd, &FdEntry)> {
+        self.entries.iter().map(|(fd, entry)| (*fd, entry))
+    }
+
     pub fn close(&mut self, fd: Fd) -> VfsResult<FileRef> {
         let entry = self.entries.remove(&fd).ok_or(VfsError::BadFd)?;
         self.cloexec.remove(&fd);
@@ -2017,7 +2084,13 @@ impl FdTable {
         }
     }
 
-    pub fn read(&mut self, tree: &PathTree, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
+    pub fn read(
+        &mut self,
+        tree: &PathTree,
+        proc_self: &ProcSelfData,
+        fd: Fd,
+        buffer: &mut [u8],
+    ) -> VfsResult<usize> {
         let entry = self.get_mut(fd)?;
         if !entry.flags().can_read() {
             return Err(VfsError::BadFd);
@@ -2034,7 +2107,19 @@ impl FdTable {
                 let mut description = entry.description();
                 let offset =
                     usize::try_from(description.offset).map_err(|_| VfsError::InvalidPath)?;
-                let available = node.data().get(offset..).unwrap_or(&[]);
+                let proc_data;
+                let data = match node.kind() {
+                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
+                        proc_data = proc_self.cmdline_bytes();
+                        &proc_data
+                    }
+                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
+                        proc_data = proc_self.environ_bytes();
+                        &proc_data
+                    }
+                    _ => node.data(),
+                };
+                let available = data.get(offset..).unwrap_or(&[]);
                 let count = available.len().min(buffer.len());
                 buffer[..count].copy_from_slice(&available[..count]);
                 description.offset += count as u64;
@@ -2167,16 +2252,19 @@ impl FdTable {
         fd: Fd,
         max_bytes: usize,
     ) -> VfsResult<Vec<DirectoryEntry>> {
-        let entry = self.get_mut(fd)?;
+        let entry = self.get(fd)?;
         if !matches!(entry.file.kind, FileKind::Directory) {
             return Err(VfsError::NotDirectory);
         }
 
-        let path = entry.path.as_ref().ok_or(VfsError::BadFd)?;
-        let mut children = tree.children(path)?;
+        let path = entry.path.as_ref().ok_or(VfsError::BadFd)?.clone();
+        let mut children = tree.static_children(&path)?;
+        if is_proc_self_fd_directory(tree, &path) {
+            children.extend(self.proc_fd_children());
+        }
         children.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let directory_inode = tree.lookup_path(path).ok_or(VfsError::NoEntry)?.inode_id();
+        let directory_inode = tree.lookup_path(&path).ok_or(VfsError::NoEntry)?.inode_id();
         let mut entries = vec![
             DirectoryEntry {
                 inode: directory_inode,
@@ -2205,6 +2293,7 @@ impl FdTable {
 
         let mut returned = Vec::new();
         let mut used = 0usize;
+        let entry = self.get_mut(fd)?;
         let description_arc = entry.description.clone();
         let mut description = description_arc
             .lock()
@@ -2244,6 +2333,19 @@ impl FdTable {
         self.next_pipe_id = self.next_pipe_id.checked_add(1).ok_or(VfsError::BadFd)?;
         Ok(id)
     }
+
+    fn proc_fd_children(&self) -> Vec<DirectoryChild> {
+        self.entries
+            .keys()
+            .filter_map(|fd| {
+                Some(DirectoryChild {
+                    name: fd.to_string(),
+                    inode: proc_self_fd_link_inode(*fd).ok()?,
+                    file_type: DT_LNK,
+                })
+            })
+            .collect()
+    }
 }
 
 impl Default for FdTable {
@@ -2257,6 +2359,7 @@ pub struct VirtualFileSystem {
     rootfs: Rootfs,
     tree: PathTree,
     fds: FdTable,
+    proc_self: ProcSelfData,
     umask: u32,
 }
 
@@ -2266,6 +2369,7 @@ impl VirtualFileSystem {
             rootfs: Rootfs::new(host_root),
             tree: PathTree::new(),
             fds: FdTable::with_stdio(),
+            proc_self: ProcSelfData::default(),
             umask: DEFAULT_UMASK,
         };
         vfs.mount_minimal_devfs()
@@ -2278,6 +2382,7 @@ impl VirtualFileSystem {
             rootfs,
             tree,
             fds,
+            proc_self: ProcSelfData::default(),
             umask: DEFAULT_UMASK,
         }
     }
@@ -2300,6 +2405,14 @@ impl VirtualFileSystem {
 
     pub fn fds_mut(&mut self) -> &mut FdTable {
         &mut self.fds
+    }
+
+    pub fn proc_self(&self) -> &ProcSelfData {
+        &self.proc_self
+    }
+
+    pub fn set_proc_self(&mut self, proc_self: ProcSelfData) {
+        self.proc_self = proc_self;
     }
 
     pub fn mount_minimal_devfs(&mut self) -> VfsResult<()> {
@@ -2414,7 +2527,7 @@ impl VirtualFileSystem {
     }
 
     pub fn read(&mut self, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
-        self.fds.read(&self.tree, fd, buffer)
+        self.fds.read(&self.tree, &self.proc_self, fd, buffer)
     }
 
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
@@ -2543,35 +2656,17 @@ impl VirtualFileSystem {
             ResolveOptions::NOFOLLOW_FINAL,
         )?;
         self.check_traversal_permissions(resolved.guest_path())?;
-        let node = self
-            .tree
-            .lookup_path(resolved.guest_path())
-            .ok_or(VfsError::NoEntry)?;
-        let PathNodeKind::Symlink(target) = node.kind() else {
-            return Err(VfsError::InvalidPath);
-        };
-        let bytes = target.as_bytes();
-        let count = bytes.len().min(buffer.len());
-        buffer[..count].copy_from_slice(&bytes[..count]);
-        Ok(count)
+        self.readlink_resolved(resolved.guest_path(), buffer)
     }
 
     pub fn readlinkat(&self, dirfd: Fd, path: &str, buffer: &mut [u8]) -> VfsResult<usize> {
         if path.is_empty() {
-            return self.fds.readlink_open(&self.tree, dirfd, buffer);
+            let entry = self.fds.get(dirfd)?;
+            let path = entry.path().ok_or(VfsError::NoEntry)?;
+            return self.readlink_resolved(path, buffer);
         }
         let resolved = self.resolve_at(dirfd, path, ResolveOptions::NOFOLLOW_FINAL, false)?;
-        let node = self
-            .tree
-            .lookup_path(resolved.guest_path())
-            .ok_or(VfsError::NoEntry)?;
-        let PathNodeKind::Symlink(target) = node.kind() else {
-            return Err(VfsError::InvalidPath);
-        };
-        let bytes = target.as_bytes();
-        let count = bytes.len().min(buffer.len());
-        buffer[..count].copy_from_slice(&bytes[..count]);
-        Ok(count)
+        self.readlink_resolved(resolved.guest_path(), buffer)
     }
 
     pub fn getdents64(&mut self, fd: Fd, max_bytes: usize) -> VfsResult<Vec<DirectoryEntry>> {
@@ -2953,10 +3048,55 @@ impl VirtualFileSystem {
     }
 
     fn stat_path(&self, path: &GuestPath) -> VfsResult<LinuxFileAttr> {
+        if let Some(fd) = proc_self_fd_path_fd(path) {
+            let target = self.proc_fd_target(fd)?;
+            return Ok(LinuxFileAttr::symlink(
+                proc_self_fd_link_inode(fd)?,
+                target.len() as u64,
+            ));
+        }
+
         self.tree
             .lookup_path(path)
             .map(PathNode::attr)
             .ok_or(VfsError::NoEntry)
+    }
+
+    fn readlink_resolved(&self, path: &GuestPath, buffer: &mut [u8]) -> VfsResult<usize> {
+        let target = if let Some(fd) = proc_self_fd_path_fd(path) {
+            Cow::Owned(self.proc_fd_target(fd)?.into_owned().into_bytes())
+        } else {
+            let node = self.tree.lookup_path(path).ok_or(VfsError::NoEntry)?;
+            match node.kind() {
+                PathNodeKind::Symlink(target) => Cow::Borrowed(target.as_bytes()),
+                PathNodeKind::Proc(ProcNodeKind::Exe) => {
+                    Cow::Borrowed(self.proc_self.executable_path())
+                }
+                PathNodeKind::Proc(ProcNodeKind::FdLink(fd)) => {
+                    Cow::Owned(self.proc_fd_target(*fd)?.into_owned().into_bytes())
+                }
+                _ => return Err(VfsError::InvalidPath),
+            }
+        };
+        let count = target.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&target[..count]);
+        Ok(count)
+    }
+
+    fn proc_fd_target(&self, fd: Fd) -> VfsResult<Cow<'_, str>> {
+        let entry = self.fds.get(fd).map_err(|_| VfsError::NoEntry)?;
+        match entry.file().kind() {
+            FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
+                let path = entry.path().ok_or(VfsError::NoEntry)?;
+                self.rootfs.visible_path(path).map(Cow::Owned)
+            }
+            FileKind::Dev(kind) => Ok(Cow::Owned(format!("/dev/{}", kind.name()))),
+            FileKind::PipeRead | FileKind::PipeWrite => {
+                Ok(Cow::Owned(format!("pipe:[{}]", entry.inode_id())))
+            }
+            FileKind::Socket => Ok(Cow::Owned(format!("socket:[{}]", entry.inode_id()))),
+            FileKind::Stdio(kind) => Ok(Cow::Owned(format!("/dev/{}", kind.name()))),
+        }
     }
 
     fn check_traversal_permissions(&self, path: &GuestPath) -> VfsResult<()> {
@@ -3004,6 +3144,32 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
         }
     }
+}
+
+fn is_proc_self_fd_directory(tree: &PathTree, path: &GuestPath) -> bool {
+    matches!(
+        tree.lookup_path(path).map(PathNode::kind),
+        Some(PathNodeKind::Proc(ProcNodeKind::FdDirectory))
+    )
+}
+
+fn proc_self_fd_path_fd(path: &GuestPath) -> Option<Fd> {
+    let components = path.as_components();
+    if components.len() != 4
+        || components[0] != "proc"
+        || components[1] != "self"
+        || components[2] != "fd"
+    {
+        return None;
+    }
+    components[3].parse::<Fd>().ok().filter(|fd| *fd >= 0)
+}
+
+fn proc_self_fd_link_inode(fd: Fd) -> VfsResult<InodeId> {
+    let fd = u64::try_from(fd).map_err(|_| VfsError::BadFd)?;
+    FIRST_PROC_SELF_FD_LINK_INODE_ID
+        .checked_add(fd)
+        .ok_or(VfsError::BadFd)
 }
 
 fn inode_backend_for_path_node(node: &PathNode, host_path: PathBuf) -> InodeBackend {
@@ -3519,6 +3685,105 @@ mod tests {
                 ("exe", DT_LNK),
                 ("fd", DT_DIR),
             ]
+        );
+    }
+
+    #[test]
+    fn proc_self_reads_process_backed_cmdline_environ_and_exe() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_procfs().unwrap();
+        vfs.set_proc_self(ProcSelfData::new(
+            b"/bin/app".to_vec(),
+            [b"/bin/app".to_vec(), b"--flag".to_vec()],
+            [b"PATH=/bin".to_vec(), b"LANG=C".to_vec()],
+        ));
+
+        let cmdline = vfs
+            .openat(AT_FDCWD, "/proc/self/cmdline", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        let mut cmdline_bytes = [0; 64];
+        let cmdline_count = vfs.read(cmdline, &mut cmdline_bytes).unwrap();
+        assert_eq!(&cmdline_bytes[..cmdline_count], b"/bin/app\0--flag\0");
+        assert_eq!(vfs.read(cmdline, &mut cmdline_bytes).unwrap(), 0);
+
+        let environ = vfs
+            .openat(AT_FDCWD, "/proc/self/environ", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        let mut environ_bytes = [0; 64];
+        let environ_count = vfs.read(environ, &mut environ_bytes).unwrap();
+        assert_eq!(&environ_bytes[..environ_count], b"PATH=/bin\0LANG=C\0");
+
+        let mut target = [0; 64];
+        let target_count = vfs.readlink("/proc/self/exe", &mut target).unwrap();
+        assert_eq!(&target[..target_count], b"/bin/app");
+    }
+
+    #[test]
+    fn proc_self_fd_directory_exposes_current_fd_links() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_devfs().unwrap();
+        vfs.mount_minimal_procfs().unwrap();
+        let file_fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        let dev_fd = vfs
+            .openat(AT_FDCWD, "/dev/null", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+        let [pipe_read, pipe_write] = vfs.pipe(OpenFlags::new(0)).unwrap();
+
+        let proc_fd = vfs
+            .openat(
+                AT_FDCWD,
+                "/proc/self/fd",
+                OpenFlags::new(O_RDONLY | O_DIRECTORY),
+                0,
+            )
+            .unwrap();
+        let entries = vfs.getdents64(proc_fd, 4096).unwrap();
+        let names = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                (".", DT_DIR),
+                ("..", DT_DIR),
+                ("0", DT_LNK),
+                ("1", DT_LNK),
+                ("2", DT_LNK),
+                ("3", DT_LNK),
+                ("4", DT_LNK),
+                ("5", DT_LNK),
+                ("6", DT_LNK),
+                ("7", DT_LNK),
+            ]
+        );
+        assert!(pipe_write > pipe_read);
+
+        let mut target = [0; 64];
+        let file_target = format!("/proc/self/fd/{file_fd}");
+        let count = vfs.readlink(&file_target, &mut target).unwrap();
+        assert_eq!(&target[..count], b"/tmp/file");
+
+        let dev_target = format!("/proc/self/fd/{dev_fd}");
+        let count = vfs.readlink(&dev_target, &mut target).unwrap();
+        assert_eq!(&target[..count], b"/dev/null");
+
+        let pipe_target = format!("/proc/self/fd/{pipe_read}");
+        let count = vfs.readlink(&pipe_target, &mut target).unwrap();
+        assert!(String::from_utf8_lossy(&target[..count]).starts_with("pipe:["));
+        assert!(
+            vfs.newfstatat(AT_FDCWD, &pipe_target, AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .is_symlink()
+        );
+
+        vfs.close(file_fd).unwrap();
+        assert_eq!(
+            vfs.readlink(&file_target, &mut target).unwrap_err(),
+            VfsError::NoEntry
         );
     }
 

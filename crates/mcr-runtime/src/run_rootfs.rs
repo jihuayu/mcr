@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use mcr_sys::{GuestContext, LinuxErrno, Syscall, SyscallRegisters};
 use mcr_task::{INITIAL_GUEST_PID, INITIAL_GUEST_TID};
-use mcr_vfs::{AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, Rootfs, VirtualFileSystem};
+use mcr_vfs::{
+    AT_FDCWD, Fd, FdTable, O_DIRECTORY, O_RDONLY, PathTree, ProcSelfData, Rootfs, VirtualFileSystem,
+};
 
 use crate::RuntimeFileSystem;
 
@@ -203,6 +205,11 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
             config.env.clone(),
         )
         .map_err(run_rootfs_linux_errno)?;
+    vfs.set_proc_self(ProcSelfData::new(
+        program.executable().path().to_vec(),
+        program.argv().to_vec(),
+        program.envp().to_vec(),
+    ));
     let mut runtime = crate::Runtime::with_tracer_and_vfs(
         program,
         vfs.clone(),
@@ -814,6 +821,36 @@ mod tests {
         .unwrap();
         assert_eq!(proc_self.status(), 0);
         assert_eq!(proc_self.stdout(), b"cmdline\nenviron\nexe\nfd\n");
+    }
+
+    #[test]
+    fn run_rootfs_exposes_proc_self_cmdline_and_environ_content() {
+        let rootfs = TestRootfs::new("proc-content");
+        rootfs.write_static_elf("/bin/busybox");
+
+        let cmdline = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"cat".to_vec(),
+                b"/proc/self/cmdline".to_vec(),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cmdline.status(), 0);
+        assert_eq!(cmdline.stdout(), b"/bin/busybox\0cat\0/proc/self/cmdline\0");
+
+        let environ = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec())
+                .with_args([
+                    b"/bin/busybox".to_vec(),
+                    b"cat".to_vec(),
+                    b"/proc/self/environ".to_vec(),
+                ])
+                .with_env([b"PATH=/bin".to_vec(), b"LANG=C".to_vec()]),
+        )
+        .unwrap();
+        assert_eq!(environ.status(), 0);
+        assert_eq!(environ.stdout(), b"PATH=/bin\0LANG=C\0");
     }
 
     #[test]
