@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mcr-elf.workspace = true
 mcr-sys.workspace = true
+mcr-task.workspace = true
 mcr-vfs.workspace = true
+
+[dev-dependencies]
+mcr-testkit.workspace = true
 
 [lints]
 workspace = true
