@@ -1,0 +1,903 @@
+use crate::abi::{GuestPid, GuestTid, SyscallArgs, SyscallRegisters};
+use crate::errno::LinuxErrno;
+use crate::return_value::SyscallReturn;
+use crate::syscall::{Syscall, SyscallNumber};
+use crate::trace::{
+    HostErrorTrace, SyscallEnterEvent, SyscallExitEvent, SyscallTraceEvent, TraceContext,
+    TraceField, UnsupportedSyscallEvent,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestContext {
+    pub pid: GuestPid,
+    pub tid: GuestTid,
+    pub registers: SyscallRegisters,
+}
+
+impl GuestContext {
+    #[must_use]
+    pub const fn new(pid: GuestPid, tid: GuestTid, registers: SyscallRegisters) -> Self {
+        Self {
+            pid,
+            tid,
+            registers,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyscallRequest {
+    pub context: TraceContext,
+    pub syscall: Syscall,
+    pub number: SyscallNumber,
+    pub args: SyscallArgs,
+}
+
+impl SyscallRequest {
+    #[must_use]
+    pub fn from_guest_context(context: GuestContext) -> Self {
+        let registers = context.registers;
+        let number = registers.number();
+
+        Self {
+            context: TraceContext {
+                pid: context.pid,
+                tid: context.tid,
+                rip: registers.rip,
+            },
+            syscall: Syscall::from_number(number),
+            number,
+            args: registers.args(),
+        }
+    }
+
+    #[must_use]
+    pub const fn arg(self, index: usize) -> Option<u64> {
+        self.args.get(index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyscallSubsystem {
+    File,
+    Memory,
+    Task,
+    Time,
+    Network,
+    Event,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyscallDescriptor {
+    pub syscall: Syscall,
+    pub subsystem: SyscallSubsystem,
+}
+
+impl SyscallDescriptor {
+    #[must_use]
+    pub const fn new(syscall: Syscall, subsystem: SyscallSubsystem) -> Self {
+        Self { syscall, subsystem }
+    }
+}
+
+pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
+    SyscallDescriptor::new(Syscall::Read, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Write, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Close, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Stat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Fstat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Poll, SyscallSubsystem::Event),
+    SyscallDescriptor::new(Syscall::Lseek, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Mmap, SyscallSubsystem::Memory),
+    SyscallDescriptor::new(Syscall::Mprotect, SyscallSubsystem::Memory),
+    SyscallDescriptor::new(Syscall::Munmap, SyscallSubsystem::Memory),
+    SyscallDescriptor::new(Syscall::Brk, SyscallSubsystem::Memory),
+    SyscallDescriptor::new(Syscall::RtSigaction, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::RtSigprocmask, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::RtSigreturn, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Ioctl, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Readv, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Writev, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Access, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Pipe, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Nanosleep, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::Dup, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Dup2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Getpid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Socket, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Connect, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Accept, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Sendmsg, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Recvmsg, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Shutdown, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Bind, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Listen, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Setsockopt, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Getsockopt, SyscallSubsystem::Network),
+    SyscallDescriptor::new(Syscall::Clone, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Fork, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Vfork, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Execve, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Exit, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Wait4, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Kill, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Uname, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Fcntl, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Ftruncate, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Getdents, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Getcwd, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Chdir, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Readlink, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Umask, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::ArchPrctl, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Futex, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getdents64, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::SetTidAddress, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::ClockGettime, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::ExitGroup, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::EpollWait, SyscallSubsystem::Event),
+    SyscallDescriptor::new(Syscall::EpollCtl, SyscallSubsystem::Event),
+    SyscallDescriptor::new(Syscall::Tgkill, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Openat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Mkdirat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Newfstatat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Unlinkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Linkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Symlinkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Readlinkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Ppoll, SyscallSubsystem::Event),
+    SyscallDescriptor::new(Syscall::SetRobustList, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::EpollCreate1, SyscallSubsystem::Event),
+    SyscallDescriptor::new(Syscall::Dup3, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Pipe2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Renameat2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Getrandom, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::Statx, SyscallSubsystem::File),
+];
+
+#[must_use]
+pub fn syscall_descriptor(syscall: Syscall) -> Option<&'static SyscallDescriptor> {
+    SYSCALL_DISPATCH_TABLE
+        .iter()
+        .find(|descriptor| descriptor.syscall == syscall)
+}
+
+#[must_use]
+pub fn syscall_descriptor_by_number(number: SyscallNumber) -> Option<&'static SyscallDescriptor> {
+    syscall_descriptor(Syscall::from_number(number))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyscallOutcome {
+    pub result: SyscallReturn,
+    pub decoded: Vec<TraceField>,
+    pub host_error: Option<HostErrorTrace>,
+    pub unsupported: bool,
+}
+
+impl SyscallOutcome {
+    #[must_use]
+    pub fn from_return(result: impl Into<SyscallReturn>) -> Self {
+        Self {
+            result: result.into(),
+            decoded: Vec::new(),
+            host_error: None,
+            unsupported: false,
+        }
+    }
+
+    #[must_use]
+    pub fn success(value: u64) -> Self {
+        Self::from_return(SyscallReturn::success(value))
+    }
+
+    #[must_use]
+    pub fn errno(errno: LinuxErrno) -> Self {
+        Self::from_return(SyscallReturn::errno(errno))
+    }
+
+    #[must_use]
+    pub fn unsupported() -> Self {
+        Self {
+            result: SyscallReturn::unsupported(),
+            decoded: Vec::new(),
+            host_error: None,
+            unsupported: true,
+        }
+    }
+
+    #[must_use]
+    pub fn with_decoded_field(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.decoded.push(TraceField::new(name, value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_decoded_fields(mut self, decoded: impl IntoIterator<Item = TraceField>) -> Self {
+        self.decoded.extend(decoded);
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_error(mut self, host_error: HostErrorTrace) -> Self {
+        self.host_error = Some(host_error);
+        self
+    }
+
+    #[must_use]
+    pub const fn is_unsupported(&self) -> bool {
+        self.unsupported
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyscallDispatchResult {
+    pub result: SyscallReturn,
+    pub encoded_rax: u64,
+}
+
+impl SyscallDispatchResult {
+    #[must_use]
+    pub const fn from_return(result: SyscallReturn) -> Self {
+        Self {
+            result,
+            encoded_rax: result.encode_u64(),
+        }
+    }
+}
+
+pub trait SyscallTracer {
+    fn record(&mut self, event: SyscallTraceEvent);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoopSyscallTracer;
+
+impl SyscallTracer for NoopSyscallTracer {
+    fn record(&mut self, _event: SyscallTraceEvent) {}
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemorySyscallTracer {
+    events: Vec<SyscallTraceEvent>,
+}
+
+impl InMemorySyscallTracer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[SyscallTraceEvent] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn into_events(self) -> Vec<SyscallTraceEvent> {
+        self.events
+    }
+}
+
+impl SyscallTracer for InMemorySyscallTracer {
+    fn record(&mut self, event: SyscallTraceEvent) {
+        self.events.push(event);
+    }
+}
+
+pub trait FileSyscalls {
+    fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait MemorySyscalls {
+    fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait TaskSyscalls {
+    fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait TimeSyscalls {
+    fn dispatch_time(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait NetworkSyscalls {
+    fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait EventSyscalls {
+    fn dispatch_event(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
+}
+
+pub trait SyscallSubsystems:
+    FileSyscalls + MemorySyscalls + TaskSyscalls + TimeSyscalls + NetworkSyscalls + EventSyscalls
+{
+}
+
+impl<T> SyscallSubsystems for T where
+    T: FileSyscalls
+        + MemorySyscalls
+        + TaskSyscalls
+        + TimeSyscalls
+        + NetworkSyscalls
+        + EventSyscalls
+{
+}
+
+pub struct SyscallDispatcher<S, T = NoopSyscallTracer> {
+    subsystems: S,
+    tracer: T,
+}
+
+impl<S> SyscallDispatcher<S, NoopSyscallTracer> {
+    #[must_use]
+    pub fn new(subsystems: S) -> Self {
+        Self::with_tracer(subsystems, NoopSyscallTracer)
+    }
+}
+
+impl<S, T> SyscallDispatcher<S, T> {
+    #[must_use]
+    pub const fn with_tracer(subsystems: S, tracer: T) -> Self {
+        Self { subsystems, tracer }
+    }
+
+    #[must_use]
+    pub const fn subsystems(&self) -> &S {
+        &self.subsystems
+    }
+
+    #[must_use]
+    pub const fn subsystems_mut(&mut self) -> &mut S {
+        &mut self.subsystems
+    }
+
+    #[must_use]
+    pub const fn tracer(&self) -> &T {
+        &self.tracer
+    }
+
+    #[must_use]
+    pub const fn tracer_mut(&mut self) -> &mut T {
+        &mut self.tracer
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (S, T) {
+        (self.subsystems, self.tracer)
+    }
+}
+
+impl<S, T> SyscallDispatcher<S, T>
+where
+    S: SyscallSubsystems,
+    T: SyscallTracer,
+{
+    pub fn dispatch(&mut self, context: GuestContext) -> SyscallDispatchResult {
+        let request = SyscallRequest::from_guest_context(context);
+        let Some(descriptor) = syscall_descriptor(request.syscall) else {
+            let event = UnsupportedSyscallEvent::new(request.context, request.number, request.args)
+                .with_decoded_fields(decode_syscall_fields(request.syscall, request.args));
+            let result = event.result;
+            self.tracer.record(SyscallTraceEvent::Unsupported(event));
+            return SyscallDispatchResult::from_return(result);
+        };
+
+        let decoded = decode_syscall_fields(request.syscall, request.args);
+        self.tracer
+            .record(SyscallTraceEvent::Enter(SyscallEnterEvent {
+                context: request.context,
+                syscall: request.syscall,
+                args: request.args,
+                decoded: decoded.clone(),
+            }));
+
+        let mut outcome = match descriptor.subsystem {
+            SyscallSubsystem::File => self.subsystems.dispatch_file(&request),
+            SyscallSubsystem::Memory => self.subsystems.dispatch_memory(&request),
+            SyscallSubsystem::Task => self.subsystems.dispatch_task(&request),
+            SyscallSubsystem::Time => self.subsystems.dispatch_time(&request),
+            SyscallSubsystem::Network => self.subsystems.dispatch_network(&request),
+            SyscallSubsystem::Event => self.subsystems.dispatch_event(&request),
+        };
+        let result = outcome.result;
+        let mut exit_decoded = decoded;
+        exit_decoded.append(&mut outcome.decoded);
+
+        if outcome.is_unsupported() {
+            self.tracer.record(SyscallTraceEvent::Unsupported(
+                UnsupportedSyscallEvent::for_syscall(
+                    request.context,
+                    request.syscall,
+                    request.args,
+                    exit_decoded,
+                ),
+            ));
+        } else {
+            self.tracer
+                .record(SyscallTraceEvent::Exit(SyscallExitEvent {
+                    context: request.context,
+                    syscall: request.syscall,
+                    args: request.args,
+                    result,
+                    decoded: exit_decoded,
+                    host_error: outcome.host_error,
+                }));
+        }
+
+        SyscallDispatchResult::from_return(result)
+    }
+}
+
+#[must_use]
+pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceField> {
+    let arg = |index| args.get(index).unwrap_or_default();
+
+    match syscall {
+        Syscall::Read | Syscall::Write => {
+            vec![
+                decimal_field("fd", arg(0)),
+                hex_field("buf", arg(1)),
+                decimal_field("count", arg(2)),
+            ]
+        }
+        Syscall::Readv | Syscall::Writev => {
+            vec![
+                decimal_field("fd", arg(0)),
+                hex_field("iov", arg(1)),
+                decimal_field("iovcnt", arg(2)),
+            ]
+        }
+        Syscall::Close | Syscall::Dup => vec![decimal_field("fd", arg(0))],
+        Syscall::Dup2 => vec![
+            decimal_field("oldfd", arg(0)),
+            decimal_field("newfd", arg(1)),
+        ],
+        Syscall::Dup3 => vec![
+            decimal_field("oldfd", arg(0)),
+            decimal_field("newfd", arg(1)),
+            hex_field("flags", arg(2)),
+        ],
+        Syscall::Fstat => vec![decimal_field("fd", arg(0)), hex_field("statbuf", arg(1))],
+        Syscall::Lseek => vec![
+            decimal_field("fd", arg(0)),
+            signed_field("offset", arg(1)),
+            decimal_field("whence", arg(2)),
+        ],
+        Syscall::Openat => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("flags", arg(2)),
+            octal_field("mode", arg(3)),
+        ],
+        Syscall::Stat | Syscall::Access | Syscall::Readlink => {
+            vec![hex_field("path_ptr", arg(0)), hex_field("buf", arg(1))]
+        }
+        Syscall::Newfstatat | Syscall::Readlinkat => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("buf", arg(2)),
+            hex_field("flags", arg(3)),
+        ],
+        Syscall::Statx => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("flags", arg(2)),
+            hex_field("mask", arg(3)),
+            hex_field("statxbuf", arg(4)),
+        ],
+        Syscall::Getdents | Syscall::Getdents64 => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("dirent", arg(1)),
+            decimal_field("count", arg(2)),
+        ],
+        Syscall::Mkdirat | Syscall::Unlinkat => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("flags_or_mode", arg(2)),
+        ],
+        Syscall::Linkat => vec![
+            signed_field("olddirfd", arg(0)),
+            hex_field("oldpath_ptr", arg(1)),
+            signed_field("newdirfd", arg(2)),
+            hex_field("newpath_ptr", arg(3)),
+            hex_field("flags", arg(4)),
+        ],
+        Syscall::Symlinkat => vec![
+            hex_field("target_ptr", arg(0)),
+            signed_field("newdirfd", arg(1)),
+            hex_field("linkpath_ptr", arg(2)),
+        ],
+        Syscall::Renameat2 => vec![
+            signed_field("olddirfd", arg(0)),
+            hex_field("oldpath_ptr", arg(1)),
+            signed_field("newdirfd", arg(2)),
+            hex_field("newpath_ptr", arg(3)),
+            hex_field("flags", arg(4)),
+        ],
+        Syscall::Pipe | Syscall::Pipe2 => {
+            vec![hex_field("pipefd", arg(0)), hex_field("flags", arg(1))]
+        }
+        Syscall::Fcntl | Syscall::Ioctl => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("cmd", arg(1)),
+            hex_field("arg", arg(2)),
+        ],
+        Syscall::Ftruncate => vec![decimal_field("fd", arg(0)), signed_field("length", arg(1))],
+        Syscall::Getcwd => vec![hex_field("buf", arg(0)), decimal_field("size", arg(1))],
+        Syscall::Chdir => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Umask => vec![octal_field("mask", arg(0))],
+        Syscall::Mmap => vec![
+            hex_field("addr", arg(0)),
+            decimal_field("length", arg(1)),
+            hex_field("prot", arg(2)),
+            hex_field("flags", arg(3)),
+            signed_field("fd", arg(4)),
+            signed_field("offset", arg(5)),
+        ],
+        Syscall::Mprotect | Syscall::Munmap => vec![
+            hex_field("addr", arg(0)),
+            decimal_field("length", arg(1)),
+            hex_field("prot_or_flags", arg(2)),
+        ],
+        Syscall::Brk => vec![hex_field("addr", arg(0))],
+        Syscall::Exit | Syscall::ExitGroup => vec![decimal_field("status", arg(0))],
+        Syscall::Getpid | Syscall::Gettid | Syscall::RtSigreturn => Vec::new(),
+        Syscall::Uname => vec![hex_field("buf", arg(0))],
+        Syscall::ArchPrctl => vec![hex_field("code", arg(0)), hex_field("addr", arg(1))],
+        Syscall::Execve => vec![
+            hex_field("path_ptr", arg(0)),
+            hex_field("argv_ptr", arg(1)),
+            hex_field("envp_ptr", arg(2)),
+        ],
+        Syscall::Clone => vec![
+            hex_field("flags", arg(0)),
+            hex_field("child_stack", arg(1)),
+            hex_field("ptid", arg(2)),
+            hex_field("ctid", arg(3)),
+            hex_field("tls", arg(4)),
+        ],
+        Syscall::Fork | Syscall::Vfork => Vec::new(),
+        Syscall::Wait4 => vec![
+            signed_field("pid", arg(0)),
+            hex_field("wstatus", arg(1)),
+            hex_field("options", arg(2)),
+            hex_field("rusage", arg(3)),
+        ],
+        Syscall::Kill => vec![signed_field("pid", arg(0)), decimal_field("sig", arg(1))],
+        Syscall::Tgkill => vec![
+            signed_field("tgid", arg(0)),
+            signed_field("tid", arg(1)),
+            decimal_field("sig", arg(2)),
+        ],
+        Syscall::RtSigaction => vec![
+            decimal_field("sig", arg(0)),
+            hex_field("act", arg(1)),
+            hex_field("oldact", arg(2)),
+            decimal_field("sigsetsize", arg(3)),
+        ],
+        Syscall::RtSigprocmask => vec![
+            decimal_field("how", arg(0)),
+            hex_field("set", arg(1)),
+            hex_field("oldset", arg(2)),
+            decimal_field("sigsetsize", arg(3)),
+        ],
+        Syscall::SetTidAddress => vec![hex_field("tidptr", arg(0))],
+        Syscall::SetRobustList => {
+            vec![hex_field("head", arg(0)), decimal_field("len", arg(1))]
+        }
+        Syscall::Futex => vec![
+            hex_field("uaddr", arg(0)),
+            hex_field("op", arg(1)),
+            decimal_field("val", arg(2)),
+            hex_field("timeout", arg(3)),
+            hex_field("uaddr2", arg(4)),
+            decimal_field("val3", arg(5)),
+        ],
+        Syscall::ClockGettime => {
+            vec![decimal_field("clockid", arg(0)), hex_field("tp", arg(1))]
+        }
+        Syscall::Nanosleep => vec![hex_field("req", arg(0)), hex_field("rem", arg(1))],
+        Syscall::Getrandom => vec![
+            hex_field("buf", arg(0)),
+            decimal_field("buflen", arg(1)),
+            hex_field("flags", arg(2)),
+        ],
+        Syscall::Socket => vec![
+            decimal_field("domain", arg(0)),
+            hex_field("type", arg(1)),
+            decimal_field("protocol", arg(2)),
+        ],
+        Syscall::Connect | Syscall::Bind => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("sockaddr", arg(1)),
+            decimal_field("addrlen", arg(2)),
+        ],
+        Syscall::Accept => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("sockaddr", arg(1)),
+            hex_field("addrlen", arg(2)),
+        ],
+        Syscall::Listen => {
+            vec![
+                decimal_field("fd", arg(0)),
+                decimal_field("backlog", arg(1)),
+            ]
+        }
+        Syscall::Sendmsg | Syscall::Recvmsg => vec![
+            decimal_field("fd", arg(0)),
+            hex_field("msg", arg(1)),
+            hex_field("flags", arg(2)),
+        ],
+        Syscall::Shutdown => vec![decimal_field("fd", arg(0)), decimal_field("how", arg(1))],
+        Syscall::Setsockopt => vec![
+            decimal_field("fd", arg(0)),
+            decimal_field("level", arg(1)),
+            decimal_field("optname", arg(2)),
+            hex_field("optval", arg(3)),
+            decimal_field("optlen", arg(4)),
+        ],
+        Syscall::Getsockopt => vec![
+            decimal_field("fd", arg(0)),
+            decimal_field("level", arg(1)),
+            decimal_field("optname", arg(2)),
+            hex_field("optval", arg(3)),
+            hex_field("optlen", arg(4)),
+        ],
+        Syscall::Poll => vec![
+            hex_field("fds", arg(0)),
+            decimal_field("nfds", arg(1)),
+            signed_field("timeout", arg(2)),
+        ],
+        Syscall::Ppoll => vec![
+            hex_field("fds", arg(0)),
+            decimal_field("nfds", arg(1)),
+            hex_field("tsp", arg(2)),
+            hex_field("sigmask", arg(3)),
+            decimal_field("sigsetsize", arg(4)),
+        ],
+        Syscall::EpollCreate1 => vec![hex_field("flags", arg(0))],
+        Syscall::EpollCtl => vec![
+            decimal_field("epfd", arg(0)),
+            decimal_field("op", arg(1)),
+            decimal_field("fd", arg(2)),
+            hex_field("event", arg(3)),
+        ],
+        Syscall::EpollWait => vec![
+            decimal_field("epfd", arg(0)),
+            hex_field("events", arg(1)),
+            decimal_field("maxevents", arg(2)),
+            signed_field("timeout", arg(3)),
+        ],
+        Syscall::Unknown(_) => (0..6)
+            .map(|index| hex_field(format!("arg{index}"), arg(index)))
+            .collect(),
+    }
+}
+
+fn unsupported_outcome(request: &SyscallRequest) -> SyscallOutcome {
+    SyscallOutcome::unsupported().with_decoded_field("unsupported", request.syscall.name())
+}
+
+fn decimal_field(name: impl Into<String>, value: u64) -> TraceField {
+    TraceField::new(name, value.to_string())
+}
+
+fn signed_field(name: impl Into<String>, value: u64) -> TraceField {
+    TraceField::new(name, (value as i64).to_string())
+}
+
+fn hex_field(name: impl Into<String>, value: u64) -> TraceField {
+    TraceField::new(name, format!("{value:#x}"))
+}
+
+fn octal_field(name: impl Into<String>, value: u64) -> TraceField {
+    TraceField::new(name, format!("{value:#o}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        EventSyscalls, FileSyscalls, GuestContext, InMemorySyscallTracer, MemorySyscalls,
+        NetworkSyscalls, SYSCALL_DISPATCH_TABLE, SyscallDispatcher, SyscallOutcome, SyscallRequest,
+        SyscallSubsystem, TaskSyscalls, TimeSyscalls, syscall_descriptor,
+    };
+    use crate::abi::SyscallRegisters;
+    use crate::errno::LinuxErrno;
+    use crate::return_value::SyscallReturn;
+    use crate::syscall::{Syscall, SyscallNumber};
+    use crate::trace::SyscallTraceEvent;
+
+    #[test]
+    fn dispatcher_table_routes_core_runtime_syscalls() {
+        assert_eq!(
+            syscall_descriptor(Syscall::Read).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::File)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::Mmap).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Memory)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::Getpid).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Task)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::ClockGettime).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Time)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::Socket).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Network)
+        );
+        assert_eq!(
+            syscall_descriptor(Syscall::EpollWait).map(|descriptor| descriptor.subsystem),
+            Some(SyscallSubsystem::Event)
+        );
+    }
+
+    #[test]
+    fn dispatcher_table_has_unique_syscall_numbers() {
+        let mut numbers = BTreeSet::new();
+
+        for descriptor in SYSCALL_DISPATCH_TABLE {
+            assert!(
+                numbers.insert(descriptor.syscall.number().raw()),
+                "duplicate syscall table entry for {}",
+                descriptor.syscall
+            );
+            assert_eq!(syscall_descriptor(descriptor.syscall), Some(descriptor));
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSubsystems {
+        file_syscalls: Vec<Syscall>,
+        task_syscalls: Vec<Syscall>,
+    }
+
+    impl FileSyscalls for RecordingSubsystems {
+        fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+            self.file_syscalls.push(request.syscall);
+            SyscallOutcome::success(12).with_decoded_field("bytes", "12")
+        }
+    }
+
+    impl MemorySyscalls for RecordingSubsystems {}
+
+    impl TaskSyscalls for RecordingSubsystems {
+        fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+            self.task_syscalls.push(request.syscall);
+            SyscallOutcome::success(u64::from(request.context.pid))
+        }
+    }
+
+    impl TimeSyscalls for RecordingSubsystems {}
+    impl NetworkSyscalls for RecordingSubsystems {}
+    impl EventSyscalls for RecordingSubsystems {}
+
+    #[test]
+    fn dispatcher_calls_subsystem_and_records_enter_exit_trace() {
+        let registers = SyscallRegisters {
+            rax: Syscall::Write.number().raw(),
+            rdi: 1,
+            rsi: 0x2000,
+            rdx: 12,
+            rip: 0x401234,
+            ..SyscallRegisters::default()
+        };
+        let mut dispatcher = SyscallDispatcher::with_tracer(
+            RecordingSubsystems::default(),
+            InMemorySyscallTracer::new(),
+        );
+
+        let result = dispatcher.dispatch(GuestContext::new(77, 78, registers));
+
+        assert_eq!(result.result, SyscallReturn::Success(12));
+        assert_eq!(result.encoded_rax, 12);
+        assert_eq!(dispatcher.subsystems().file_syscalls, vec![Syscall::Write]);
+        let events = dispatcher.tracer().events();
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            SyscallTraceEvent::Enter(event) => {
+                assert_eq!(event.context.pid, 77);
+                assert_eq!(event.context.tid, 78);
+                assert_eq!(event.context.rip, 0x401234);
+                assert_eq!(event.syscall, Syscall::Write);
+                assert_eq!(event.args.raw(), [1, 0x2000, 12, 0, 0, 0]);
+                assert!(event.decoded.iter().any(|field| field.name == "fd"));
+            }
+            other => panic!("expected enter event, got {other:?}"),
+        }
+
+        match &events[1] {
+            SyscallTraceEvent::Exit(event) => {
+                assert_eq!(event.syscall, Syscall::Write);
+                assert_eq!(event.result, SyscallReturn::Success(12));
+                assert!(event.decoded.iter().any(|field| field.name == "bytes"));
+                assert!(event.host_error.is_none());
+            }
+            other => panic!("expected exit event, got {other:?}"),
+        }
+    }
+
+    #[derive(Default)]
+    struct UnsupportedSubsystems;
+
+    impl FileSyscalls for UnsupportedSubsystems {}
+    impl MemorySyscalls for UnsupportedSubsystems {}
+    impl TaskSyscalls for UnsupportedSubsystems {}
+    impl TimeSyscalls for UnsupportedSubsystems {}
+    impl NetworkSyscalls for UnsupportedSubsystems {}
+    impl EventSyscalls for UnsupportedSubsystems {}
+
+    #[test]
+    fn known_syscall_without_subsystem_support_returns_enosys_and_traces_unsupported() {
+        let registers = SyscallRegisters {
+            rax: Syscall::Mmap.number().raw(),
+            rsi: 4096,
+            rip: 0x402000,
+            ..SyscallRegisters::default()
+        };
+        let mut dispatcher =
+            SyscallDispatcher::with_tracer(UnsupportedSubsystems, InMemorySyscallTracer::new());
+
+        let result = dispatcher.dispatch(GuestContext::new(1, 2, registers));
+
+        assert_eq!(result.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+        assert_eq!(result.encoded_rax as i64, -38);
+        assert!(matches!(
+            dispatcher.tracer().events(),
+            [
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Unsupported(_)
+            ]
+        ));
+    }
+
+    #[test]
+    fn unknown_syscall_returns_enosys_without_entering_a_subsystem() {
+        let registers = SyscallRegisters {
+            rax: 9999,
+            rip: 0x403000,
+            ..SyscallRegisters::default()
+        };
+        let mut dispatcher = SyscallDispatcher::with_tracer(
+            RecordingSubsystems::default(),
+            InMemorySyscallTracer::new(),
+        );
+
+        let result = dispatcher.dispatch(GuestContext::new(10, 11, registers));
+
+        assert_eq!(result.result, SyscallReturn::unsupported());
+        assert_eq!(result.encoded_rax as i64, -38);
+        assert!(dispatcher.subsystems().file_syscalls.is_empty());
+        assert!(dispatcher.subsystems().task_syscalls.is_empty());
+
+        match dispatcher.tracer().events() {
+            [SyscallTraceEvent::Unsupported(event)] => {
+                assert_eq!(event.number, SyscallNumber::new(9999));
+                assert_eq!(event.syscall, Syscall::Unknown(SyscallNumber::new(9999)));
+                assert_eq!(event.context.rip, 0x403000);
+                assert_eq!(event.result, SyscallReturn::unsupported());
+            }
+            other => panic!("expected one unsupported event, got {other:?}"),
+        }
+    }
+}
