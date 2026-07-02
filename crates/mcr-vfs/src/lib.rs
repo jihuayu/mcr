@@ -71,6 +71,12 @@ const DEV_ZERO_INODE_ID: InodeId = DEV_NULL_INODE_ID + 1;
 const DEV_URANDOM_INODE_ID: InodeId = DEV_NULL_INODE_ID + 2;
 const FIRST_USER_FD: Fd = 3;
 const FIRST_PIPE_INODE_ID: InodeId = 1 << 62;
+const PROC_INODE_ID: InodeId = 1 << 60;
+const PROC_SELF_INODE_ID: InodeId = PROC_INODE_ID + 1;
+const PROC_SELF_EXE_INODE_ID: InodeId = PROC_INODE_ID + 2;
+const PROC_SELF_CMDLINE_INODE_ID: InodeId = PROC_INODE_ID + 3;
+const PROC_SELF_ENVIRON_INODE_ID: InodeId = PROC_INODE_ID + 4;
+const PROC_SELF_FD_INODE_ID: InodeId = PROC_INODE_ID + 5;
 const DEFAULT_PIPE_CAPACITY: usize = 65_536;
 const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
@@ -403,6 +409,40 @@ impl PathTree {
         self.insert_dev_node("/dev/urandom", DEV_URANDOM_INODE_ID, DevNodeKind::Urandom)
     }
 
+    pub fn mount_minimal_procfs(&mut self) -> VfsResult<()> {
+        self.insert_proc_static_node("/proc", PROC_INODE_ID, ProcNodeKind::Directory, 0o555)?;
+        self.insert_proc_static_node(
+            "/proc/self",
+            PROC_SELF_INODE_ID,
+            ProcNodeKind::Directory,
+            0o555,
+        )?;
+        self.insert_proc_static_node(
+            "/proc/self/exe",
+            PROC_SELF_EXE_INODE_ID,
+            ProcNodeKind::Exe,
+            0o777,
+        )?;
+        self.insert_proc_static_node(
+            "/proc/self/cmdline",
+            PROC_SELF_CMDLINE_INODE_ID,
+            ProcNodeKind::Cmdline,
+            0o444,
+        )?;
+        self.insert_proc_static_node(
+            "/proc/self/environ",
+            PROC_SELF_ENVIRON_INODE_ID,
+            ProcNodeKind::Environ,
+            0o400,
+        )?;
+        self.insert_proc_static_node(
+            "/proc/self/fd",
+            PROC_SELF_FD_INODE_ID,
+            ProcNodeKind::FdDirectory,
+            0o555,
+        )
+    }
+
     pub fn lookup_path(&self, path: &GuestPath) -> Option<&PathNode> {
         let inode_id = self.nodes.get(path)?;
         self.inodes.get(inode_id)
@@ -462,8 +502,12 @@ impl PathTree {
                 continue;
             };
             match node.kind() {
-                PathNodeKind::Directory => continue,
+                PathNodeKind::Directory
+                | PathNodeKind::Proc(ProcNodeKind::Directory | ProcNodeKind::FdDirectory) => {
+                    continue;
+                }
                 PathNodeKind::File | PathNodeKind::Device(_) => return None,
+                PathNodeKind::Proc(_) => return None,
                 PathNodeKind::Symlink(target) => {
                     let suffix = &path.components[ancestor_len..];
                     let mut rewritten = target.clone();
@@ -512,6 +556,7 @@ impl PathTree {
             PathNodeKind::Directory => LinuxFileAttr::directory_with_mode(inode_id, mode),
             PathNodeKind::File => LinuxFileAttr::regular(inode_id, mode, 0),
             PathNodeKind::Device(_) => LinuxFileAttr::character_device(inode_id, mode),
+            PathNodeKind::Proc(kind) => kind.attr(inode_id, mode),
             PathNodeKind::Symlink(target) => LinuxFileAttr::symlink(inode_id, target.len() as u64),
         };
         self.insert_path_node(
@@ -579,6 +624,34 @@ impl PathTree {
                 inode_id,
                 kind: PathNodeKind::Device(kind),
                 metadata: MetadataSidecar::new(LinuxFileAttr::character_device(inode_id, 0o666)),
+                data: Vec::new(),
+            },
+        )
+    }
+
+    fn insert_proc_static_node(
+        &mut self,
+        path: &str,
+        inode_id: InodeId,
+        kind: ProcNodeKind,
+        mode: u32,
+    ) -> VfsResult<()> {
+        let path = parse_absolute_path(path)?;
+        if let Some(node) = self.lookup_path(&path) {
+            if matches!(node.kind(), PathNodeKind::Proc(existing) if *existing == kind) {
+                return Ok(());
+            }
+            return Err(VfsError::AlreadyExists);
+        }
+        if !path.is_root() {
+            self.ensure_parent_dir(&path)?;
+        }
+        self.insert_path_node(
+            path,
+            PathNode {
+                inode_id,
+                kind: PathNodeKind::Proc(kind),
+                metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
                 data: Vec::new(),
             },
         )
@@ -660,7 +733,7 @@ impl PathNode {
     }
 
     pub fn is_directory(&self) -> bool {
-        self.kind == PathNodeKind::Directory
+        is_directory_kind(&self.kind)
     }
 
     pub fn attr(&self) -> LinuxFileAttr {
@@ -724,7 +797,55 @@ pub enum PathNodeKind {
     Directory,
     File,
     Device(DevNodeKind),
+    Proc(ProcNodeKind),
     Symlink(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcNodeKind {
+    Directory,
+    Exe,
+    Cmdline,
+    Environ,
+    FdDirectory,
+    FdLink(Fd),
+}
+
+impl ProcNodeKind {
+    fn attr(self, inode: InodeId, mode: u32) -> LinuxFileAttr {
+        match self {
+            Self::Directory | Self::FdDirectory => LinuxFileAttr::directory_with_mode(inode, mode),
+            Self::Exe | Self::FdLink(_) => LinuxFileAttr::symlink(inode, 0),
+            Self::Cmdline | Self::Environ => LinuxFileAttr::regular(inode, mode, 0),
+        }
+    }
+
+    fn file_kind(self) -> FileKind {
+        match self {
+            Self::Directory | Self::FdDirectory => FileKind::Directory,
+            Self::Exe | Self::FdLink(_) => FileKind::Symlink,
+            Self::Cmdline | Self::Environ => FileKind::Regular,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::Exe => "self/exe",
+            Self::Cmdline => "self/cmdline",
+            Self::Environ => "self/environ",
+            Self::FdDirectory => "self/fd",
+            Self::FdLink(_) => "self/fd",
+        }
+    }
+}
+
+fn is_directory_kind(kind: &PathNodeKind) -> bool {
+    matches!(
+        kind,
+        PathNodeKind::Directory
+            | PathNodeKind::Proc(ProcNodeKind::Directory | ProcNodeKind::FdDirectory)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1007,7 +1128,7 @@ impl<'a> PathResolver<'a> {
                             pending.push(next);
                         }
                     } else if let Some(node) = self.tree.lookup_path(&next_path) {
-                        if !node.is_directory() && !pending.is_empty() {
+                        if !is_directory_kind(node.kind()) && !pending.is_empty() {
                             return Err(VfsError::NotDirectory);
                         }
                         *current = next_path;
@@ -2133,6 +2254,10 @@ impl VirtualFileSystem {
         self.tree.mount_minimal_devfs()
     }
 
+    pub fn mount_minimal_procfs(&mut self) -> VfsResult<()> {
+        self.tree.mount_minimal_procfs()
+    }
+
     pub fn getcwd(&self) -> VfsResult<String> {
         self.rootfs.visible_path(self.rootfs.cwd())
     }
@@ -2211,6 +2336,7 @@ impl VirtualFileSystem {
             PathNodeKind::Directory => FileKind::Directory,
             PathNodeKind::File => FileKind::Regular,
             PathNodeKind::Device(kind) => FileKind::Dev(*kind),
+            PathNodeKind::Proc(kind) => kind.file_kind(),
             PathNodeKind::Symlink(_) => FileKind::Symlink,
         };
         self.fds.insert_open(
@@ -2822,6 +2948,7 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
 fn inode_backend_for_path_node(node: &PathNode, host_path: PathBuf) -> InodeBackend {
     match node.kind() {
         PathNodeKind::Device(kind) => InodeBackend::DevVirtual(DevNode::new(*kind)),
+        PathNodeKind::Proc(kind) => InodeBackend::ProcVirtual(ProcNode::new(kind.name())),
         PathNodeKind::Directory | PathNodeKind::File | PathNodeKind::Symlink(_) => {
             InodeBackend::HostPath(HostPathRef::new(host_path))
         }
@@ -3215,6 +3342,81 @@ mod tests {
                 ("null", DT_CHR),
                 ("urandom", DT_CHR),
                 ("zero", DT_CHR),
+            ]
+        );
+    }
+
+    #[test]
+    fn minimal_procfs_nodes_have_linux_metadata_shapes() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_procfs().unwrap();
+
+        let proc_stat = vfs.newfstatat(AT_FDCWD, "/proc", 0).unwrap();
+        let self_stat = vfs.newfstatat(AT_FDCWD, "/proc/self", 0).unwrap();
+        let fd_stat = vfs.newfstatat(AT_FDCWD, "/proc/self/fd", 0).unwrap();
+        let exe_stat = vfs
+            .newfstatat(AT_FDCWD, "/proc/self/exe", AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        let cmdline_stat = vfs.newfstatat(AT_FDCWD, "/proc/self/cmdline", 0).unwrap();
+        let environ_stat = vfs.newfstatat(AT_FDCWD, "/proc/self/environ", 0).unwrap();
+
+        assert!(proc_stat.is_directory());
+        assert_eq!(proc_stat.mode & 0o777, 0o555);
+        assert!(self_stat.is_directory());
+        assert!(fd_stat.is_directory());
+        assert!(exe_stat.is_symlink());
+        assert_eq!(exe_stat.mode & 0o777, 0o777);
+        assert!(cmdline_stat.is_regular());
+        assert_eq!(cmdline_stat.mode & 0o777, 0o444);
+        assert!(environ_stat.is_regular());
+        assert_eq!(environ_stat.mode & 0o777, 0o400);
+        assert!(vfs.access("/proc/self/cmdline", R_OK).is_ok());
+        assert_eq!(
+            vfs.access("/proc/self/environ", W_OK).unwrap_err(),
+            VfsError::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn minimal_procfs_directories_list_proc_entry_types() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_procfs().unwrap();
+
+        let proc_fd = vfs
+            .openat(AT_FDCWD, "/proc", OpenFlags::new(O_RDONLY | O_DIRECTORY), 0)
+            .unwrap();
+        let proc_entries = vfs.getdents64(proc_fd, 4096).unwrap();
+        let proc_entries = proc_entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proc_entries,
+            vec![(".", DT_DIR), ("..", DT_DIR), ("self", DT_DIR)]
+        );
+
+        let self_fd = vfs
+            .openat(
+                AT_FDCWD,
+                "/proc/self",
+                OpenFlags::new(O_RDONLY | O_DIRECTORY),
+                0,
+            )
+            .unwrap();
+        let self_entries = vfs.getdents64(self_fd, 4096).unwrap();
+        let self_entries = self_entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            self_entries,
+            vec![
+                (".", DT_DIR),
+                ("..", DT_DIR),
+                ("cmdline", DT_REG),
+                ("environ", DT_REG),
+                ("exe", DT_LNK),
+                ("fd", DT_DIR),
             ]
         );
     }
