@@ -15,6 +15,7 @@ fn cli_runs_mvp_busybox_smokes() {
     let echo = SmokeCommand::new(mcr)
         .args([
             "run-rootfs",
+            "--mvp-emulator",
             rootfs.path().to_str().unwrap(),
             "/bin/busybox",
             "echo",
@@ -29,6 +30,7 @@ fn cli_runs_mvp_busybox_smokes() {
     let ls = SmokeCommand::new(mcr)
         .args([
             "run-rootfs",
+            "--mvp-emulator",
             rootfs.path().to_str().unwrap(),
             "/bin/busybox",
             "ls",
@@ -43,6 +45,7 @@ fn cli_runs_mvp_busybox_smokes() {
     let cat = SmokeCommand::new(mcr)
         .args([
             "run-rootfs",
+            "--mvp-emulator",
             rootfs.path().to_str().unwrap(),
             "/bin/busybox",
             "cat",
@@ -64,6 +67,7 @@ fn cli_runs_shell_procfs_devfs_smokes() {
     let echo_pipe = SmokeCommand::new(mcr)
         .args([
             "run-rootfs",
+            "--mvp-emulator",
             rootfs.path().to_str().unwrap(),
             "/bin/sh",
             "-c",
@@ -78,6 +82,7 @@ fn cli_runs_shell_procfs_devfs_smokes() {
     let proc_dev = SmokeCommand::new(mcr)
         .args([
             "run-rootfs",
+            "--mvp-emulator",
             rootfs.path().to_str().unwrap(),
             "/bin/sh",
             "-c",

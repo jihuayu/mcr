@@ -17,6 +17,7 @@ pub struct RunRootfsConfig {
     program: Vec<u8>,
     args: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
+    mvp_emulator: bool,
 }
 
 impl RunRootfsConfig {
@@ -28,6 +29,7 @@ impl RunRootfsConfig {
             args: vec![program.clone()],
             program,
             env: Vec::new(),
+            mvp_emulator: false,
         }
     }
 
@@ -52,6 +54,12 @@ impl RunRootfsConfig {
     }
 
     #[must_use]
+    pub const fn with_mvp_emulator(mut self, enabled: bool) -> Self {
+        self.mvp_emulator = enabled;
+        self
+    }
+
+    #[must_use]
     pub fn rootfs(&self) -> &Path {
         &self.rootfs
     }
@@ -69,6 +77,11 @@ impl RunRootfsConfig {
     #[must_use]
     pub fn env(&self) -> &[Vec<u8>] {
         &self.env
+    }
+
+    #[must_use]
+    pub const fn mvp_emulator(&self) -> bool {
+        self.mvp_emulator
     }
 }
 
@@ -226,7 +239,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
             runtime.vfs().stdout_snapshot(),
             runtime.vfs().stderr_snapshot(),
         )),
-        Err(error) if error.linux_errno() == LinuxErrno::ENOEXEC => {
+        Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
         Err(error) => Err(run_rootfs_linux_errno(error.linux_errno())),
@@ -763,23 +776,21 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mcr_sys::Syscall;
+    use mcr_sys::{LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
-    use super::{RunRootfsConfig, run_rootfs};
+    use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
 
     #[test]
     fn run_rootfs_executes_busybox_echo_smoke() {
         let rootfs = TestRootfs::new("echo");
         rootfs.write_static_elf("/bin/busybox");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"echo".to_vec(),
-                b"hello".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"echo".to_vec(),
+            b"hello".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
@@ -794,24 +805,20 @@ mod tests {
         rootfs.write_file("/etc/os-release", b"NAME=Alpine\n");
         rootfs.write_file("/hello.txt", b"hello\n");
 
-        let ls = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"ls".to_vec(),
-                b"/".to_vec(),
-            ]),
-        )
+        let ls = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"ls".to_vec(),
+            b"/".to_vec(),
+        ]))
         .unwrap();
         assert_eq!(ls.status(), 0);
         assert_eq!(ls.stdout(), b"bin\ndev\netc\nhello.txt\nproc\n");
 
-        let cat = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"cat".to_vec(),
-                b"/etc/os-release".to_vec(),
-            ]),
-        )
+        let cat = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"cat".to_vec(),
+            b"/etc/os-release".to_vec(),
+        ]))
         .unwrap();
         assert_eq!(cat.status(), 0);
         assert_eq!(cat.stdout(), b"NAME=Alpine\n");
@@ -822,24 +829,20 @@ mod tests {
         let rootfs = TestRootfs::new("proc-dev");
         rootfs.write_static_elf("/bin/busybox");
 
-        let dev = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"ls".to_vec(),
-                b"/dev".to_vec(),
-            ]),
-        )
+        let dev = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"ls".to_vec(),
+            b"/dev".to_vec(),
+        ]))
         .unwrap();
         assert_eq!(dev.status(), 0);
         assert_eq!(dev.stdout(), b"null\nurandom\nzero\n");
 
-        let proc_self = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"ls".to_vec(),
-                b"/proc/self".to_vec(),
-            ]),
-        )
+        let proc_self = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"ls".to_vec(),
+            b"/proc/self".to_vec(),
+        ]))
         .unwrap();
         assert_eq!(proc_self.status(), 0);
         assert_eq!(proc_self.stdout(), b"cmdline\nenviron\nexe\nfd\n");
@@ -850,15 +853,13 @@ mod tests {
         let rootfs = TestRootfs::new("dns-config");
         rootfs.write_static_elf("/bin/busybox");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"cat".to_vec(),
-                b"/etc/hosts".to_vec(),
-                b"/etc/resolv.conf".to_vec(),
-                b"/etc/nsswitch.conf".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"cat".to_vec(),
+            b"/etc/hosts".to_vec(),
+            b"/etc/resolv.conf".to_vec(),
+            b"/etc/nsswitch.conf".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
@@ -874,13 +875,11 @@ mod tests {
         rootfs.write_static_elf("/bin/busybox");
         rootfs.write_file("/etc/resolv.conf", b"nameserver 9.9.9.9\n");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"cat".to_vec(),
-                b"/etc/resolv.conf".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"cat".to_vec(),
+            b"/etc/resolv.conf".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
@@ -892,19 +891,17 @@ mod tests {
         let rootfs = TestRootfs::new("proc-content");
         rootfs.write_static_elf("/bin/busybox");
 
-        let cmdline = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"cat".to_vec(),
-                b"/proc/self/cmdline".to_vec(),
-            ]),
-        )
+        let cmdline = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"cat".to_vec(),
+            b"/proc/self/cmdline".to_vec(),
+        ]))
         .unwrap();
         assert_eq!(cmdline.status(), 0);
         assert_eq!(cmdline.stdout(), b"/bin/busybox\0cat\0/proc/self/cmdline\0");
 
         let environ = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec())
+            emulated_config(&rootfs, b"/bin/busybox")
                 .with_args([
                     b"/bin/busybox".to_vec(),
                     b"cat".to_vec(),
@@ -923,13 +920,11 @@ mod tests {
         rootfs.write_dynamic_elf("/bin/busybox", "/lib/ld-musl-x86_64.so.1");
         rootfs.write_interpreter_elf("/lib/ld-musl-x86_64.so.1");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
-                b"/bin/busybox".to_vec(),
-                b"echo".to_vec(),
-                b"dynamic".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/busybox").with_args([
+            b"/bin/busybox".to_vec(),
+            b"echo".to_vec(),
+            b"dynamic".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
@@ -955,13 +950,11 @@ mod tests {
         let rootfs = TestRootfs::new("shell-pipe");
         rootfs.write_static_elf("/bin/sh");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/sh".to_vec()).with_args([
-                b"/bin/sh".to_vec(),
-                b"-c".to_vec(),
-                b"echo hi | cat".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/sh").with_args([
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            b"echo hi | cat".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
@@ -974,18 +967,40 @@ mod tests {
         let rootfs = TestRootfs::new("shell-proc-dev");
         rootfs.write_static_elf("/bin/sh");
 
-        let output = run_rootfs(
-            RunRootfsConfig::new(rootfs.path(), b"/bin/sh".to_vec()).with_args([
-                b"/bin/sh".to_vec(),
-                b"-c".to_vec(),
-                b"cat /proc/self/cmdline >/dev/null && head -c 4 /dev/zero >/dev/null".to_vec(),
-            ]),
-        )
+        let output = run_rootfs(emulated_config(&rootfs, b"/bin/sh").with_args([
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            b"cat /proc/self/cmdline >/dev/null && head -c 4 /dev/zero >/dev/null".to_vec(),
+        ]))
         .unwrap();
 
         assert_eq!(output.status(), 0);
         assert_eq!(output.stdout(), b"");
         assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
+    fn run_rootfs_does_not_use_mvp_emulator_by_default() {
+        let rootfs = TestRootfs::new("mvp-disabled");
+        rootfs.write_static_elf("/bin/busybox");
+
+        let error = run_rootfs(
+            RunRootfsConfig::new(rootfs.path(), b"/bin/busybox".to_vec()).with_args([
+                b"/bin/busybox".to_vec(),
+                b"echo".to_vec(),
+                b"hello".to_vec(),
+            ]),
+        )
+        .expect_err("synthetic busybox should not fall back to the MVP emulator by default");
+
+        match error {
+            RunRootfsError::Linux(errno) => assert_eq!(errno, LinuxErrno::ENOEXEC),
+            other => panic!("expected guest runtime ENOEXEC, got {other:?}"),
+        }
+    }
+
+    fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {
+        RunRootfsConfig::new(rootfs.path(), program.to_vec()).with_mvp_emulator(true)
     }
 
     struct TestRootfs {
