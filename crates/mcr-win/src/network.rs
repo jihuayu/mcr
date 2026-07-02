@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::error::{HostError, HostOperation, HostResult};
@@ -23,6 +24,34 @@ pub enum SocketProtocol {
     Default,
     Tcp,
     Udp,
+}
+
+/// Host socket shutdown direction.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HostShutdown {
+    Read,
+    Write,
+    Both,
+}
+
+/// Supported socket options surfaced by the host adapter.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HostSocketOptionName {
+    ReuseAddress,
+    KeepAlive,
+    SendBufferSize,
+    ReceiveBufferSize,
+    SocketError,
+    SocketType,
+    TcpNoDelay,
+}
+
+/// Supported socket option values.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HostSocketOptionValue {
+    Bool(bool),
+    Int(i32),
+    Kind(SocketKind),
 }
 
 /// Socket readiness events used by the host networking adapter.
@@ -162,6 +191,72 @@ pub struct HostSocket {
     _private: (),
 }
 
+impl HostSocket {
+    /// Connects this socket to a remote address.
+    pub fn connect(&self, address: SocketAddr) -> HostResult<()> {
+        connect_platform(self, address)
+    }
+
+    /// Binds this socket to a local address.
+    pub fn bind(&self, address: SocketAddr) -> HostResult<()> {
+        bind_platform(self, address)
+    }
+
+    /// Marks this socket as a listening socket.
+    pub fn listen(&self, backlog: i32) -> HostResult<()> {
+        listen_platform(self, backlog)
+    }
+
+    /// Accepts a pending connection.
+    pub fn accept(&self) -> HostResult<(Self, SocketAddr)> {
+        accept_platform(self)
+    }
+
+    /// Sends bytes on this socket.
+    pub fn send(&self, buffer: &[u8]) -> HostResult<usize> {
+        send_platform(self, buffer)
+    }
+
+    /// Receives bytes from this socket.
+    pub fn recv(&self, buffer: &mut [u8]) -> HostResult<usize> {
+        recv_platform(self, buffer)
+    }
+
+    /// Sets host nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> HostResult<()> {
+        set_nonblocking_platform(self, nonblocking)
+    }
+
+    /// Sets a supported socket option.
+    pub fn set_option(
+        &self,
+        name: HostSocketOptionName,
+        value: HostSocketOptionValue,
+    ) -> HostResult<()> {
+        set_socket_option_platform(self, name, value)
+    }
+
+    /// Reads a supported socket option.
+    pub fn get_option(&self, name: HostSocketOptionName) -> HostResult<HostSocketOptionValue> {
+        get_socket_option_platform(self, name)
+    }
+
+    /// Shuts down one or both directions of this socket.
+    pub fn shutdown(&self, how: HostShutdown) -> HostResult<()> {
+        shutdown_platform(self, how)
+    }
+
+    /// Returns this socket's local address.
+    pub fn local_addr(&self) -> HostResult<SocketAddr> {
+        socket_addr_platform(self, SocketAddressKind::Local)
+    }
+
+    /// Returns this socket's peer address.
+    pub fn peer_addr(&self) -> HostResult<SocketAddr> {
+        socket_addr_platform(self, SocketAddressKind::Peer)
+    }
+}
+
 #[cfg(windows)]
 impl Drop for HostSocket {
     fn drop(&mut self) {
@@ -193,6 +288,74 @@ fn poll_platform(entries: &mut [SocketPoll<'_>], _timeout: Option<Duration>) -> 
     } else {
         Err(HostError::unsupported(HostOperation::PollSockets))
     }
+}
+
+#[cfg(not(windows))]
+fn connect_platform(_socket: &HostSocket, _address: SocketAddr) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::ConnectSocket))
+}
+
+#[cfg(not(windows))]
+fn bind_platform(_socket: &HostSocket, _address: SocketAddr) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::BindSocket))
+}
+
+#[cfg(not(windows))]
+fn listen_platform(_socket: &HostSocket, _backlog: i32) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::ListenSocket))
+}
+
+#[cfg(not(windows))]
+fn accept_platform(_socket: &HostSocket) -> HostResult<(HostSocket, SocketAddr)> {
+    Err(HostError::unsupported(HostOperation::AcceptSocket))
+}
+
+#[cfg(not(windows))]
+fn send_platform(_socket: &HostSocket, _buffer: &[u8]) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::SendSocket))
+}
+
+#[cfg(not(windows))]
+fn recv_platform(_socket: &HostSocket, _buffer: &mut [u8]) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
+fn set_nonblocking_platform(_socket: &HostSocket, _nonblocking: bool) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::SetSocketNonblocking))
+}
+
+#[cfg(not(windows))]
+fn set_socket_option_platform(
+    _socket: &HostSocket,
+    _name: HostSocketOptionName,
+    _value: HostSocketOptionValue,
+) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::SetSocketOption))
+}
+
+#[cfg(not(windows))]
+fn get_socket_option_platform(
+    _socket: &HostSocket,
+    _name: HostSocketOptionName,
+) -> HostResult<HostSocketOptionValue> {
+    Err(HostError::unsupported(HostOperation::GetSocketOption))
+}
+
+#[cfg(not(windows))]
+fn shutdown_platform(_socket: &HostSocket, _how: HostShutdown) -> HostResult<()> {
+    Err(HostError::unsupported(HostOperation::ShutdownSocket))
+}
+
+#[cfg(not(windows))]
+fn socket_addr_platform(_socket: &HostSocket, _kind: SocketAddressKind) -> HostResult<SocketAddr> {
+    Err(HostError::unsupported(HostOperation::QuerySocketAddress))
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SocketAddressKind {
+    Local,
+    Peer,
 }
 
 #[cfg(windows)]
@@ -263,6 +426,181 @@ fn poll_platform(entries: &mut [SocketPoll<'_>], timeout: Option<Duration>) -> H
 }
 
 #[cfg(windows)]
+fn connect_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> {
+    let storage = SocketAddressStorage::from_socket_addr(address);
+    // SAFETY: `storage` points to a valid sockaddr for the supplied address.
+    let status = unsafe { connect(socket.raw, storage.as_sockaddr(), storage.len()) };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::ConnectSocket,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn bind_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> {
+    let storage = SocketAddressStorage::from_socket_addr(address);
+    // SAFETY: `storage` points to a valid sockaddr for the supplied address.
+    let status = unsafe { bind(socket.raw, storage.as_sockaddr(), storage.len()) };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::BindSocket));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn listen_platform(socket: &HostSocket, backlog: i32) -> HostResult<()> {
+    // SAFETY: Arguments are plain Winsock values.
+    let status = unsafe { listen(socket.raw, backlog) };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::ListenSocket,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn accept_platform(socket: &HostSocket) -> HostResult<(HostSocket, SocketAddr)> {
+    let mut storage = SockaddrStorage::default();
+    let mut len = size_of_i32::<SockaddrStorage>()?;
+    // SAFETY: `storage` and `len` point to writable sockaddr storage.
+    let accepted = unsafe { accept(socket.raw, storage.as_mut_sockaddr(), &mut len) };
+    if accepted == crate::windows::INVALID_SOCKET {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::AcceptSocket,
+        ));
+    }
+    Ok((
+        HostSocket { raw: accepted },
+        socket_addr_from_storage(&storage)?,
+    ))
+}
+
+#[cfg(windows)]
+fn send_platform(socket: &HostSocket, buffer: &[u8]) -> HostResult<usize> {
+    let len = i32::try_from(buffer.len())
+        .map_err(|_| HostError::invalid_input(HostOperation::SendSocket))?;
+    // SAFETY: `buffer` points to `len` readable bytes for the duration of the call.
+    let sent = unsafe { send(socket.raw, buffer.as_ptr().cast(), len, 0) };
+    if sent == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::SendSocket));
+    }
+    Ok(sent as usize)
+}
+
+#[cfg(windows)]
+fn recv_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<usize> {
+    let len = i32::try_from(buffer.len())
+        .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
+    // SAFETY: `buffer` points to `len` writable bytes for the duration of the call.
+    let received = unsafe { recv(socket.raw, buffer.as_mut_ptr().cast(), len, 0) };
+    if received == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
+    }
+    Ok(received as usize)
+}
+
+#[cfg(windows)]
+fn set_nonblocking_platform(socket: &HostSocket, nonblocking: bool) -> HostResult<()> {
+    let mut mode = u32::from(nonblocking);
+    // SAFETY: `mode` points to writable u_long storage as required by ioctlsocket.
+    let status = unsafe { ioctlsocket(socket.raw, FIONBIO, &mut mode) };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::SetSocketNonblocking,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_socket_option_platform(
+    socket: &HostSocket,
+    name: HostSocketOptionName,
+    value: HostSocketOptionValue,
+) -> HostResult<()> {
+    let (level, option, raw) = socket_option_to_winsock(name, value)?;
+    // SAFETY: `raw` points to an initialized i32 option value.
+    let status = unsafe {
+        setsockopt(
+            socket.raw,
+            level,
+            option,
+            std::ptr::from_ref(&raw).cast(),
+            size_of_i32::<i32>()?,
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::SetSocketOption,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn get_socket_option_platform(
+    socket: &HostSocket,
+    name: HostSocketOptionName,
+) -> HostResult<HostSocketOptionValue> {
+    let (level, option) = socket_option_name_to_winsock(name);
+    let mut raw = 0i32;
+    let mut len = size_of_i32::<i32>()?;
+    // SAFETY: `raw` and `len` point to writable option storage.
+    let status = unsafe {
+        getsockopt(
+            socket.raw,
+            level,
+            option,
+            std::ptr::from_mut(&mut raw).cast(),
+            &mut len,
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::GetSocketOption,
+        ));
+    }
+    socket_option_from_winsock(name, raw)
+}
+
+#[cfg(windows)]
+fn shutdown_platform(socket: &HostSocket, how: HostShutdown) -> HostResult<()> {
+    // SAFETY: Arguments are plain Winsock values.
+    let status = unsafe { shutdown(socket.raw, how.to_winsock()) };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::ShutdownSocket,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn socket_addr_platform(socket: &HostSocket, kind: SocketAddressKind) -> HostResult<SocketAddr> {
+    let mut storage = SockaddrStorage::default();
+    let mut len = size_of_i32::<SockaddrStorage>()?;
+    let status = match kind {
+        SocketAddressKind::Local => {
+            // SAFETY: `storage` and `len` point to writable sockaddr storage.
+            unsafe { getsockname(socket.raw, storage.as_mut_sockaddr(), &mut len) }
+        }
+        SocketAddressKind::Peer => {
+            // SAFETY: `storage` and `len` point to writable sockaddr storage.
+            unsafe { getpeername(socket.raw, storage.as_mut_sockaddr(), &mut len) }
+        }
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::QuerySocketAddress,
+        ));
+    }
+    socket_addr_from_storage(&storage)
+}
+
+#[cfg(windows)]
 fn duration_to_poll_timeout(duration: Duration) -> i32 {
     if duration.is_zero() {
         return 0;
@@ -300,6 +638,28 @@ impl SocketProtocol {
             Self::Default => 0,
             Self::Tcp => IPPROTO_TCP,
             Self::Udp => IPPROTO_UDP,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SocketKind {
+    const fn from_winsock(value: i32) -> HostResult<Self> {
+        match value {
+            SOCK_STREAM => Ok(Self::Stream),
+            SOCK_DGRAM => Ok(Self::Datagram),
+            _ => Err(HostError::invalid_input(HostOperation::GetSocketOption)),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl HostShutdown {
+    const fn to_winsock(self) -> i32 {
+        match self {
+            Self::Read => SD_RECEIVE,
+            Self::Write => SD_SEND,
+            Self::Both => SD_BOTH,
         }
     }
 }
@@ -362,6 +722,31 @@ const POLLIN: i16 = 0x0300;
 const POLLPRI: i16 = 0x0400;
 
 #[cfg(windows)]
+const SOL_SOCKET: i32 = 0xffff;
+#[cfg(windows)]
+const SO_REUSEADDR: i32 = 0x0004;
+#[cfg(windows)]
+const SO_KEEPALIVE: i32 = 0x0008;
+#[cfg(windows)]
+const SO_SNDBUF: i32 = 0x1001;
+#[cfg(windows)]
+const SO_RCVBUF: i32 = 0x1002;
+#[cfg(windows)]
+const SO_ERROR: i32 = 0x1007;
+#[cfg(windows)]
+const SO_TYPE: i32 = 0x1008;
+#[cfg(windows)]
+const TCP_NODELAY: i32 = 0x0001;
+#[cfg(windows)]
+const FIONBIO: i32 = -2_147_190_526;
+#[cfg(windows)]
+const SD_RECEIVE: i32 = 0;
+#[cfg(windows)]
+const SD_SEND: i32 = 1;
+#[cfg(windows)]
+const SD_BOTH: i32 = 2;
+
+#[cfg(windows)]
 #[repr(C)]
 struct WsaData {
     version: u16,
@@ -397,6 +782,209 @@ struct WsaPollFd {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct Sockaddr {
+    family: u16,
+    data: [u8; 14],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrIn {
+    family: u16,
+    port: u16,
+    addr: u32,
+    zero: [u8; 8],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct In6Addr {
+    bytes: [u8; 16],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrIn6 {
+    family: u16,
+    port: u16,
+    flowinfo: u32,
+    addr: In6Addr,
+    scope_id: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrStorage {
+    family: u16,
+    data: [u8; 126],
+}
+
+#[cfg(windows)]
+impl Default for SockaddrStorage {
+    fn default() -> Self {
+        Self {
+            family: 0,
+            data: [0; 126],
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SockaddrStorage {
+    fn as_mut_sockaddr(&mut self) -> *mut Sockaddr {
+        std::ptr::from_mut(self).cast()
+    }
+}
+
+#[cfg(windows)]
+union SocketAddressStorage {
+    inet: SockaddrIn,
+    inet6: SockaddrIn6,
+    storage: SockaddrStorage,
+}
+
+#[cfg(windows)]
+impl SocketAddressStorage {
+    fn from_socket_addr(address: SocketAddr) -> Self {
+        match address {
+            SocketAddr::V4(address) => Self {
+                inet: SockaddrIn {
+                    family: AF_INET as u16,
+                    port: address.port().to_be(),
+                    addr: u32::from_ne_bytes(address.ip().octets()),
+                    zero: [0; 8],
+                },
+            },
+            SocketAddr::V6(address) => Self {
+                inet6: SockaddrIn6 {
+                    family: AF_INET6 as u16,
+                    port: address.port().to_be(),
+                    flowinfo: address.flowinfo(),
+                    addr: In6Addr {
+                        bytes: address.ip().octets(),
+                    },
+                    scope_id: address.scope_id(),
+                },
+            },
+        }
+    }
+
+    fn as_sockaddr(&self) -> *const Sockaddr {
+        std::ptr::from_ref(self).cast()
+    }
+
+    fn len(&self) -> i32 {
+        // SAFETY: The active union field's first member is the address family.
+        let family = unsafe { self.storage.family };
+        match i32::from(family) {
+            AF_INET => size_of_i32::<SockaddrIn>().expect("sockaddr_in size fits i32"),
+            AF_INET6 => size_of_i32::<SockaddrIn6>().expect("sockaddr_in6 size fits i32"),
+            _ => size_of_i32::<SockaddrStorage>().expect("sockaddr_storage size fits i32"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn socket_addr_from_storage(storage: &SockaddrStorage) -> HostResult<SocketAddr> {
+    match i32::from(storage.family) {
+        AF_INET => {
+            // SAFETY: Caller populated storage through Winsock for an AF_INET address.
+            let inet = unsafe {
+                std::ptr::from_ref(storage)
+                    .cast::<SockaddrIn>()
+                    .read_unaligned()
+            };
+            Ok(SocketAddr::from((
+                std::net::Ipv4Addr::from(inet.addr.to_ne_bytes()),
+                u16::from_be(inet.port),
+            )))
+        }
+        AF_INET6 => {
+            // SAFETY: Caller populated storage through Winsock for an AF_INET6 address.
+            let inet6 = unsafe {
+                std::ptr::from_ref(storage)
+                    .cast::<SockaddrIn6>()
+                    .read_unaligned()
+            };
+            Ok(SocketAddr::from(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(inet6.addr.bytes),
+                u16::from_be(inet6.port),
+                inet6.flowinfo,
+                inet6.scope_id,
+            )))
+        }
+        _ => Err(HostError::invalid_input(HostOperation::QuerySocketAddress)),
+    }
+}
+
+#[cfg(windows)]
+fn socket_option_name_to_winsock(name: HostSocketOptionName) -> (i32, i32) {
+    match name {
+        HostSocketOptionName::ReuseAddress => (SOL_SOCKET, SO_REUSEADDR),
+        HostSocketOptionName::KeepAlive => (SOL_SOCKET, SO_KEEPALIVE),
+        HostSocketOptionName::SendBufferSize => (SOL_SOCKET, SO_SNDBUF),
+        HostSocketOptionName::ReceiveBufferSize => (SOL_SOCKET, SO_RCVBUF),
+        HostSocketOptionName::SocketError => (SOL_SOCKET, SO_ERROR),
+        HostSocketOptionName::SocketType => (SOL_SOCKET, SO_TYPE),
+        HostSocketOptionName::TcpNoDelay => (IPPROTO_TCP, TCP_NODELAY),
+    }
+}
+
+#[cfg(windows)]
+fn socket_option_to_winsock(
+    name: HostSocketOptionName,
+    value: HostSocketOptionValue,
+) -> HostResult<(i32, i32, i32)> {
+    let (level, option) = socket_option_name_to_winsock(name);
+    let raw = match (name, value) {
+        (
+            HostSocketOptionName::ReuseAddress
+            | HostSocketOptionName::KeepAlive
+            | HostSocketOptionName::TcpNoDelay,
+            HostSocketOptionValue::Bool(value),
+        ) => i32::from(value),
+        (
+            HostSocketOptionName::SendBufferSize | HostSocketOptionName::ReceiveBufferSize,
+            HostSocketOptionValue::Int(value),
+        ) => value,
+        (HostSocketOptionName::SocketError | HostSocketOptionName::SocketType, _) => {
+            return Err(HostError::invalid_input(HostOperation::SetSocketOption));
+        }
+        _ => return Err(HostError::invalid_input(HostOperation::SetSocketOption)),
+    };
+    Ok((level, option, raw))
+}
+
+#[cfg(windows)]
+fn socket_option_from_winsock(
+    name: HostSocketOptionName,
+    raw: i32,
+) -> HostResult<HostSocketOptionValue> {
+    match name {
+        HostSocketOptionName::ReuseAddress
+        | HostSocketOptionName::KeepAlive
+        | HostSocketOptionName::TcpNoDelay => Ok(HostSocketOptionValue::Bool(raw != 0)),
+        HostSocketOptionName::SendBufferSize
+        | HostSocketOptionName::ReceiveBufferSize
+        | HostSocketOptionName::SocketError => Ok(HostSocketOptionValue::Int(raw)),
+        HostSocketOptionName::SocketType => {
+            Ok(HostSocketOptionValue::Kind(SocketKind::from_winsock(raw)?))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn size_of_i32<T>() -> HostResult<i32> {
+    i32::try_from(std::mem::size_of::<T>())
+        .map_err(|_| HostError::invalid_input(HostOperation::QuerySocketAddress))
+}
+
+#[cfg(windows)]
 #[link(name = "ws2_32")]
 unsafe extern "system" {
     fn WSAStartup(version_requested: u16, data: *mut WsaData) -> i32;
@@ -404,10 +992,53 @@ unsafe extern "system" {
     fn socket(af: i32, socket_type: i32, protocol: i32) -> crate::windows::Socket;
     fn closesocket(socket: crate::windows::Socket) -> i32;
     fn WSAPoll(fd_array: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
+    fn connect(socket: crate::windows::Socket, name: *const Sockaddr, name_len: i32) -> i32;
+    fn bind(socket: crate::windows::Socket, name: *const Sockaddr, name_len: i32) -> i32;
+    fn listen(socket: crate::windows::Socket, backlog: i32) -> i32;
+    fn accept(
+        socket: crate::windows::Socket,
+        address: *mut Sockaddr,
+        address_len: *mut i32,
+    ) -> crate::windows::Socket;
+    fn send(
+        socket: crate::windows::Socket,
+        buffer: *const std::ffi::c_char,
+        len: i32,
+        flags: i32,
+    ) -> i32;
+    fn recv(
+        socket: crate::windows::Socket,
+        buffer: *mut std::ffi::c_char,
+        len: i32,
+        flags: i32,
+    ) -> i32;
+    fn ioctlsocket(socket: crate::windows::Socket, cmd: i32, argp: *mut u32) -> i32;
+    fn setsockopt(
+        socket: crate::windows::Socket,
+        level: i32,
+        option_name: i32,
+        option_value: *const std::ffi::c_char,
+        option_len: i32,
+    ) -> i32;
+    fn getsockopt(
+        socket: crate::windows::Socket,
+        level: i32,
+        option_name: i32,
+        option_value: *mut std::ffi::c_char,
+        option_len: *mut i32,
+    ) -> i32;
+    fn shutdown(socket: crate::windows::Socket, how: i32) -> i32;
+    fn getsockname(socket: crate::windows::Socket, name: *mut Sockaddr, name_len: *mut i32) -> i32;
+    fn getpeername(socket: crate::windows::Socket, name: *mut Sockaddr, name_len: *mut i32) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::{
+        AddressFamily, HostShutdown, HostSocketOptionName, HostSocketOptionValue, SocketKind,
+        SocketPoll, SocketProtocol,
+    };
     use super::{NetworkStack, SocketEvents};
 
     #[test]
@@ -425,5 +1056,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(ready, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tcp_loopback_socket_round_trip_uses_host_adapter() {
+        let stack = NetworkStack::start().unwrap();
+        let listener = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let local = listener.local_addr().unwrap();
+
+        let client = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        client
+            .set_option(
+                HostSocketOptionName::TcpNoDelay,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        client.connect(local).unwrap();
+
+        let (server, peer) = listener.accept().unwrap();
+        assert_eq!(peer.ip(), client.local_addr().unwrap().ip());
+        assert_eq!(client.peer_addr().unwrap(), server.local_addr().unwrap());
+        assert_eq!(
+            client.get_option(HostSocketOptionName::TcpNoDelay).unwrap(),
+            HostSocketOptionValue::Bool(true)
+        );
+        assert_eq!(
+            client.get_option(HostSocketOptionName::SocketType).unwrap(),
+            HostSocketOptionValue::Kind(SocketKind::Stream)
+        );
+
+        let mut poll = [SocketPoll::new(&client, SocketEvents::write())];
+        assert_eq!(
+            stack
+                .poll(&mut poll, Some(std::time::Duration::from_millis(50)))
+                .unwrap(),
+            1
+        );
+        assert!(poll[0].readiness.writable);
+
+        assert_eq!(client.send(b"ping").unwrap(), 4);
+        let mut buffer = [0; 4];
+        assert_eq!(server.recv(&mut buffer).unwrap(), 4);
+        assert_eq!(&buffer, b"ping");
+
+        server.shutdown(HostShutdown::Both).unwrap();
     }
 }

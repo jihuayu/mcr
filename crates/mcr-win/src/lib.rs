@@ -23,7 +23,8 @@ pub use files::{
 };
 pub use memory::{HostMemory, MemoryProtection};
 pub use network::{
-    AddressFamily, HostSocket, NetworkStack, SocketEvents, SocketKind, SocketPoll, SocketProtocol,
+    AddressFamily, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
+    NetworkStack, SocketEvents, SocketKind, SocketPoll, SocketProtocol,
 };
 pub use random::fill_random;
 pub use sync::{
