@@ -1,15 +1,15 @@
 pub mod memory;
 pub mod run_rootfs;
 
+use std::collections::BTreeMap;
+
 pub use memory::{
     DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
     GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
 };
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 
-use mcr_elf::{
-    GuestMemoryImage, GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions,
-};
+use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
 use mcr_jit::GuestRegisters;
 use mcr_sys::{
     Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls, FcntlSyscallArgs,
@@ -969,6 +969,16 @@ impl Runtime {
         &mut self.dispatcher.subsystems_mut().tasks
     }
 
+    #[must_use]
+    pub fn memory(&self) -> &GuestMemory {
+        &self.dispatcher.subsystems().memory
+    }
+
+    #[must_use]
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.dispatcher.subsystems_mut().memory
+    }
+
     pub fn dispatch_syscall(&mut self, context: GuestContext) -> SyscallDispatchResult {
         self.dispatcher.dispatch(context)
     }
@@ -997,6 +1007,16 @@ where
     }
 
     #[must_use]
+    pub fn memory(&self) -> &GuestMemory {
+        &self.dispatcher.subsystems().memory
+    }
+
+    #[must_use]
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.dispatcher.subsystems_mut().memory
+    }
+
+    #[must_use]
     pub const fn tracer(&self) -> &T {
         self.dispatcher.tracer()
     }
@@ -1019,12 +1039,24 @@ where
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
+    memory: GuestMemory,
+    futex_waiters: BTreeMap<u64, u64>,
 }
 
 impl RuntimeSubsystems {
     pub fn new(program: GuestProgram) -> Result<Self, RuntimeError> {
+        let tasks = GuestKernel::new(program)?;
+        let memory = GuestMemory::from_image(
+            tasks
+                .process(mcr_task::INITIAL_GUEST_PID)
+                .expect("runtime always starts with an initial process")
+                .image()
+                .memory(),
+        )?;
         Ok(Self {
-            tasks: GuestKernel::new(program)?,
+            tasks,
+            memory,
+            futex_waiters: BTreeMap::new(),
         })
     }
 
@@ -1039,7 +1071,17 @@ impl RuntimeSubsystems {
     }
 
     #[must_use]
-    pub fn current_image(&self) -> &GuestMemoryImage {
+    pub const fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    #[must_use]
+    pub const fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.memory
+    }
+
+    #[must_use]
+    pub fn current_image(&self) -> &mcr_elf::GuestMemoryImage {
         self.tasks
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process")
@@ -1049,7 +1091,11 @@ impl RuntimeSubsystems {
 }
 
 impl FileSyscalls for RuntimeSubsystems {}
-impl MemorySyscalls for RuntimeSubsystems {}
+impl MemorySyscalls for RuntimeSubsystems {
+    fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        self.memory.dispatch_memory(request)
+    }
+}
 impl TimeSyscalls for RuntimeSubsystems {}
 impl NetworkSyscalls for RuntimeSubsystems {}
 impl EventSyscalls for RuntimeSubsystems {}
@@ -1071,11 +1117,11 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
 }
 
 impl RuntimeSubsystems {
-    fn dispatch_futex(&self, args: FutexSyscallArgs) -> SyscallOutcome {
+    fn dispatch_futex(&mut self, args: FutexSyscallArgs) -> SyscallOutcome {
         outcome(self.futex(args))
     }
 
-    fn futex(&self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+    fn futex(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
         if args.op & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG) != 0 {
             return Err(LinuxErrno::EINVAL);
         }
@@ -1088,37 +1134,55 @@ impl RuntimeSubsystems {
 
         match args.command() {
             LINUX_FUTEX_WAIT => self.futex_wait(args),
-            LINUX_FUTEX_WAKE => Ok(0),
+            LINUX_FUTEX_WAKE => Ok(self.futex_wake(args)),
             _ => Err(LinuxErrno::EINVAL),
         }
     }
 
-    fn futex_wait(&self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
-        let value = read_guest_u32(self.current_image(), args.uaddr)?;
+    fn futex_wait(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+        let value = read_guest_u32(&self.memory, args.uaddr)?;
         if value != args.val {
             return Err(LinuxErrno::EAGAIN);
         }
         if args.timeout == 0 {
-            return Err(LinuxErrno::ENOSYS);
+            *self.futex_waiters.entry(args.uaddr).or_default() += 1;
+            return Ok(0);
         }
         Err(LinuxErrno::ETIMEDOUT)
     }
+
+    fn futex_wake(&mut self, args: FutexSyscallArgs) -> u64 {
+        let Some(waiters) = self.futex_waiters.get_mut(&args.uaddr) else {
+            return 0;
+        };
+        let woken = (*waiters).min(u64::from(args.val));
+        *waiters -= woken;
+        if *waiters == 0 {
+            self.futex_waiters.remove(&args.uaddr);
+        }
+        woken
+    }
 }
 
-fn read_guest_u32(image: &GuestMemoryImage, addr: u64) -> Result<u32, LinuxErrno> {
-    let bytes = image.read(addr, 4).ok_or(LinuxErrno::EFAULT)?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("slice len")))
+fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, LinuxErrno> {
+    let mut bytes = [0; 4];
+    memory
+        .read_bytes(addr, &mut bytes)
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 #[derive(Debug)]
 pub enum RuntimeError {
     Task(TaskError),
+    Memory(GuestMemoryError),
 }
 
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Task(error) => write!(formatter, "{error}"),
+            Self::Memory(error) => write!(formatter, "{error:?}"),
         }
     }
 }
@@ -1128,6 +1192,12 @@ impl std::error::Error for RuntimeError {}
 impl From<TaskError> for RuntimeError {
     fn from(value: TaskError) -> Self {
         Self::Task(value)
+    }
+}
+
+impl From<GuestMemoryError> for RuntimeError {
+    fn from(value: GuestMemoryError) -> Self {
+        Self::Memory(value)
     }
 }
 
@@ -1178,7 +1248,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use mcr_sys::{
-        GuestContext, InMemorySyscallTracer, Syscall, SyscallRegisters, SyscallReturn,
+        GuestContext, InMemorySyscallTracer, LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE,
+        LINUX_PROT_READ, LINUX_PROT_WRITE, Syscall, SyscallRegisters, SyscallReturn,
         SyscallTraceEvent,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
@@ -1252,6 +1323,10 @@ mod tests {
     #[test]
     fn private_futex_wait_mismatch_returns_eagain() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0u32.to_le_bytes())
+            .unwrap();
 
         let result = runtime.dispatch_syscall(context(
             Syscall::Futex,
@@ -1374,6 +1449,78 @@ mod tests {
         ));
 
         assert_eq!(result.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn private_futex_wait_reads_mutated_runtime_memory_and_wake_counts_waiter() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &7u32.to_le_bytes())
+            .unwrap();
+
+        let wait = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                7,
+                0,
+                0,
+                0,
+            ],
+        ));
+        let wake = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        assert_eq!(wake.result, SyscallReturn::Success(1));
+    }
+
+    #[test]
+    fn runtime_memory_syscalls_update_memory_used_by_futex() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let mmap = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                0,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS),
+                u64::MAX,
+                0,
+            ],
+        ));
+        let SyscallReturn::Success(addr) = mmap.result else {
+            panic!("mmap should succeed: {:?}", mmap.result);
+        };
+        runtime
+            .memory_mut()
+            .write(addr, &9u32.to_le_bytes())
+            .unwrap();
+
+        let wait = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                addr,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                9,
+                1,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ETIMEDOUT));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use mcr_elf::GuestMemoryImage;
 use mcr_sys::{
     BrkSyscallArgs, LINUX_MAP_HUGETLB, LINUX_MAP_PRIVATE, LINUX_MAP_SHARED, LINUX_MAP_SYNC,
     LINUX_MAP_TYPE_MASK, LINUX_MAP_VALID_MASK, LINUX_PROT_EXEC, LINUX_PROT_READ,
@@ -51,6 +52,15 @@ impl GuestMemoryProtection {
             (true, false, false) => MemoryProtection::ReadOnly,
             (false, false, false) => MemoryProtection::NoAccess,
         }
+    }
+
+    #[must_use]
+    pub fn from_segment(permissions: mcr_elf::SegmentPermissions) -> Self {
+        Self::new(
+            permissions.read(),
+            permissions.write(),
+            permissions.execute(),
+        )
     }
 }
 
@@ -206,6 +216,27 @@ impl GuestMemory {
             mmap_base,
             address_space_end,
         })
+    }
+
+    pub fn from_image(image: &GuestMemoryImage) -> Result<Self, GuestMemoryError> {
+        let initial_brk = align_up(image.brk().max(MIN_GUEST_ADDRESS))?;
+        let mut memory = Self::new(initial_brk)?;
+        for vma in image.vmas() {
+            let region = image
+                .regions()
+                .iter()
+                .find(|region| region.start() == vma.start() && region.end() == vma.end())
+                .ok_or(GuestMemoryError::InvalidAddress)?;
+            memory.insert_loaded_mapping(
+                vma.start(),
+                vma.end()
+                    .checked_sub(vma.start())
+                    .ok_or(GuestMemoryError::InvalidAddress)?,
+                GuestMemoryProtection::from_segment(vma.permissions()),
+                region.bytes(),
+            )?;
+        }
+        Ok(memory)
     }
 
     #[must_use]
@@ -403,6 +434,50 @@ impl GuestMemory {
                 end,
                 protection,
                 kind,
+                allocation_id,
+                allocation_offset: 0,
+            },
+        );
+        Ok(())
+    }
+
+    fn insert_loaded_mapping(
+        &mut self,
+        start: u64,
+        length: u64,
+        protection: GuestMemoryProtection,
+        bytes: &[u8],
+    ) -> Result<(), GuestMemoryError> {
+        let end = checked_mapping_end(start, length, self.address_space_end)?;
+        if self.overlaps(start, end) {
+            return Err(GuestMemoryError::AddressInUse);
+        }
+        let len = usize::try_from(length).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        if bytes.len() != len {
+            return Err(GuestMemoryError::InvalidLength);
+        }
+
+        let mut memory = HostMemory::allocate(len, MemoryProtection::ReadWrite)
+            .map_err(GuestMemoryError::Host)?;
+        memory.as_mut_slice().copy_from_slice(bytes);
+        memory
+            .protect(protection.to_host())
+            .map_err(GuestMemoryError::Host)?;
+
+        let allocation_id = self.next_allocation_id;
+        self.next_allocation_id = self
+            .next_allocation_id
+            .checked_add(1)
+            .ok_or(GuestMemoryError::OutOfMemory)?;
+        self.allocations
+            .insert(allocation_id, GuestAllocation { memory });
+        self.vmas.insert(
+            start,
+            GuestVma {
+                start,
+                end,
+                protection,
+                kind: GuestVmaKind::Anonymous,
                 allocation_id,
                 allocation_offset: 0,
             },
@@ -690,6 +765,26 @@ impl MemorySyscalls for GuestMemory {
             }
             _ => SyscallOutcome::unsupported(),
         }
+    }
+}
+
+impl crate::GuestMemoryAccess for GuestMemory {
+    fn read_bytes(
+        &self,
+        addr: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), crate::GuestMemoryAccessError> {
+        self.read(addr, buffer)
+            .map_err(|_| crate::GuestMemoryAccessError::Fault)
+    }
+
+    fn write_bytes(
+        &mut self,
+        addr: u64,
+        buffer: &[u8],
+    ) -> Result<(), crate::GuestMemoryAccessError> {
+        self.write(addr, buffer)
+            .map_err(|_| crate::GuestMemoryAccessError::Fault)
     }
 }
 
