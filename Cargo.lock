@@ -43,6 +43,10 @@ version = "0.1.0"
 [[package]]
 name = "mcr-runtime"
 version = "0.1.0"
+dependencies = [
+ "mcr-sys",
+ "mcr-vfs",
+]
 
 [[package]]
 name = "mcr-sys"

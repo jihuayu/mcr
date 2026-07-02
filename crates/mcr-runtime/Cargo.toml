@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+mcr-sys.workspace = true
+mcr-vfs.workspace = true
+
 [lints]
 workspace = true
