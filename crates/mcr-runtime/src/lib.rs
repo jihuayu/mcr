@@ -9,6 +9,14 @@ use mcr_vfs::{
     DirectoryEntry, Fd, LinuxFileAttr, OpenFlags, SeekWhence, VfsError, VirtualFileSystem,
 };
 
+pub mod memory;
+
+pub use memory::{
+    DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome,
+    GuestMemoryError as GuestMemoryMapError, GuestMemoryMap, GuestMemoryProtection, GuestVma,
+    GuestVmaKind, MIN_GUEST_ADDRESS,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub trait GuestMemory {
@@ -21,21 +29,22 @@ pub trait GuestMemory {
             let mut byte = [0];
             self.read_bytes(
                 addr.checked_add(offset as u64)
-                    .ok_or(GuestMemoryError::Fault)?,
+                    .ok_or(GuestMemoryError::Fault(LinuxErrno::EFAULT))?,
                 &mut byte,
             )?;
             if byte[0] == 0 {
-                return String::from_utf8(bytes).map_err(|_| GuestMemoryError::Fault);
+                return String::from_utf8(bytes)
+                    .map_err(|_| GuestMemoryError::Fault(LinuxErrno::EFAULT));
             }
             bytes.push(byte[0]);
         }
-        Err(GuestMemoryError::Fault)
+        Err(GuestMemoryError::Fault(LinuxErrno::EFAULT))
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMemoryError {
-    Fault,
+    Fault(LinuxErrno),
 }
 
 pub struct RuntimeFileSystem<M> {
@@ -322,8 +331,10 @@ fn vfs_errno(error: VfsError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno()).unwrap_or(LinuxErrno::EINVAL)
 }
 
-fn memory_errno(_error: GuestMemoryError) -> LinuxErrno {
-    LinuxErrno::EFAULT
+fn memory_errno(error: GuestMemoryError) -> LinuxErrno {
+    match error {
+        GuestMemoryError::Fault(errno) => errno,
+    }
 }
 
 fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, LinuxErrno> {
@@ -541,7 +552,11 @@ impl RuntimeSubsystems {
 }
 
 impl FileSyscalls for RuntimeSubsystems {}
-impl MemorySyscalls for RuntimeSubsystems {}
+impl MemorySyscalls for RuntimeSubsystems {
+    fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        self.tasks.dispatch_memory_for_current_process(request)
+    }
+}
 impl TimeSyscalls for RuntimeSubsystems {}
 impl NetworkSyscalls for RuntimeSubsystems {}
 impl EventSyscalls for RuntimeSubsystems {}
@@ -857,7 +872,7 @@ mod tests {
                 *byte = *self
                     .bytes
                     .get(&(addr + index as u64))
-                    .ok_or(GuestMemoryError::Fault)?;
+                    .ok_or(GuestMemoryError::Fault(LinuxErrno::EFAULT))?;
             }
             Ok(())
         }

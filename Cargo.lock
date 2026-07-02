@@ -49,6 +49,7 @@ dependencies = [
  "mcr-task",
  "mcr-testkit",
  "mcr-vfs",
+ "mcr-win",
 ]
 
 [[package]]
