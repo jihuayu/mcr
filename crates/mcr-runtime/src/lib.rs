@@ -1,9 +1,11 @@
 pub mod memory;
+pub mod run_rootfs;
 
 pub use memory::{
     DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
     GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
 };
+pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 
 use mcr_elf::{
     GuestMemoryImage, GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions,
