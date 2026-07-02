@@ -1,0 +1,12 @@
+[package]
+name = "mcr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mcr"
+path = "src/main.rs"
+
+[lints]
+workspace = true
