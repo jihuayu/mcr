@@ -2389,6 +2389,65 @@ impl FdTable {
         }
     }
 
+    pub fn pread(
+        &self,
+        tree: &PathTree,
+        proc_self: &ProcSelfData,
+        fd: Fd,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<usize> {
+        let entry = self.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+
+        match entry.file.kind {
+            FileKind::Regular | FileKind::Symlink => {
+                let node = tree
+                    .lookup_inode(entry.inode_id())
+                    .ok_or(VfsError::NoEntry)?;
+                if node.attr().is_directory() {
+                    return Err(VfsError::IsDirectory);
+                }
+                let proc_data;
+                let data = match node.kind() {
+                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
+                        proc_data = proc_self.cmdline_bytes();
+                        &proc_data
+                    }
+                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
+                        proc_data = proc_self.environ_bytes();
+                        &proc_data
+                    }
+                    _ => node.data(),
+                };
+                let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
+                let available = data.get(offset..).unwrap_or(&[]);
+                let count = available.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&available[..count]);
+                Ok(count)
+            }
+            FileKind::Dev(DevNodeKind::Null) => Ok(0),
+            FileKind::Dev(DevNodeKind::Zero) => {
+                buffer.fill(0);
+                Ok(buffer.len())
+            }
+            FileKind::Dev(DevNodeKind::Urandom) => {
+                fill_urandom(buffer)?;
+                Ok(buffer.len())
+            }
+            FileKind::Dev(DevNodeKind::Stdin) => Ok(0),
+            FileKind::Dev(_) => Err(VfsError::BadFd),
+            FileKind::PipeRead
+            | FileKind::PipeWrite
+            | FileKind::Socket
+            | FileKind::Epoll
+            | FileKind::Directory
+            | FileKind::Stdio(_) => Err(VfsError::BadFd),
+        }
+    }
+
     pub fn readlink_open(&self, tree: &PathTree, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
         let entry = self.get(fd)?;
         let node = tree
@@ -2824,6 +2883,11 @@ impl VirtualFileSystem {
 
     pub fn read(&mut self, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
         self.fds.read(&self.tree, &self.proc_self, fd, buffer)
+    }
+
+    pub fn pread(&self, fd: Fd, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+        self.fds
+            .pread(&self.tree, &self.proc_self, fd, offset, buffer)
     }
 
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
@@ -3766,6 +3830,22 @@ mod tests {
             table.insert_exact(-1, regular_file(1), false).unwrap_err(),
             VfsError::BadFd
         );
+    }
+
+    #[test]
+    fn pread_reads_regular_file_without_changing_fd_offset() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        assert_eq!(vfs.lseek(fd, 2, SeekWhence::Set).unwrap(), 2);
+        let mut buffer = [0; 3];
+
+        let count = vfs.pread(fd, 1, &mut buffer).unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(&buffer, b"ell");
+        assert_eq!(vfs.fds().get(fd).unwrap().offset(), 2);
     }
 
     #[test]
