@@ -2,14 +2,16 @@
 
 ## Current Milestone Boundary
 
-Development is split into two required stages.
+Development is split into two required runtime stages. Build work starts only after Phase 2 exits.
 
 | Stage | Goal | Exit criteria |
 |---|---|---|
 | MVP | Run static Linux x86-64 ELF and BusyBox/Alpine commands from a rootfs. | BusyBox smoke suite passes with P0 syscall coverage and deterministic crash diagnostics. |
 | Phase 2 | Run shell commands, common `fork+exec`, networking, and minimal `/proc`/`/dev`. | Alpine shell, curl/git networking, and language runtime smoke tests pass. |
+| Phase 3 | Build constrained Dockerfile images with native MCR builder and OCI/Docker output. | `mcr build` produces valid OCI layout and Docker tar for fixed Dockerfile fixtures. |
+| Phase 4 | Adapt stable build contracts to BuildKit worker/executor. | `buildctl` drives the supported Dockerfile subset through the MCR worker. |
 
-Work after Phase 2 is tracked as backlog. It must not be implemented inside MVP/Phase 2 tasks unless a task explicitly moves the boundary.
+Phase 3 and Phase 4 work is tracked in `docs/architecture/build.md`, `docs/plan/analysis/buildkit.md`, and `docs/plan/tasks/`. It must not be implemented inside MVP/Phase 2 tasks unless a task explicitly moves the boundary.
 
 ## Repository Layout
 
@@ -25,6 +27,9 @@ crates/
   mcr-net/       # sockets, DNS, poll/epoll
   mcr-win/       # Windows host adapters
   mcr-testkit/   # fixtures and smoke harness
+  mcr-image/     # post-Phase 2 OCI content, image, registry, and exporter contracts
+  mcr-snapshot/  # post-Phase 2 build snapshot and layer diff contracts
+  mcr-build/     # post-Phase 2 native builder and future BuildKit adapter
 docs/
   product/
   architecture/
@@ -153,13 +158,13 @@ The delivery order is:
 
 Tasks with no path overlap may be parallelized in separate worktrees, but dependent integration tasks wait for predecessor tasks to land.
 
-## Deferred Work
+## Deferred Or Later Work
 
-The following are intentionally outside the current plan:
+The following are intentionally outside MVP and Phase 2:
 
-- Dockerfile parser and builder;
-- OCI image writer, layer diff, and registry interactions;
-- BuildKit worker/executor;
+- Dockerfile parser and builder before Phase 3;
+- OCI image writer, layer diff, and registry interactions before Phase 3;
+- BuildKit worker/executor before Phase 4;
 - Docker Engine API facade;
 - overlay lower/upper layer implementation beyond VFS design compatibility;
 - IOCP performance rewrite;

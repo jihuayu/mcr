@@ -6,6 +6,14 @@ MCR is a Windows-native Linux userspace runtime for trusted development workload
 
 The first planned delivery is not a Docker Desktop replacement. It is the runtime foundation needed before any Dockerfile builder, OCI image writer, BuildKit worker, or Docker Engine API facade is worth building.
 
+After Phase 2, the preferred build direction is:
+
+1. deliver a native MCR builder that can execute a constrained Dockerfile subset and export OCI/Docker images;
+2. use that native builder to harden the runtime executor, snapshot diff, content store, and image output contracts;
+3. adapt those contracts to a BuildKit worker/executor so BuildKit can own Dockerfile frontend, LLB solving, cache, and exporters.
+
+Docker Engine API compatibility remains later than BuildKit worker integration.
+
 ## Target User
 
 The target user is a developer who wants to run lightweight Linux CLI and build tools on Windows without starting WSL2 or a VM. The expected workload is trusted code owned by the user or their team.
@@ -73,4 +81,14 @@ Phase 2 is complete when:
 | Trust model | Trusted development workloads | Strong sandboxing would dominate the design and block the runtime proof. |
 | Process model | One host process per guest container through Phase 2 | This keeps guest IDs, fd tables, futex keys, signals, and `/proc` under one runtime authority. |
 | gVisor reuse | Reference only | gVisor's syscall tables, tests, and architecture are useful, but its platform layer depends on Linux mechanisms. |
-| BuildKit reuse | Deferred | Runtime correctness must exist before a BuildKit executor can be meaningful. |
+| BuildKit reuse | Native builder first, BuildKit worker second | Runtime correctness, snapshot diff, and OCI output must exist before a BuildKit executor can be meaningful. |
+
+## Post-Phase 2 Build Target
+
+The first build-capable release is successful when:
+
+- `mcr build -t demo .` executes `FROM`, `ARG`, `ENV`, `WORKDIR`, `COPY`/`ADD`, `RUN`, `CMD`, and `ENTRYPOINT` for the documented subset;
+- each `RUN` executes through the same runtime path used by `mcr run-rootfs`;
+- file changes from `COPY`/`ADD` and `RUN` are captured as deterministic OCI layers with whiteout support;
+- the image config, manifest, and layer blobs validate as an OCI image layout and can also be exported as a Docker-compatible tarball;
+- a later BuildKit worker can reuse the same executor, snapshot, content, and image contracts without changing guest runtime semantics.

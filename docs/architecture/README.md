@@ -4,7 +4,7 @@
 
 The architecture centers on a userspace Linux ABI runtime. The runtime owns guest execution, guest kernel-like state, and translation between Linux ABI calls and Windows host APIs.
 
-It does not own Dockerfile solving, OCI image creation, Docker Engine API compatibility, or strong security isolation in the current plan.
+Through Phase 2 it does not own Dockerfile solving, OCI image creation, Docker Engine API compatibility, or strong security isolation. Post-Phase 2 build work is defined separately in [Build, OCI, and BuildKit design](build.md).
 
 ## System Shape
 
@@ -55,6 +55,9 @@ The planned Rust workspace uses package names that match subsystem boundaries.
 | `mcr-net` | Sockets, DNS, `poll`, `epoll`, AF_UNIX compatibility. |
 | `mcr-win` | Windows-specific host adapters. |
 | `mcr-testkit` | Rootfs fixtures, guest test binaries, smoke runner, golden output assertions. |
+| `mcr-image` | Post-Phase 2 OCI content store, image metadata, registry pull/push, layout and tar exporters. |
+| `mcr-snapshot` | Post-Phase 2 build snapshot roots, lower/upper views, diff walking, and OCI whiteout export. |
+| `mcr-build` | Post-Phase 2 Dockerfile subset execution and later BuildKit worker bridge. |
 
 ## Cross-Module Creation Flow
 
@@ -82,6 +85,23 @@ mcr-sys
 
 Integration tasks must prove these creation and call chains with real implementations, not mocks.
 
+Post-Phase 2 build flow:
+
+```text
+mcr-cli
+  parses build command
+  calls mcr-build
+
+mcr-build
+  parses the supported Dockerfile subset
+  resolves base images through mcr-image
+  creates build snapshots through mcr-snapshot
+  executes RUN steps through mcr-runtime
+  exports image metadata and layers through mcr-image
+```
+
+The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-image` contracts. It must not introduce a second runtime execution path.
+
 ## State Ownership
 
 | State | Owner | Notes |
@@ -93,6 +113,9 @@ Integration tasks must prove these creation and call chains with real implementa
 | Syscall ABI table | `mcr-sys` | Syscall numbers, argument decoding, and errno conversion live here. |
 | Socket readiness | `mcr-net` | Exposes Linux readiness semantics over host Winsock readiness/completion. |
 | Host handles | `mcr-win` adapters | Handles must not leak into Linux-facing types. |
+| OCI blobs and descriptors | `mcr-image` | Content-addressed blobs are keyed by digest and never by mutable tags. |
+| Build snapshot roots | `mcr-snapshot` | Build layers are derived from explicit lower/upper state, not host directory diffs alone. |
+| Dockerfile build graph | `mcr-build` first, BuildKit later | Native builder owns the first constrained graph; BuildKit owns LLB solving after the worker exists. |
 
 ## Architecture Constraints
 
@@ -101,3 +124,5 @@ Integration tasks must prove these creation and call chains with real implementa
 - Windows adapters stay below subsystem policy; they do not decide guest path, pid, signal, or fd semantics.
 - Through Phase 2, process-private futex relies on the one-host-process-per-container model.
 - Unsupported syscalls must be tracked and tested as unsupported behavior, not silently ignored.
+- Build steps must call the same runtime executor as user-visible `run-rootfs` workloads.
+- BuildKit integration must be an adapter over MCR executor, snapshot, content, and image contracts, not a forked implementation of those contracts.
