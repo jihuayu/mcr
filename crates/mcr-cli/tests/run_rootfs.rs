@@ -37,7 +37,7 @@ fn cli_runs_mvp_busybox_smokes() {
         .run()
         .unwrap();
     assert_eq!(ls.status().code(), Some(0));
-    assert_eq!(ls.stdout(), b"bin\netc\nhello.txt\n");
+    assert_eq!(ls.stdout(), b"bin\ndev\netc\nhello.txt\nproc\n");
     assert_eq!(ls.stderr(), b"");
 
     let cat = SmokeCommand::new(mcr)
@@ -53,6 +53,41 @@ fn cli_runs_mvp_busybox_smokes() {
     assert_eq!(cat.status().code(), Some(0));
     assert_eq!(cat.stdout(), b"NAME=Alpine\n");
     assert_eq!(cat.stderr(), b"");
+}
+
+#[test]
+fn cli_runs_shell_procfs_devfs_smokes() {
+    let rootfs = TestRootfs::new("cli-shell-smoke");
+    rootfs.write_static_elf("/bin/sh");
+    let mcr = env!("CARGO_BIN_EXE_mcr");
+
+    let echo_pipe = SmokeCommand::new(mcr)
+        .args([
+            "run-rootfs",
+            rootfs.path().to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "echo hi | cat",
+        ])
+        .run()
+        .unwrap();
+    assert_eq!(echo_pipe.status().code(), Some(0));
+    assert_eq!(echo_pipe.stdout(), b"hi\n");
+    assert_eq!(echo_pipe.stderr(), b"");
+
+    let proc_dev = SmokeCommand::new(mcr)
+        .args([
+            "run-rootfs",
+            rootfs.path().to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "cat /proc/self/cmdline >/dev/null && head -c 4 /dev/zero >/dev/null",
+        ])
+        .run()
+        .unwrap();
+    assert_eq!(proc_dev.status().code(), Some(0));
+    assert_eq!(proc_dev.stdout(), b"");
+    assert_eq!(proc_dev.stderr(), b"");
 }
 
 struct TestRootfs {
