@@ -1,4 +1,13 @@
-use mcr_elf::{GuestMemoryImage, GuestVma, GuestVmaKind, SegmentPermissions};
+pub mod memory;
+
+pub use memory::{
+    DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
+    GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
+};
+
+use mcr_elf::{
+    GuestMemoryImage, GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions,
+};
 use mcr_jit::GuestRegisters;
 use mcr_sys::{
     EventSyscalls, FileSyscalls, GuestContext, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
@@ -13,30 +22,30 @@ use mcr_vfs::{
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
-pub trait GuestMemory {
-    fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryError>;
-    fn write_bytes(&mut self, addr: u64, buffer: &[u8]) -> Result<(), GuestMemoryError>;
+pub trait GuestMemoryAccess {
+    fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryAccessError>;
+    fn write_bytes(&mut self, addr: u64, buffer: &[u8]) -> Result<(), GuestMemoryAccessError>;
 
-    fn read_c_string(&self, addr: u64, max_len: usize) -> Result<String, GuestMemoryError> {
+    fn read_c_string(&self, addr: u64, max_len: usize) -> Result<String, GuestMemoryAccessError> {
         let mut bytes = Vec::new();
         for offset in 0..max_len {
             let mut byte = [0];
             self.read_bytes(
                 addr.checked_add(offset as u64)
-                    .ok_or(GuestMemoryError::Fault)?,
+                    .ok_or(GuestMemoryAccessError::Fault)?,
                 &mut byte,
             )?;
             if byte[0] == 0 {
-                return String::from_utf8(bytes).map_err(|_| GuestMemoryError::Fault);
+                return String::from_utf8(bytes).map_err(|_| GuestMemoryAccessError::Fault);
             }
             bytes.push(byte[0]);
         }
-        Err(GuestMemoryError::Fault)
+        Err(GuestMemoryAccessError::Fault)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuestMemoryError {
+pub enum GuestMemoryAccessError {
     Fault,
 }
 
@@ -107,7 +116,7 @@ pub struct DiagnosticVma {
 
 impl DiagnosticVma {
     #[must_use]
-    pub fn from_guest_vma(vma: &GuestVma) -> Self {
+    pub fn from_guest_vma(vma: &ElfGuestVma) -> Self {
         Self {
             start: vma.start(),
             end: vma.end(),
@@ -191,9 +200,9 @@ pub enum DiagnosticVmaKind {
 
 impl DiagnosticVmaKind {
     #[must_use]
-    pub const fn from_guest_kind(kind: &GuestVmaKind) -> Self {
+    pub const fn from_guest_kind(kind: &ElfGuestVmaKind) -> Self {
         match kind {
-            GuestVmaKind::ElfLoad {
+            ElfGuestVmaKind::ElfLoad {
                 program_header_index,
                 file_offset,
                 file_size,
@@ -202,7 +211,7 @@ impl DiagnosticVmaKind {
                 file_offset: *file_offset,
                 file_size: *file_size,
             },
-            GuestVmaKind::Stack => Self::Stack,
+            ElfGuestVmaKind::Stack => Self::Stack,
         }
     }
 }
@@ -354,7 +363,7 @@ impl<M> RuntimeFileSystem<M> {
 
 impl<M> FileSyscalls for RuntimeFileSystem<M>
 where
-    M: GuestMemory,
+    M: GuestMemoryAccess,
 {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let result = match request.syscall {
@@ -379,7 +388,7 @@ where
 
 impl<M> FileSyscalls for &mut RuntimeFileSystem<M>
 where
-    M: GuestMemory,
+    M: GuestMemoryAccess,
 {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         RuntimeFileSystem::dispatch_file(self, request)
@@ -388,7 +397,7 @@ where
 
 impl<M> RuntimeFileSystem<M>
 where
-    M: GuestMemory,
+    M: GuestMemoryAccess,
 {
     fn sys_openat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let dirfd = arg_i32(request, 0);
@@ -605,7 +614,7 @@ fn vfs_errno(error: VfsError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno()).unwrap_or(LinuxErrno::EINVAL)
 }
 
-fn memory_errno(_error: GuestMemoryError) -> LinuxErrno {
+fn memory_errno(_error: GuestMemoryAccessError) -> LinuxErrno {
     LinuxErrno::EFAULT
 }
 
@@ -1170,18 +1179,18 @@ mod tests {
         }
     }
 
-    impl GuestMemory for TestMemory {
-        fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryError> {
+    impl GuestMemoryAccess for TestMemory {
+        fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryAccessError> {
             for (index, byte) in buffer.iter_mut().enumerate() {
                 *byte = *self
                     .bytes
                     .get(&(addr + index as u64))
-                    .ok_or(GuestMemoryError::Fault)?;
+                    .ok_or(GuestMemoryAccessError::Fault)?;
             }
             Ok(())
         }
 
-        fn write_bytes(&mut self, addr: u64, buffer: &[u8]) -> Result<(), GuestMemoryError> {
+        fn write_bytes(&mut self, addr: u64, buffer: &[u8]) -> Result<(), GuestMemoryAccessError> {
             self.write(addr, buffer);
             Ok(())
         }

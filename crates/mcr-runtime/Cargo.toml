@@ -10,6 +10,7 @@ mcr-elf.workspace = true
 mcr-sys.workspace = true
 mcr-task.workspace = true
 mcr-vfs.workspace = true
+mcr-win.workspace = true
 
 [dev-dependencies]
 mcr-testkit.workspace = true
