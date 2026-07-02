@@ -19,6 +19,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+getrandom = "0.4.3"
 mcr-cli = { path = "crates/mcr-cli" }
 mcr-elf = { path = "crates/mcr-elf" }
 mcr-jit = { path = "crates/mcr-jit" }

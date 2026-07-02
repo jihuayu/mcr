@@ -3013,43 +3013,8 @@ fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
     }
 }
 
-#[cfg(not(windows))]
 fn fill_urandom(buffer: &mut [u8]) -> VfsResult<()> {
-    use std::io::Read;
-
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(buffer))
-        .map_err(|_| VfsError::InvalidPath)
-}
-
-#[cfg(windows)]
-fn fill_urandom(buffer: &mut [u8]) -> VfsResult<()> {
-    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
-    const MAX_CHUNK: usize = u32::MAX as usize;
-
-    unsafe extern "system" {
-        fn BCryptGenRandom(
-            h_algorithm: *mut core::ffi::c_void,
-            pb_buffer: *mut u8,
-            cb_buffer: u32,
-            dw_flags: u32,
-        ) -> i32;
-    }
-
-    for chunk in buffer.chunks_mut(MAX_CHUNK) {
-        let status = unsafe {
-            BCryptGenRandom(
-                core::ptr::null_mut(),
-                chunk.as_mut_ptr(),
-                chunk.len() as u32,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        if status < 0 {
-            return Err(VfsError::InvalidPath);
-        }
-    }
-    Ok(())
+    getrandom::fill(buffer).map_err(|_| VfsError::InvalidPath)
 }
 
 #[cfg(test)]
