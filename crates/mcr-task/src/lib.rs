@@ -3,9 +3,12 @@ use std::fmt;
 
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};
 use mcr_sys::{
-    CloneSyscallArgs, GuestAddress, GuestPid, GuestTid, LINUX_CLONE_EXIT_SIGNAL_MASK,
-    LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, LinuxUtsname, Syscall,
-    SyscallOutcome, SyscallRequest, TaskSyscalls, Wait4SyscallArgs,
+    CloneSyscallArgs, GuestAddress, GuestPid, GuestTid, KillSyscallArgs,
+    LINUX_CLONE_EXIT_SIGNAL_MASK, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_KERNEL_SIGSET_SIZE,
+    LINUX_ROBUST_LIST_HEAD_SIZE, LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK,
+    LINUX_SIGCHLD, LinuxErrno, LinuxUtsname, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs,
+    SetRobustListSyscallArgs, SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest,
+    TaskSyscalls, TgkillSyscallArgs, Wait4SyscallArgs,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -19,6 +22,9 @@ pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
+pub const LINUX_SIGKILL: u32 = 9;
+pub const LINUX_SIGTERM: u32 = 15;
+pub const LINUX_SIGNAL_COUNT: u32 = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestExecutable {
@@ -293,6 +299,63 @@ pub enum ExitState {
     Exited { status: i32 },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuestSignalAction {
+    action: GuestAddress,
+}
+
+impl GuestSignalAction {
+    #[must_use]
+    pub const fn new(action: GuestAddress) -> Self {
+        Self { action }
+    }
+
+    #[must_use]
+    pub const fn action(self) -> GuestAddress {
+        self.action
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SignalState {
+    actions: BTreeMap<u32, GuestSignalAction>,
+    blocked: u64,
+}
+
+impl SignalState {
+    #[must_use]
+    pub fn action(&self, signal: u32) -> Option<GuestSignalAction> {
+        self.actions.get(&signal).copied()
+    }
+
+    #[must_use]
+    pub const fn blocked(&self) -> u64 {
+        self.blocked
+    }
+
+    fn set_action(&mut self, signal: u32, action: GuestSignalAction) {
+        self.actions.insert(signal, action);
+    }
+
+    fn apply_mask(&mut self, how: u32, mask: u64) -> Result<(), TaskError> {
+        match how {
+            LINUX_SIG_BLOCK => {
+                self.blocked |= mask;
+                Ok(())
+            }
+            LINUX_SIG_UNBLOCK => {
+                self.blocked &= !mask;
+                Ok(())
+            }
+            LINUX_SIG_SETMASK => {
+                self.blocked = mask;
+                Ok(())
+            }
+            _ => Err(TaskError::InvalidSignalMaskHow(how)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitedChild {
     pid: GuestPid,
@@ -435,6 +498,7 @@ pub struct GuestProcess {
     sid: GuestPid,
     image: GuestImageState,
     files: GuestFdTable,
+    signals: SignalState,
     children: BTreeSet<GuestPid>,
     exit_state: ExitState,
 }
@@ -473,6 +537,16 @@ impl GuestProcess {
     #[must_use]
     pub const fn files_mut(&mut self) -> &mut GuestFdTable {
         &mut self.files
+    }
+
+    #[must_use]
+    pub const fn signals(&self) -> &SignalState {
+        &self.signals
+    }
+
+    #[must_use]
+    pub const fn signals_mut(&mut self) -> &mut SignalState {
+        &mut self.signals
     }
 
     #[must_use]
@@ -572,6 +646,41 @@ impl GuestKernel {
                     arg(request, 3),
                 ),
             ),
+            Syscall::RtSigaction => self.rt_sigaction_current(
+                tid,
+                RtSigactionSyscallArgs::new(
+                    arg(request, 0) as u32,
+                    arg(request, 1),
+                    arg(request, 2),
+                    arg(request, 3),
+                ),
+            ),
+            Syscall::RtSigprocmask => self.rt_sigprocmask_current(
+                tid,
+                RtSigprocmaskSyscallArgs::new(
+                    arg(request, 0) as u32,
+                    arg(request, 1),
+                    arg(request, 2),
+                    arg(request, 3),
+                ),
+            ),
+            Syscall::RtSigreturn => SyscallOutcome::success(0),
+            Syscall::Kill => self.kill_current(KillSyscallArgs::new(
+                arg(request, 0) as i32,
+                arg(request, 1) as u32,
+            )),
+            Syscall::Tgkill => self.tgkill_current(TgkillSyscallArgs::new(
+                arg(request, 0) as i32,
+                arg(request, 1) as i32,
+                arg(request, 2) as u32,
+            )),
+            Syscall::SetTidAddress => {
+                self.set_tid_address_current(tid, SetTidAddressSyscallArgs::new(arg(request, 0)))
+            }
+            Syscall::SetRobustList => self.set_robust_list_current(
+                tid,
+                SetRobustListSyscallArgs::new(arg(request, 0), arg(request, 1)),
+            ),
             Syscall::Uname => self.uname(arg(request, 0)),
             Syscall::ArchPrctl => self.arch_prctl(tid, arg(request, 0), arg(request, 1)),
             Syscall::Execve => {
@@ -630,6 +739,7 @@ impl GuestKernel {
                 sid: parent.sid,
                 image: parent.image,
                 files: parent.files,
+                signals: parent.signals,
                 children: BTreeSet::new(),
                 exit_state: ExitState::Running,
             },
@@ -756,6 +866,128 @@ impl GuestKernel {
         }
     }
 
+    pub fn rt_sigaction_current(
+        &mut self,
+        tid: GuestTid,
+        args: RtSigactionSyscallArgs,
+    ) -> SyscallOutcome {
+        let Some(pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if let Err(error) = validate_signal(args.sig) {
+            return error.into_outcome();
+        }
+        if args.sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(args.sigsetsize).into_outcome();
+        }
+        if args.act != 0 {
+            let Some(process) = self.process_mut(pid) else {
+                return SyscallOutcome::errno(LinuxErrno::ESRCH);
+            };
+            process
+                .signals
+                .set_action(args.sig, GuestSignalAction::new(args.act));
+        }
+        SyscallOutcome::success(0).with_decoded_field("signal", args.sig.to_string())
+    }
+
+    pub fn rt_sigprocmask_current(
+        &mut self,
+        tid: GuestTid,
+        args: RtSigprocmaskSyscallArgs,
+    ) -> SyscallOutcome {
+        let Some(pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if args.sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(args.sigsetsize).into_outcome();
+        }
+        if !args.supported_how() {
+            return TaskError::InvalidSignalMaskHow(args.how).into_outcome();
+        }
+        if args.set != 0 {
+            let Some(process) = self.process_mut(pid) else {
+                return SyscallOutcome::errno(LinuxErrno::ESRCH);
+            };
+            if let Err(error) = process.signals.apply_mask(args.how, args.set) {
+                return error.into_outcome();
+            }
+        }
+        SyscallOutcome::success(0).with_decoded_field("signal_mask", format!("{:#x}", args.set))
+    }
+
+    pub fn kill_current(&mut self, args: KillSyscallArgs) -> SyscallOutcome {
+        if args.pid <= 0 {
+            return TaskError::UnsupportedSignalTarget(args.pid).into_outcome();
+        }
+        let pid = args.pid as GuestPid;
+        if !self.processes.contains_key(&pid) {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+        if let Err(error) = validate_signal_or_probe(args.sig) {
+            return error.into_outcome();
+        }
+        if args.sig == 0 {
+            return SyscallOutcome::success(0);
+        }
+        if is_terminating_signal(args.sig) {
+            return self.exit_group(pid, signal_exit_status(args.sig));
+        }
+        SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
+    }
+
+    pub fn tgkill_current(&mut self, args: TgkillSyscallArgs) -> SyscallOutcome {
+        if args.tgid <= 0 || args.tid <= 0 {
+            return TaskError::UnsupportedSignalTarget(args.tid).into_outcome();
+        }
+        let pid = args.tgid as GuestPid;
+        let tid = args.tid as GuestTid;
+        let Some(task) = self.task(tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if task.pid != pid {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+        if let Err(error) = validate_signal_or_probe(args.sig) {
+            return error.into_outcome();
+        }
+        if args.sig == 0 {
+            return SyscallOutcome::success(0);
+        }
+        if is_terminating_signal(args.sig) {
+            return self.exit_task(tid, signal_exit_status(args.sig));
+        }
+        SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
+    }
+
+    pub fn set_tid_address_current(
+        &mut self,
+        tid: GuestTid,
+        args: SetTidAddressSyscallArgs,
+    ) -> SyscallOutcome {
+        let Some(task) = self.task_mut(tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        task.clear_child_tid = (args.tidptr != 0).then_some(args.tidptr);
+        SyscallOutcome::success(u64::from(tid))
+            .with_decoded_field("clear_child_tid", format!("{:#x}", args.tidptr))
+    }
+
+    pub fn set_robust_list_current(
+        &mut self,
+        tid: GuestTid,
+        args: SetRobustListSyscallArgs,
+    ) -> SyscallOutcome {
+        if args.len != LINUX_ROBUST_LIST_HEAD_SIZE {
+            return TaskError::InvalidRobustListLength(args.len).into_outcome();
+        }
+        let Some(task) = self.task_mut(tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        task.robust_list = (args.head != 0).then_some(args.head);
+        SyscallOutcome::success(0).with_decoded_field("robust_list", format!("{:#x}", args.head))
+    }
+
     pub fn arch_prctl(
         &mut self,
         tid: GuestTid,
@@ -818,6 +1050,7 @@ impl GuestKernel {
                 sid: pid,
                 image,
                 files: GuestFdTable::with_stdio(),
+                signals: SignalState::default(),
                 children: BTreeSet::new(),
                 exit_state: ExitState::Running,
             },
@@ -939,12 +1172,17 @@ impl TaskSyscalls for GuestKernel {
 pub enum TaskError {
     BadFd(i32),
     InvalidCloneFlags(u64),
+    InvalidRobustListLength(u64),
+    InvalidSignal(u32),
+    InvalidSignalMaskHow(u32),
+    InvalidSigsetSize(u64),
     InvalidWaitOptions(u32),
     NoChild,
     PidExhausted,
     TidExhausted,
     UnknownPid(GuestPid),
     UnknownTid(GuestTid),
+    UnsupportedSignalTarget(i32),
     WouldBlock,
     Elf(mcr_elf::ElfValidationError),
     Image(GuestImageError),
@@ -955,7 +1193,13 @@ impl TaskError {
     pub const fn linux_errno(&self) -> LinuxErrno {
         match self {
             Self::BadFd(_) => LinuxErrno::EBADF,
-            Self::InvalidCloneFlags(_) | Self::InvalidWaitOptions(_) => LinuxErrno::EINVAL,
+            Self::InvalidCloneFlags(_)
+            | Self::InvalidRobustListLength(_)
+            | Self::InvalidSignal(_)
+            | Self::InvalidSignalMaskHow(_)
+            | Self::InvalidSigsetSize(_)
+            | Self::InvalidWaitOptions(_)
+            | Self::UnsupportedSignalTarget(_) => LinuxErrno::EINVAL,
             Self::NoChild => LinuxErrno::ECHILD,
             Self::PidExhausted | Self::TidExhausted => LinuxErrno::EAGAIN,
             Self::UnknownPid(_) | Self::UnknownTid(_) => LinuxErrno::ESRCH,
@@ -977,6 +1221,12 @@ impl fmt::Display for TaskError {
             Self::InvalidCloneFlags(flags) => {
                 write!(formatter, "unsupported clone flags {flags:#x}")
             }
+            Self::InvalidRobustListLength(length) => {
+                write!(formatter, "invalid robust list length {length}")
+            }
+            Self::InvalidSignal(signal) => write!(formatter, "invalid signal {signal}"),
+            Self::InvalidSignalMaskHow(how) => write!(formatter, "invalid signal mask how {how}"),
+            Self::InvalidSigsetSize(size) => write!(formatter, "invalid sigset size {size}"),
             Self::InvalidWaitOptions(options) => {
                 write!(formatter, "unsupported wait4 options {options:#x}")
             }
@@ -985,6 +1235,9 @@ impl fmt::Display for TaskError {
             Self::TidExhausted => write!(formatter, "guest TID namespace exhausted"),
             Self::UnknownPid(pid) => write!(formatter, "unknown guest pid {pid}"),
             Self::UnknownTid(tid) => write!(formatter, "unknown guest tid {tid}"),
+            Self::UnsupportedSignalTarget(pid) => {
+                write!(formatter, "unsupported signal target {pid}")
+            }
             Self::WouldBlock => write!(formatter, "waitable child has not exited"),
             Self::Elf(error) => write!(formatter, "{error}"),
             Self::Image(error) => write!(formatter, "{error}"),
@@ -1055,6 +1308,30 @@ const fn is_supported_fork_like_clone(flags: u64) -> bool {
     (exit_signal == 0 || exit_signal == LINUX_SIGCHLD)
         && (semantic_flags == 0 || semantic_flags == (LINUX_CLONE_VM | LINUX_CLONE_VFORK))
         && flags & !(LINUX_CLONE_EXIT_SIGNAL_MASK | LINUX_CLONE_VM | LINUX_CLONE_VFORK) == 0
+}
+
+const fn validate_signal(signal: u32) -> Result<(), TaskError> {
+    if signal > 0 && signal <= LINUX_SIGNAL_COUNT {
+        Ok(())
+    } else {
+        Err(TaskError::InvalidSignal(signal))
+    }
+}
+
+const fn validate_signal_or_probe(signal: u32) -> Result<(), TaskError> {
+    if signal <= LINUX_SIGNAL_COUNT {
+        Ok(())
+    } else {
+        Err(TaskError::InvalidSignal(signal))
+    }
+}
+
+const fn is_terminating_signal(signal: u32) -> bool {
+    matches!(signal, LINUX_SIGKILL | LINUX_SIGTERM)
+}
+
+const fn signal_exit_status(signal: u32) -> i32 {
+    128 + (signal as i32)
 }
 
 fn linux_utsname() -> LinuxUtsname {
@@ -1390,6 +1667,332 @@ mod tests {
         assert_eq!(task.tls(), TlsState::new());
         assert!(process.files().contains(3));
         assert!(!process.files().contains(4));
+    }
+
+    #[test]
+    fn rt_sigaction_saves_action_and_rejects_invalid_signal_or_sigset_size() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigaction,
+                [
+                    LINUX_SIGTERM as u64,
+                    0x7000,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .signals()
+                .action(LINUX_SIGTERM)
+                .unwrap()
+                .action(),
+            0x7000
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigaction,
+                [0, 0x8000, 0, LINUX_KERNEL_SIGSET_SIZE, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigaction,
+                [
+                    LINUX_SIGTERM as u64,
+                    0x8000,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE + 1,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_SETMASK as u64,
+                    0b1010,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .signals()
+                .blocked(),
+            0b1010
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_BLOCK as u64,
+                    0b0101,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .signals()
+                .blocked(),
+            0b1111
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_UNBLOCK as u64,
+                    0b0011,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .signals()
+                .blocked(),
+            0b1100
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [99, 0b1111, 0, LINUX_KERNEL_SIGSET_SIZE, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_SETMASK as u64,
+                    0b1111,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE + 1,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn kill_probe_checks_process_and_sigterm_exits_group() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Kill,
+                [INITIAL_GUEST_PID as u64, 0, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Running
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Kill, [999, 0, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Kill,
+                [INITIAL_GUEST_PID as u64, LINUX_SIGTERM as u64, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Exited { status: 143 }
+        );
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Exited { status: 143 }
+        );
+    }
+
+    #[test]
+    fn tgkill_sigkill_exits_target_task() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Tgkill,
+                [
+                    INITIAL_GUEST_PID as u64,
+                    INITIAL_GUEST_TID as u64,
+                    LINUX_SIGKILL as u64,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Exited { status: 137 }
+        );
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Exited { status: 137 }
+        );
+    }
+
+    #[test]
+    fn set_tid_address_sets_and_clears_clear_child_tid() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::SetTidAddress, [0x9000, 0, 0, 0, 0, 0],),
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().clear_child_tid(),
+            Some(0x9000)
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::SetTidAddress, [0, 0, 0, 0, 0, 0],),
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().clear_child_tid(),
+            None
+        );
+    }
+
+    #[test]
+    fn set_robust_list_sets_list_and_rejects_invalid_len() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::SetRobustList,
+                [0xa000, LINUX_ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().robust_list(),
+            Some(0xa000)
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::SetRobustList,
+                [0xb000, LINUX_ROBUST_LIST_HEAD_SIZE + 1, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().robust_list(),
+            Some(0xa000)
+        );
+    }
+
+    #[test]
+    fn fork_child_inherits_signal_action_and_mask() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigaction,
+                [
+                    LINUX_SIGTERM as u64,
+                    0x7000,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_SETMASK as u64,
+                    0x55,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Fork, [0; 6]),
+            SyscallReturn::Success(2)
+        );
+
+        let child_signals = kernel.process(2).unwrap().signals();
+        assert_eq!(
+            child_signals.action(LINUX_SIGTERM).unwrap().action(),
+            0x7000
+        );
+        assert_eq!(child_signals.blocked(), 0x55);
     }
 
     fn dispatch_task_syscall(

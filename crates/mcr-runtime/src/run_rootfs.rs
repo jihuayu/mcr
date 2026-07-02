@@ -495,6 +495,7 @@ impl From<crate::RuntimeError> for RunRootfsError {
     fn from(value: crate::RuntimeError) -> Self {
         match value {
             crate::RuntimeError::Task(error) => Self::UnsupportedProgram(error.to_string()),
+            crate::RuntimeError::Memory(error) => Self::UnsupportedProgram(format!("{error:?}")),
         }
     }
 }
