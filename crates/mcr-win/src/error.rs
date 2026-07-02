@@ -29,6 +29,17 @@ pub enum HostOperation {
     OpenSocket,
     PollSockets,
     CloseSocket,
+    ConnectSocket,
+    BindSocket,
+    ListenSocket,
+    AcceptSocket,
+    SendSocket,
+    RecvSocket,
+    SetSocketNonblocking,
+    SetSocketOption,
+    GetSocketOption,
+    ShutdownSocket,
+    QuerySocketAddress,
 }
 
 impl fmt::Display for HostOperation {
@@ -55,6 +66,17 @@ impl fmt::Display for HostOperation {
             Self::OpenSocket => "open socket",
             Self::PollSockets => "poll sockets",
             Self::CloseSocket => "close socket",
+            Self::ConnectSocket => "connect socket",
+            Self::BindSocket => "bind socket",
+            Self::ListenSocket => "listen socket",
+            Self::AcceptSocket => "accept socket",
+            Self::SendSocket => "send socket",
+            Self::RecvSocket => "receive socket",
+            Self::SetSocketNonblocking => "set socket nonblocking mode",
+            Self::SetSocketOption => "set socket option",
+            Self::GetSocketOption => "get socket option",
+            Self::ShutdownSocket => "shutdown socket",
+            Self::QuerySocketAddress => "query socket address",
         };
         f.write_str(operation)
     }
