@@ -1,7 +1,7 @@
 ---
 id: testkit-001
 scope: testkit
-status: ready
+status: in-progress
 depends-on: [boot-001]
 ---
 
