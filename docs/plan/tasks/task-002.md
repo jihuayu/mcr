@@ -1,7 +1,7 @@
 ---
 id: task-002
 scope: task
-status: pending
+status: in-progress
 depends-on: [elf-003, fd-001]
 ---
 
