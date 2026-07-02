@@ -244,6 +244,13 @@ struct GuestFlags {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicOp {
+    And,
+    Or,
+    Xor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMemoryOperandAccessKind {
     Read,
     Write,
@@ -927,6 +934,48 @@ where
             write_reg32(registers, instruction.op0_register(), result)?;
             flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
+        Code::And_rm64_r64
+        | Code::And_r64_rm64
+        | Code::And_rm64_imm32
+        | Code::And_rm64_imm8
+        | Code::And_RAX_imm32 => {
+            execute_logic_u64(registers, flags, memory, &instruction, LogicOp::And)?;
+        }
+        Code::And_rm32_r32
+        | Code::And_r32_rm32
+        | Code::And_rm32_imm32
+        | Code::And_rm32_imm8
+        | Code::And_EAX_imm32 => {
+            execute_logic_u32(registers, flags, memory, &instruction, LogicOp::And)?;
+        }
+        Code::Or_rm64_r64
+        | Code::Or_r64_rm64
+        | Code::Or_rm64_imm32
+        | Code::Or_rm64_imm8
+        | Code::Or_RAX_imm32 => {
+            execute_logic_u64(registers, flags, memory, &instruction, LogicOp::Or)?;
+        }
+        Code::Or_rm32_r32
+        | Code::Or_r32_rm32
+        | Code::Or_rm32_imm32
+        | Code::Or_rm32_imm8
+        | Code::Or_EAX_imm32 => {
+            execute_logic_u32(registers, flags, memory, &instruction, LogicOp::Or)?;
+        }
+        Code::Xor_rm64_r64
+        | Code::Xor_r64_rm64
+        | Code::Xor_rm64_imm32
+        | Code::Xor_rm64_imm8
+        | Code::Xor_RAX_imm32 => {
+            execute_logic_u64(registers, flags, memory, &instruction, LogicOp::Xor)?;
+        }
+        Code::Xor_rm32_r32
+        | Code::Xor_r32_rm32
+        | Code::Xor_rm32_imm32
+        | Code::Xor_rm32_imm8
+        | Code::Xor_EAX_imm32 => {
+            execute_logic_u32(registers, flags, memory, &instruction, LogicOp::Xor)?;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1007,13 +1056,6 @@ where
                 16,
             );
         }
-        Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32
-            if instruction.op1_kind() == OpKind::Register
-                && instruction.op0_register() == instruction.op1_register() =>
-        {
-            write_reg64(registers, instruction.op0_register(), 0)?;
-            flags.set_logic_result(0, 64);
-        }
         Code::Test_rm32_r32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1028,6 +1070,16 @@ where
         {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = read_reg64(registers, instruction.op1_register())?;
+            flags.set_logic_result(lhs & rhs, 64);
+        }
+        Code::Test_rm32_imm32 | Code::Test_rm32_imm32_F7r1 | Code::Test_EAX_imm32 => {
+            let lhs = read_operand_u32(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u32(&instruction)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 32);
+        }
+        Code::Test_rm64_imm32 | Code::Test_rm64_imm32_F7r1 | Code::Test_RAX_imm32 => {
+            let lhs = read_operand_u64(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u64(&instruction)?;
             flags.set_logic_result(lhs & rhs, 64);
         }
         Code::Test_rm8_r8 => {
@@ -1309,6 +1361,50 @@ fn immediate_as_u8(instruction: &Instruction) -> Result<u8, ExecutionError> {
     }
 }
 
+fn execute_logic_u64<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+    operation: LogicOp,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let lhs = read_operand_u64(registers, memory, instruction, 0)?;
+    let rhs = read_operand_or_immediate_u64(registers, memory, instruction, 1)?;
+    let result = apply_logic(lhs, rhs, operation);
+    write_operand_u64(registers, memory, instruction, 0, result)?;
+    flags.set_logic_result(result, 64);
+    Ok(())
+}
+
+fn execute_logic_u32<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+    operation: LogicOp,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let lhs = read_operand_u32(registers, memory, instruction, 0)?;
+    let rhs = read_operand_or_immediate_u32(registers, memory, instruction, 1)?;
+    let result = apply_logic(u64::from(lhs), u64::from(rhs), operation) as u32;
+    write_operand_u32(registers, memory, instruction, 0, result)?;
+    flags.set_logic_result(u64::from(result), 32);
+    Ok(())
+}
+
+const fn apply_logic(lhs: u64, rhs: u64, operation: LogicOp) -> u64 {
+    match operation {
+        LogicOp::And => lhs & rhs,
+        LogicOp::Or => lhs | rhs,
+        LogicOp::Xor => lhs ^ rhs,
+    }
+}
+
 fn effective_address(
     registers: &GuestRegisters,
     instruction: &Instruction,
@@ -1392,6 +1488,114 @@ where
             memory,
             instruction.ip(),
             effective_address(registers, instruction)?,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn read_operand_u64<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u64, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => read_reg64(registers, instruction.op_register(operand)),
+        OpKind::Memory => read_memory_u64(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn read_operand_or_immediate_u32<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u32, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Immediate8to32 | OpKind::Immediate32 => immediate_as_u32(instruction),
+        _ => read_operand_u32(registers, memory, instruction, operand),
+    }
+}
+
+fn read_operand_or_immediate_u64<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u64, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Immediate8to64 | OpKind::Immediate32to64 | OpKind::Immediate64 => {
+            immediate_as_u64(instruction)
+        }
+        _ => read_operand_u64(registers, memory, instruction, operand),
+    }
+}
+
+fn write_operand_u32<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+    value: u32,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => write_reg32(registers, instruction.op_register(operand), value),
+        OpKind::Memory => write_memory_u32(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+            value,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn write_operand_u64<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+    value: u64,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => write_reg64(registers, instruction.op_register(operand), value),
+        OpKind::Memory => write_memory_u64(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+            value,
         ),
         _ => Err(ExecutionError::MissingSyscall {
             terminator: BlockTerminator::Invalid {
@@ -2206,6 +2410,75 @@ mod tests {
         );
         assert_eq!(registers.rax, 7);
         assert_eq!(registers.rip, 0x460037);
+    }
+
+    #[test]
+    fn execution_core_executes_register_bitwise_logic_and_immediate_test() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0xf0, 0xf0, 0xf0, 0xf0, // mov eax,0xf0f0f0f0
+                0x25, 0xf0, 0x0f, 0xf0, 0x0f, // and eax,0x0ff00ff0
+                0x0d, 0x0f, 0x00, 0x0f, 0x00, // or eax,0x000f000f
+                0x35, 0xff, 0x00, 0xff, 0x00, // xor eax,0x00ff00ff
+                0x48, 0xc7, 0xc7, 0xf0, 0xff, 0xff, 0xff, // mov rdi,-16
+                0x48, 0x83, 0xe7, 0xf8, // and rdi,-8
+                0x48, 0x83, 0xcf, 0x0f, // or rdi,0xf
+                0x48, 0x81, 0xf7, 0xff, 0x00, 0x00, 0x00, // xor rdi,0xff
+                0x48, 0xf7, 0xc7, 0xff, 0x00, 0x00, 0x00, // test rdi,0xff
+                0x74, 0x07, // je success
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x460080,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute register bitwise logic before syscall");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.registers().rdi, 0xffff_ffff_ffff_ff00);
+        assert_eq!(trap.site().rip, 0x4600bf);
+    }
+
+    #[test]
+    fn execution_core_executes_memory_bitwise_logic_and_immediate_test() {
+        let block = GuestBlock::new(
+            &[
+                0x81, 0x23, 0x0f, 0x0f, 0x0f, 0x0f, // and dword ptr [rbx],0x0f0f0f0f
+                0x81, 0x0b, 0x00, 0x00, 0x00, 0xf0, // or dword ptr [rbx],0xf0000000
+                0x31, 0x03, // xor dword ptr [rbx],eax
+                0xf7, 0x03, 0xff, 0x00, 0x00, 0x00, // test dword ptr [rbx],0xff
+                0x74, 0x07, // je success
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x460100,
+        );
+        let registers = GuestRegisters {
+            rax: 0xf000_000f,
+            rbx: 0x701000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x701000, &0xff00_00ff_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute memory bitwise logic before syscall");
+
+        assert_eq!(u32::from_le_bytes(memory.read(0x701000)), 0x0f00_0000);
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x460122);
     }
 
     #[test]
