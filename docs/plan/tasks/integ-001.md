@@ -1,7 +1,7 @@
 ---
 id: integ-001
 scope: mvp-integration
-status: pending
+status: in-progress
 depends-on: [testkit-001, jit-001, sys-001, mem-001, vfs-002, task-001, diag-001]
 ---
 
