@@ -6893,6 +6893,43 @@ mod tests {
     }
 
     #[test]
+    fn guest_execution_preserves_stack_push_pop_before_syscall() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0xbb, 0x2a, 0x00, 0x00, 0x00, // mov ebx,42
+                0x53, // push rbx
+                0x5f, // pop rdi
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        let initial_rsp = runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .regs()
+            .rsp();
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("stack push/pop feeds exit_group syscall");
+
+        assert_eq!(step.task_state(), TaskState::Exited { status: 42 });
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .regs()
+                .rsp(),
+            initial_rsp
+        );
+    }
+
+    #[test]
     fn guest_execution_surfaces_guest_memory_operand_fault() {
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
