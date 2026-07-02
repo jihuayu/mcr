@@ -1866,6 +1866,27 @@ pub enum IoctlReply {
     U32(u32),
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ClosedFdIds {
+    pub socket_ids: Vec<u64>,
+    pub epoll_ids: Vec<u64>,
+}
+
+impl ClosedFdIds {
+    pub fn is_empty(&self) -> bool {
+        self.socket_ids.is_empty() && self.epoll_ids.is_empty()
+    }
+
+    fn add_entry(&mut self, entry: &FdEntry) {
+        if let Some(socket_id) = socket_id_for_entry(entry) {
+            self.socket_ids.push(socket_id);
+        }
+        if let Some(epoll_id) = epoll_id_for_entry(entry) {
+            self.epoll_ids.push(epoll_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FdTable {
     entries: BTreeMap<Fd, FdEntry>,
@@ -2028,6 +2049,22 @@ impl FdTable {
             InodeBackend::Epoll(epoll) => Ok(epoll.id()),
             _ => Err(VfsError::BadFd),
         }
+    }
+
+    pub fn socket_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.values().filter_map(socket_id_for_entry)
+    }
+
+    pub fn socket_fd_count(&self, socket_id: u64) -> usize {
+        self.socket_ids().filter(|id| *id == socket_id).count()
+    }
+
+    pub fn epoll_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.values().filter_map(epoll_id_for_entry)
+    }
+
+    pub fn epoll_fd_count(&self, epoll_id: u64) -> usize {
+        self.epoll_ids().filter(|id| *id == epoll_id).count()
     }
 
     pub fn insert_at_or_above(
@@ -2278,11 +2315,16 @@ impl FdTable {
         self.get(fd).map(|_| self.cloexec.contains(&fd))
     }
 
-    pub fn close_on_exec(&mut self) {
+    pub fn close_on_exec(&mut self) -> ClosedFdIds {
         let cloexec = std::mem::take(&mut self.cloexec);
+        let mut closed = ClosedFdIds::default();
         for fd in cloexec {
-            self.entries.remove(&fd);
+            if let Some(entry) = self.entries.remove(&fd) {
+                closed.add_entry(&entry);
+                unregister_fd_endpoint(&entry.file);
+            }
         }
+        closed
     }
 
     pub fn read(
@@ -2553,6 +2595,26 @@ impl FdTable {
     }
 }
 
+fn socket_id_for_entry(entry: &FdEntry) -> Option<u64> {
+    if !matches!(entry.file().kind(), FileKind::Socket) {
+        return None;
+    }
+    match entry.file().inode().backend() {
+        InodeBackend::Socket(socket) => Some(socket.id()),
+        _ => None,
+    }
+}
+
+fn epoll_id_for_entry(entry: &FdEntry) -> Option<u64> {
+    if !matches!(entry.file().kind(), FileKind::Epoll) {
+        return None;
+    }
+    match entry.file().inode().backend() {
+        InodeBackend::Epoll(epoll) => Some(epoll.id()),
+        _ => None,
+    }
+}
+
 impl Default for FdTable {
     fn default() -> Self {
         Self::new()
@@ -2610,6 +2672,10 @@ impl VirtualFileSystem {
 
     pub fn fds_mut(&mut self) -> &mut FdTable {
         &mut self.fds
+    }
+
+    pub fn replace_fds(&mut self, fds: FdTable) -> FdTable {
+        std::mem::replace(&mut self.fds, fds)
     }
 
     pub fn stdout_snapshot(&self) -> Vec<u8> {
@@ -2795,6 +2861,22 @@ impl VirtualFileSystem {
 
     pub fn epoll_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
         self.fds.epoll_id_for_fd(fd)
+    }
+
+    pub fn socket_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.fds.socket_ids()
+    }
+
+    pub fn socket_fd_count(&self, socket_id: u64) -> usize {
+        self.fds.socket_fd_count(socket_id)
+    }
+
+    pub fn epoll_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.fds.epoll_ids()
+    }
+
+    pub fn epoll_fd_count(&self, epoll_id: u64) -> usize {
+        self.fds.epoll_fd_count(epoll_id)
     }
 
     pub fn poll_readiness(&self, fd: Fd) -> VfsResult<FdReadiness> {
@@ -3697,11 +3779,22 @@ mod tests {
 
         table.set_cloexec(keep, true).unwrap();
         table.set_cloexec(close, false).unwrap();
-        table.close_on_exec();
+        assert!(table.close_on_exec().is_empty());
 
         assert_eq!(table.get(keep).unwrap_err(), VfsError::BadFd);
         assert!(table.get(close).is_ok());
         assert!(table.get(0).is_ok());
+    }
+
+    #[test]
+    fn cloexec_pipe_fds_unregister_endpoints_on_exec() {
+        let mut table = FdTable::with_stdio();
+        let [read_fd, write_fd] = table.pipe(OpenFlags::new(O_CLOEXEC)).unwrap();
+
+        assert!(table.close_on_exec().is_empty());
+
+        assert_eq!(table.get(read_fd).unwrap_err(), VfsError::BadFd);
+        assert_eq!(table.get(write_fd).unwrap_err(), VfsError::BadFd);
     }
 
     #[test]
