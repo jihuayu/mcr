@@ -35,9 +35,11 @@ cargo test --workspace
 mcr run-rootfs alpine-rootfs /bin/sh -c "curl --version"
 mcr run-rootfs alpine-rootfs /bin/sh -c "git --version"
 mcr run-rootfs alpine-rootfs /bin/sh -c "curl -fsSL https://example.com >/dev/null"
+mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world"
 ```
 
 ## Notes
 
-- External-network tests should have a local deterministic fallback in CI.
+- External-network tests are intentional acceptance gates for this task; keep normal workspace tests deterministic by making the corresponding testkit contracts ignored or environment-gated.
+- `alpine-rootfs` must include `curl`, `git`, CA certificates, and writable `/tmp` before this task is marked done.
 - Network namespaces, port publishing, and raw sockets remain unsupported.

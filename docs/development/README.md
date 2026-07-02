@@ -124,7 +124,9 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs alpine-rootfs /bin/busybox cat /etc/os-release` | VFS P0 |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "echo hi"` | Phase 2 shell |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "curl --version"` | Phase 2 networking |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "curl -fsSL https://example.com >/dev/null"` | Phase 2 networking |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "git --version"` | Phase 2 networking |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world"` | Phase 2 networking |
 | `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Phase 2 workload matrix |
 | `mcr run-rootfs python-rootfs /bin/sh -c "python -V"` | Phase 2 workload matrix |
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Phase 2 workload matrix |

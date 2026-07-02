@@ -19,7 +19,7 @@ Dockerfile builder, OCI output, BuildKit, and Docker Engine API are outside this
 | `mcr-task` | guest task syscalls, process events | PID/TID, exit, exec, wait, futex, signals | elf, vfs, win sync | `task-001`, `task-002`, `task-003` |
 | `mcr-net` | socket syscalls and readiness waits | Linux socket and event compatibility | win net adapter, vfs fd table | `net-001`, `net-002` |
 | `mcr-win` | host requests | typed Windows capability wrappers | none | `win-001` |
-| `mcr-testkit` | fixtures, expected outputs | unit and smoke harnesses | CLI/runtime milestones | `testkit-001`, integration tasks |
+| `mcr-testkit` | fixtures, expected outputs | unit and opt-in smoke harnesses | CLI/runtime milestones | `testkit-001`, `testkit-002`, integration tasks |
 
 ## Integration Enumeration
 
@@ -45,6 +45,7 @@ Each integration task must connect real modules instead of leaving stubs.
 ```text
 boot-001
   -> testkit-001
+      -> testkit-002
   -> abi-001 -> sys-001
   -> win-001
   -> elf-001 -> elf-002
