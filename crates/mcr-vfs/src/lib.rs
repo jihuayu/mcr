@@ -1699,6 +1699,56 @@ impl From<StdioKind> for DevNodeKind {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct StdioCapture {
+    inner: Arc<Mutex<StdioCaptureState>>,
+}
+
+impl StdioCapture {
+    fn snapshot(&self, kind: StdioKind) -> Vec<u8> {
+        let state = self.state();
+        match kind {
+            StdioKind::Stdin => Vec::new(),
+            StdioKind::Stdout => state.stdout.clone(),
+            StdioKind::Stderr => state.stderr.clone(),
+        }
+    }
+
+    fn take(&self, kind: StdioKind) -> Vec<u8> {
+        let mut state = self.state();
+        match kind {
+            StdioKind::Stdin => Vec::new(),
+            StdioKind::Stdout => std::mem::take(&mut state.stdout),
+            StdioKind::Stderr => std::mem::take(&mut state.stderr),
+        }
+    }
+
+    fn write(&self, kind: StdioKind, buffer: &[u8]) -> VfsResult<usize> {
+        let mut state = self.state();
+        match kind {
+            StdioKind::Stdin => Err(VfsError::BadFd),
+            StdioKind::Stdout => {
+                state.stdout.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            StdioKind::Stderr => {
+                state.stderr.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, StdioCaptureState> {
+        self.inner.lock().expect("stdio capture mutex poisoned")
+    }
+}
+
+#[derive(Debug, Default)]
+struct StdioCaptureState {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FdEntry {
     file: FileRef,
@@ -1770,6 +1820,7 @@ pub struct FdTable {
     entries: BTreeMap<Fd, FdEntry>,
     cloexec: HashSet<Fd>,
     next_pipe_id: u64,
+    stdio: StdioCapture,
 }
 
 impl Clone for FdTable {
@@ -1782,6 +1833,7 @@ impl Clone for FdTable {
             entries,
             cloexec: self.cloexec.clone(),
             next_pipe_id: self.next_pipe_id,
+            stdio: self.stdio.clone(),
         }
     }
 }
@@ -1800,6 +1852,7 @@ impl FdTable {
             entries: BTreeMap::new(),
             cloexec: HashSet::new(),
             next_pipe_id: 1,
+            stdio: StdioCapture::default(),
         }
     }
 
@@ -2022,6 +2075,22 @@ impl FdTable {
         Ok(new_capacity)
     }
 
+    pub fn stdout_snapshot(&self) -> Vec<u8> {
+        self.stdio.snapshot(StdioKind::Stdout)
+    }
+
+    pub fn stderr_snapshot(&self) -> Vec<u8> {
+        self.stdio.snapshot(StdioKind::Stderr)
+    }
+
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        self.stdio.take(StdioKind::Stdout)
+    }
+
+    pub fn take_stderr(&mut self) -> Vec<u8> {
+        self.stdio.take(StdioKind::Stderr)
+    }
+
     pub fn available_bytes(&self, tree: &PathTree, fd: Fd) -> VfsResult<usize> {
         let entry = self.get(fd)?;
         match entry.file().kind() {
@@ -2160,6 +2229,7 @@ impl FdTable {
     }
 
     pub fn write(&mut self, tree: &mut PathTree, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
+        let stdio = self.stdio.clone();
         let entry = self.get_mut(fd)?;
         if !entry.flags().can_write() {
             return Err(VfsError::BadFd);
@@ -2192,8 +2262,7 @@ impl FdTable {
             FileKind::PipeRead => Err(VfsError::BadFd),
             FileKind::PipeWrite => pipe_write(entry, buffer),
             FileKind::Socket => Err(VfsError::BadFd),
-            FileKind::Stdio(StdioKind::Stdout | StdioKind::Stderr) => Ok(buffer.len()),
-            FileKind::Stdio(StdioKind::Stdin) => Err(VfsError::BadFd),
+            FileKind::Stdio(kind) => stdio.write(kind, buffer),
         }
     }
 
@@ -2405,6 +2474,22 @@ impl VirtualFileSystem {
 
     pub fn fds_mut(&mut self) -> &mut FdTable {
         &mut self.fds
+    }
+
+    pub fn stdout_snapshot(&self) -> Vec<u8> {
+        self.fds.stdout_snapshot()
+    }
+
+    pub fn stderr_snapshot(&self) -> Vec<u8> {
+        self.fds.stderr_snapshot()
+    }
+
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        self.fds.take_stdout()
+    }
+
+    pub fn take_stderr(&mut self) -> Vec<u8> {
+        self.fds.take_stderr()
     }
 
     pub fn proc_self(&self) -> &ProcSelfData {
@@ -3353,6 +3438,58 @@ mod tests {
         assert!(!table.cloexec(0).unwrap());
         assert!(!table.cloexec(1).unwrap());
         assert!(!table.cloexec(2).unwrap());
+    }
+
+    #[test]
+    fn stdio_writes_are_captured_and_can_be_taken() {
+        let mut vfs = sample_vfs();
+
+        assert_eq!(vfs.write(1, b"hello ").unwrap(), 6);
+        assert_eq!(vfs.write(1, b"stdout").unwrap(), 6);
+        assert_eq!(vfs.write(2, b"warn").unwrap(), 4);
+
+        assert_eq!(vfs.stdout_snapshot(), b"hello stdout");
+        assert_eq!(vfs.stderr_snapshot(), b"warn");
+        assert_eq!(vfs.fds().stdout_snapshot(), b"hello stdout");
+        assert_eq!(vfs.fds().stderr_snapshot(), b"warn");
+        assert_eq!(vfs.take_stdout(), b"hello stdout");
+        assert_eq!(vfs.take_stderr(), b"warn");
+        assert_eq!(vfs.stdout_snapshot(), b"");
+        assert_eq!(vfs.stderr_snapshot(), b"");
+    }
+
+    #[test]
+    fn stdio_stdin_stays_empty_and_not_writable() {
+        let mut vfs = sample_vfs();
+        let mut buffer = [0xaa; 8];
+
+        assert_eq!(vfs.read(0, &mut buffer).unwrap(), 0);
+        assert_eq!(buffer, [0xaa; 8]);
+        assert_eq!(vfs.write(0, b"input").unwrap_err(), VfsError::BadFd);
+        assert_eq!(vfs.stdout_snapshot(), b"");
+        assert_eq!(vfs.stderr_snapshot(), b"");
+    }
+
+    #[test]
+    fn stdio_capture_survives_dup_and_fd_table_clone() {
+        let mut vfs = sample_vfs();
+        let stdout_dup = vfs.dup(1).unwrap();
+        let stderr_dup = vfs.dup2(2, 9).unwrap();
+
+        assert_eq!(vfs.write(stdout_dup, b"dup").unwrap(), 3);
+        assert_eq!(vfs.write(stderr_dup, b"err").unwrap(), 3);
+
+        let mut cloned_table = vfs.fds().clone();
+        let mut tree = vfs.tree().clone();
+        assert_eq!(cloned_table.write(&mut tree, 1, b"-clone").unwrap(), 6);
+        assert_eq!(cloned_table.write(&mut tree, 2, b"-clone").unwrap(), 6);
+
+        assert_eq!(vfs.stdout_snapshot(), b"dup-clone");
+        assert_eq!(vfs.stderr_snapshot(), b"err-clone");
+        assert_eq!(cloned_table.take_stdout(), b"dup-clone");
+        assert_eq!(cloned_table.take_stderr(), b"err-clone");
+        assert_eq!(vfs.stdout_snapshot(), b"");
+        assert_eq!(vfs.stderr_snapshot(), b"");
     }
 
     #[test]
