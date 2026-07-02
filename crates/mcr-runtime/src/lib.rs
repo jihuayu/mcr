@@ -357,6 +357,7 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
     }
 }
 
+#[derive(Debug)]
 pub struct RuntimeFileSystem<M> {
     vfs: VirtualFileSystem,
     memory: M,
@@ -1262,8 +1263,28 @@ impl Runtime {
     where
         T: SyscallTracer,
     {
+        Self::with_tracer_and_vfs(program, RuntimeSubsystems::default_vfs(), tracer)
+    }
+
+    pub fn with_vfs(program: GuestProgram, vfs: VirtualFileSystem) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            dispatcher: SyscallDispatcher::new(RuntimeSubsystems::with_vfs(program, vfs)?),
+        })
+    }
+
+    pub fn with_tracer_and_vfs<T>(
+        program: GuestProgram,
+        vfs: VirtualFileSystem,
+        tracer: T,
+    ) -> Result<RuntimeWithTracer<T>, RuntimeError>
+    where
+        T: SyscallTracer,
+    {
         Ok(RuntimeWithTracer {
-            dispatcher: SyscallDispatcher::with_tracer(RuntimeSubsystems::new(program)?, tracer),
+            dispatcher: SyscallDispatcher::with_tracer(
+                RuntimeSubsystems::with_vfs(program, vfs)?,
+                tracer,
+            ),
         })
     }
 
@@ -1279,12 +1300,12 @@ impl Runtime {
 
     #[must_use]
     pub fn memory(&self) -> &GuestMemory {
-        &self.dispatcher.subsystems().memory
+        self.dispatcher.subsystems().files.memory()
     }
 
     #[must_use]
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
-        &mut self.dispatcher.subsystems_mut().memory
+        self.dispatcher.subsystems_mut().files.memory_mut()
     }
 
     pub fn dispatch_syscall(&mut self, context: GuestContext) -> SyscallDispatchResult {
@@ -1316,12 +1337,12 @@ where
 
     #[must_use]
     pub fn memory(&self) -> &GuestMemory {
-        &self.dispatcher.subsystems().memory
+        self.dispatcher.subsystems().files.memory()
     }
 
     #[must_use]
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
-        &mut self.dispatcher.subsystems_mut().memory
+        self.dispatcher.subsystems_mut().files.memory_mut()
     }
 
     #[must_use]
@@ -1347,12 +1368,16 @@ where
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
-    memory: GuestMemory,
+    files: RuntimeFileSystem<GuestMemory>,
     futex_waiters: BTreeMap<u64, u64>,
 }
 
 impl RuntimeSubsystems {
     pub fn new(program: GuestProgram) -> Result<Self, RuntimeError> {
+        Self::with_vfs(program, Self::default_vfs())
+    }
+
+    pub fn with_vfs(program: GuestProgram, vfs: VirtualFileSystem) -> Result<Self, RuntimeError> {
         let tasks = GuestKernel::new(program)?;
         let memory = GuestMemory::from_image(
             tasks
@@ -1363,9 +1388,15 @@ impl RuntimeSubsystems {
         )?;
         Ok(Self {
             tasks,
-            memory,
+            files: RuntimeFileSystem::new(vfs, memory),
             futex_waiters: BTreeMap::new(),
         })
+    }
+
+    fn default_vfs() -> VirtualFileSystem {
+        // Runtime::new has no rootfs argument yet. Keep the placeholder explicit and route
+        // future rootfs-aware callers through Runtime::with_vfs after loading their VFS.
+        VirtualFileSystem::new("/")
     }
 
     #[must_use]
@@ -1379,13 +1410,13 @@ impl RuntimeSubsystems {
     }
 
     #[must_use]
-    pub const fn memory(&self) -> &GuestMemory {
-        &self.memory
+    pub fn memory(&self) -> &GuestMemory {
+        self.files.memory()
     }
 
     #[must_use]
-    pub const fn memory_mut(&mut self) -> &mut GuestMemory {
-        &mut self.memory
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        self.files.memory_mut()
     }
 
     #[must_use]
@@ -1398,14 +1429,22 @@ impl RuntimeSubsystems {
     }
 }
 
-impl FileSyscalls for RuntimeSubsystems {}
+impl FileSyscalls for RuntimeSubsystems {
+    fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        self.files.dispatch_file(request)
+    }
+}
 impl MemorySyscalls for RuntimeSubsystems {
     fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
-        self.memory.dispatch_memory(request)
+        self.files.memory_mut().dispatch_memory(request)
     }
 }
 impl TimeSyscalls for RuntimeSubsystems {}
-impl NetworkSyscalls for RuntimeSubsystems {}
+impl NetworkSyscalls for RuntimeSubsystems {
+    fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        self.files.dispatch_network(request)
+    }
+}
 impl EventSyscalls for RuntimeSubsystems {}
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
@@ -1448,7 +1487,7 @@ impl RuntimeSubsystems {
     }
 
     fn futex_wait(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
-        let value = read_guest_u32(&self.memory, args.uaddr)?;
+        let value = read_guest_u32(self.files.memory(), args.uaddr)?;
         if value != args.val {
             return Err(LinuxErrno::EAGAIN);
         }
@@ -1831,6 +1870,226 @@ mod tests {
         ));
 
         assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ETIMEDOUT));
+    }
+
+    #[test]
+    fn runtime_dispatch_routes_socket_control_syscalls_through_vfs() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let socket = runtime.dispatch_syscall(context(
+            Syscall::Socket,
+            [
+                u64::from(LINUX_AF_INET),
+                u64::from(LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK),
+                u64::from(LINUX_IPPROTO_TCP),
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(socket.result, SyscallReturn::Success(3));
+
+        let fcntl_fd =
+            runtime.dispatch_syscall(context(Syscall::Fcntl, [3, u64::from(F_GETFD), 0, 0, 0, 0]));
+        assert_eq!(
+            fcntl_fd.result,
+            SyscallReturn::Success(u64::from(mcr_vfs::FD_CLOEXEC))
+        );
+
+        let fcntl_fl =
+            runtime.dispatch_syscall(context(Syscall::Fcntl, [3, u64::from(F_GETFL), 0, 0, 0, 0]));
+        assert_eq!(
+            fcntl_fl.result,
+            SyscallReturn::Success(u64::from(O_RDWR | O_NONBLOCK))
+        );
+
+        let fstat = runtime.dispatch_syscall(context(Syscall::Fstat, [3, 0x402000, 0, 0, 0, 0]));
+        assert_eq!(fstat.result, SyscallReturn::Success(0));
+        let mut mode = [0; 4];
+        runtime.memory().read(0x402000 + 24, &mut mode).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(mode) & mcr_vfs::S_IFMT,
+            mcr_vfs::S_IFSOCK
+        );
+    }
+
+    #[test]
+    fn runtime_dispatch_routes_socket_address_and_option_controls() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Bind,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Listen, [3, 16, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Accept4, [3, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Accept, [3, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        );
+
+        runtime
+            .memory_mut()
+            .write(0x402100, &(SOCKADDR_IN_LEN as u32).to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getsockname,
+                    [3, 0x402200, 0x402100, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let mut len = [0; 4];
+        runtime.memory().read(0x402100, &mut len).unwrap();
+        assert_eq!(u32::from_le_bytes(len), SOCKADDR_IN_LEN as u32);
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ]
+                ))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        runtime
+            .memory_mut()
+            .write(0x402300, &ipv4_sockaddr(443))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [4, 0x402300, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        runtime
+            .memory_mut()
+            .write(0x402400, &(SOCKADDR_IN_LEN as u32).to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getpeername,
+                    [4, 0x402500, 0x402400, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Shutdown,
+                    [4, u64::from(LINUX_SHUT_RDWR), 0, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        runtime
+            .memory_mut()
+            .write(0x402600, &1u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Setsockopt,
+                    [
+                        4,
+                        u64::from(LINUX_SOL_SOCKET),
+                        u64::from(LINUX_SO_REUSEADDR),
+                        0x402600,
+                        4,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        runtime
+            .memory_mut()
+            .write(0x402800, &4u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getsockopt,
+                    [
+                        4,
+                        u64::from(LINUX_SOL_SOCKET),
+                        u64::from(LINUX_SO_REUSEADDR),
+                        0x402700,
+                        0x402800,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let mut opt = [0; 4];
+        runtime.memory().read(0x402700, &mut opt).unwrap();
+        assert_eq!(u32::from_le_bytes(opt), 1);
+    }
+
+    #[test]
+    fn runtime_dispatch_keeps_unsupported_network_io_unsupported() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sendto, [0; 6]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+        );
     }
 
     #[test]
