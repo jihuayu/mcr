@@ -1,3 +1,36 @@
+//! Windows host adapters for MCR.
+//!
+//! This crate exposes narrow host capabilities only. Linux ABI policy and errno
+//! conversion live in the owning runtime, VFS, task, syscall, and networking
+//! layers above this crate.
+
+pub mod clocks;
+pub mod error;
+pub mod files;
+pub mod memory;
+pub mod network;
+pub mod random;
+pub mod sync;
+
+#[cfg(windows)]
+mod windows;
+
+pub use clocks::{monotonic_time, sleep_for, system_time};
+pub use error::{HostError, HostErrorCode, HostErrorKind, HostOperation, HostResult};
+pub use files::{
+    FileAccess, FileCreation, FileOptions, FileShare, HostFile, RenameMode, create_hard_link,
+    create_symlink_file, delete_file, rename_file, replace_file,
+};
+pub use memory::{HostMemory, MemoryProtection};
+pub use network::{
+    AddressFamily, HostSocket, NetworkStack, SocketEvents, SocketKind, SocketPoll, SocketProtocol,
+};
+pub use random::fill_random;
+pub use sync::{
+    AddressWaitResult, wait_on_address_u32, wake_by_address_all_u32, wake_by_address_single_u32,
+};
+
+/// Stable crate name used by workspace smoke tests.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 #[cfg(test)]

@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = { level = "allow", priority = 1 }
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
