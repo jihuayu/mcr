@@ -86,6 +86,30 @@ cargo test --workspace
 
 Windows-only integration tasks also run the relevant smoke command through `mcr-testkit`.
 
+## Testkit Fixture Contract
+
+`mcr-testkit` discovers fixture metadata from `tests/fixtures` by default, or
+from `MCR_FIXTURES_DIR` when a local cache is used. The crate owns three fixture
+surfaces:
+
+- `guest-binaries/manifest.mcr` declares Linux x86-64 guest binaries by name,
+  relative path, ABI, format, linkage, milestone stage, and whether the payload
+  is required for the current test.
+- `rootfs/manifest.mcr` declares rootfs names, extracted paths, optional archive
+  paths, architecture, distro/version metadata, source URL, milestone stage, and
+  whether the payload is required.
+- `golden/` stores exact stdout/stderr files for smoke assertions.
+
+Rootfs archives and extracted rootfs directories are fixture payloads, not source
+files. Keep them out of git and materialize them in a local fixture cache before
+running ignored integration smokes. Metadata-only fixtures use `required=false`
+so normal unit tests can validate the contract without downloading large rootfs
+archives.
+
+Smoke tests use `SmokeCommand` plus `GoldenOutput` assertions. A smoke remains
+`#[ignore]` until the owning runtime integration task enables the corresponding
+command from the table below.
+
 Smoke commands become required as soon as their owning task lands:
 
 | Smoke | Introduced by |
