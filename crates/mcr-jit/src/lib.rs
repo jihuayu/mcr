@@ -714,6 +714,74 @@ where
             let value = read_reg32(registers, instruction.op1_register())?;
             write_memory_u32(memory, rip, address, value)?;
         }
+        Code::Mov_r8_rm8 | Code::Mov_rm8_r8
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let value = read_reg8(registers, instruction.op1_register())?;
+            write_reg8(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_r8_rm8
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_memory_u8(memory, rip, address)?;
+            write_reg8(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_rm8_r8
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_reg8(registers, instruction.op1_register())?;
+            write_memory_u8(memory, rip, address, value)?;
+        }
+        Code::Mov_r16_rm16 | Code::Mov_rm16_r16
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let value = read_reg16(registers, instruction.op1_register())?;
+            write_reg16(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_r16_rm16
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_memory_u16(memory, rip, address)?;
+            write_reg16(registers, instruction.op0_register(), value)?;
+        }
+        Code::Mov_rm16_r16
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let value = read_reg16(registers, instruction.op1_register())?;
+            write_memory_u16(memory, rip, address, value)?;
+        }
+        Code::Mov_r8_imm8 if instruction.op0_kind() == OpKind::Register => {
+            write_reg8(
+                registers,
+                instruction.op0_register(),
+                instruction.immediate8(),
+            )?;
+        }
+        Code::Mov_rm8_imm8 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            write_memory_u8(memory, rip, address, instruction.immediate8())?;
+        }
+        Code::Mov_r16_imm16 if instruction.op0_kind() == OpKind::Register => {
+            write_reg16(
+                registers,
+                instruction.op0_register(),
+                instruction.immediate16(),
+            )?;
+        }
+        Code::Mov_rm16_imm16 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            write_memory_u16(memory, rip, address, instruction.immediate16())?;
+        }
         Code::Movzx_r32_rm8 => {
             let value = u32::from(read_operand_u8(registers, memory, &instruction, 1)?);
             write_reg32(registers, instruction.op0_register(), value)?;
@@ -899,6 +967,46 @@ where
                 32,
             );
         }
+        Code::Cmp_rm8_r8 | Code::Cmp_r8_rm8 => {
+            let lhs = read_operand_u8(registers, memory, &instruction, 0)?;
+            let rhs = read_operand_u8(registers, memory, &instruction, 1)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                8,
+            );
+        }
+        Code::Cmp_rm16_r16 | Code::Cmp_r16_rm16 => {
+            let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
+            let rhs = read_operand_u16(registers, memory, &instruction, 1)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                16,
+            );
+        }
+        Code::Cmp_rm8_imm8 | Code::Cmp_rm8_imm8_82 => {
+            let lhs = read_operand_u8(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u8(&instruction)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                8,
+            );
+        }
+        Code::Cmp_rm16_imm16 | Code::Cmp_rm16_imm8 => {
+            let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u16(&instruction)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                16,
+            );
+        }
         Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32
             if instruction.op1_kind() == OpKind::Register
                 && instruction.op0_register() == instruction.op1_register() =>
@@ -921,6 +1029,26 @@ where
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = read_reg64(registers, instruction.op1_register())?;
             flags.set_logic_result(lhs & rhs, 64);
+        }
+        Code::Test_rm8_r8 => {
+            let lhs = read_operand_u8(registers, memory, &instruction, 0)?;
+            let rhs = read_operand_u8(registers, memory, &instruction, 1)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 8);
+        }
+        Code::Test_rm16_r16 => {
+            let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
+            let rhs = read_operand_u16(registers, memory, &instruction, 1)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 16);
+        }
+        Code::Test_rm8_imm8 | Code::Test_rm8_imm8_F6r1 => {
+            let lhs = read_operand_u8(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u8(&instruction)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 8);
+        }
+        Code::Test_rm16_imm16 | Code::Test_rm16_imm16_F7r1 => {
+            let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
+            let rhs = immediate_as_u16(&instruction)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 16);
         }
         Code::Nopd | Code::Nopq => {}
         _ => {
@@ -1158,6 +1286,29 @@ fn immediate_as_u32(instruction: &Instruction) -> Result<u32, ExecutionError> {
     }
 }
 
+fn immediate_as_u16(instruction: &Instruction) -> Result<u16, ExecutionError> {
+    match instruction.op1_kind() {
+        OpKind::Immediate8to16 => Ok(instruction.immediate8to16() as u16),
+        OpKind::Immediate16 => Ok(instruction.immediate16()),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn immediate_as_u8(instruction: &Instruction) -> Result<u8, ExecutionError> {
+    match instruction.op1_kind() {
+        OpKind::Immediate8 => Ok(instruction.immediate8()),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
 fn effective_address(
     registers: &GuestRegisters,
     instruction: &Instruction,
@@ -1280,6 +1431,30 @@ where
             error,
         })?;
     Ok(u16::from_le_bytes(bytes))
+}
+
+fn write_memory_u8<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    value: u8,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    write_memory_bytes(memory, rip, address, &[value])
+}
+
+fn write_memory_u16<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    value: u16,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    write_memory_bytes(memory, rip, address, &value.to_le_bytes())
 }
 
 fn read_memory_u32<M>(memory: &mut M, rip: u64, address: u64) -> Result<u32, ExecutionError>
@@ -1467,6 +1642,74 @@ fn read_reg32(registers: &GuestRegisters, register: Register) -> Result<u32, Exe
         }
     };
     Ok(value as u32)
+}
+
+fn write_reg8(
+    registers: &mut GuestRegisters,
+    register: Register,
+    value: u8,
+) -> Result<(), ExecutionError> {
+    let value = u64::from(value);
+    match register {
+        Register::AL => registers.rax = (registers.rax & !0xff) | value,
+        Register::CL => registers.rcx = (registers.rcx & !0xff) | value,
+        Register::DL => registers.rdx = (registers.rdx & !0xff) | value,
+        Register::BL => registers.rbx = (registers.rbx & !0xff) | value,
+        Register::AH => registers.rax = (registers.rax & !0xff00) | (value << 8),
+        Register::CH => registers.rcx = (registers.rcx & !0xff00) | (value << 8),
+        Register::DH => registers.rdx = (registers.rdx & !0xff00) | (value << 8),
+        Register::BH => registers.rbx = (registers.rbx & !0xff00) | (value << 8),
+        Register::SPL => registers.rsp = (registers.rsp & !0xff) | value,
+        Register::BPL => registers.rbp = (registers.rbp & !0xff) | value,
+        Register::SIL => registers.rsi = (registers.rsi & !0xff) | value,
+        Register::DIL => registers.rdi = (registers.rdi & !0xff) | value,
+        Register::R8L => registers.r8 = (registers.r8 & !0xff) | value,
+        Register::R9L => registers.r9 = (registers.r9 & !0xff) | value,
+        Register::R10L => registers.r10 = (registers.r10 & !0xff) | value,
+        Register::R11L => registers.r11 = (registers.r11 & !0xff) | value,
+        Register::R12L => registers.r12 = (registers.r12 & !0xff) | value,
+        Register::R13L => registers.r13 = (registers.r13 & !0xff) | value,
+        Register::R14L => registers.r14 = (registers.r14 & !0xff) | value,
+        Register::R15L => registers.r15 = (registers.r15 & !0xff) | value,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_reg16(
+    registers: &mut GuestRegisters,
+    register: Register,
+    value: u16,
+) -> Result<(), ExecutionError> {
+    let value = u64::from(value);
+    match register {
+        Register::AX => registers.rax = (registers.rax & !0xffff) | value,
+        Register::BX => registers.rbx = (registers.rbx & !0xffff) | value,
+        Register::CX => registers.rcx = (registers.rcx & !0xffff) | value,
+        Register::DX => registers.rdx = (registers.rdx & !0xffff) | value,
+        Register::SI => registers.rsi = (registers.rsi & !0xffff) | value,
+        Register::DI => registers.rdi = (registers.rdi & !0xffff) | value,
+        Register::BP => registers.rbp = (registers.rbp & !0xffff) | value,
+        Register::SP => registers.rsp = (registers.rsp & !0xffff) | value,
+        Register::R8W => registers.r8 = (registers.r8 & !0xffff) | value,
+        Register::R9W => registers.r9 = (registers.r9 & !0xffff) | value,
+        Register::R10W => registers.r10 = (registers.r10 & !0xffff) | value,
+        Register::R11W => registers.r11 = (registers.r11 & !0xffff) | value,
+        Register::R12W => registers.r12 = (registers.r12 & !0xffff) | value,
+        Register::R13W => registers.r13 = (registers.r13 & !0xffff) | value,
+        Register::R14W => registers.r14 = (registers.r14 & !0xffff) | value,
+        Register::R15W => registers.r15 = (registers.r15 & !0xffff) | value,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid { rip: registers.rip },
+            });
+        }
+    }
+    Ok(())
 }
 
 fn write_reg32(
@@ -2093,6 +2336,74 @@ mod tests {
         assert_eq!(trap.registers().rdx, 0xffff_ffff_ffff_8000);
         assert_eq!(trap.registers().rsi, 0xffff_ffff_ffff_ffff);
         assert_eq!(trap.site().rip, 0x4611d1);
+    }
+
+    #[test]
+    fn execution_core_executes_narrow_mov_memory_and_register_operands() {
+        let block = GuestBlock::new(
+            &[
+                0xc6, 0x03, 0x41, // mov byte ptr [rbx],0x41
+                0x66, 0xc7, 0x43, 0x01, 0x80, 0x7f, // mov word ptr [rbx+1],0x7f80
+                0x8a, 0x03, // mov al,byte ptr [rbx]
+                0x66, 0x8b, 0x4b, 0x01, // mov cx,word ptr [rbx+1]
+                0x88, 0x4b, 0x03, // mov byte ptr [rbx+3],cl
+                0x66, 0x89, 0x43, 0x04, // mov word ptr [rbx+4],ax
+                0x0f, 0x05, // syscall
+            ],
+            0x4611e0,
+        );
+        let registers = GuestRegisters {
+            rax: 0xffff_ffff_ffff_0000,
+            rbx: 0x711800,
+            rcx: 0xffff_ffff_ffff_0000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x711800, &[0; 8]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute narrow mov operands before syscall");
+
+        assert_eq!(trap.registers().rax, 0xffff_ffff_ffff_0041);
+        assert_eq!(trap.registers().rcx, 0xffff_ffff_ffff_7f80);
+        assert_eq!(
+            memory.read::<8>(0x711800),
+            [0x41, 0x80, 0x7f, 0x80, 0x41, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(trap.site().rip, 0x4611f6);
+    }
+
+    #[test]
+    fn execution_core_branches_on_narrow_memory_cmp_and_test() {
+        let block = GuestBlock::new(
+            &[
+                0x80, 0x3b, 0x41, // cmp byte ptr [rbx],0x41
+                0x75, 0x15, // jne exit
+                0xf6, 0x43, 0x01, 0x80, // test byte ptr [rbx+1],0x80
+                0x74, 0x0f, // je exit
+                0x66, 0x81, 0x7b, 0x01, 0x80, 0x7f, // cmp word ptr [rbx+1],0x7f80
+                0x75, 0x07, // jne exit
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,60
+                0x0f, 0x05, // syscall
+            ],
+            0x461220,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x712000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x712000, &[0x41, 0x80, 0x7f]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute narrow cmp/test branches before syscall");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x461238);
     }
 
     #[test]
