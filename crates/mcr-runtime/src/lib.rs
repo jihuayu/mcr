@@ -12,10 +12,11 @@ use mcr_elf::{
 };
 use mcr_jit::GuestRegisters;
 use mcr_sys::{
-    EventSyscalls, FileSyscalls, GuestContext, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
-    LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, SyscallDispatchResult,
-    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
-    SyscallTracer, TimeSyscalls,
+    Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls, FcntlSyscallArgs,
+    FileSyscalls, GuestContext, IoctlSyscallArgs, LinuxErrno, LinuxIovec, LinuxStat, LinuxStatx,
+    LinuxStatxTimestamp, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
+    PipeSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
+    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls,
 };
 use mcr_task::{GuestExecutable, GuestKernel, GuestProgram, TaskError};
 use mcr_vfs::{
@@ -384,6 +385,13 @@ where
             mcr_sys::Syscall::Readlink => self.sys_readlink(request),
             mcr_sys::Syscall::Readlinkat => self.sys_readlinkat(request),
             mcr_sys::Syscall::Getdents64 => self.sys_getdents64(request),
+            mcr_sys::Syscall::Pipe => self.sys_pipe(request),
+            mcr_sys::Syscall::Pipe2 => self.sys_pipe2(request),
+            mcr_sys::Syscall::Dup => self.sys_dup(request),
+            mcr_sys::Syscall::Dup2 => self.sys_dup2(request),
+            mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
+            mcr_sys::Syscall::Fcntl => self.sys_fcntl(request),
+            mcr_sys::Syscall::Ioctl => self.sys_ioctl(request),
             mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
             mcr_sys::Syscall::Unlinkat => self.sys_unlinkat(request),
             mcr_sys::Syscall::Renameat2 => self.sys_renameat2(request),
@@ -572,6 +580,69 @@ where
             .write_bytes(arg(request, 1), &encoded)
             .map_err(memory_errno)?;
         Ok(encoded.len() as u64)
+    }
+
+    fn sys_pipe(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = PipeSyscallArgs::new(arg(request, 0));
+        self.create_pipe(args.pipefd, OpenFlags::new(0))
+    }
+
+    fn sys_pipe2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = Pipe2SyscallArgs::new(arg(request, 0), arg_u32(request, 1));
+        self.create_pipe(args.pipefd, OpenFlags::new(args.flags))
+    }
+
+    fn create_pipe(&mut self, pipefd_addr: u64, flags: OpenFlags) -> Result<u64, LinuxErrno> {
+        let [read_fd, write_fd] = self.vfs.pipe(flags).map_err(vfs_errno)?;
+        self.memory
+            .write_bytes(pipefd_addr, &read_fd.to_le_bytes())
+            .map_err(memory_errno)?;
+        self.memory
+            .write_bytes(pipefd_addr + 4, &write_fd.to_le_bytes())
+            .map_err(memory_errno)?;
+        Ok(0)
+    }
+
+    fn sys_dup(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = DupSyscallArgs::new(arg_i32(request, 0));
+        Ok(self.vfs.dup(args.oldfd).map_err(vfs_errno)? as u64)
+    }
+
+    fn sys_dup2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = Dup2SyscallArgs::new(arg_i32(request, 0), arg_i32(request, 1));
+        Ok(self.vfs.dup2(args.oldfd, args.newfd).map_err(vfs_errno)? as u64)
+    }
+
+    fn sys_dup3(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = Dup3SyscallArgs::new(
+            arg_i32(request, 0),
+            arg_i32(request, 1),
+            arg_u32(request, 2),
+        );
+        Ok(self
+            .vfs
+            .dup3(args.oldfd, args.newfd, OpenFlags::new(args.flags))
+            .map_err(vfs_errno)? as u64)
+    }
+
+    fn sys_fcntl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = FcntlSyscallArgs::new(arg_i32(request, 0), arg_u32(request, 1), arg(request, 2));
+        self.vfs
+            .fcntl(args.fd, args.cmd, args.arg)
+            .map_err(vfs_errno)
+    }
+
+    fn sys_ioctl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let args = IoctlSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg(request, 2));
+        match self.vfs.ioctl(args.fd, args.request).map_err(vfs_errno)? {
+            mcr_vfs::IoctlReply::None => Ok(0),
+            mcr_vfs::IoctlReply::U32(value) => {
+                self.memory
+                    .write_bytes(args.argp, &value.to_le_bytes())
+                    .map_err(memory_errno)?;
+                Ok(0)
+            }
+        }
     }
 
     fn sys_mkdirat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1045,8 +1116,9 @@ mod tests {
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
     use mcr_vfs::{
-        AT_FDCWD, FdTable, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_WRONLY, PathTree,
-        RENAME_NOREPLACE, Rootfs, VirtualFileSystem,
+        AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
+        O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PathTree, RENAME_NOREPLACE, Rootfs,
+        TIOCGWINSZ, VirtualFileSystem,
     };
 
     use super::*;
@@ -1331,6 +1403,125 @@ mod tests {
     }
 
     #[test]
+    fn fd_management_syscalls_wire_to_vfs_and_guest_memory() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Dup, [3, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Dup2, [3, 7, 0, 0, 0, 0]),
+            SyscallReturn::Success(7)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Dup3,
+                [3, 8, u64::from(O_CLOEXEC), 0, 0, 0]
+            ),
+            SyscallReturn::Success(8)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [8, u64::from(F_GETFD), 0, 0, 0, 0]
+            ),
+            SyscallReturn::Success(1)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(F_DUPFD_CLOEXEC), 20, 0, 0, 0],
+            ),
+            SyscallReturn::Success(20)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [
+                    4,
+                    u64::from(mcr_vfs::F_SETFL),
+                    u64::from(O_NONBLOCK),
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(F_GETFL), 0, 0, 0, 0]
+            ),
+            SyscallReturn::Success(u64::from(O_RDWR | O_NONBLOCK))
+        );
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Pipe2,
+                [0x2000, u64::from(O_CLOEXEC | O_NONBLOCK), 0, 0, 0, 0]
+            ),
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_at(runtime.memory(), 0x2000);
+        let write_fd = i32_at(runtime.memory(), 0x2004);
+        assert!(runtime.vfs().fds().cloexec(read_fd).unwrap());
+        assert!(runtime.vfs().fds().cloexec(write_fd).unwrap());
+
+        runtime.memory_mut().write(0x2100, b"pipe");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Write,
+                [write_fd as u64, 0x2100, 4, 0, 0, 0]
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Ioctl,
+                [read_fd as u64, FIONREAD, 0x2200, 0, 0, 0]
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u32_at(runtime.memory(), 0x2200), 4);
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Read,
+                [read_fd as u64, 0x2300, 4, 0, 0, 0]
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2300, 4), b"pipe");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Ioctl,
+                [1, TIOCGWINSZ, 0x2400, 0, 0, 0]
+            ),
+            SyscallReturn::Errno(LinuxErrno::ENOTTY)
+        );
+    }
+
+    #[test]
     fn errno_cases_match_linux_shapes() {
         let mut runtime = runtime_with_sample_vfs();
         runtime.memory_mut().write_cstr(0x1000, "/missing");
@@ -1474,6 +1665,14 @@ mod tests {
 
     fn u64_at(memory: &TestMemory, addr: u64) -> u64 {
         u64::from_le_bytes(memory.read(addr, 8).try_into().expect("slice len"))
+    }
+
+    fn u32_at(memory: &TestMemory, addr: u64) -> u32 {
+        u32::from_le_bytes(memory.read(addr, 4).try_into().expect("slice len"))
+    }
+
+    fn i32_at(memory: &TestMemory, addr: u64) -> i32 {
+        i32::from_le_bytes(memory.read(addr, 4).try_into().expect("slice len"))
     }
 
     fn u16_at(memory: &TestMemory, addr: u64) -> u16 {

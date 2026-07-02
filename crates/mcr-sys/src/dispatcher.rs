@@ -749,6 +749,20 @@ mod tests {
             syscall_descriptor(Syscall::EpollWait).map(|descriptor| descriptor.subsystem),
             Some(SyscallSubsystem::Event)
         );
+        for syscall in [
+            Syscall::Pipe,
+            Syscall::Pipe2,
+            Syscall::Dup,
+            Syscall::Dup2,
+            Syscall::Dup3,
+            Syscall::Fcntl,
+            Syscall::Ioctl,
+        ] {
+            assert_eq!(
+                syscall_descriptor(syscall).map(|descriptor| descriptor.subsystem),
+                Some(SyscallSubsystem::File)
+            );
+        }
     }
 
     #[test]
