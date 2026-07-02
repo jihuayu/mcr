@@ -1,7 +1,7 @@
 ---
 id: testkit-002
 scope: testkit
-status: pending
+status: done
 depends-on: [testkit-001]
 ---
 
