@@ -1547,9 +1547,29 @@ where
                 8,
             );
         }
+        Code::Cmp_AL_imm8 => {
+            let lhs = read_reg8(registers, Register::AL)?;
+            let rhs = instruction.immediate8();
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                8,
+            );
+        }
         Code::Cmp_rm16_imm16 | Code::Cmp_rm16_imm8 => {
             let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
             let rhs = immediate_as_u16(&instruction)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                16,
+            );
+        }
+        Code::Cmp_AX_imm16 => {
+            let lhs = read_reg16(registers, Register::AX)?;
+            let rhs = instruction.immediate16();
             flags.set_sub_result(
                 u64::from(lhs),
                 u64::from(rhs),
@@ -4497,6 +4517,34 @@ mod tests {
 
         assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
         assert_eq!(trap.site().rip, 0x47009e);
+    }
+
+    #[test]
+    fn execution_core_uses_narrow_accumulator_cmp_immediate_for_branch() {
+        let block = GuestBlock::new(
+            &[
+                0xb0, 0x6c, // mov al,0x6c
+                0x3c, 0x6c, // cmp al,0x6c
+                0x74, 0x07, // je success
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x4700a0,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute cmp al immediate before branch");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x4700b2);
     }
 
     #[test]
