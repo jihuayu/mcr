@@ -849,6 +849,11 @@ where
             registers.rsp = registers.rsp.wrapping_sub(8);
             write_memory_u64(memory, rip, registers.rsp, value)?;
         }
+        Code::Pushq_imm32 | Code::Pushq_imm8 => {
+            let value = immediate_operand_as_u64(&instruction, 0)?;
+            registers.rsp = registers.rsp.wrapping_sub(8);
+            write_memory_u64(memory, rip, registers.rsp, value)?;
+        }
         Code::Pop_r64 if instruction.op0_kind() == OpKind::Register => {
             let value = read_memory_u64(memory, rip, registers.rsp)?;
             registers.rsp = registers.rsp.wrapping_add(8);
@@ -1366,6 +1371,22 @@ fn immediate_as_u16(instruction: &Instruction) -> Result<u16, ExecutionError> {
 fn immediate_as_u8(instruction: &Instruction) -> Result<u8, ExecutionError> {
     match instruction.op1_kind() {
         OpKind::Immediate8 => Ok(instruction.immediate8()),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn immediate_operand_as_u64(
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u64, ExecutionError> {
+    match instruction.op_kind(operand) {
+        OpKind::Immediate8to64 => Ok(instruction.immediate8to64() as u64),
+        OpKind::Immediate32to64 => Ok(instruction.immediate32to64() as u64),
+        OpKind::Immediate64 => Ok(instruction.immediate64()),
         _ => Err(ExecutionError::MissingSyscall {
             terminator: BlockTerminator::Invalid {
                 rip: instruction.ip(),
@@ -2818,6 +2839,35 @@ mod tests {
         assert_eq!(trap.registers().rax, 0x8877_6655_4433_2211);
         assert_eq!(trap.registers().rsp, 0x730008);
         assert_eq!(memory.read_u64(0x730000), 0x8877_6655_4433_2211);
+    }
+
+    #[test]
+    fn execution_core_pushes_sign_extended_immediate_values() {
+        let block = GuestBlock::new(
+            &[
+                0x68, 0x78, 0x56, 0x34, 0x12, // push 0x12345678
+                0x6a, 0xff, // push -1
+                0x5f, // pop rdi
+                0x5e, // pop rsi
+                0x0f, 0x05, // syscall
+            ],
+            0x461420,
+        );
+        let registers = GuestRegisters {
+            rsp: 0x724010,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x724000, &[0; 16]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("push immediate values before syscall");
+
+        assert_eq!(trap.registers().rdi, u64::MAX);
+        assert_eq!(trap.registers().rsi, 0x1234_5678);
+        assert_eq!(trap.registers().rsp, 0x724010);
+        assert_eq!(trap.site().rip, 0x461429);
     }
 
     #[test]
