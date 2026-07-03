@@ -571,7 +571,7 @@ impl SameIsaExecutionCore {
     where
         M: GuestMemoryOperandAccess,
     {
-        const MAX_CONTROL_FLOW_STEPS: usize = 32;
+        const MAX_CONTROL_FLOW_STEPS: usize = 256;
 
         let mut registers = registers;
         let mut current_rip = block.rip();
@@ -3286,5 +3286,30 @@ mod tests {
             error.to_string(),
             "guest block terminated with x86 exception before syscall at guest rip 0x0000000000402100 (UD2 or another exception terminator)"
         );
+    }
+
+    #[test]
+    fn execution_core_allows_long_linearized_control_flow_to_syscall() {
+        let mut bytes = Vec::new();
+        for _ in 0..40 {
+            bytes.extend_from_slice(&[
+                0x39, 0xc0, // cmp eax,eax
+                0x75, 0x00, // jne next
+            ]);
+        }
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+        let block = GuestBlock::new(&bytes, 0x481000);
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap(block, registers)
+            .expect("execute realistic libc startup control-flow run before syscall");
+
+        assert_eq!(trap.registers().rax, 0);
+        assert_eq!(trap.site().rip, 0x4810a0);
     }
 }
