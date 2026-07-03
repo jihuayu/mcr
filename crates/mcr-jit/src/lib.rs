@@ -1276,6 +1276,30 @@ where
             write_reg8(registers, Register::AL, quotient as u8)?;
             write_reg8(registers, Register::AH, remainder as u8)?;
         }
+        Code::Neg_rm64 => {
+            let lhs = read_operand_u64(registers, memory, &instruction, 0)?;
+            let result = 0_u64.wrapping_sub(lhs);
+            write_operand_u64(registers, memory, &instruction, 0, result)?;
+            flags.set_sub_result(0, lhs, result, 64);
+        }
+        Code::Neg_rm32 => {
+            let lhs = read_operand_u32(registers, memory, &instruction, 0)?;
+            let result = 0_u32.wrapping_sub(lhs);
+            write_operand_u32(registers, memory, &instruction, 0, result)?;
+            flags.set_sub_result(0, u64::from(lhs), u64::from(result), 32);
+        }
+        Code::Neg_rm16 => {
+            let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
+            let result = 0_u16.wrapping_sub(lhs);
+            write_operand_u16(registers, memory, &instruction, 0, result)?;
+            flags.set_sub_result(0, u64::from(lhs), u64::from(result), 16);
+        }
+        Code::Neg_rm8 => {
+            let lhs = read_operand_u8(registers, memory, &instruction, 0)?;
+            let result = 0_u8.wrapping_sub(lhs);
+            write_operand_u8(registers, memory, &instruction, 0, result)?;
+            flags.set_sub_result(0, u64::from(lhs), u64::from(result), 8);
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -3409,6 +3433,33 @@ mod tests {
         assert_eq!(trap.registers().rcx, 14);
         assert_eq!(u32::from_le_bytes(memory.read(0x713810)), 6);
         assert_eq!(trap.site().rip, 0x46916a);
+    }
+
+    #[test]
+    fn execution_core_negates_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x49, 0xf7, 0xdc, // neg r12
+                0xf7, 0x5b, 0x08, // neg dword ptr [rbx+8]
+                0x0f, 0x05, // syscall
+            ],
+            0x469170,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x713c00,
+            r12: 8,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x713c08, &3_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute neg operands before syscall");
+
+        assert_eq!(trap.registers().r12, u64::MAX - 7);
+        assert_eq!(u32::from_le_bytes(memory.read(0x713c08)), u32::MAX - 2);
+        assert_eq!(trap.site().rip, 0x469176);
     }
 
     #[test]
