@@ -319,7 +319,7 @@ fn write_guest_run_diagnostics(
                 vma.start(),
                 vma.end(),
                 format_diagnostic_permissions(vma.permissions()),
-                format_diagnostic_memory_vma_kind(vma.kind())
+                format_diagnostic_memory_vma_kind(vma.kind(), diagnostics)
             )?;
         } else if let Some(vma) = diagnostics
             .vmas()
@@ -390,12 +390,19 @@ fn format_diagnostic_vma_kind(kind: &crate::DiagnosticVmaKind) -> String {
     }
 }
 
-fn format_diagnostic_memory_vma_kind(kind: crate::DiagnosticMemoryVmaKind) -> String {
+fn format_diagnostic_memory_vma_kind(
+    kind: crate::DiagnosticMemoryVmaKind,
+    diagnostics: &RuntimeDiagnostics,
+) -> String {
     match kind {
         crate::DiagnosticMemoryVmaKind::Anonymous => "anonymous".to_owned(),
         crate::DiagnosticMemoryVmaKind::Heap => "heap".to_owned(),
         crate::DiagnosticMemoryVmaKind::FileBacked { fd, offset, shared } => {
-            format!("file_backed(fd={fd}, offset=0x{offset:x}, shared={shared})")
+            let path = diagnostics
+                .fd_path(fd)
+                .map(bytes_lossy)
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            format!("file_backed(fd={fd}, path={path}, offset=0x{offset:x}, shared={shared})")
         }
     }
 }

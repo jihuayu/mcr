@@ -288,6 +288,7 @@ pub struct RuntimeDiagnostics {
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
     memory_vmas: Vec<DiagnosticMemoryVma>,
+    fd_paths: Vec<DiagnosticFdPath>,
     tasks: Vec<DiagnosticTask>,
     last_syscall: Option<DiagnosticSyscall>,
 }
@@ -302,6 +303,16 @@ impl RuntimeDiagnostics {
     pub fn capture_with_memory(
         kernel: &GuestKernel,
         memory: Option<&GuestMemory>,
+        events: &[SyscallTraceEvent],
+    ) -> Self {
+        Self::capture_with_memory_and_fds(kernel, memory, None, events)
+    }
+
+    #[must_use]
+    pub fn capture_with_memory_and_fds(
+        kernel: &GuestKernel,
+        memory: Option<&GuestMemory>,
+        fds: Option<&mcr_vfs::FdTable>,
         events: &[SyscallTraceEvent],
     ) -> Self {
         let process = kernel
@@ -324,6 +335,13 @@ impl RuntimeDiagnostics {
                     memory
                         .vmas()
                         .map(DiagnosticMemoryVma::from_guest_vma)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            fd_paths: fds
+                .map(|fds| {
+                    fds.entries()
+                        .filter_map(DiagnosticFdPath::from_entry)
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -361,6 +379,19 @@ impl RuntimeDiagnostics {
     }
 
     #[must_use]
+    pub fn fd_paths(&self) -> &[DiagnosticFdPath] {
+        &self.fd_paths
+    }
+
+    #[must_use]
+    pub fn fd_path(&self, fd: i32) -> Option<&[u8]> {
+        self.fd_paths
+            .iter()
+            .find(|entry| entry.fd() == fd)
+            .map(DiagnosticFdPath::path)
+    }
+
+    #[must_use]
     pub fn tasks(&self) -> &[DiagnosticTask] {
         &self.tasks
     }
@@ -376,6 +407,32 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticFdPath {
+    fd: i32,
+    path: Vec<u8>,
+}
+
+impl DiagnosticFdPath {
+    #[must_use]
+    pub fn from_entry((fd, entry): (i32, &mcr_vfs::FdEntry)) -> Option<Self> {
+        Some(Self {
+            fd,
+            path: entry.path()?.to_string().into_bytes(),
+        })
+    }
+
+    #[must_use]
+    pub const fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &[u8] {
+        &self.path
     }
 }
 
@@ -740,9 +797,10 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
 
     #[must_use]
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        RuntimeDiagnostics::capture_with_memory(
+        RuntimeDiagnostics::capture_with_memory_and_fds(
             self.kernel(),
             Some(self.memory()),
+            Some(self.vfs().fds()),
             self.tracer().events(),
         )
     }
@@ -4725,8 +4783,12 @@ mod tests {
 
     #[test]
     fn runtime_file_backed_mmap_populates_private_mapping_from_vfs_fd() {
-        let mut runtime =
-            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        let mut runtime = Runtime::with_tracer_and_vfs(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            RuntimeDiagnosticsTracer::new(),
+        )
+        .unwrap();
         runtime
             .memory_mut()
             .write(0x402000, b"/tmp/file\0")
@@ -4764,6 +4826,19 @@ mod tests {
         runtime.memory().read(0x7000_0000, &mut bytes).unwrap();
         assert_eq!(&bytes[..5], b"hello");
         assert_eq!(&bytes[5..], &[0, 0, 0]);
+        let diagnostics = runtime.diagnostics();
+        assert_eq!(diagnostics.fd_path(3), Some(b"/tmp/file".as_slice()));
+        assert!(diagnostics.memory_vmas().iter().any(|vma| {
+            vma.start() == 0x7000_0000
+                && matches!(
+                    vma.kind(),
+                    DiagnosticMemoryVmaKind::FileBacked {
+                        fd: 3,
+                        offset: 0,
+                        shared: false
+                    }
+                )
+        }));
         assert_eq!(runtime.vfs().fds().get(3).unwrap().offset(), 2);
         assert_eq!(
             runtime.memory_mut().write(0x7000_0000, b"x"),
