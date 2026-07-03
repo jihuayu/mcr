@@ -40,7 +40,7 @@ use mcr_sys::{
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
-    INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
+    INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState, TlsState,
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
@@ -2282,6 +2282,7 @@ where
         .ok_or(GuestExecutionError::MissingTask(tid))?;
     let pid = task.pid();
     let gpr = task.regs();
+    let tls = task.tls();
     if !matches!(task.state(), TaskState::Runnable) {
         return Err(GuestExecutionError::TaskExited {
             tid,
@@ -2304,7 +2305,7 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, block_rip),
-            registers_from_gpr(gpr),
+            registers_from_gpr(gpr, tls),
             memory,
         )?
     };
@@ -2354,7 +2355,7 @@ fn read_guest_executable_window(
     Ok((vma.start(), bytes))
 }
 
-fn registers_from_gpr(value: GprState) -> GuestRegisters {
+fn registers_from_gpr(value: GprState, tls: TlsState) -> GuestRegisters {
     GuestRegisters {
         rax: value.rax(),
         rbx: value.rbx(),
@@ -2374,6 +2375,8 @@ fn registers_from_gpr(value: GprState) -> GuestRegisters {
         r15: value.r15(),
         rip: value.rip(),
         rflags: value.rflags(),
+        fs_base: tls.fs_base(),
+        gs_base: tls.gs_base(),
     }
 }
 

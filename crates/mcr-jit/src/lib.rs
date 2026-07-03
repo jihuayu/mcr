@@ -233,6 +233,8 @@ pub struct GuestRegisters {
     pub r15: u64,
     pub rip: u64,
     pub rflags: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2123,7 +2125,13 @@ fn effective_address(
             read_reg64(registers, index)?.wrapping_mul(u64::from(instruction.memory_index_scale()))
         }
     };
-    Ok(base
+    let segment_base = match instruction.memory_segment() {
+        Register::FS => registers.fs_base,
+        Register::GS => registers.gs_base,
+        _ => 0,
+    };
+    Ok(segment_base
+        .wrapping_add(base)
         .wrapping_add(index)
         .wrapping_add(instruction.memory_displacement64()))
 }
@@ -2909,6 +2917,8 @@ mod tests {
             r15: 0x1515,
             rip: site.rip,
             rflags: 0x202,
+            fs_base: 0x1616,
+            gs_base: 0x1717,
         };
         let original = registers;
         let mut captured = None;
@@ -2937,6 +2947,8 @@ mod tests {
         assert_eq!(registers.r13, original.r13);
         assert_eq!(registers.r14, original.r14);
         assert_eq!(registers.r15, original.r15);
+        assert_eq!(registers.fs_base, original.fs_base);
+        assert_eq!(registers.gs_base, original.gs_base);
     }
 
     #[test]
@@ -3526,6 +3538,32 @@ mod tests {
             ]
         );
         assert_eq!(trap.site().rip, 0x469185);
+    }
+
+    #[test]
+    fn execution_core_resolves_fs_segment_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x64, 0x48, 0x8b, 0x14, 0x25, 0x00, 0x00, 0x00,
+                0x00, // mov rdx,qword ptr fs:[0]
+                0x0f, 0x05, // syscall
+            ],
+            0x469188,
+        );
+        let registers = GuestRegisters {
+            fs_base: 0x715000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory =
+            TestGuestMemory::with_bytes(0x715000, &0x8877_6655_4433_2211_u64.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("resolve fs-relative memory load");
+
+        assert_eq!(trap.registers().rdx, 0x8877_6655_4433_2211);
+        assert_eq!(trap.site().rip, 0x469191);
     }
 
     #[test]
