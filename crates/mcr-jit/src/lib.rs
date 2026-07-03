@@ -1353,6 +1353,18 @@ where
             flags.carry = overflow;
             flags.overflow = overflow;
         }
+        Code::Stosq_m64_RAX => {
+            execute_stos(registers, memory, rip, instruction.has_rep_prefix(), 8)?;
+        }
+        Code::Stosd_m32_EAX => {
+            execute_stos(registers, memory, rip, instruction.has_rep_prefix(), 4)?;
+        }
+        Code::Stosw_m16_AX => {
+            execute_stos(registers, memory, rip, instruction.has_rep_prefix(), 2)?;
+        }
+        Code::Stosb_m8_AL => {
+            execute_stos(registers, memory, rip, instruction.has_rep_prefix(), 1)?;
+        }
         Code::Movq_xmm_rm64
             if instruction.op0_register() == Register::XMM0
                 && instruction.op1_kind() == OpKind::Register =>
@@ -2134,6 +2146,36 @@ where
 {
     let value = u8::from(condition_satisfied(instruction.code(), *flags)?);
     write_operand_u8(registers, memory, instruction, 0, value)
+}
+
+fn execute_stos<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    rip: u64,
+    has_rep_prefix: bool,
+    width: usize,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let count = if has_rep_prefix { registers.rcx } else { 1 };
+    let value = registers.rax.to_le_bytes();
+    let bytes = &value[..width];
+    let step = width as u64;
+    let direction_down = registers.rflags & (1 << 10) != 0;
+
+    for _ in 0..count {
+        write_memory_bytes(memory, rip, registers.rdi, bytes)?;
+        registers.rdi = if direction_down {
+            registers.rdi.wrapping_sub(step)
+        } else {
+            registers.rdi.wrapping_add(step)
+        };
+    }
+    if has_rep_prefix {
+        registers.rcx = 0;
+    }
+    Ok(())
 }
 
 fn condition_satisfied(code: Code, flags: GuestFlags) -> Result<bool, ExecutionError> {
@@ -3623,6 +3665,38 @@ mod tests {
         assert_eq!(trap.registers().r9, 42);
         assert_eq!(trap.registers().rdx, 0xffff_fff4);
         assert_eq!(trap.site().rip, 0x469187);
+    }
+
+    #[test]
+    fn execution_core_executes_rep_stosq() {
+        let block = GuestBlock::new(
+            &[
+                0xf3, 0x48, 0xab, // rep stosq qword ptr es:[rdi],rax
+                0x0f, 0x05, // syscall
+            ],
+            0x469190,
+        );
+        let registers = GuestRegisters {
+            rax: 0x1122_3344_5566_7788,
+            rcx: 3,
+            rdi: 0x715800,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x715800, &[0; 24]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute rep stosq before syscall");
+
+        let expected = [
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33,
+            0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        ];
+        assert_eq!(memory.read::<24>(0x715800), expected);
+        assert_eq!(trap.registers().rcx, 0);
+        assert_eq!(trap.registers().rdi, 0x715818);
+        assert_eq!(trap.site().rip, 0x469193);
     }
 
     #[test]
