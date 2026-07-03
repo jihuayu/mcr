@@ -7172,10 +7172,7 @@ mod tests {
                 .result,
             SyscallReturn::Success(0)
         );
-        assert_eq!(
-            u32_from_guest(runtime.memory(), 0x402200),
-            u32::from(LinuxErrno::EINPROGRESS.raw())
-        );
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402200), 0);
 
         write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLOUT);
         let ready = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));

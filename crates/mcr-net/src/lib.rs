@@ -878,19 +878,23 @@ impl GuestSocketTable {
         id: SocketId,
         option: SocketOptionName,
     ) -> Result<u32, SocketError> {
+        if option == SocketOptionName::SocketError
+            && matches!(self.socket(id)?.state, SocketState::Connecting(_))
+            && let Err(error) = self.finish_nonblocking_connect(id)
+        {
+            if let Ok(socket) = self.socket_mut(id) {
+                socket.last_error = None;
+            }
+            return Ok(error.linux_errno().code() as u32);
+        }
+
         let socket = self.socket_mut(id)?;
         let value = match option {
             SocketOptionName::SocketType => socket.socket_type.to_linux(),
-            SocketOptionName::SocketError => {
-                if matches!(socket.state, SocketState::Connecting(_)) {
-                    LinuxErrno::OperationInProgress.code() as u32
-                } else {
-                    socket
-                        .last_error
-                        .take()
-                        .map_or(0, |errno| errno.code() as u32)
-                }
-            }
+            SocketOptionName::SocketError => socket
+                .last_error
+                .take()
+                .map_or(0, |errno| errno.code() as u32),
             SocketOptionName::ReuseAddr => bool_to_socket_option(socket.options.reuse_addr),
             SocketOptionName::KeepAlive => bool_to_socket_option(socket.options.keep_alive),
             SocketOptionName::SendBuffer => socket.options.send_buffer_size,
@@ -2536,13 +2540,6 @@ mod tests {
                 .linux_errno(),
             LinuxErrno::OperationAlreadyInProgress
         );
-        assert_eq!(
-            table
-                .get_option(stream, SocketOptionName::SocketError)
-                .expect("SO_ERROR"),
-            LinuxErrno::OperationInProgress.code() as u32
-        );
-
         let readiness = table
             .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
             .expect("poll writable");
@@ -2559,6 +2556,51 @@ mod tests {
                 .get_option(stream, SocketOptionName::SocketError)
                 .expect("SO_ERROR"),
             0
+        );
+    }
+
+    #[test]
+    fn nonblocking_connect_completes_after_so_error_query() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_connect_error(HostIoError::new(
+                    LinuxErrno::OperationWouldBlock,
+                    "connect would block",
+                ))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("connect should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            0
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected {
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer,
+            }
         );
     }
 
@@ -2607,6 +2649,53 @@ mod tests {
                 .get_option(stream, SocketOptionName::SocketError)
                 .expect("SO_ERROR"),
             LinuxErrno::ConnectionRefused.code() as u32
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR is consumed"),
+            0
+        );
+    }
+
+    #[test]
+    fn nonblocking_connect_failure_is_reported_after_so_error_query() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_pending_connect_error(
+                    HostIoError::new(LinuxErrno::ConnectionRefused, "connection refused"),
+                )),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 9);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("connect should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            LinuxErrno::ConnectionRefused.code() as u32
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Created
         );
         assert_eq!(
             table
