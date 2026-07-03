@@ -881,6 +881,17 @@ where
             write_reg64(registers, instruction.op0_register(), result)?;
             flags.set_add_result(lhs, rhs, result, 64);
         }
+        Code::Add_rm64_r64
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u64(memory, rip, address)?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_add(rhs);
+            write_memory_u64(memory, rip, address, result)?;
+            flags.set_add_result(lhs, rhs, result, 64);
+        }
         Code::Add_rm32_r32 | Code::Add_r32_rm32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -889,6 +900,17 @@ where
             let rhs = read_reg32(registers, instruction.op1_register())?;
             let result = lhs.wrapping_add(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
+            flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
+        }
+        Code::Add_rm32_r32
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u32(memory, rip, address)?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_add(rhs);
+            write_memory_u32(memory, rip, address, result)?;
             flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Add_rm64_imm32 | Code::Add_rm64_imm8
@@ -2627,6 +2649,36 @@ mod tests {
 
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 11);
+    }
+
+    #[test]
+    fn execution_core_adds_registers_into_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x01, 0x13, // add qword ptr [rbx],rdx
+                0x01, 0x4b, 0x08, // add dword ptr [rbx+8],ecx
+                0x0f, 0x05, // syscall
+            ],
+            0x469100,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x712100,
+            rcx: 3,
+            rdx: 5,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory =
+            TestGuestMemory::with_bytes(0x712100, &[7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0]);
+
+        SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute memory add operands before syscall");
+
+        assert_eq!(
+            memory.read::<12>(0x712100),
+            [12, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]
+        );
     }
 
     #[test]
