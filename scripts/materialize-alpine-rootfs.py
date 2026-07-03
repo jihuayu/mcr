@@ -15,9 +15,9 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
-import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -66,6 +66,14 @@ class ApkPackage:
         return f"{self.name}-{self.version}.apk"
 
 
+@dataclass(frozen=True)
+class WorktreeCache:
+    main_repo_root: Path
+    fixtures_dir: Path
+    rootfs_dir: Path
+    archive_path: Path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download and extract the Alpine rootfs fixture for mcr."
@@ -107,16 +115,44 @@ def main() -> int:
         action="store_true",
         help="validate the existing fixture and do not download or extract anything",
     )
+    parser.add_argument(
+        "--no-worktree-cache",
+        action="store_true",
+        help="materialize inside this checkout even when it is a linked git worktree",
+    )
     args = parser.parse_args()
 
     try:
-        repo_root = Path(__file__).resolve().parents[1]
+        script_root = Path(__file__).resolve().parents[1]
+        repo_root = discover_repo_root(script_root)
         fixtures_dir = absolutize(repo_root, args.fixtures_dir)
         record = read_rootfs_record(fixtures_dir, ROOTFS_NAME)
         rootfs_dir = fixtures_dir / record.path
         archive_path = fixtures_dir / record.archive_path
+        cache = None
+        if not args.no_worktree_cache and not args.fixtures_dir.is_absolute():
+            cache = discover_worktree_cache(repo_root, args.fixtures_dir, record)
 
         if args.check_only:
+            validate_rootfs(rootfs_dir, require_network_packages=not args.no_network_packages)
+            print(f"{ROOTFS_NAME} is ready at {rootfs_dir}")
+            return 0
+
+        if cache is not None:
+            ensure_cached_worktree_rootfs(
+                cache=cache,
+                mirror=args.mirror.rstrip("/"),
+                arch=args.arch,
+                force=args.force,
+                package_names=()
+                if args.no_network_packages
+                else package_list(args.packages),
+            )
+            link_worktree_rootfs(
+                rootfs_dir=rootfs_dir,
+                cached_rootfs_dir=cache.rootfs_dir,
+                force=args.force,
+            )
             validate_rootfs(rootfs_dir, require_network_packages=not args.no_network_packages)
             print(f"{ROOTFS_NAME} is ready at {rootfs_dir}")
             return 0
@@ -190,6 +226,138 @@ def materialize_rootfs(
     print(f"Alpine {release.version} ({release.branch}) archive: {archive_path}")
     if package_names:
         print("installed packages: " + ", ".join(package_names))
+
+
+def discover_repo_root(script_root: Path) -> Path:
+    output = git_capture(script_root, "rev-parse", "--show-toplevel")
+    if output is None:
+        return script_root.resolve()
+    return Path(output).resolve()
+
+
+def discover_worktree_cache(
+    repo_root: Path, fixtures_arg: Path, record: RootfsRecord
+) -> WorktreeCache | None:
+    main_repo_root = discover_main_worktree(repo_root)
+    if main_repo_root is None or same_path(main_repo_root, repo_root):
+        return None
+
+    main_fixtures_dir = main_repo_root / fixtures_arg
+    main_record = read_rootfs_record(main_fixtures_dir, record.name)
+    return WorktreeCache(
+        main_repo_root=main_repo_root,
+        fixtures_dir=main_fixtures_dir,
+        rootfs_dir=main_fixtures_dir / main_record.path,
+        archive_path=main_fixtures_dir / main_record.archive_path,
+    )
+
+
+def discover_main_worktree(repo_root: Path) -> Path | None:
+    output = git_capture(repo_root, "worktree", "list", "--porcelain")
+    if output is None:
+        return None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).resolve()
+    return None
+
+
+def git_capture(cwd: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(cwd), *args),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def ensure_cached_worktree_rootfs(
+    *,
+    cache: WorktreeCache,
+    mirror: str,
+    arch: str,
+    force: bool,
+    package_names: tuple[str, ...],
+) -> None:
+    require_network_packages = bool(package_names)
+    if cache.rootfs_dir.exists():
+        try:
+            validate_rootfs(
+                cache.rootfs_dir,
+                require_network_packages=require_network_packages,
+            )
+        except MaterializeError as error:
+            if not force:
+                raise MaterializeError(
+                    f"cached {ROOTFS_NAME} at {cache.rootfs_dir} is invalid: {error}; "
+                    "rerun with --force to rebuild it"
+                ) from error
+        else:
+            print(f"using cached {ROOTFS_NAME} from main worktree {cache.rootfs_dir}")
+            return
+    elif os.path.lexists(cache.rootfs_dir):
+        if not force:
+            raise MaterializeError(
+                f"cached {ROOTFS_NAME} path is a broken symlink: {cache.rootfs_dir}; "
+                "rerun with --force to rebuild it"
+            )
+        cache.rootfs_dir.unlink()
+
+    print(f"materializing cached {ROOTFS_NAME} in main worktree {cache.main_repo_root}")
+    materialize_rootfs(
+        mirror=mirror,
+        arch=arch,
+        fixtures_dir=cache.fixtures_dir,
+        rootfs_dir=cache.rootfs_dir,
+        archive_path=cache.archive_path,
+        force=force,
+        package_names=package_names,
+    )
+
+
+def link_worktree_rootfs(
+    *, rootfs_dir: Path, cached_rootfs_dir: Path, force: bool
+) -> None:
+    rootfs_dir.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(rootfs_dir):
+        if rootfs_dir.is_symlink():
+            if rootfs_dir.exists() and same_path(rootfs_dir.resolve(), cached_rootfs_dir):
+                print(f"{ROOTFS_NAME} already links to {cached_rootfs_dir}")
+                return
+            if not force:
+                raise MaterializeError(
+                    f"{rootfs_dir} is already a symlink; use --force to relink it"
+                )
+            rootfs_dir.unlink()
+        elif rootfs_dir.is_dir():
+            if not force:
+                raise MaterializeError(
+                    f"{rootfs_dir} already exists; use --force to replace it with "
+                    f"a symlink to {cached_rootfs_dir}"
+                )
+            shutil.rmtree(rootfs_dir)
+        else:
+            if not force:
+                raise MaterializeError(
+                    f"{rootfs_dir} already exists; use --force to replace it with "
+                    f"a symlink to {cached_rootfs_dir}"
+                )
+            rootfs_dir.unlink()
+
+    target = os.path.relpath(cached_rootfs_dir, rootfs_dir.parent)
+    os.symlink(target, rootfs_dir, target_is_directory=True)
+    print(f"linked {rootfs_dir} -> {target}")
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return left.resolve() == right.resolve()
 
 
 def package_list(extra_packages: list[str] | None) -> tuple[str, ...]:
