@@ -23,7 +23,7 @@ use mcr_jit::{
 };
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
-    SocketOptionName, SocketSpec,
+    SocketOptionName, SocketProtocol, SocketSpec, SocketType,
 };
 use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
@@ -950,6 +950,17 @@ where
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
+        if let Some(datagram_address) = address {
+            if self.socket_is_udp_datagram(socket_id)? {
+                let buffer = self.read_iovec_bytes(&iovecs)?;
+                let count = self
+                    .sockets
+                    .send_to(socket_id, &buffer, datagram_address)
+                    .map_err(net_errno)?;
+                return Ok(count as u64);
+            }
+        }
+
         let mut total = 0u64;
         for iovec in iovecs {
             let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
@@ -1674,6 +1685,29 @@ where
             });
         }
         Ok(iovecs)
+    }
+
+    fn read_iovec_bytes(&self, iovecs: &[LinuxIovec]) -> Result<Vec<u8>, LinuxErrno> {
+        let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            total.checked_add(len).ok_or(LinuxErrno::EINVAL)
+        })?;
+        let mut buffer = Vec::with_capacity(capacity);
+        for iovec in iovecs {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let start = buffer.len();
+            buffer.resize(start + len, 0);
+            self.memory
+                .read_bytes(iovec.iov_base, &mut buffer[start..])
+                .map_err(memory_errno)?;
+        }
+        Ok(buffer)
+    }
+
+    fn socket_is_udp_datagram(&self, id: SocketId) -> Result<bool, LinuxErrno> {
+        let socket = self.sockets.socket(id).map_err(net_errno)?;
+        Ok(socket.socket_type() == SocketType::Datagram
+            && socket.effective_protocol() == SocketProtocol::Udp)
     }
 
     fn write_stat(&mut self, addr: u64, attr: LinuxFileAttr) -> Result<(), LinuxErrno> {
@@ -6861,6 +6895,7 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(transport.sent_bytes(), b"dns?");
+        assert_eq!(transport.sent_calls(), vec![b"dns?".to_vec()]);
 
         assert_eq!(
             dispatch_network(
@@ -7794,6 +7829,10 @@ mod tests {
             self.state.borrow().sent.clone()
         }
 
+        fn sent_calls(&self) -> Vec<Vec<u8>> {
+            self.state.borrow().sent_calls.clone()
+        }
+
         fn push_incoming(&self, bytes: &[u8]) {
             self.state.borrow_mut().incoming.extend_from_slice(bytes);
         }
@@ -7821,6 +7860,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestSocketState {
         sent: Vec<u8>,
+        sent_calls: Vec<Vec<u8>>,
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
         connect_would_block_once: bool,
@@ -7913,7 +7953,9 @@ mod tests {
         }
 
         fn send(&mut self, buffer: &[u8]) -> Result<usize, mcr_net::HostIoError> {
-            self.state.borrow_mut().sent.extend_from_slice(buffer);
+            let mut state = self.state.borrow_mut();
+            state.sent.extend_from_slice(buffer);
+            state.sent_calls.push(buffer.to_vec());
             Ok(buffer.len())
         }
 
