@@ -4,11 +4,14 @@ use std::fmt;
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};
 use mcr_sys::{
     CloneSyscallArgs, GuestAddress, GuestPid, GuestTid, KillSyscallArgs,
-    LINUX_CLONE_EXIT_SIGNAL_MASK, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_KERNEL_SIGSET_SIZE,
-    LINUX_ROBUST_LIST_HEAD_SIZE, LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK,
-    LINUX_SIGCHLD, LinuxErrno, LinuxUtsname, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs,
-    SetRobustListSyscallArgs, SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest,
-    TaskSyscalls, TgkillSyscallArgs, Wait4SyscallArgs,
+    LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_DETACHED,
+    LINUX_CLONE_EXIT_SIGNAL_MASK, LINUX_CLONE_FILES, LINUX_CLONE_FS, LINUX_CLONE_PARENT_SETTID,
+    LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM, LINUX_CLONE_THREAD,
+    LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_KERNEL_SIGSET_SIZE, LINUX_ROBUST_LIST_HEAD_SIZE,
+    LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK, LINUX_SIGCHLD, LinuxErrno, LinuxUtsname,
+    RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs, SetRobustListSyscallArgs,
+    SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest, TaskSyscalls,
+    TgkillSyscallArgs, Wait4SyscallArgs,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -460,6 +463,10 @@ impl GuestTask {
     #[must_use]
     pub const fn clear_child_tid(&self) -> Option<GuestAddress> {
         self.clear_child_tid
+    }
+
+    pub fn take_clear_child_tid(&mut self) -> Option<GuestAddress> {
+        self.clear_child_tid.take()
     }
 }
 
@@ -1037,6 +1044,9 @@ impl GuestKernel {
         args: CloneSyscallArgs,
         child_regs: GprState,
     ) -> SyscallOutcome {
+        if args.has_clone_thread() {
+            return self.thread_current_with_child_regs(tid, args, child_regs);
+        }
         if !is_supported_fork_like_clone(args.flags) {
             return TaskError::InvalidCloneFlags(args.flags).into_outcome();
         }
@@ -1051,6 +1061,16 @@ impl GuestKernel {
         args: CloneSyscallArgs,
         child_return_rip: GuestAddress,
     ) -> SyscallOutcome {
+        if args.has_clone_thread() {
+            let Some(parent_regs) = self.task(tid).map(|task| task.regs) else {
+                return SyscallOutcome::errno(LinuxErrno::ESRCH);
+            };
+            return self.thread_current_with_child_regs(
+                tid,
+                args,
+                parent_regs.with_syscall_return(child_return_rip, 0),
+            );
+        }
         if !is_supported_fork_like_clone(args.flags) {
             return TaskError::InvalidCloneFlags(args.flags).into_outcome();
         }
@@ -1547,6 +1567,51 @@ impl GuestKernel {
         }
     }
 
+    fn thread_current_with_child_regs(
+        &mut self,
+        tid: GuestTid,
+        args: CloneSyscallArgs,
+        mut child_regs: GprState,
+    ) -> SyscallOutcome {
+        if !is_supported_thread_clone(args.flags) {
+            return TaskError::InvalidCloneFlags(args.flags).into_outcome();
+        }
+
+        let Some(parent_task) = self.task(tid).cloned() else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if !self.processes.contains_key(&parent_task.pid) {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+
+        let child_tid = match self.allocate_tid() {
+            Ok(tid) => tid,
+            Err(error) => return error.into_outcome(),
+        };
+
+        if args.child_stack != 0 {
+            child_regs.rsp = args.child_stack;
+        }
+
+        let mut child_task = parent_task;
+        child_task.tid = child_tid;
+        child_task.regs = child_regs;
+        child_task.state = TaskState::Runnable;
+        child_task.robust_list = None;
+        child_task.clear_child_tid =
+            (args.has_clone_child_cleartid() && args.child_tid != 0).then_some(args.child_tid);
+        if args.has_clone_settls() {
+            child_task.tls.fs_base = args.tls;
+        }
+
+        self.tasks.insert(child_tid, child_task);
+
+        SyscallOutcome::success(u64::from(child_tid))
+            .with_decoded_field("guest_tid", child_tid.to_string())
+            .with_decoded_field("clone_kind", "thread")
+            .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
+    }
+
     fn exited_waitable_child(
         &self,
         parent_pid: GuestPid,
@@ -1785,6 +1850,22 @@ const fn is_supported_fork_like_clone(flags: u64) -> bool {
         && flags & !(LINUX_CLONE_EXIT_SIGNAL_MASK | LINUX_CLONE_VM | LINUX_CLONE_VFORK) == 0
 }
 
+const fn is_supported_thread_clone(flags: u64) -> bool {
+    const REQUIRED: u64 = LINUX_CLONE_VM
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SIGHAND
+        | LINUX_CLONE_THREAD;
+    const OPTIONAL: u64 = LINUX_CLONE_SYSVSEM
+        | LINUX_CLONE_SETTLS
+        | LINUX_CLONE_PARENT_SETTID
+        | LINUX_CLONE_CHILD_CLEARTID
+        | LINUX_CLONE_CHILD_SETTID
+        | LINUX_CLONE_DETACHED;
+    let exit_signal = flags & LINUX_CLONE_EXIT_SIGNAL_MASK;
+    exit_signal == 0 && flags & REQUIRED == REQUIRED && flags & !(REQUIRED | OPTIONAL) == 0
+}
+
 const fn validate_signal(signal: u32) -> Result<(), TaskError> {
     if signal > 0 && signal <= LINUX_SIGNAL_COUNT {
         Ok(())
@@ -1827,7 +1908,11 @@ fn write_uts_field(field: &mut [u8], value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use mcr_sys::{LINUX_WNOHANG, Syscall, SyscallRegisters, SyscallReturn};
+    use mcr_sys::{
+        LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_FILES, LINUX_CLONE_FS, LINUX_CLONE_PARENT_SETTID,
+        LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM, LINUX_CLONE_THREAD,
+        LINUX_CLONE_VM, LINUX_WNOHANG, Syscall, SyscallRegisters, SyscallReturn,
+    };
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
 
     use super::*;
@@ -2094,10 +2179,45 @@ mod tests {
             dispatch_task_syscall(
                 &mut kernel,
                 Syscall::Clone,
-                [LINUX_CLONE_VM | 0x0001_0000, 0, 0, 0, 0, 0],
+                [LINUX_CLONE_VM | LINUX_CLONE_THREAD, 0, 0, 0, 0, 0],
             ),
             SyscallReturn::Errno(LinuxErrno::EINVAL)
         );
+    }
+
+    #[test]
+    fn clone_thread_shape_creates_task_in_current_process() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_SYSVSEM
+            | LINUX_CLONE_SETTLS
+            | LINUX_CLONE_PARENT_SETTID
+            | LINUX_CLONE_CHILD_CLEARTID;
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Clone,
+                [flags, 0x7000_0000, 0x402000, 0x402004, 0x6000_0000, 0],
+            ),
+            SyscallReturn::Success(2)
+        );
+
+        let child = kernel.task(2).unwrap();
+        assert_eq!(child.pid(), INITIAL_GUEST_PID);
+        assert_eq!(child.tid(), 2);
+        assert_eq!(child.regs().rax(), 0);
+        assert_eq!(child.regs().rip(), 0x401236);
+        assert_eq!(child.regs().rsp(), 0x7000_0000);
+        assert_eq!(child.tls().fs_base(), 0x6000_0000);
+        assert_eq!(child.clear_child_tid(), Some(0x402004));
+        assert!(kernel.process(2).is_none());
+        assert_eq!(kernel.next_pid(), 2);
+        assert_eq!(kernel.next_tid(), 3);
     }
 
     #[test]

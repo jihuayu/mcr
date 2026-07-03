@@ -26,24 +26,24 @@ use mcr_net::{
     SocketOptionName, SocketProtocol, SocketSpec, SocketType,
 };
 use mcr_sys::{
-    Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
-    FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext, IoctlSyscallArgs,
-    LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
-    LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT,
-    LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
-    LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
-    LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
-    LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LinuxEpollEvent, LinuxErrno, LinuxIovec,
-    LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec,
-    LinuxUtsname, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
-    PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs,
-    SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult,
-    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
-    SyscallTracer, TimeSyscalls, TraceField,
+    Accept4SyscallArgs, CloneSyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs,
+    EventSyscalls, FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext,
+    IoctlSyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
+    LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
+    LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
+    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC,
+    LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN,
+    LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
+    LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx,
+    LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
+    NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
+    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
+    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
+    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
-    CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
-    INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
+    CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProcess, GuestProgram,
+    GuestTask, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -167,11 +167,7 @@ impl FutexRegistry {
             self.finish_wait(uaddr, &entry);
             return Ok(0);
         }
-        let Some(timeout) = timeout else {
-            self.finish_wait(uaddr, &entry);
-            return Err(LinuxErrno::EAGAIN);
-        };
-        let result = mcr_win::wait_on_address_u32(&entry.value, value, Some(timeout));
+        let result = mcr_win::wait_on_address_u32(&entry.value, value, timeout);
         match result {
             Ok(mcr_win::AddressWaitResult::TimedOut) => {
                 self.finish_wait(uaddr, &entry);
@@ -1938,6 +1934,16 @@ fn arg_u32(request: &SyscallRequest, index: usize) -> u32 {
     arg(request, index) as u32
 }
 
+fn clone_args_from_request(request: &SyscallRequest) -> CloneSyscallArgs {
+    CloneSyscallArgs::new(
+        arg(request, 0),
+        arg(request, 1),
+        arg(request, 2),
+        arg(request, 3),
+        arg(request, 4),
+    )
+}
+
 fn optional_linux_id(value: u32) -> Option<u32> {
     (value != u32::MAX).then_some(value)
 }
@@ -2747,6 +2753,17 @@ where
     dispatch_guest_task_with_dispatcher(dispatcher, INITIAL_GUEST_TID)
 }
 
+fn is_nonreturning_exit_syscall(
+    registers: mcr_sys::SyscallRegisters,
+    result: &SyscallDispatchResult,
+) -> bool {
+    matches!(result.result, SyscallReturn::Success(_))
+        && matches!(
+            registers.syscall(),
+            mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup
+        )
+}
+
 fn dispatch_guest_task_with_dispatcher<T>(
     dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
     tid: mcr_sys::GuestTid,
@@ -2802,6 +2819,25 @@ where
         tid,
         trap.registers().syscall_registers(),
     ));
+    let syscall_registers = trap.registers().syscall_registers();
+    if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
+        let trap_regs = gpr_from_registers(trap.registers());
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        if task.regs() == gpr {
+            task.set_regs(trap_regs);
+        }
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            task.regs().rip(),
+            dispatch_result.encoded_rax,
+            task.state(),
+        ));
+    }
     let mut registers = trap.registers();
     registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
 
@@ -2928,6 +2964,24 @@ where
                 before_rip,
                 blocked_regs.rip(),
                 blocked_regs.rax(),
+                task.state(),
+            ));
+        }
+        if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
+            let trap_regs = gpr_from_registers(registers);
+            let task = dispatcher
+                .subsystems_mut()
+                .tasks
+                .task_mut(tid)
+                .ok_or(GuestExecutionError::MissingTask(tid))?;
+            if task.regs() == gpr {
+                task.set_regs(trap_regs);
+            }
+            return Ok(GuestExecutionStep::new(
+                tid,
+                before_rip,
+                task.regs().rip(),
+                dispatch_result.encoded_rax,
                 task.state(),
             ));
         }
@@ -4199,6 +4253,20 @@ impl RuntimeSubsystems {
         }
     }
 
+    fn clone_native_fp_for_thread(
+        &mut self,
+        parent_tid: mcr_sys::GuestTid,
+        child_tid: mcr_sys::GuestTid,
+    ) {
+        if let Some(state) = self.native_fp.get(&parent_tid).copied() {
+            self.native_fp.insert(child_tid, state);
+        }
+    }
+
+    fn drop_native_fp_for_tid(&mut self, tid: mcr_sys::GuestTid) {
+        self.native_fp.remove(&tid);
+    }
+
     fn drop_native_fp_for_process(&mut self, pid: mcr_sys::GuestPid) {
         let tids = self
             .tasks
@@ -4482,8 +4550,8 @@ impl RuntimeSubsystems {
                 }
             }
             mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup => {
-                self.drop_native_fp_for_process(pid);
-                if let Err(errno) = self.drop_process_resources(pid) {
+                let exit_group = request.syscall == mcr_sys::Syscall::ExitGroup;
+                if let Err(errno) = self.finish_task_exit(pid, request.context.tid, exit_group) {
                     return SyscallOutcome::errno(errno);
                 }
             }
@@ -4501,6 +4569,36 @@ impl RuntimeSubsystems {
             _ => {}
         }
         outcome
+    }
+
+    fn finish_task_exit(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        exit_group: bool,
+    ) -> Result<(), LinuxErrno> {
+        if !exit_group
+            && let Some(clear_child_tid) = self
+                .tasks
+                .task_mut(tid)
+                .and_then(GuestTask::take_clear_child_tid)
+        {
+            write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
+            self.store_selected_process_memory(pid)?;
+            self.futexes.wake(clear_child_tid, u32::MAX);
+        }
+
+        let process_exited = matches!(
+            self.tasks.process(pid).map(GuestProcess::exit_state),
+            Some(ExitState::Exited { .. })
+        );
+        if exit_group || process_exited {
+            self.drop_native_fp_for_process(pid);
+            self.drop_process_resources(pid)
+        } else {
+            self.drop_native_fp_for_tid(tid);
+            Ok(())
+        }
     }
 
     fn resume_waiting_tasks(&mut self) -> Result<Vec<CompletedWait>, LinuxErrno> {
@@ -4574,6 +4672,8 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
+        let clone_args =
+            (request.syscall == mcr_sys::Syscall::Clone).then(|| clone_args_from_request(request));
         let pending_child_regs = self.pending_fork_child_regs.take();
         let outcome = if self.native_execution {
             match pending_child_regs {
@@ -4584,6 +4684,15 @@ impl RuntimeSubsystems {
             self.tasks.dispatch_for_current_task(request)
         };
         if !matches!(outcome.result, SyscallReturn::Success(_)) {
+            return outcome;
+        }
+        if let Some(child_tid) = thread_child_tid(&outcome.decoded) {
+            if let Some(args) = clone_args
+                && let Err(errno) = self.write_clone_tid_pointers(pid, args, child_tid)
+            {
+                return SyscallOutcome::errno(errno);
+            }
+            self.clone_native_fp_for_thread(request.context.tid, child_tid);
             return outcome;
         }
         let Some(child_pid) = fork_child_pid(&outcome.decoded) else {
@@ -4634,6 +4743,27 @@ impl RuntimeSubsystems {
             ),
             _ => SyscallOutcome::unsupported(),
         }
+    }
+
+    fn write_clone_tid_pointers(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        args: CloneSyscallArgs,
+        child_tid: mcr_sys::GuestTid,
+    ) -> Result<(), LinuxErrno> {
+        let mut wrote = false;
+        if args.has_clone_parent_settid() && args.parent_tid != 0 {
+            write_guest_u32(self.files.memory_mut(), args.parent_tid, child_tid)?;
+            wrote = true;
+        }
+        if args.has_clone_child_settid() && args.child_tid != 0 {
+            write_guest_u32(self.files.memory_mut(), args.child_tid, child_tid)?;
+            wrote = true;
+        }
+        if wrote {
+            self.store_selected_process_memory(pid)?;
+        }
+        Ok(())
     }
 
     fn dispatch_execve(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -5641,6 +5771,13 @@ fn fork_child_pid(decoded: &[TraceField]) -> Option<mcr_sys::GuestPid> {
         .and_then(|field| field.value.parse().ok())
 }
 
+fn thread_child_tid(decoded: &[TraceField]) -> Option<mcr_sys::GuestTid> {
+    decoded
+        .iter()
+        .find(|field| field.name == "guest_tid")
+        .and_then(|field| field.value.parse().ok())
+}
+
 fn wait_status_from_decoded(decoded: &[TraceField]) -> Option<u32> {
     decoded
         .iter()
@@ -5674,6 +5811,16 @@ fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, Lin
         .read_bytes(addr, &mut bytes)
         .map_err(|_| LinuxErrno::EFAULT)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn write_guest_u32(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    value: u32,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &value.to_le_bytes())
+        .map_err(|_| LinuxErrno::EFAULT)
 }
 
 fn read_guest_i64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<i64, LinuxErrno> {
@@ -5819,15 +5966,18 @@ mod tests {
 
     use mcr_net::SocketState;
     use mcr_sys::{
-        GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC,
-        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
-        LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS,
-        LINUX_MAP_FIXED, LINUX_MAP_PRIVATE, LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN,
-        LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
-        LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR,
-        LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
-        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
-        LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
+        GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6,
+        LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
+        LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
+        LINUX_CLONE_THREAD, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
+        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
+        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
+        LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
+        LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
+        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
+        LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
+        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallRegisters,
+        SyscallReturn, SyscallTraceEvent,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -6403,38 +6553,21 @@ mod tests {
     }
 
     #[test]
-    fn private_futex_null_timeout_wait_does_not_return_success_or_count_fake_waiter() {
-        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
-        runtime
-            .memory_mut()
-            .write(0x402000, &7u32.to_le_bytes())
-            .unwrap();
+    fn private_futex_registry_null_timeout_wait_blocks_until_wake() {
+        let mut registry = FutexRegistry::default();
+        let waiter_registry = registry.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut registry = waiter_registry;
+            registry.wait(0x402000, 7, None, || false)
+        });
 
-        let wait = runtime.dispatch_syscall(context(
-            Syscall::Futex,
-            [
-                0x402000,
-                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
-                7,
-                0,
-                0,
-                0,
-            ],
-        ));
-        let wake = runtime.dispatch_syscall(context(
-            Syscall::Futex,
-            [
-                0x402000,
-                u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
-                1,
-                0,
-                0,
-                0,
-            ],
-        ));
+        while registry.waiter_count(0x402000) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
-        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
-        assert_eq!(wake.result, SyscallReturn::Success(0));
+        assert_eq!(registry.wake(0x402000, 1), 1);
+        assert_eq!(waiter.join().unwrap(), Ok(0));
+        assert_eq!(registry.waiter_count(0x402000), 0);
     }
 
     #[test]
@@ -10022,7 +10155,7 @@ mod tests {
 
         assert_eq!(step.tid(), INITIAL_GUEST_TID);
         assert_eq!(step.before_rip(), 0x401000);
-        assert_eq!(step.after_rip(), 0x401002);
+        assert_eq!(step.after_rip(), 0x401000);
         assert_eq!(step.encoded_rax(), 0);
         assert_eq!(step.task_state(), TaskState::Exited { status: 42 });
         assert_eq!(
@@ -10032,7 +10165,7 @@ mod tests {
                 .unwrap()
                 .regs()
                 .rip(),
-            0x401002
+            0x401000
         );
         assert_eq!(
             runtime
@@ -10082,7 +10215,7 @@ mod tests {
             .expect("exit_group step executes");
 
         assert_eq!(second_step.before_rip(), 0x401011);
-        assert_eq!(second_step.after_rip(), 0x40101b);
+        assert_eq!(second_step.after_rip(), 0x401019);
         assert_eq!(second_step.task_state(), TaskState::Exited { status: 0x7f });
         assert_eq!(
             runtime
@@ -10116,7 +10249,7 @@ mod tests {
             .expect("guest memory load feeds exit_group syscall");
 
         assert_eq!(step.before_rip(), 0x401000);
-        assert_eq!(step.after_rip(), 0x40100d);
+        assert_eq!(step.after_rip(), 0x40100b);
         assert_eq!(step.task_state(), TaskState::Exited { status: 77 });
         assert_eq!(
             runtime
@@ -10273,7 +10406,7 @@ mod tests {
                 .unwrap()
                 .regs()
                 .rip(),
-            0x401002
+            0x401000
         );
     }
 
@@ -10350,6 +10483,58 @@ mod tests {
         assert_eq!(u32_from_guest(runtime.memory(), 0x402000), 23 << 8);
         assert!(runtime.kernel().process(2).is_none());
         assert!(runtime.memory_for_process(2).is_none());
+    }
+
+    #[test]
+    fn thread_clone_writes_tid_pointers_and_exit_keeps_process_alive() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.memory_mut().write(0x402000, &[0xaa; 8]).unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_SYSVSEM
+            | LINUX_CLONE_SETTLS
+            | LINUX_CLONE_PARENT_SETTID
+            | LINUX_CLONE_CHILD_SETTID
+            | LINUX_CLONE_CHILD_CLEARTID;
+
+        let clone = runtime.dispatch_syscall(context(
+            Syscall::Clone,
+            [flags, 0x7000_0000, 0x402000, 0x402004, 0x6000_0000, 0],
+        ));
+
+        assert_eq!(clone.result, SyscallReturn::Success(2));
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402000), 2);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402004), 2);
+        let child = runtime.kernel().task(2).unwrap();
+        assert_eq!(child.pid(), INITIAL_GUEST_PID);
+        assert_eq!(child.regs().rsp(), 0x7000_0000);
+        assert_eq!(child.tls().fs_base(), 0x6000_0000);
+
+        let exit = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            2,
+            Syscall::Exit,
+            [0, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exit.result, SyscallReturn::Success(0));
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402004), 0);
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .exit_state(),
+            ExitState::Running
+        );
+        assert_eq!(
+            runtime.kernel().task(2).unwrap().state(),
+            TaskState::Exited { status: 0 }
+        );
+        assert_eq!(runtime.kernel().task(2).unwrap().clear_child_tid(), None);
     }
 
     #[test]

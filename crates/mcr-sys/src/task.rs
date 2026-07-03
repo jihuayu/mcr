@@ -6,7 +6,17 @@ pub const LINUX_SIG_BLOCK: u32 = 0;
 pub const LINUX_SIG_UNBLOCK: u32 = 1;
 pub const LINUX_SIG_SETMASK: u32 = 2;
 pub const LINUX_CLONE_VM: u64 = 0x0000_0100;
+pub const LINUX_CLONE_FS: u64 = 0x0000_0200;
+pub const LINUX_CLONE_FILES: u64 = 0x0000_0400;
+pub const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
 pub const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
+pub const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
+pub const LINUX_CLONE_SYSVSEM: u64 = 0x0004_0000;
+pub const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
+pub const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+pub const LINUX_CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+pub const LINUX_CLONE_DETACHED: u64 = 0x0040_0000;
+pub const LINUX_CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 pub const LINUX_CLONE_EXIT_SIGNAL_MASK: u64 = 0x0000_00ff;
 pub const LINUX_FUTEX_WAIT: u32 = 0;
 pub const LINUX_FUTEX_WAKE: u32 = 1;
@@ -57,6 +67,31 @@ impl CloneSyscallArgs {
     #[must_use]
     pub const fn has_clone_vfork(self) -> bool {
         self.flags & LINUX_CLONE_VFORK != 0
+    }
+
+    #[must_use]
+    pub const fn has_clone_thread(self) -> bool {
+        self.flags & LINUX_CLONE_THREAD != 0
+    }
+
+    #[must_use]
+    pub const fn has_clone_settls(self) -> bool {
+        self.flags & LINUX_CLONE_SETTLS != 0
+    }
+
+    #[must_use]
+    pub const fn has_clone_parent_settid(self) -> bool {
+        self.flags & LINUX_CLONE_PARENT_SETTID != 0
+    }
+
+    #[must_use]
+    pub const fn has_clone_child_cleartid(self) -> bool {
+        self.flags & LINUX_CLONE_CHILD_CLEARTID != 0
+    }
+
+    #[must_use]
+    pub const fn has_clone_child_settid(self) -> bool {
+        self.flags & LINUX_CLONE_CHILD_SETTID != 0
     }
 }
 
