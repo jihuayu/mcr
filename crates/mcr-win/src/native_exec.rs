@@ -92,7 +92,6 @@ mod linux_x86_64 {
 
     core::arch::global_asm!(
         r#"
-        .intel_syntax noprefix
         .text
         .global mcr_enter_guest_x86_64
         .type mcr_enter_guest_x86_64, @function
@@ -151,7 +150,6 @@ mod linux_x86_64 {
         pop rbp
         ret
         .size mcr_enter_guest_x86_64, .-mcr_enter_guest_x86_64
-        .att_syntax prefix
         "#
     );
 
@@ -163,7 +161,7 @@ mod linux_x86_64 {
         );
     }
 
-    pub(super) fn execute_x86_64_until_trap(
+    pub fn execute_x86_64_until_trap(
         registers: &mut HostCpuRegisters,
         fs_base: u64,
     ) -> Result<(), NativeExecutionError> {
