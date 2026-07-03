@@ -1008,6 +1008,16 @@ impl MetadataSidecar {
         self.touch_ctime();
     }
 
+    pub fn set_owner(&mut self, uid: Option<u32>, gid: Option<u32>) {
+        if let Some(uid) = uid {
+            self.attr.uid = uid;
+        }
+        if let Some(gid) = gid {
+            self.attr.gid = gid;
+        }
+        self.touch_ctime();
+    }
+
     pub fn set_size(&mut self, size: u64) {
         self.attr.size = size;
         self.attr.blocks = size.div_ceil(512);
@@ -3040,6 +3050,26 @@ impl VirtualFileSystem {
         self.newfstatat(dirfd, path, flags)
     }
 
+    pub fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()> {
+        let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
+        self.tree
+            .lookup_path_mut(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?
+            .metadata
+            .set_mode(mode);
+        Ok(())
+    }
+
+    pub fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>) -> VfsResult<()> {
+        let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
+        self.tree
+            .lookup_path_mut(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?
+            .metadata
+            .set_owner(uid, gid);
+        Ok(())
+    }
+
     pub fn utimensat(
         &mut self,
         dirfd: Fd,
@@ -4626,6 +4656,13 @@ mod tests {
         assert_eq!(touched.atime_nsec, 20);
         assert_eq!(touched.mtime_sec, 30);
         assert_eq!(touched.mtime_nsec, 40);
+
+        vfs.chmod("renamed", 0o600).unwrap();
+        vfs.chown("renamed", Some(1000), Some(1001)).unwrap();
+        let owned = vfs.newfstatat(AT_FDCWD, "renamed", 0).unwrap();
+        assert_eq!(owned.mode & 0o777, 0o600);
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 1001);
     }
 
     #[test]

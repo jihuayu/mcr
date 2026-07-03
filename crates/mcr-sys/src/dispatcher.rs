@@ -152,6 +152,8 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Unlink, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Symlink, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Readlink, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Chmod, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Chown, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Umask, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::ArchPrctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
@@ -546,6 +548,12 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("newpath_ptr", arg(1)),
         ],
         Syscall::Unlink => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Chmod => vec![hex_field("path_ptr", arg(0)), octal_field("mode", arg(1))],
+        Syscall::Chown => vec![
+            hex_field("path_ptr", arg(0)),
+            decimal_field("uid", arg(1)),
+            decimal_field("gid", arg(2)),
+        ],
         Syscall::Utimensat => vec![
             signed_field("dirfd", arg(0)),
             hex_field("path_ptr", arg(1)),

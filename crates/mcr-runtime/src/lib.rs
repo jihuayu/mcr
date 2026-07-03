@@ -680,6 +680,8 @@ where
             mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Chmod => self.sys_chmod(request),
+            mcr_sys::Syscall::Chown => self.sys_chown(request),
             mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
             mcr_sys::Syscall::Chdir => self.sys_chdir(request),
@@ -1546,6 +1548,26 @@ where
         Ok(0)
     }
 
+    fn sys_chmod(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chmod(&path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_chown(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chown(
+                &path,
+                optional_linux_id(arg_u32(request, 1)),
+                optional_linux_id(arg_u32(request, 2)),
+            )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_utimensat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let flags = arg_u32(request, 3);
         if flags & !(mcr_vfs::AT_SYMLINK_NOFOLLOW | mcr_vfs::AT_EMPTY_PATH) != 0 {
@@ -1679,6 +1701,10 @@ fn arg_i32(request: &SyscallRequest, index: usize) -> Fd {
 
 fn arg_u32(request: &SyscallRequest, index: usize) -> u32 {
     arg(request, index) as u32
+}
+
+fn optional_linux_id(value: u32) -> Option<u32> {
+    (value != u32::MAX).then_some(value)
 }
 
 fn usize_arg(request: &SyscallRequest, index: usize) -> Result<usize, LinuxErrno> {
@@ -6631,6 +6657,22 @@ mod tests {
         assert_eq!(touched.atime_nsec, 20);
         assert_eq!(touched.mtime_sec, 30);
         assert_eq!(touched.mtime_nsec, 40);
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chmod, [0x1200, 0o600, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chown, [0x1200, 1000, 1001, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        let owned = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(owned.mode & 0o777, 0o600);
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 1001);
     }
 
     #[test]

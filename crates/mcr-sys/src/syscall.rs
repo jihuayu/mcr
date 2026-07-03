@@ -106,6 +106,8 @@ pub enum Syscall {
     Rename,
     Readlink,
     Symlink,
+    Chmod,
+    Chown,
     Umask,
     ArchPrctl,
     Gettid,
@@ -209,6 +211,8 @@ impl Syscall {
     pub const SYMLINK: SyscallNumber = SyscallNumber::new(88);
     pub const LINK: SyscallNumber = SyscallNumber::new(86);
     pub const UNLINK: SyscallNumber = SyscallNumber::new(87);
+    pub const CHMOD: SyscallNumber = SyscallNumber::new(90);
+    pub const CHOWN: SyscallNumber = SyscallNumber::new(92);
     pub const UMASK: SyscallNumber = SyscallNumber::new(95);
     pub const ARCH_PRCTL: SyscallNumber = SyscallNumber::new(158);
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
@@ -300,6 +304,8 @@ impl Syscall {
             87 => Self::Unlink,
             88 => Self::Symlink,
             89 => Self::Readlink,
+            90 => Self::Chmod,
+            92 => Self::Chown,
             95 => Self::Umask,
             102 => Self::Getuid,
             104 => Self::Getgid,
@@ -418,6 +424,8 @@ impl Syscall {
             Self::Rename => Self::RENAME,
             Self::Readlink => Self::READLINK,
             Self::Symlink => Self::SYMLINK,
+            Self::Chmod => Self::CHMOD,
+            Self::Chown => Self::CHOWN,
             Self::Umask => Self::UMASK,
             Self::ArchPrctl => Self::ARCH_PRCTL,
             Self::Gettid => Self::GETTID,
@@ -524,6 +532,8 @@ impl Syscall {
             Self::Rename => "rename",
             Self::Readlink => "readlink",
             Self::Symlink => "symlink",
+            Self::Chmod => "chmod",
+            Self::Chown => "chown",
             Self::Umask => "umask",
             Self::ArchPrctl => "arch_prctl",
             Self::Gettid => "gettid",
