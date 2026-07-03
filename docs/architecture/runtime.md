@@ -201,7 +201,9 @@ MCR uses host networking and virtualizes the guest socket ABI.
 Phase 2 networking includes:
 
 - AF_INET and AF_INET6 TCP client sockets;
-- DNS resolution compatible with common libc resolver flows;
+- DNS resolution compatible with common libc resolver flows by exposing guest-visible
+  `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, and UDP datagram sockets;
+  Phase 2 does not add a separate runtime-only host resolver ABI;
 - selected server-side bind/listen/accept behavior for local smoke tests;
 - AF_UNIX if available on the target Windows version;
 - `getsockopt` and `setsockopt` cases required by curl/git/language runtimes.
