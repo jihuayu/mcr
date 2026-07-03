@@ -3011,6 +3011,7 @@ impl VirtualFileSystem {
         )?;
         let path = resolved.guest_path().clone();
         let node_missing = resolved.inode().is_none();
+        let mut created = false;
 
         if node_missing {
             if !flags.create() {
@@ -3019,6 +3020,7 @@ impl VirtualFileSystem {
             self.tree.ensure_parent_dir(&path)?;
             self.check_parent_write_permissions(&path)?;
             self.create_resolved_file(path.clone(), mode & !self.umask)?;
+            created = true;
         } else if flags.create() && flags.exclusive() {
             return Err(VfsError::AlreadyExists);
         }
@@ -3040,7 +3042,9 @@ impl VirtualFileSystem {
         if flags.can_write() {
             access_mode |= W_OK;
         }
-        node.attr().check_access(access_mode)?;
+        if !created {
+            node.attr().check_access(access_mode)?;
+        }
         if flags.truncate() && flags.can_write() && matches!(node.kind(), PathNodeKind::File) {
             self.tree
                 .lookup_path_mut(&path)
@@ -4767,6 +4771,32 @@ mod tests {
             vfs.openat(AT_FDCWD, "/tmp/new", OpenFlags::new(O_DIRECTORY), 0)
                 .unwrap_err(),
             VfsError::NotDirectory
+        );
+    }
+
+    #[test]
+    fn vfs_openat_allows_created_readonly_file_to_use_requested_fd_access() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(
+                AT_FDCWD,
+                "/tmp/pack",
+                OpenFlags::new(O_CREAT | O_EXCL | O_RDWR),
+                0o444,
+            )
+            .unwrap();
+
+        assert_eq!(vfs.write(fd, b"pack").unwrap(), 4);
+        assert_eq!(
+            vfs.newfstatat(AT_FDCWD, "/tmp/pack", 0).unwrap().mode & 0o777,
+            0o444
+        );
+        vfs.close(fd).unwrap();
+
+        assert_eq!(
+            vfs.openat(AT_FDCWD, "/tmp/pack", OpenFlags::new(O_WRONLY), 0)
+                .unwrap_err(),
+            VfsError::PermissionDenied
         );
     }
 
