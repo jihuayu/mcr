@@ -251,6 +251,13 @@ enum LogicOp {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShiftOp {
+    Shl,
+    Shr,
+    Sar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMemoryOperandAccessKind {
     Read,
     Write,
@@ -1011,6 +1018,34 @@ where
         | Code::Xor_EAX_imm32 => {
             execute_logic_u32(registers, flags, memory, &instruction, LogicOp::Xor)?;
         }
+        Code::Shl_rm64_1
+        | Code::Shl_rm64_imm8
+        | Code::Shl_rm64_CL
+        | Code::Sal_rm64_1
+        | Code::Sal_rm64_imm8
+        | Code::Sal_rm64_CL => {
+            execute_shift_u64(registers, flags, memory, &instruction, ShiftOp::Shl)?;
+        }
+        Code::Shr_rm64_1 | Code::Shr_rm64_imm8 | Code::Shr_rm64_CL => {
+            execute_shift_u64(registers, flags, memory, &instruction, ShiftOp::Shr)?;
+        }
+        Code::Sar_rm64_1 | Code::Sar_rm64_imm8 | Code::Sar_rm64_CL => {
+            execute_shift_u64(registers, flags, memory, &instruction, ShiftOp::Sar)?;
+        }
+        Code::Shl_rm32_1
+        | Code::Shl_rm32_imm8
+        | Code::Shl_rm32_CL
+        | Code::Sal_rm32_1
+        | Code::Sal_rm32_imm8
+        | Code::Sal_rm32_CL => {
+            execute_shift_u32(registers, flags, memory, &instruction, ShiftOp::Shl)?;
+        }
+        Code::Shr_rm32_1 | Code::Shr_rm32_imm8 | Code::Shr_rm32_CL => {
+            execute_shift_u32(registers, flags, memory, &instruction, ShiftOp::Shr)?;
+        }
+        Code::Sar_rm32_1 | Code::Sar_rm32_imm8 | Code::Sar_rm32_CL => {
+            execute_shift_u32(registers, flags, memory, &instruction, ShiftOp::Sar)?;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1203,6 +1238,30 @@ impl GuestFlags {
         self.set_zero_sign(mask_to_width(result, bits), bits);
         self.carry = false;
         self.overflow = false;
+    }
+
+    fn set_shift_result(
+        &mut self,
+        operation: ShiftOp,
+        lhs: u64,
+        result: u64,
+        count: u32,
+        bits: u32,
+    ) {
+        let lhs = mask_to_width(lhs, bits);
+        let result = mask_to_width(result, bits);
+
+        self.set_zero_sign(result, bits);
+        self.carry = match operation {
+            ShiftOp::Shl => lhs & (1_u64 << (bits - count)) != 0,
+            ShiftOp::Shr | ShiftOp::Sar => lhs & (1_u64 << (count - 1)) != 0,
+        };
+        self.overflow = match (operation, count) {
+            (ShiftOp::Shl, 1) => ((result & sign_bit(bits)) != 0) ^ self.carry,
+            (ShiftOp::Shr, 1) => lhs & sign_bit(bits) != 0,
+            (ShiftOp::Sar, 1) => false,
+            _ => false,
+        };
     }
 
     fn set_zero_sign(&mut self, result: u64, bits: u32) {
@@ -1478,6 +1537,84 @@ const fn apply_logic(lhs: u64, rhs: u64, operation: LogicOp) -> u64 {
         LogicOp::Or => lhs | rhs,
         LogicOp::Xor => lhs ^ rhs,
     }
+}
+
+fn execute_shift_u64<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+    operation: ShiftOp,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let lhs = read_operand_u64(registers, memory, instruction, 0)?;
+    let count = shift_count(registers, instruction, 64)?;
+    if count == 0 {
+        return Ok(());
+    }
+
+    let result = apply_shift(lhs, count, 64, operation);
+    write_operand_u64(registers, memory, instruction, 0, result)?;
+    flags.set_shift_result(operation, lhs, result, count, 64);
+    Ok(())
+}
+
+fn execute_shift_u32<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+    operation: ShiftOp,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let lhs = u64::from(read_operand_u32(registers, memory, instruction, 0)?);
+    let count = shift_count(registers, instruction, 32)?;
+    if count == 0 {
+        return Ok(());
+    }
+
+    let result = apply_shift(lhs, count, 32, operation) as u32;
+    write_operand_u32(registers, memory, instruction, 0, result)?;
+    flags.set_shift_result(operation, lhs, u64::from(result), count, 32);
+    Ok(())
+}
+
+fn shift_count(
+    registers: &GuestRegisters,
+    instruction: &Instruction,
+    bits: u32,
+) -> Result<u32, ExecutionError> {
+    let raw = match instruction.op1_kind() {
+        OpKind::Immediate8 => instruction.immediate8(),
+        OpKind::Register if instruction.op1_register() == Register::CL => {
+            read_reg8(registers, Register::CL)?
+        }
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid {
+                    rip: instruction.ip(),
+                },
+            });
+        }
+    };
+    Ok(u32::from(raw) & if bits == 64 { 0x3f } else { 0x1f })
+}
+
+fn apply_shift(lhs: u64, count: u32, bits: u32, operation: ShiftOp) -> u64 {
+    let lhs = mask_to_width(lhs, bits);
+    let result = match operation {
+        ShiftOp::Shl => lhs << count,
+        ShiftOp::Shr => lhs >> count,
+        ShiftOp::Sar => {
+            let shift = 64 - bits;
+            ((lhs << shift) as i64 >> shift >> count) as u64
+        }
+    };
+    mask_to_width(result, bits)
 }
 
 fn effective_address(
@@ -2679,6 +2816,36 @@ mod tests {
             memory.read::<12>(0x712100),
             [12, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn execution_core_executes_register_shift_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x80, // mov rax,0x8000000000000004
+                0x48, 0xd1, 0xe8, // shr rax,1
+                0xb9, 0x03, 0x00, 0x00, 0x00, // mov ecx,3
+                0xd3, 0xe0, // shl eax,cl
+                0x48, 0xc1, 0xff, 0x04, // sar rdi,4
+                0x0f, 0x05, // syscall
+            ],
+            0x469180,
+        );
+        let registers = GuestRegisters {
+            rdi: 0xffff_ffff_ffff_ff00,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute register shifts before syscall");
+
+        assert_eq!(trap.registers().rax, 0x10);
+        assert_eq!(trap.registers().rdi, 0xffff_ffff_ffff_fff0);
+        assert_eq!(trap.site().rip, 0x469198);
     }
 
     #[test]
