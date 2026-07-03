@@ -31,10 +31,10 @@ use mcr_sys::{
     LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
     LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT,
     LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
-    LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL,
-    LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
-    LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx,
-    LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
+    LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
+    LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
+    LINUX_POLLPRI, LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat,
+    LinuxStatx, LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
     NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
     SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
     SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
@@ -917,7 +917,7 @@ where
             arg(request, 5),
         );
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        validate_socket_message_flags(args.flags, SocketOperation::Send)?;
+        validate_send_message_flags(args.flags, SocketOperation::Send)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
         self.memory
@@ -944,7 +944,7 @@ where
             arg(request, 5),
         );
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        validate_socket_message_flags(args.flags, SocketOperation::Recv)?;
+        validate_recv_message_flags(args.flags, SocketOperation::Recv)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
         let count = if args.sockaddr != 0 || args.addrlen != 0 {
@@ -969,7 +969,7 @@ where
         let args =
             SendRecvMsgSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg_u32(request, 2));
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        validate_socket_message_flags(args.flags, SocketOperation::SendMsg)?;
+        validate_send_message_flags(args.flags, SocketOperation::SendMsg)?;
         let message = read_msghdr(&self.memory, args.msg)?;
         if message.msg_control != 0 || message.msg_controllen != 0 {
             return Err(net_errno(GuestSocketTable::unsupported_socket_io(
@@ -1028,7 +1028,7 @@ where
         let args =
             SendRecvMsgSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg_u32(request, 2));
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        validate_socket_message_flags(args.flags, SocketOperation::RecvMsg)?;
+        validate_recv_message_flags(args.flags, SocketOperation::RecvMsg)?;
         let message = read_msghdr(&self.memory, args.msg)?;
         if message.msg_control != 0 || message.msg_controllen != 0 {
             return Err(net_errno(GuestSocketTable::unsupported_socket_io(
@@ -1912,8 +1912,18 @@ fn time_errno(error: mcr_win::HostError) -> LinuxErrno {
     host_sync_errno(error.kind())
 }
 
-fn validate_socket_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
+fn validate_send_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
     if flags & !(LINUX_MSG_NOSIGNAL | LINUX_MSG_DONTWAIT) == 0 {
+        Ok(())
+    } else {
+        Err(net_errno(GuestSocketTable::unsupported_socket_flags(
+            operation,
+        )))
+    }
+}
+
+fn validate_recv_message_flags(flags: u32, operation: SocketOperation) -> Result<(), LinuxErrno> {
+    if flags & !(LINUX_MSG_DONTWAIT | LINUX_MSG_CMSG_CLOEXEC) == 0 {
         Ok(())
     } else {
         Err(net_errno(GuestSocketTable::unsupported_socket_flags(
@@ -5751,11 +5761,12 @@ mod tests {
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC,
         LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
         LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS,
-        LINUX_MAP_FIXED, LINUX_MAP_PRIVATE, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL,
-        LINUX_POLLOUT, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR,
-        LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
-        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
-        LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
+        LINUX_MAP_FIXED, LINUX_MAP_PRIVATE, LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN,
+        LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE,
+        LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE,
+        LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM,
+        LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn,
+        SyscallTraceEvent,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -7789,6 +7800,54 @@ mod tests {
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
+    }
+
+    #[test]
+    fn recvmsg_accepts_cmsg_cloexec_without_control_messages() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write_iovec(0x3000, 0x4000, 4);
+        runtime.memory_mut().write_msghdr(0x5000, 0, 0, 0x3000, 1);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Recvmsg,
+                [3, 0x5000, u64::from(LINUX_MSG_CMSG_CLOEXEC), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x4000, 4), b"pong");
     }
 
     #[test]
