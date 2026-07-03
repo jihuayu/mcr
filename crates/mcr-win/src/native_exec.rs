@@ -129,6 +129,7 @@ mod windows_x86_64 {
     const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xc000_0005;
     const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    const EXCEPTION_PRIVILEGED_INSTRUCTION: u32 = 0xc000_0096;
 
     #[repr(C)]
     struct NativeExecutionState {
@@ -509,6 +510,7 @@ mod windows_x86_64 {
             };
             if record.exception_code != EXCEPTION_ILLEGAL_INSTRUCTION
                 && record.exception_code != EXCEPTION_ACCESS_VIOLATION
+                && record.exception_code != EXCEPTION_PRIVILEGED_INSTRUCTION
             {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
