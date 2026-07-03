@@ -1105,6 +1105,24 @@ where
         | Code::Cmovg_r32_rm32 => {
             execute_cmov_u32(registers, flags, memory, &instruction)?;
         }
+        Code::Seto_rm8
+        | Code::Setno_rm8
+        | Code::Setb_rm8
+        | Code::Setae_rm8
+        | Code::Sete_rm8
+        | Code::Setne_rm8
+        | Code::Setbe_rm8
+        | Code::Seta_rm8
+        | Code::Sets_rm8
+        | Code::Setns_rm8
+        | Code::Setp_rm8
+        | Code::Setnp_rm8
+        | Code::Setl_rm8
+        | Code::Setge_rm8
+        | Code::Setle_rm8
+        | Code::Setg_rm8 => {
+            execute_setcc_u8(registers, flags, memory, &instruction)?;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1730,26 +1748,47 @@ where
     Ok(())
 }
 
+fn execute_setcc_u8<M>(
+    registers: &mut GuestRegisters,
+    flags: &GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let value = u8::from(condition_satisfied(instruction.code(), *flags)?);
+    write_operand_u8(registers, memory, instruction, 0, value)
+}
+
 fn condition_satisfied(code: Code, flags: GuestFlags) -> Result<bool, ExecutionError> {
     match code {
-        Code::Cmovo_r32_rm32 | Code::Cmovo_r64_rm64 => Ok(flags.overflow),
-        Code::Cmovno_r32_rm32 | Code::Cmovno_r64_rm64 => Ok(!flags.overflow),
-        Code::Cmovb_r32_rm32 | Code::Cmovb_r64_rm64 => Ok(flags.carry),
-        Code::Cmovae_r32_rm32 | Code::Cmovae_r64_rm64 => Ok(!flags.carry),
-        Code::Cmove_r32_rm32 | Code::Cmove_r64_rm64 => Ok(flags.zero),
-        Code::Cmovne_r32_rm32 | Code::Cmovne_r64_rm64 => Ok(!flags.zero),
-        Code::Cmovbe_r32_rm32 | Code::Cmovbe_r64_rm64 => Ok(flags.carry || flags.zero),
-        Code::Cmova_r32_rm32 | Code::Cmova_r64_rm64 => Ok(!flags.carry && !flags.zero),
-        Code::Cmovs_r32_rm32 | Code::Cmovs_r64_rm64 => Ok(flags.sign),
-        Code::Cmovns_r32_rm32 | Code::Cmovns_r64_rm64 => Ok(!flags.sign),
-        Code::Cmovp_r32_rm32 | Code::Cmovp_r64_rm64 => Ok(flags.parity),
-        Code::Cmovnp_r32_rm32 | Code::Cmovnp_r64_rm64 => Ok(!flags.parity),
-        Code::Cmovl_r32_rm32 | Code::Cmovl_r64_rm64 => Ok(flags.sign != flags.overflow),
-        Code::Cmovge_r32_rm32 | Code::Cmovge_r64_rm64 => Ok(flags.sign == flags.overflow),
-        Code::Cmovle_r32_rm32 | Code::Cmovle_r64_rm64 => {
+        Code::Cmovo_r32_rm32 | Code::Cmovo_r64_rm64 | Code::Seto_rm8 => Ok(flags.overflow),
+        Code::Cmovno_r32_rm32 | Code::Cmovno_r64_rm64 | Code::Setno_rm8 => Ok(!flags.overflow),
+        Code::Cmovb_r32_rm32 | Code::Cmovb_r64_rm64 | Code::Setb_rm8 => Ok(flags.carry),
+        Code::Cmovae_r32_rm32 | Code::Cmovae_r64_rm64 | Code::Setae_rm8 => Ok(!flags.carry),
+        Code::Cmove_r32_rm32 | Code::Cmove_r64_rm64 | Code::Sete_rm8 => Ok(flags.zero),
+        Code::Cmovne_r32_rm32 | Code::Cmovne_r64_rm64 | Code::Setne_rm8 => Ok(!flags.zero),
+        Code::Cmovbe_r32_rm32 | Code::Cmovbe_r64_rm64 | Code::Setbe_rm8 => {
+            Ok(flags.carry || flags.zero)
+        }
+        Code::Cmova_r32_rm32 | Code::Cmova_r64_rm64 | Code::Seta_rm8 => {
+            Ok(!flags.carry && !flags.zero)
+        }
+        Code::Cmovs_r32_rm32 | Code::Cmovs_r64_rm64 | Code::Sets_rm8 => Ok(flags.sign),
+        Code::Cmovns_r32_rm32 | Code::Cmovns_r64_rm64 | Code::Setns_rm8 => Ok(!flags.sign),
+        Code::Cmovp_r32_rm32 | Code::Cmovp_r64_rm64 | Code::Setp_rm8 => Ok(flags.parity),
+        Code::Cmovnp_r32_rm32 | Code::Cmovnp_r64_rm64 | Code::Setnp_rm8 => Ok(!flags.parity),
+        Code::Cmovl_r32_rm32 | Code::Cmovl_r64_rm64 | Code::Setl_rm8 => {
+            Ok(flags.sign != flags.overflow)
+        }
+        Code::Cmovge_r32_rm32 | Code::Cmovge_r64_rm64 | Code::Setge_rm8 => {
+            Ok(flags.sign == flags.overflow)
+        }
+        Code::Cmovle_r32_rm32 | Code::Cmovle_r64_rm64 | Code::Setle_rm8 => {
             Ok(flags.zero || flags.sign != flags.overflow)
         }
-        Code::Cmovg_r32_rm32 | Code::Cmovg_r64_rm64 => {
+        Code::Cmovg_r32_rm32 | Code::Cmovg_r64_rm64 | Code::Setg_rm8 => {
             Ok(!flags.zero && flags.sign == flags.overflow)
         }
         _ => Err(ExecutionError::MissingSyscall {
@@ -1919,6 +1958,32 @@ where
     match instruction.op_kind(operand) {
         OpKind::Register => write_reg32(registers, instruction.op_register(operand), value),
         OpKind::Memory => write_memory_u32(
+            memory,
+            instruction.ip(),
+            effective_address(registers, instruction)?,
+            value,
+        ),
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid {
+                rip: instruction.ip(),
+            },
+        }),
+    }
+}
+
+fn write_operand_u8<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+    value: u8,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Register => write_reg8(registers, instruction.op_register(operand), value),
+        OpKind::Memory => write_memory_u8(
             memory,
             instruction.ip(),
             effective_address(registers, instruction)?,
@@ -3045,6 +3110,34 @@ mod tests {
         assert_eq!(trap.registers().rax, 0x3333);
         assert_eq!(trap.registers().rdx, 0x1111);
         assert_eq!(trap.site().rip, 0x4691cb);
+    }
+
+    #[test]
+    fn execution_core_executes_setcc_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x83, 0x7b, 0x10, 0x07, // cmp qword ptr [rbx+0x10],7
+                0x0f, 0x94, 0xc1, // sete cl
+                0x0f, 0x95, 0x43, 0x18, // setne byte ptr [rbx+0x18]
+                0x0f, 0x05, // syscall
+            ],
+            0x4691e0,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x714800,
+            rcx: 0xff00,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x714810, &7_u64.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute setcc before syscall");
+
+        assert_eq!(trap.registers().rcx, 0xff01);
+        assert_eq!(memory.read::<1>(0x714818), [0]);
+        assert_eq!(trap.site().rip, 0x4691ec);
     }
 
     #[test]
