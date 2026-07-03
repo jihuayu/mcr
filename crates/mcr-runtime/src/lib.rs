@@ -3310,6 +3310,7 @@ impl RuntimeSubsystems {
             .vfs()
             .pread(fd, offset as u64, &mut bytes)
             .map_err(vfs_errno)?;
+        zero_elf_load_bss_tail(self.files.vfs(), fd, offset as u64, &mut bytes[..count]);
         let writable = mcr_sys::MprotectSyscallArgs {
             addr: mapped,
             length,
@@ -4329,6 +4330,107 @@ impl RuntimeSubsystems {
 const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
 
+fn zero_elf_load_bss_tail(vfs: &VirtualFileSystem, fd: Fd, mapped_offset: u64, bytes: &mut [u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let Some(headers) = read_elf64_program_headers(vfs, fd) else {
+        return;
+    };
+    let Some(mapped_end) = mapped_offset.checked_add(bytes.len() as u64) else {
+        return;
+    };
+
+    for header in headers {
+        if header.kind != ELF_PT_LOAD || header.mem_size <= header.file_size {
+            continue;
+        }
+
+        let Some(tail_start) = header.offset.checked_add(header.file_size) else {
+            continue;
+        };
+        let Some(tail_end) = header.offset.checked_add(header.mem_size) else {
+            continue;
+        };
+        let overlap_start = tail_start.max(mapped_offset);
+        let overlap_end = tail_end.min(mapped_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let start = usize::try_from(overlap_start - mapped_offset).unwrap_or(bytes.len());
+        let end = usize::try_from(overlap_end - mapped_offset).unwrap_or(bytes.len());
+        bytes[start..end].fill(0);
+    }
+}
+
+#[derive(Debug)]
+struct Elf64ProgramHeaderView {
+    kind: u32,
+    offset: u64,
+    file_size: u64,
+    mem_size: u64,
+}
+
+const ELF_HEADER_LEN: usize = 64;
+const ELF_PROGRAM_HEADER_MIN_LEN: usize = 56;
+const ELF_PT_LOAD: u32 = 1;
+const MAX_ELF_PROGRAM_HEADERS: usize = 1024;
+const MAX_ELF_PROGRAM_HEADER_LEN: usize = 4096;
+
+fn read_elf64_program_headers(
+    vfs: &VirtualFileSystem,
+    fd: Fd,
+) -> Option<Vec<Elf64ProgramHeaderView>> {
+    let mut elf_header = [0; ELF_HEADER_LEN];
+    if vfs.pread(fd, 0, &mut elf_header).ok()? < ELF_HEADER_LEN {
+        return None;
+    }
+    if elf_header.get(0..4) != Some(b"\x7fELF") || elf_header[4] != 2 || elf_header[5] != 1 {
+        return None;
+    }
+
+    let ph_offset = le_u64(&elf_header[32..40]);
+    let ph_entry_size = usize::from(le_u16(&elf_header[54..56]));
+    let ph_count = usize::from(le_u16(&elf_header[56..58]));
+    if ph_entry_size < ELF_PROGRAM_HEADER_MIN_LEN
+        || ph_entry_size > MAX_ELF_PROGRAM_HEADER_LEN
+        || ph_count > MAX_ELF_PROGRAM_HEADERS
+    {
+        return None;
+    }
+
+    let mut headers = Vec::with_capacity(ph_count);
+    let mut ph_bytes = vec![0; ph_entry_size];
+    for index in 0..ph_count {
+        let entry_offset = ph_offset.checked_add((index * ph_entry_size) as u64)?;
+        if vfs.pread(fd, entry_offset, &mut ph_bytes).ok()? < ELF_PROGRAM_HEADER_MIN_LEN {
+            return None;
+        }
+        headers.push(Elf64ProgramHeaderView {
+            kind: le_u32(&ph_bytes[0..4]),
+            offset: le_u64(&ph_bytes[8..16]),
+            file_size: le_u64(&ph_bytes[32..40]),
+            mem_size: le_u64(&ph_bytes[40..48]),
+        });
+    }
+
+    Some(headers)
+}
+
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
+}
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
+}
+
 fn poll_timeout(raw: u64) -> Result<Option<Duration>, LinuxErrno> {
     let timeout_ms = raw as i32;
     if timeout_ms < 0 {
@@ -4954,6 +5056,46 @@ mod tests {
             runtime.memory_mut().write(0x7000_0000, b"x"),
             Err(GuestMemoryError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn runtime_file_backed_mmap_zero_fills_elf_load_bss_tail() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/tmp").unwrap();
+        tree.create_file_with_content("/tmp/libcrypto.so.3", elf_with_bss_tail_garbage(), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/app", 0x401000), tree);
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/libcrypto.so.3\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+
+        let mapped = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                0x7000_0000,
+                GUEST_PAGE_SIZE,
+                u64::from(mcr_sys::LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                0,
+            ],
+        ));
+
+        assert_eq!(mapped.result, SyscallReturn::Success(0x7000_0000));
+        let mut bytes = [0xff; 16];
+        runtime.memory().read(0x7000_0100, &mut bytes).unwrap();
+        assert_eq!(&bytes[..8], b"LOADDATA");
+        assert_eq!(&bytes[8..], &[0; 8]);
     }
 
     #[test]
@@ -7771,6 +7913,36 @@ mod tests {
             SyscallReturn::Success(0)
         );
         runtime
+    }
+
+    fn elf_with_bss_tail_garbage() -> Vec<u8> {
+        const PH_OFFSET: usize = 64;
+        const LOAD_OFFSET: usize = 0x100;
+        let mut bytes = vec![0; LOAD_OFFSET + 16];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&(PH_OFFSET as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        bytes[PH_OFFSET..PH_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[PH_OFFSET + 4..PH_OFFSET + 8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[PH_OFFSET + 8..PH_OFFSET + 16].copy_from_slice(&(LOAD_OFFSET as u64).to_le_bytes());
+        bytes[PH_OFFSET + 16..PH_OFFSET + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[PH_OFFSET + 24..PH_OFFSET + 32].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[PH_OFFSET + 32..PH_OFFSET + 40].copy_from_slice(&8u64.to_le_bytes());
+        bytes[PH_OFFSET + 40..PH_OFFSET + 48].copy_from_slice(&16u64.to_le_bytes());
+        bytes[PH_OFFSET + 48..PH_OFFSET + 56].copy_from_slice(&8u64.to_le_bytes());
+
+        bytes[LOAD_OFFSET..LOAD_OFFSET + 8].copy_from_slice(b"LOADDATA");
+        bytes[LOAD_OFFSET + 8..LOAD_OFFSET + 16].copy_from_slice(b"garbage!");
+        bytes
     }
 
     fn ipv4_sockaddr(port: u16) -> Vec<u8> {
