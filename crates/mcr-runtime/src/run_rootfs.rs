@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use mcr_jit::ExecutionError;
 use mcr_net::WinHostSocketTransport;
 use mcr_sys::LinuxErrno;
 use mcr_vfs::{
@@ -167,7 +168,10 @@ impl fmt::Display for RunRootfsError {
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Vfs(error) => write!(formatter, "{error}"),
             Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
-            Self::GuestRun(error) => write!(formatter, "guest runtime error: {error}"),
+            Self::GuestRun(error) => {
+                write!(formatter, "guest runtime error: {error}")?;
+                write_native_fault_registers(formatter, error)
+            }
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
             }
@@ -196,6 +200,35 @@ impl std::error::Error for RunRootfsError {
             | Self::UnsupportedApplet(_)
             | Self::UnsupportedShell(_) => None,
         }
+    }
+}
+
+fn write_native_fault_registers(
+    formatter: &mut fmt::Formatter<'_>,
+    error: &crate::GuestRunError,
+) -> fmt::Result {
+    let Some(registers) = native_fault_registers(error) else {
+        return Ok(());
+    };
+    write!(
+        formatter,
+        "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rsp=0x{:016x}",
+        registers.rax,
+        registers.rbx,
+        registers.rcx,
+        registers.rdx,
+        registers.rsi,
+        registers.rdi,
+        registers.rsp
+    )
+}
+
+fn native_fault_registers(error: &crate::GuestRunError) -> Option<mcr_jit::GuestRegisters> {
+    match error {
+        crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
+            ExecutionError::NativeFault { registers, .. },
+        )) => Some(*registers),
+        _ => None,
     }
 }
 
@@ -1048,6 +1081,31 @@ mod tests {
             }
             other => panic!("expected detailed guest runtime error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn guest_run_error_reports_native_fault_registers() {
+        let error = RunRootfsError::GuestRun(crate::GuestRunError::GuestExecution(
+            crate::GuestExecutionError::Execution(mcr_jit::ExecutionError::NativeFault {
+                signal: -1073741819,
+                rip: 0x7000_004d_5305,
+                address: 0x9139b,
+                registers: mcr_jit::GuestRegisters {
+                    rax: u64::MAX,
+                    rcx: 1,
+                    rdx: 0x7000_007b_3280,
+                    rdi: 0x9139b,
+                    rsp: 0x1001_ffb58,
+                    ..mcr_jit::GuestRegisters::default()
+                },
+            }),
+        ));
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("fault registers:"));
+        assert!(rendered.contains("rax=0xffffffffffffffff"));
+        assert!(rendered.contains("rdi=0x000000000009139b"));
+        assert!(rendered.contains("rsp=0x00000001001ffb58"));
     }
 
     fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {

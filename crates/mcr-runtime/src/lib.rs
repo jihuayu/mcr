@@ -2587,7 +2587,7 @@ where
         native_registers.mxcsr = native_fp.mxcsr;
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
         restore_executable_syscalls(memory, patches)?;
-        native_result.map_err(native_execution_error)?;
+        native_result.map_err(|error| native_execution_error(error, native_registers))?;
         dispatcher.subsystems_mut().set_native_fp(
             tid,
             mcr_win::HostFloatingPointState {
@@ -2782,7 +2782,10 @@ fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
     }
 }
 
-fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
+fn native_execution_error(
+    error: mcr_win::NativeExecutionError,
+    registers: mcr_win::HostCpuRegisters,
+) -> GuestExecutionError {
     match error {
         mcr_win::NativeExecutionError::GuestFault {
             signal,
@@ -2792,6 +2795,7 @@ fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutio
             signal,
             rip,
             address,
+            registers: guest_registers_from_host(registers),
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
         | mcr_win::NativeExecutionError::SignalHandler(_)
@@ -2800,6 +2804,7 @@ fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutio
                 signal: 0,
                 rip: 0,
                 address: 0,
+                registers: GuestRegisters::default(),
             })
         }
     }
