@@ -126,6 +126,13 @@ a host `apk` binary. Rebuild an existing ignored fixture with:
 python3 scripts/materialize-alpine-rootfs.py --force
 ```
 
+When the script runs inside a linked git worktree, it treats the main workspace
+as the rootfs cache. If the main workspace already has
+`tests/fixtures/rootfs/alpine-rootfs`, the current worktree gets a symlink to
+that payload. If not, the script materializes the payload in the main workspace
+first and then links to it. Use `--no-worktree-cache` to keep the payload local
+to the current checkout.
+
 Smoke tests use `SmokeCommand` plus `GoldenOutput` assertions. A smoke remains
 `#[ignore]` until the owning runtime integration task enables the corresponding
 command from the table below.

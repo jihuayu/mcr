@@ -17,5 +17,11 @@ digest, extracts it to `tests/fixtures/rootfs/alpine-rootfs`, and adds the
 `curl`, `git`, and CA-certificate packages needed by the Phase 2 network smoke
 contracts. Use `--force` to rebuild an existing ignored fixture payload.
 
+When run from a linked git worktree, the script uses the main workspace as the
+fixture cache. It reuses `tests/fixtures/rootfs/alpine-rootfs` from the main
+workspace when present, otherwise it materializes the payload there first, then
+creates a symlink from the current worktree to the cached rootfs. Use
+`--no-worktree-cache` to force a local materialization in the current checkout.
+
 Phase 2 network smokes use `alpine-rootfs` and expect the extracted payload to
 provide `/bin/sh`, `curl`, `git`, CA certificates, and a writable `/tmp`.
