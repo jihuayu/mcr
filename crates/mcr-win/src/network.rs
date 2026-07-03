@@ -841,7 +841,7 @@ const SO_TYPE: i32 = 0x1008;
 #[cfg(windows)]
 const TCP_NODELAY: i32 = 0x0001;
 #[cfg(windows)]
-const FIONBIO: i32 = -2_147_190_526;
+const FIONBIO: i32 = 0x8004_667e_u32 as i32;
 #[cfg(windows)]
 const SD_RECEIVE: i32 = 0;
 #[cfg(windows)]
@@ -1175,6 +1175,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(ready, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn udp_socket_accepts_nonblocking_mode() {
+        let stack = NetworkStack::start().unwrap();
+        let socket = stack
+            .open_socket(
+                AddressFamily::Inet,
+                SocketKind::Datagram,
+                SocketProtocol::Udp,
+            )
+            .unwrap();
+
+        socket.set_nonblocking(true).unwrap();
+        socket.set_nonblocking(false).unwrap();
     }
 
     #[cfg(windows)]
