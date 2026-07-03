@@ -1131,12 +1131,58 @@ where
             let rhs = read_reg64(registers, instruction.op1_register())?;
             flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
         }
+        Code::Cmp_rm64_r64
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u64(memory, rip, address)?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
+        }
+        Code::Cmp_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_memory_u64(memory, rip, address)?;
+            flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
+        }
         Code::Cmp_rm32_r32 | Code::Cmp_r32_rm32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = read_reg32(registers, instruction.op1_register())?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                32,
+            );
+        }
+        Code::Cmp_rm32_r32
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u32(memory, rip, address)?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                32,
+            );
+        }
+        Code::Cmp_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_memory_u32(memory, rip, address)?;
             flags.set_sub_result(
                 u64::from(lhs),
                 u64::from(rhs),
@@ -3703,6 +3749,38 @@ mod tests {
 
         assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
         assert_eq!(trap.site().rip, 0x4700cc);
+    }
+
+    #[test]
+    fn execution_core_uses_memory_register_cmp_for_setcc() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x39, 0x73, 0x10, // cmp qword ptr [rbx+0x10],rsi
+                0x0f, 0x94, 0xc0, // sete al
+                0x3b, 0x4b, 0x18, // cmp ecx,dword ptr [rbx+0x18]
+                0x0f, 0x95, 0xc2, // setne dl
+                0x0f, 0x05, // syscall
+            ],
+            0x470100,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x714400,
+            rcx: 8,
+            rdx: 0xff00,
+            rsi: 7,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x714410, &7_u64.to_le_bytes());
+        memory.write(0x714418, &8_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute memory/register cmp before setcc");
+
+        assert_eq!(trap.registers().rax, 1);
+        assert_eq!(trap.registers().rdx, 0xff00);
+        assert_eq!(trap.site().rip, 0x47010d);
     }
 
     #[test]
