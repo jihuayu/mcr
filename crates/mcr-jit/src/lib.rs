@@ -1408,6 +1408,12 @@ where
                 &xmm0.to_le_bytes(),
             )?;
         }
+        Code::Pxor_xmm_xmmm128
+            if instruction.op0_register() == Register::XMM0
+                && instruction.op1_register() == Register::XMM0 =>
+        {
+            *xmm0 = 0;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -3811,6 +3817,31 @@ mod tests {
             ]
         );
         assert_eq!(trap.site().rip, 0x469185);
+    }
+
+    #[test]
+    fn execution_core_zeroes_xmm0_for_vector_store() {
+        let block = GuestBlock::new(
+            &[
+                0x66, 0x0f, 0xef, 0xc0, // pxor xmm0,xmm0
+                0x41, 0x0f, 0x11, 0x02, // movups xmmword ptr [r10],xmm0
+                0x0f, 0x05, // syscall
+            ],
+            0x469186,
+        );
+        let registers = GuestRegisters {
+            r10: 0x714020,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x714020, &[0xff; 16]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("zero xmm0 before vector store");
+
+        assert_eq!(memory.read::<16>(0x714020), [0; 16]);
+        assert_eq!(trap.site().rip, 0x46918e);
     }
 
     #[test]
