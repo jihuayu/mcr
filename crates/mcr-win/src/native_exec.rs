@@ -356,6 +356,7 @@ mod windows_x86_64 {
         registers.rflags = u64::from(context.eflags);
 
         if record.exception_code == EXCEPTION_BREAKPOINT {
+            registers.rip = registers.rip.saturating_sub(1);
             state.fault_code = 0;
         } else {
             state.fault_code = record.exception_code;
