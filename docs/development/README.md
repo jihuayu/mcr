@@ -146,6 +146,7 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs alpine-rootfs /bin/busybox ls /` | VFS P0 |
 | `mcr run-rootfs alpine-rootfs /bin/busybox cat /etc/os-release` | VFS P0 |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "echo hi"` | Phase 2 shell |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "<common filesystem/text/process command>"` | Phase 2 shell command matrix |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "curl --version"` | Phase 2 networking |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "curl -fsSL https://example.com >/dev/null"` | Phase 2 networking |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "git --version"` | Phase 2 networking |
@@ -163,6 +164,15 @@ explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored shell_smoke_contract
+```
+
+The ignored common command matrix uses the same `MCR_BIN` and
+materialized-rootfs gate, and covers the guest shell path for `cat`, `mkdir`,
+`ls`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `echo`, `grep`,
+`head`, `tail`, `sed`, `chmod`, `chown`, and `ps`. Run it explicitly with:
+
+```powershell
+MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored common_command_matrix_contract
 ```
 
 The ignored network tests use the same `MCR_BIN` and materialized-rootfs gate,
