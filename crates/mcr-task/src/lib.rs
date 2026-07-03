@@ -15,7 +15,10 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub const INITIAL_GUEST_PID: GuestPid = 1;
 pub const INITIAL_GUEST_TID: GuestTid = 1;
+#[cfg(not(windows))]
 pub const DEFAULT_STACK_TOP: GuestAddress = 0x8000_0000;
+#[cfg(windows)]
+pub const DEFAULT_STACK_TOP: GuestAddress = 0x1_0020_0000;
 pub const DEFAULT_STACK_SIZE: u64 = 0x20_0000;
 const X86_64_SYSCALL_INSTRUCTION_LEN: GuestAddress = 2;
 const X86_64_DEFAULT_RFLAGS: u64 = 0x202;
@@ -834,6 +837,20 @@ impl GuestKernel {
         match request.syscall {
             Syscall::Getpid => SyscallOutcome::success(u64::from(task.pid)),
             Syscall::Gettid => SyscallOutcome::success(u64::from(task.tid)),
+            Syscall::Getppid => {
+                SyscallOutcome::success(u64::from(task_process(self, task.pid).parent.unwrap_or(0)))
+            }
+            Syscall::Getpgrp => {
+                SyscallOutcome::success(u64::from(task_process(self, task.pid).pgid))
+            }
+            Syscall::Getuid | Syscall::Geteuid | Syscall::Getgid | Syscall::Getegid => {
+                SyscallOutcome::success(0)
+            }
+            Syscall::Setuid | Syscall::Setgid | Syscall::Setreuid | Syscall::Setregid => {
+                SyscallOutcome::success(0)
+            }
+            Syscall::Setpgid => self.setpgid_current(task.pid, arg(request, 0), arg(request, 1)),
+            Syscall::Setsid => self.setsid_current(task.pid),
             Syscall::Fork => self.fork_like_current(tid, "fork", child_return_rip(request)),
             Syscall::Vfork => self.fork_like_current(tid, "vfork", child_return_rip(request)),
             Syscall::Clone => self.clone_current_with_return(
@@ -918,6 +935,77 @@ impl GuestKernel {
 
     pub fn clone_current(&mut self, tid: GuestTid, args: CloneSyscallArgs) -> SyscallOutcome {
         self.clone_current_with_return(tid, args, current_syscall_return_rip(self, tid))
+    }
+
+    fn setpgid_current(
+        &mut self,
+        current_pid: GuestPid,
+        raw_pid: u64,
+        raw_pgid: u64,
+    ) -> SyscallOutcome {
+        let pid = if raw_pid == 0 {
+            current_pid
+        } else {
+            match GuestPid::try_from(raw_pid) {
+                Ok(pid) => pid,
+                Err(_) => return SyscallOutcome::errno(LinuxErrno::EINVAL),
+            }
+        };
+        let pgid = if raw_pgid == 0 {
+            pid
+        } else {
+            match GuestPid::try_from(raw_pgid) {
+                Ok(pgid) => pgid,
+                Err(_) => return SyscallOutcome::errno(LinuxErrno::EINVAL),
+            }
+        };
+        let Some(process) = self.processes.get_mut(&pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if process.parent != Some(current_pid) && pid != current_pid {
+            return SyscallOutcome::errno(LinuxErrno::EPERM);
+        }
+        process.pgid = pgid;
+        SyscallOutcome::success(0)
+    }
+
+    fn setsid_current(&mut self, current_pid: GuestPid) -> SyscallOutcome {
+        let Some(process) = self.processes.get_mut(&current_pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        process.sid = current_pid;
+        process.pgid = current_pid;
+        SyscallOutcome::success(current_pid.into())
+    }
+
+    pub fn fork_current_with_child_regs(
+        &mut self,
+        tid: GuestTid,
+        child_regs: GprState,
+    ) -> SyscallOutcome {
+        self.fork_like_current_with_child_regs(tid, "fork", child_regs)
+    }
+
+    pub fn vfork_current_with_child_regs(
+        &mut self,
+        tid: GuestTid,
+        child_regs: GprState,
+    ) -> SyscallOutcome {
+        self.fork_like_current_with_child_regs(tid, "vfork", child_regs)
+    }
+
+    pub fn clone_current_with_child_regs(
+        &mut self,
+        tid: GuestTid,
+        args: CloneSyscallArgs,
+        child_regs: GprState,
+    ) -> SyscallOutcome {
+        if !is_supported_fork_like_clone(args.flags) {
+            return TaskError::InvalidCloneFlags(args.flags).into_outcome();
+        }
+
+        self.fork_like_current_with_child_regs(tid, "clone", child_regs)
+            .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
     }
 
     fn clone_current_with_return(
@@ -1103,7 +1191,7 @@ impl GuestKernel {
                 let Some(task) = self.task_mut(tid) else {
                     return SyscallOutcome::errno(LinuxErrno::ESRCH);
                 };
-                task.regs = task.regs.with_syscall_return(return_rip, 0);
+                task.regs = task.regs.with_syscall_return(return_rip, task.regs.rax());
                 task.state = TaskState::WaitingForChild { args };
                 SyscallOutcome::success(0).with_decoded_field("task_blocked", "wait4")
             }
@@ -1368,6 +1456,25 @@ impl GuestKernel {
             Ok((child_pid, child_tid)) => {
                 if let Some(child_task) = self.task_mut(child_tid) {
                     child_task.regs = child_task.regs.with_syscall_return(child_return_rip, 0);
+                }
+                SyscallOutcome::success(u64::from(child_pid))
+                    .with_decoded_field("guest_pid", child_pid.to_string())
+                    .with_decoded_field("fork_kind", syscall)
+            }
+            Err(error) => error.into_outcome(),
+        }
+    }
+
+    fn fork_like_current_with_child_regs(
+        &mut self,
+        tid: GuestTid,
+        syscall: &'static str,
+        child_regs: GprState,
+    ) -> SyscallOutcome {
+        match self.fork_child_task(tid) {
+            Ok((child_pid, child_tid)) => {
+                if let Some(child_task) = self.task_mut(child_tid) {
+                    child_task.regs = child_regs;
                 }
                 SyscallOutcome::success(u64::from(child_pid))
                     .with_decoded_field("guest_pid", child_pid.to_string())

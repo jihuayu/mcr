@@ -83,6 +83,7 @@ impl SyscallDescriptor {
 pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Read, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Write, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Open, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Close, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Stat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Fstat, SyscallSubsystem::File),
@@ -100,6 +101,18 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Writev, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Access, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pipe, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Getuid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getgid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setuid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setgid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Geteuid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getegid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setpgid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getppid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getpgrp, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setsid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setreuid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Setregid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Nanosleep, SyscallSubsystem::Time),
     SyscallDescriptor::new(Syscall::Dup, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Dup2, SyscallSubsystem::File),
@@ -482,6 +495,11 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             signed_field("offset", arg(1)),
             decimal_field("whence", arg(2)),
         ],
+        Syscall::Open => vec![
+            hex_field("path_ptr", arg(0)),
+            hex_field("flags", arg(1)),
+            octal_field("mode", arg(2)),
+        ],
         Syscall::Openat => vec![
             signed_field("dirfd", arg(0)),
             hex_field("path_ptr", arg(1)),
@@ -560,7 +578,21 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         ],
         Syscall::Brk => vec![hex_field("addr", arg(0))],
         Syscall::Exit | Syscall::ExitGroup => vec![decimal_field("status", arg(0))],
-        Syscall::Getpid | Syscall::Gettid | Syscall::RtSigreturn => Vec::new(),
+        Syscall::Getpid
+        | Syscall::Gettid
+        | Syscall::Getppid
+        | Syscall::Getpgrp
+        | Syscall::Getuid
+        | Syscall::Geteuid
+        | Syscall::Getgid
+        | Syscall::Getegid
+        | Syscall::Setsid
+        | Syscall::RtSigreturn => Vec::new(),
+        Syscall::Setuid | Syscall::Setgid => vec![decimal_field("id", arg(0))],
+        Syscall::Setreuid | Syscall::Setregid => {
+            vec![decimal_field("rid", arg(0)), decimal_field("eid", arg(1))]
+        }
+        Syscall::Setpgid => vec![decimal_field("pid", arg(0)), decimal_field("pgid", arg(1))],
         Syscall::Uname => vec![hex_field("buf", arg(0))],
         Syscall::ArchPrctl => vec![hex_field("code", arg(0)), hex_field("addr", arg(1))],
         Syscall::Execve => vec![
