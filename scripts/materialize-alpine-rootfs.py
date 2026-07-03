@@ -677,7 +677,9 @@ def write_runtime_defaults(rootfs_dir: Path, mirror: str, branch: str) -> None:
     write_text_if_missing(rootfs_dir / "etc/nsswitch.conf", "hosts: files dns\n")
     repositories = rootfs_dir / "etc/apk/repositories"
     repositories.parent.mkdir(parents=True, exist_ok=True)
-    repositories.write_text(f"{mirror}/{branch}/main\n{mirror}/{branch}/community\n")
+    repositories.write_text(
+        f"{mirror}/{branch}/main\n{mirror}/{branch}/community\n", newline="\n"
+    )
 
     for directory in ("dev", "proc", "sys", "run", "tmp"):
         (rootfs_dir / directory).mkdir(parents=True, exist_ok=True)
@@ -687,7 +689,7 @@ def write_runtime_defaults(rootfs_dir: Path, mirror: str, branch: str) -> None:
 def write_text_if_missing(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists() or not path.read_text().strip():
-        path.write_text(contents)
+        path.write_text(contents, newline="\n")
 
 
 def validate_rootfs(rootfs_dir: Path, *, require_network_packages: bool) -> None:
