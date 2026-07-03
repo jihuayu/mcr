@@ -3117,6 +3117,15 @@ impl VirtualFileSystem {
         Ok(anonymous_attr(entry.file()))
     }
 
+    pub fn sync_fd(&self, fd: Fd) -> VfsResult<()> {
+        let entry = self.fds.get(fd)?;
+        if matches!(entry.file().kind(), FileKind::Regular | FileKind::Directory) {
+            Ok(())
+        } else {
+            Err(VfsError::InvalidPath)
+        }
+    }
+
     pub fn statfs(&self, path: &str) -> VfsResult<LinuxStatfs> {
         if path.is_empty() {
             return Err(VfsError::NoEntry);
@@ -4798,6 +4807,23 @@ mod tests {
                 .unwrap_err(),
             VfsError::PermissionDenied
         );
+    }
+
+    #[test]
+    fn vfs_sync_fd_validates_descriptor_without_persistence_side_effects() {
+        let mut vfs = sample_vfs();
+        let file = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        let dir = vfs
+            .openat(AT_FDCWD, "/tmp", OpenFlags::new(O_RDONLY | O_DIRECTORY), 0)
+            .unwrap();
+        let [pipe_read, _pipe_write] = vfs.pipe(OpenFlags::new(0)).unwrap();
+
+        assert_eq!(vfs.sync_fd(file), Ok(()));
+        assert_eq!(vfs.sync_fd(dir), Ok(()));
+        assert_eq!(vfs.sync_fd(pipe_read).unwrap_err(), VfsError::InvalidPath);
+        assert_eq!(vfs.sync_fd(99).unwrap_err(), VfsError::BadFd);
     }
 
     #[test]

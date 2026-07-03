@@ -42,6 +42,8 @@ pub enum Syscall {
     Stat,
     Fstat,
     Lstat,
+    Fsync,
+    Fdatasync,
     Poll,
     Lseek,
     Mmap,
@@ -169,6 +171,8 @@ impl Syscall {
     pub const STAT: SyscallNumber = SyscallNumber::new(4);
     pub const FSTAT: SyscallNumber = SyscallNumber::new(5);
     pub const LSTAT: SyscallNumber = SyscallNumber::new(6);
+    pub const FSYNC: SyscallNumber = SyscallNumber::new(74);
+    pub const FDATASYNC: SyscallNumber = SyscallNumber::new(75);
     pub const POLL: SyscallNumber = SyscallNumber::new(7);
     pub const LSEEK: SyscallNumber = SyscallNumber::new(8);
     pub const MMAP: SyscallNumber = SyscallNumber::new(9);
@@ -339,6 +343,8 @@ impl Syscall {
             62 => Self::Kill,
             63 => Self::Uname,
             72 => Self::Fcntl,
+            74 => Self::Fsync,
+            75 => Self::Fdatasync,
             77 => Self::Ftruncate,
             78 => Self::Getdents,
             79 => Self::Getcwd,
@@ -426,6 +432,8 @@ impl Syscall {
             Self::Stat => Self::STAT,
             Self::Fstat => Self::FSTAT,
             Self::Lstat => Self::LSTAT,
+            Self::Fsync => Self::FSYNC,
+            Self::Fdatasync => Self::FDATASYNC,
             Self::Poll => Self::POLL,
             Self::Lseek => Self::LSEEK,
             Self::Mmap => Self::MMAP,
@@ -556,6 +564,8 @@ impl Syscall {
             Self::Stat => "stat",
             Self::Fstat => "fstat",
             Self::Lstat => "lstat",
+            Self::Fsync => "fsync",
+            Self::Fdatasync => "fdatasync",
             Self::Poll => "poll",
             Self::Lseek => "lseek",
             Self::Mmap => "mmap",
@@ -708,6 +718,8 @@ mod tests {
         assert_eq!(Syscall::ClockGettime.name(), "clock_gettime");
 
         for (number, syscall, name) in [
+            (Syscall::FSYNC, Syscall::Fsync, "fsync"),
+            (Syscall::FDATASYNC, Syscall::Fdatasync, "fdatasync"),
             (Syscall::SCHED_YIELD, Syscall::SchedYield, "sched_yield"),
             (Syscall::MADVISE, Syscall::Madvise, "madvise"),
             (Syscall::GETTIMEOFDAY, Syscall::Gettimeofday, "gettimeofday"),

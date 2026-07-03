@@ -88,6 +88,8 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Stat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Fstat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Lstat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Fsync, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Fdatasync, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Poll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Lseek, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Mmap, SyscallSubsystem::Memory),
@@ -527,6 +529,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("flags", arg(2)),
         ],
         Syscall::Fstat => vec![decimal_field("fd", arg(0)), hex_field("statbuf", arg(1))],
+        Syscall::Fsync | Syscall::Fdatasync => vec![decimal_field("fd", arg(0))],
         Syscall::Lseek => vec![
             decimal_field("fd", arg(0)),
             signed_field("offset", arg(1)),
@@ -939,6 +942,8 @@ mod tests {
             Syscall::Dup3,
             Syscall::Fcntl,
             Syscall::Ioctl,
+            Syscall::Fsync,
+            Syscall::Fdatasync,
         ] {
             assert_eq!(
                 syscall_descriptor(syscall).map(|descriptor| descriptor.subsystem),
@@ -1036,6 +1041,8 @@ mod tests {
                 [3, 0x9000, 0, 0, 0, 0],
                 &[("fd", "3"), ("buf", "0x9000")][..],
             ),
+            (Syscall::Fsync, [4, 0, 0, 0, 0, 0], &[("fd", "4")][..]),
+            (Syscall::Fdatasync, [5, 0, 0, 0, 0, 0], &[("fd", "5")][..]),
             (
                 Syscall::Prctl,
                 [1, 2, 3, 4, 5, 0],

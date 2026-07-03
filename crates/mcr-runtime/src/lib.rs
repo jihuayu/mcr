@@ -695,6 +695,7 @@ where
             mcr_sys::Syscall::Lstat => self.sys_lstat(request),
             mcr_sys::Syscall::Statfs => self.sys_statfs(request),
             mcr_sys::Syscall::Fstatfs => self.sys_fstatfs(request),
+            mcr_sys::Syscall::Fsync | mcr_sys::Syscall::Fdatasync => self.sys_sync_fd(request),
             mcr_sys::Syscall::Newfstatat => self.sys_newfstatat(request),
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
@@ -1266,6 +1267,11 @@ where
             self.vfs.write(fd, &buffer).map_err(vfs_errno)?
         };
         Ok(count as u64)
+    }
+
+    fn sys_sync_fd(&self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        self.vfs.sync_fd(arg_i32(request, 0)).map_err(vfs_errno)?;
+        Ok(0)
     }
 
     fn sys_readv(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -8782,6 +8788,33 @@ mod tests {
         );
         assert_eq!(runtime.memory().read(0x3100, 2), b"ab");
         assert_eq!(runtime.memory().read(0x3200, 2), b"cd");
+    }
+
+    #[test]
+    fn fsync_and_fdatasync_validate_guest_fd_as_noop_flushes() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fsync, [3, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fdatasync, [3, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fsync, [99, 0, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::EBADF)
+        );
     }
 
     #[test]
