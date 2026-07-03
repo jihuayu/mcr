@@ -881,17 +881,6 @@ where
             write_reg64(registers, instruction.op0_register(), result)?;
             flags.set_add_result(lhs, rhs, result, 64);
         }
-        Code::Add_rm64_r64
-            if instruction.op0_kind() == OpKind::Memory
-                && instruction.op1_kind() == OpKind::Register =>
-        {
-            let address = effective_address(registers, &instruction)?;
-            let lhs = read_memory_u64(memory, rip, address)?;
-            let rhs = read_reg64(registers, instruction.op1_register())?;
-            let result = lhs.wrapping_add(rhs);
-            write_memory_u64(memory, rip, address, result)?;
-            flags.set_add_result(lhs, rhs, result, 64);
-        }
         Code::Add_rm32_r32 | Code::Add_r32_rm32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -900,17 +889,6 @@ where
             let rhs = read_reg32(registers, instruction.op1_register())?;
             let result = lhs.wrapping_add(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
-            flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
-        }
-        Code::Add_rm32_r32
-            if instruction.op0_kind() == OpKind::Memory
-                && instruction.op1_kind() == OpKind::Register =>
-        {
-            let address = effective_address(registers, &instruction)?;
-            let lhs = read_memory_u32(memory, rip, address)?;
-            let rhs = read_reg32(registers, instruction.op1_register())?;
-            let result = lhs.wrapping_add(rhs);
-            write_memory_u32(memory, rip, address, result)?;
             flags.set_add_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
         }
         Code::Add_rm64_imm32 | Code::Add_rm64_imm8
@@ -1132,23 +1110,12 @@ where
             let rhs = immediate_as_u8(&instruction)?;
             flags.set_logic_result(u64::from(lhs & rhs), 8);
         }
-        Code::Test_AL_imm8 => {
-            let lhs = read_reg8(registers, Register::AL)?;
-            let rhs = instruction.immediate8();
-            flags.set_logic_result(u64::from(lhs & rhs), 8);
-        }
         Code::Test_rm16_imm16 | Code::Test_rm16_imm16_F7r1 => {
             let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
             let rhs = immediate_as_u16(&instruction)?;
             flags.set_logic_result(u64::from(lhs & rhs), 16);
         }
-        Code::Test_AX_imm16 => {
-            let lhs = read_reg16(registers, Register::AX)?;
-            let rhs = instruction.immediate16();
-            flags.set_logic_result(u64::from(lhs & rhs), 16);
-        }
         Code::Nopd | Code::Nopq => {}
-        _ if instruction.mnemonic() == Mnemonic::Nop => {}
         _ => {
             return Err(ExecutionError::MissingSyscall {
                 terminator: BlockTerminator::ControlFlow {
@@ -2587,98 +2554,6 @@ mod tests {
         );
         assert_eq!(registers.rax, 7);
         assert_eq!(registers.rip, 0x460037);
-    }
-
-    #[test]
-    fn execution_core_ignores_multibyte_nops() {
-        let block = GuestBlock::new(
-            &[
-                0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nop dword ptr [rax]
-                0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00,
-                0x00, // nop word ptr cs:[rax+rax]
-                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
-                0x0f, 0x05, // syscall
-            ],
-            0x468000,
-        );
-        let mut registers = GuestRegisters {
-            rip: block.rip(),
-            rflags: 0x246,
-            ..GuestRegisters::default()
-        };
-        let mut captured_number = None;
-        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
-            captured_number = Some(context.registers.number());
-            SyscallReturn::success(9).encode_u64()
-        });
-
-        SameIsaExecutionCore::new()
-            .execute_until_syscall(block, &mut registers, &mut trampoline)
-            .expect("execute through musl-style multi-byte nops");
-
-        assert_eq!(captured_number, Some(Syscall::GETPID));
-        assert_eq!(registers.rax, 9);
-    }
-
-    #[test]
-    fn execution_core_evaluates_accumulator_test_immediates() {
-        let block = GuestBlock::new(
-            &[
-                0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax,3
-                0xa8, 0x01, // test al,1
-                0x74, 0x07, // je skipped
-                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
-                0x0f, 0x05, // syscall
-            ],
-            0x469000,
-        );
-        let mut registers = GuestRegisters {
-            rip: block.rip(),
-            rflags: 0x246,
-            ..GuestRegisters::default()
-        };
-        let mut captured_number = None;
-        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
-            captured_number = Some(context.registers.number());
-            SyscallReturn::success(11).encode_u64()
-        });
-
-        SameIsaExecutionCore::new()
-            .execute_until_syscall(block, &mut registers, &mut trampoline)
-            .expect("execute accumulator test immediate");
-
-        assert_eq!(captured_number, Some(Syscall::GETPID));
-        assert_eq!(registers.rax, 11);
-    }
-
-    #[test]
-    fn execution_core_adds_registers_into_memory_operands() {
-        let block = GuestBlock::new(
-            &[
-                0x48, 0x01, 0x13, // add qword ptr [rbx],rdx
-                0x01, 0x4b, 0x08, // add dword ptr [rbx+8],ecx
-                0x0f, 0x05, // syscall
-            ],
-            0x469100,
-        );
-        let registers = GuestRegisters {
-            rbx: 0x712100,
-            rcx: 3,
-            rdx: 5,
-            rip: block.rip(),
-            ..GuestRegisters::default()
-        };
-        let mut memory =
-            TestGuestMemory::with_bytes(0x712100, &[7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0]);
-
-        SameIsaExecutionCore::new()
-            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
-            .expect("execute memory add operands before syscall");
-
-        assert_eq!(
-            memory.read::<12>(0x712100),
-            [12, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]
-        );
     }
 
     #[test]
