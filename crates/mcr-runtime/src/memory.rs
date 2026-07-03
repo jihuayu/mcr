@@ -451,6 +451,17 @@ impl GuestMemory {
         }
     }
 
+    pub fn set_mmap_base(&mut self, mmap_base: u64) -> Result<(), GuestMemoryError> {
+        if mmap_base < MIN_GUEST_ADDRESS
+            || mmap_base >= self.address_space_end
+            || !is_page_aligned(mmap_base)
+        {
+            return Err(GuestMemoryError::InvalidAddress);
+        }
+        self.mmap_base = mmap_base;
+        Ok(())
+    }
+
     pub fn read(&self, address: u64, buf: &mut [u8]) -> Result<(), GuestMemoryError> {
         self.copy_guest(address, buf, AccessKind::Read)
     }

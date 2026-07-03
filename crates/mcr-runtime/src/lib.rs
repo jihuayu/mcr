@@ -82,6 +82,8 @@ const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 const LINUX_GRND_NONBLOCK: u64 = 0x0001;
 const LINUX_GRND_RANDOM: u64 = 0x0002;
 const LINUX_GRND_SUPPORTED_FLAGS: u64 = LINUX_GRND_NONBLOCK | LINUX_GRND_RANDOM;
+#[cfg(all(windows, target_arch = "x86_64"))]
+const WINDOWS_NATIVE_MMAP_BASE: u64 = 0x5000_0000;
 const LINUX_EFD_NONBLOCK: u32 = mcr_vfs::O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u32 = mcr_vfs::O_CLOEXEC;
 const LINUX_EFD_SUPPORTED_FLAGS: u32 = LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC;
@@ -3091,6 +3093,7 @@ fn find_executable_syscall_patches(
 fn find_executable_fs_relative_patches(
     memory: &mut GuestMemory,
     skipped_ranges: &[(u64, u64)],
+    previous_fs_base: u64,
 ) -> Result<Vec<(u64, FsRelativePatch)>, GuestExecutionError> {
     let executable_ranges = memory
         .vmas()
@@ -3105,7 +3108,9 @@ fn find_executable_fs_relative_patches(
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
         for offset in 0..bytes.len() {
-            if let Some(original) = fs_relative_original(&bytes[offset..]) {
+            if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
+                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
+            }) {
                 patches.push((start + offset as u64, FsRelativePatch { original }));
             }
         }
@@ -3160,6 +3165,35 @@ fn fs_relative_original(bytes: &[u8]) -> Option<[u8; 9]> {
     }
 
     Some(bytes[..9].try_into().expect("slice length checked"))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_original_from_replacement(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
+    if fs_base == 0
+        || bytes.len() < 9
+        || bytes[0] & 0xf8 != 0x48
+        || !matches!(bytes[1], 0x8b | 0x2b)
+        || bytes[2] & 0xc7 != 0x04
+        || bytes[3] != 0x25
+        || bytes[8] != 0x90
+    {
+        return None;
+    }
+
+    let absolute = u32::from_le_bytes(bytes[4..8].try_into().expect("slice length checked"));
+    let displacement = i64::from(absolute) - fs_base as i64;
+    let displacement = i32::try_from(displacement).ok()?.to_le_bytes();
+    Some([
+        0x64,
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        displacement[0],
+        displacement[1],
+        displacement[2],
+        displacement[3],
+    ])
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -3462,7 +3496,19 @@ impl RuntimeSubsystems {
         })
     }
 
-    pub const fn enable_native_execution(&mut self) {
+    pub fn enable_native_execution(&mut self) {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            self.files
+                .memory_mut()
+                .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
+                .expect("Windows native mmap base is page-aligned and within guest space");
+            for memory in self.process_memory.values_mut() {
+                memory
+                    .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
+                    .expect("Windows native mmap base is page-aligned and within guest space");
+            }
+        }
         self.native_execution = true;
     }
 
@@ -3490,7 +3536,7 @@ impl RuntimeSubsystems {
             {
                 let mut added_fs_patch = false;
                 for (address, patch) in
-                    find_executable_fs_relative_patches(memory, &scanned_ranges)?
+                    find_executable_fs_relative_patches(memory, &scanned_ranges, cache.fs_base)?
                 {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
                         cache.fs_relative_patches.entry(address)
@@ -4221,7 +4267,6 @@ impl RuntimeSubsystems {
     }
 
     fn materialize_selected_memory_at_guest_addresses(&mut self) -> Result<(), LinuxErrno> {
-        let pid = self.selected_memory_pid;
         let snapshot = self
             .files
             .memory()
@@ -4232,16 +4277,13 @@ impl RuntimeSubsystems {
             .try_clone_runtime_at_guest_addresses()
             .map_err(|error| error.errno())?;
         *self.files.memory_mut() = memory;
-        self.invalidate_native_patch_cache(pid);
         Ok(())
     }
 
     fn drop_selected_memory_allocations(&mut self) {
-        let pid = self.selected_memory_pid;
         let empty = self.files.memory().empty_clone_layout();
         let selected = std::mem::replace(self.files.memory_mut(), empty);
         drop(selected);
-        self.invalidate_native_patch_cache(pid);
     }
 
     fn store_selected_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -4526,7 +4568,6 @@ impl RuntimeSubsystems {
             *self.files.memory_mut() = memory;
         }
         self.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
-        self.invalidate_native_patch_cache(self.selected_memory_pid);
         Ok(())
     }
 
@@ -11097,6 +11138,31 @@ mod tests {
         assert_eq!(&parent_bytes, b"parent");
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_execution_uses_patchable_low_mmap_base() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.enable_native_execution();
+
+        let mapped = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                0,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS),
+                u64::MAX,
+                0,
+            ],
+        ));
+
+        assert_eq!(
+            mapped.result,
+            SyscallReturn::Success(WINDOWS_NATIVE_MMAP_BASE)
+        );
+        assert!(WINDOWS_NATIVE_MMAP_BASE <= i32::MAX as u64);
+    }
+
     #[test]
     fn runtime_execve_reads_filename_argv_envp_from_guest_memory_and_vfs() {
         let mut tree = PathTree::new();
@@ -11752,6 +11818,69 @@ mod tests {
         assert_eq!(
             guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
             [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_survives_memory_rematerialization() {
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .materialize_selected_memory_at_guest_addresses()
+            .unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7010_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_recovers_existing_fs_replacement_after_invalidation() {
+        let fs_load = [0x64, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .invalidate_native_patch_cache(pid);
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x5010_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x1c, 0x25, 0x00, 0x00, 0x10, 0x50, 0x90]
         );
     }
 
