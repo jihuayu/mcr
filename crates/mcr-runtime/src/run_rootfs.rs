@@ -235,6 +235,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         crate::RuntimeDiagnosticsTracer::new(),
         transport,
     )?;
+    runtime.enable_native_execution();
 
     match runtime.run_guest_until_exit() {
         Ok(status) => Ok(RunRootfsOutput::new(

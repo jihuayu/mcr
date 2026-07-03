@@ -1954,6 +1954,10 @@ impl Runtime {
         run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
     }
 
+    pub fn enable_native_execution(&mut self) {
+        self.dispatcher.subsystems_mut().enable_native_execution();
+    }
+
     pub fn into_kernel(self) -> GuestKernel {
         self.dispatcher.into_parts().0.tasks
     }
@@ -2027,6 +2031,10 @@ where
 
     pub fn run_guest_until_exit(&mut self) -> Result<i32, GuestRunError> {
         run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
+    }
+
+    pub fn enable_native_execution(&mut self) {
+        self.dispatcher.subsystems_mut().enable_native_execution();
     }
 
     pub fn into_parts(self) -> (GuestKernel, T) {
@@ -2292,6 +2300,11 @@ where
     }
 
     let before_rip = gpr.rip();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if dispatcher.subsystems().native_execution && pid == INITIAL_GUEST_PID {
+        return dispatch_native_guest_task_with_dispatcher(dispatcher, tid, pid, gpr, before_rip);
+    }
+
     let block = {
         let memory = dispatcher
             .subsystems()
@@ -2337,6 +2350,116 @@ where
         final_regs.rax(),
         task.state(),
     ))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn dispatch_native_guest_task_with_dispatcher<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    gpr: GprState,
+    before_rip: u64,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
+    {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        let Some(vma) = memory.vma_containing(before_rip) else {
+            return Err(GuestExecutionError::Memory(GuestMemoryError::NotMapped));
+        };
+        if !vma.protection().execute {
+            return Err(GuestExecutionError::Memory(GuestMemoryError::AccessDenied));
+        }
+        patch_executable_syscalls(memory)?;
+    }
+
+    let mut native_registers = host_registers_from_gpr(gpr);
+    mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base)
+        .map_err(native_execution_error)?;
+    let mut registers = guest_registers_from_host(native_registers);
+    let site = mcr_jit::SyscallSite {
+        rip: registers.rip,
+        next_rip: registers.rip + 2,
+    };
+    let dispatch_result =
+        dispatcher.dispatch(GuestContext::new(pid, tid, registers.syscall_registers()));
+    registers.apply_syscall_return(dispatch_result.encoded_rax, site.next_rip);
+
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == gpr {
+        let updated_regs = gpr_from_registers(registers);
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    ))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn patch_executable_syscalls(memory: &mut GuestMemory) -> Result<(), GuestExecutionError> {
+    let executable_ranges = memory
+        .vmas()
+        .filter(|vma| vma.protection().execute)
+        .map(|vma| (vma.start(), vma.end()))
+        .collect::<Vec<_>>();
+    for (start, end) in executable_ranges {
+        let len = usize::try_from(end - start)
+            .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+        let mut bytes = vec![0; len];
+        memory.read(start, &mut bytes)?;
+        for (offset, window) in bytes.windows(2).enumerate() {
+            if window == [0x0f, 0x05] {
+                memory.patch_code(start + offset as u64, &[0xcc, 0x90])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
+    match error {
+        mcr_win::NativeExecutionError::GuestFault {
+            signal,
+            rip,
+            address,
+        } => GuestExecutionError::Execution(ExecutionError::NativeFault {
+            signal,
+            rip,
+            address,
+        }),
+        mcr_win::NativeExecutionError::UnsupportedHost
+        | mcr_win::NativeExecutionError::SignalHandler(_)
+        | mcr_win::NativeExecutionError::HostFs => {
+            GuestExecutionError::Execution(ExecutionError::NativeFault {
+                signal: 0,
+                rip: 0,
+                address: 0,
+            })
+        }
+    }
 }
 
 fn read_guest_block(
@@ -2393,6 +2516,54 @@ fn gpr_from_registers(value: GuestRegisters) -> GprState {
     )
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn host_registers_from_gpr(value: GprState) -> mcr_win::HostCpuRegisters {
+    mcr_win::HostCpuRegisters {
+        rax: value.rax(),
+        rbx: value.rbx(),
+        rcx: value.rcx(),
+        rdx: value.rdx(),
+        rsi: value.rsi(),
+        rdi: value.rdi(),
+        rbp: value.rbp(),
+        rsp: value.rsp(),
+        r8: value.r8(),
+        r9: value.r9(),
+        r10: value.r10(),
+        r11: value.r11(),
+        r12: value.r12(),
+        r13: value.r13(),
+        r14: value.r14(),
+        r15: value.r15(),
+        rip: value.rip(),
+        rflags: value.rflags(),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn guest_registers_from_host(value: mcr_win::HostCpuRegisters) -> GuestRegisters {
+    GuestRegisters {
+        rax: value.rax,
+        rbx: value.rbx,
+        rcx: value.rcx,
+        rdx: value.rdx,
+        rsi: value.rsi,
+        rdi: value.rdi,
+        rbp: value.rbp,
+        rsp: value.rsp,
+        r8: value.r8,
+        r9: value.r9,
+        r10: value.r10,
+        r11: value.r11,
+        r12: value.r12,
+        r13: value.r13,
+        r14: value.r14,
+        r15: value.r15,
+        rip: value.rip,
+        rflags: value.rflags,
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
@@ -2403,6 +2574,7 @@ pub struct RuntimeSubsystems {
     selected_fds_pid: mcr_sys::GuestPid,
     futexes: FutexRegistry,
     epolls: EpollRegistry,
+    native_execution: bool,
 }
 
 impl RuntimeSubsystems {
@@ -2432,6 +2604,7 @@ impl RuntimeSubsystems {
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
+            native_execution: false,
         })
     }
 
@@ -2458,7 +2631,12 @@ impl RuntimeSubsystems {
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
+            native_execution: false,
         })
+    }
+
+    pub const fn enable_native_execution(&mut self) {
+        self.native_execution = true;
     }
 
     fn default_vfs() -> VirtualFileSystem {
