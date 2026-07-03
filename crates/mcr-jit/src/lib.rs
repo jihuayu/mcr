@@ -1321,6 +1321,38 @@ where
             let value = !read_operand_u8(registers, memory, &instruction, 0)?;
             write_operand_u8(registers, memory, &instruction, 0, value)?;
         }
+        Code::Imul_r64_rm64 => {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_operand_u64(registers, memory, &instruction, 1)?;
+            let (result, overflow) = signed_mul_truncated(lhs, rhs, 64);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.carry = overflow;
+            flags.overflow = overflow;
+        }
+        Code::Imul_r64_rm64_imm32 | Code::Imul_r64_rm64_imm8 => {
+            let lhs = read_operand_u64(registers, memory, &instruction, 1)?;
+            let rhs = immediate_operand_as_u64(&instruction, 2)?;
+            let (result, overflow) = signed_mul_truncated(lhs, rhs, 64);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.carry = overflow;
+            flags.overflow = overflow;
+        }
+        Code::Imul_r32_rm32 => {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_operand_u32(registers, memory, &instruction, 1)?;
+            let (result, overflow) = signed_mul_truncated(u64::from(lhs), u64::from(rhs), 32);
+            write_reg32(registers, instruction.op0_register(), result as u32)?;
+            flags.carry = overflow;
+            flags.overflow = overflow;
+        }
+        Code::Imul_r32_rm32_imm32 | Code::Imul_r32_rm32_imm8 => {
+            let lhs = read_operand_u32(registers, memory, &instruction, 1)?;
+            let rhs = immediate_operand_as_u64(&instruction, 2)?;
+            let (result, overflow) = signed_mul_truncated(u64::from(lhs), rhs, 32);
+            write_reg32(registers, instruction.op0_register(), result as u32)?;
+            flags.carry = overflow;
+            flags.overflow = overflow;
+        }
         Code::Movq_xmm_rm64
             if instruction.op0_register() == Register::XMM0
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1664,6 +1696,15 @@ fn sign_extend_u64(value: u64, bits: u32) -> u64 {
     ((value << shift) as i64 >> shift) as u64
 }
 
+fn signed_mul_truncated(lhs: u64, rhs: u64, bits: u32) -> (u64, bool) {
+    let lhs = sign_extend_u64(mask_to_width(lhs, bits), bits) as i64 as i128;
+    let rhs = sign_extend_u64(mask_to_width(rhs, bits), bits) as i64 as i128;
+    let full = lhs * rhs;
+    let result = mask_to_width(full as u64, bits);
+    let truncated = sign_extend_u64(result, bits) as i64 as i128;
+    (result, full != truncated)
+}
+
 const fn x86_exception(rip: u64) -> ExecutionError {
     ExecutionError::MissingSyscall {
         terminator: BlockTerminator::ControlFlow {
@@ -1868,7 +1909,12 @@ fn immediate_operand_as_u64(
     operand: u32,
 ) -> Result<u64, ExecutionError> {
     match instruction.op_kind(operand) {
+        OpKind::Immediate8 => Ok(u64::from(instruction.immediate8())),
+        OpKind::Immediate8to16 => Ok(instruction.immediate8to16() as u64),
+        OpKind::Immediate8to32 => Ok(instruction.immediate8to32() as u64),
         OpKind::Immediate8to64 => Ok(instruction.immediate8to64() as u64),
+        OpKind::Immediate16 => Ok(u64::from(instruction.immediate16())),
+        OpKind::Immediate32 => Ok(u64::from(instruction.immediate32())),
         OpKind::Immediate32to64 => Ok(instruction.immediate32to64() as u64),
         OpKind::Immediate64 => Ok(instruction.immediate64()),
         _ => Err(ExecutionError::MissingSyscall {
@@ -3549,6 +3595,34 @@ mod tests {
         assert_eq!(trap.registers().rax, !0x0f0f_u64);
         assert_eq!(u32::from_le_bytes(memory.read(0x713e08)), !0x00ff_00ff_u32);
         assert_eq!(trap.site().rip, 0x46917e);
+    }
+
+    #[test]
+    fn execution_core_executes_two_operand_imul() {
+        let block = GuestBlock::new(
+            &[
+                0x4c, 0x0f, 0xaf, 0xc8, // imul r9,rax
+                0x6b, 0xd2, 0xfd, // imul edx,edx,-3
+                0x0f, 0x05, // syscall
+            ],
+            0x469180,
+        );
+        let registers = GuestRegisters {
+            rax: 7,
+            rdx: 4,
+            r9: 6,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute imul before syscall");
+
+        assert_eq!(trap.registers().r9, 42);
+        assert_eq!(trap.registers().rdx, 0xffff_fff4);
+        assert_eq!(trap.site().rip, 0x469187);
     }
 
     #[test]
