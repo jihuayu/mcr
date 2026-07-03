@@ -1072,6 +1072,52 @@ pub struct LinuxFileAttr {
     pub ctime_nsec: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxFsKind {
+    ExtLike,
+    TmpfsLike,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxStatfs {
+    pub kind: LinuxFsKind,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub name_max: u64,
+}
+
+impl LinuxStatfs {
+    const fn ext_like() -> Self {
+        Self {
+            kind: LinuxFsKind::ExtLike,
+            block_size: 4096,
+            blocks: 262_144,
+            blocks_free: 196_608,
+            blocks_available: 196_608,
+            files: 65_536,
+            files_free: 49_152,
+            name_max: 255,
+        }
+    }
+
+    const fn tmpfs_like() -> Self {
+        Self {
+            kind: LinuxFsKind::TmpfsLike,
+            block_size: 4096,
+            blocks: 65_536,
+            blocks_free: 49_152,
+            blocks_available: 49_152,
+            files: 32_768,
+            files_free: 24_576,
+            name_max: 255,
+        }
+    }
+}
+
 impl LinuxFileAttr {
     pub fn directory(inode: InodeId) -> Self {
         Self::directory_with_mode(inode, 0o755)
@@ -2280,6 +2326,13 @@ impl FdTable {
         self.entries.iter().map(|(fd, entry)| (*fd, entry))
     }
 
+    pub fn fds_in_range(&self, first: Fd, last: Fd) -> Vec<Fd> {
+        self.entries
+            .range(first..=last)
+            .map(|(fd, _)| *fd)
+            .collect()
+    }
+
     pub fn close(&mut self, fd: Fd) -> VfsResult<FileRef> {
         let entry = self.entries.remove(&fd).ok_or(VfsError::BadFd)?;
         self.cloexec.remove(&fd);
@@ -3060,6 +3113,30 @@ impl VirtualFileSystem {
         Ok(anonymous_attr(entry.file()))
     }
 
+    pub fn statfs(&self, path: &str) -> VfsResult<LinuxStatfs> {
+        if path.is_empty() {
+            return Err(VfsError::NoEntry);
+        }
+        let resolved = self.rootfs.resolve_path(path, &self.tree)?;
+        self.check_traversal_permissions(resolved.guest_path())?;
+        let node = self
+            .tree
+            .lookup_path(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?;
+        Ok(statfs_for_path_node(node))
+    }
+
+    pub fn fstatfs(&self, fd: Fd) -> VfsResult<LinuxStatfs> {
+        let entry = self.fds.get(fd)?;
+        Ok(
+            if let Some(node) = self.tree.lookup_inode(entry.inode_id()) {
+                statfs_for_path_node(node)
+            } else {
+                statfs_for_file(entry.file())
+            },
+        )
+    }
+
     pub fn pipe(&mut self, flags: OpenFlags) -> VfsResult<[Fd; 2]> {
         self.fds.pipe(flags)
     }
@@ -3238,6 +3315,27 @@ impl VirtualFileSystem {
         let resolved = self.rootfs.resolve_path(path, &self.tree)?;
         self.check_traversal_permissions(resolved.guest_path())?;
         let attr = self.stat_path(resolved.guest_path())?;
+        attr.check_access(mode)
+    }
+
+    pub fn faccessat2(&self, dirfd: Fd, path: &str, mode: u32, flags: u32) -> VfsResult<()> {
+        if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        let attr = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            self.fstat(dirfd)?
+        } else {
+            if path.is_empty() {
+                return Err(VfsError::NoEntry);
+            }
+            let options = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                ResolveOptions::NOFOLLOW_FINAL
+            } else {
+                ResolveOptions::FOLLOW
+            };
+            let resolved = self.resolve_at(dirfd, path, options, false)?;
+            self.stat_path(resolved.guest_path())?
+        };
         attr.check_access(mode)
     }
 
@@ -3748,6 +3846,28 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
         FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
         }
+    }
+}
+
+fn statfs_for_path_node(node: &PathNode) -> LinuxStatfs {
+    match node.kind() {
+        PathNodeKind::Proc(_) | PathNodeKind::Device(_) => LinuxStatfs::tmpfs_like(),
+        PathNodeKind::Directory | PathNodeKind::File | PathNodeKind::Symlink(_) => {
+            LinuxStatfs::ext_like()
+        }
+    }
+}
+
+fn statfs_for_file(file: &FileRef) -> LinuxStatfs {
+    match file.kind() {
+        FileKind::Dev(_)
+        | FileKind::PipeRead
+        | FileKind::PipeWrite
+        | FileKind::Socket
+        | FileKind::Epoll
+        | FileKind::Eventfd
+        | FileKind::Stdio(_) => LinuxStatfs::tmpfs_like(),
+        FileKind::Regular | FileKind::Directory | FileKind::Symlink => LinuxStatfs::ext_like(),
     }
 }
 

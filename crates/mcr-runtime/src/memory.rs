@@ -1163,6 +1163,11 @@ impl MemorySyscalls for GuestMemory {
                 self.mprotect(MprotectSyscallArgs::from_args(request.args))
                     .map(|()| 0),
             ),
+            Syscall::Madvise => syscall_result(self.madvise(
+                request.args.get(0).unwrap_or_default(),
+                request.args.get(1).unwrap_or_default(),
+                request.args.get(2).unwrap_or_default() as u32,
+            )),
             Syscall::Brk => {
                 let outcome = self.set_brk(BrkSyscallArgs::from_args(request.args).addr);
                 let mut syscall_outcome = SyscallOutcome::success(outcome.current);
@@ -1173,6 +1178,22 @@ impl MemorySyscalls for GuestMemory {
             }
             _ => SyscallOutcome::unsupported(),
         }
+    }
+}
+
+impl GuestMemory {
+    pub fn madvise(&self, addr: u64, length: u64, advice: u32) -> Result<u64, GuestMemoryError> {
+        if !is_page_aligned(addr) {
+            return Err(GuestMemoryError::InvalidAddress);
+        }
+        if !is_supported_madvise(advice) {
+            return Err(GuestMemoryError::InvalidFlags);
+        }
+        if length == 0 {
+            return Ok(0);
+        }
+        checked_raw_range(addr, length)?;
+        Ok(0)
     }
 }
 
@@ -1358,6 +1379,13 @@ fn page_round_length(length: u64) -> Result<u64, GuestMemoryError> {
 
 const fn is_page_aligned(value: u64) -> bool {
     value % GUEST_PAGE_SIZE == 0
+}
+
+const fn is_supported_madvise(advice: u32) -> bool {
+    matches!(
+        advice,
+        0..=4 | 8..=25 | 100 | 101
+    )
 }
 
 const fn align_up(value: u64) -> Result<u64, GuestMemoryError> {
@@ -1724,5 +1752,29 @@ mod tests {
         let outcome = memory.dispatch_memory(&request);
 
         assert_eq!(outcome.result, mcr_sys::SyscallReturn::success(MMAP_BASE));
+    }
+
+    #[test]
+    fn madvise_accepts_common_hints_and_rejects_invalid_arguments() {
+        let memory = memory();
+
+        assert_eq!(memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 0), Ok(0));
+        assert_eq!(memory.madvise(MMAP_BASE, 0, 4), Ok(0));
+        assert_eq!(memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 8), Ok(0));
+        assert_eq!(memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 25), Ok(0));
+        assert_eq!(memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 100), Ok(0));
+        assert_eq!(memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 101), Ok(0));
+        assert_eq!(
+            memory.madvise(MMAP_BASE + 1, GUEST_PAGE_SIZE, 0),
+            Err(GuestMemoryError::InvalidAddress)
+        );
+        assert_eq!(
+            memory.madvise(MMAP_BASE, GUEST_PAGE_SIZE, 0xffff),
+            Err(GuestMemoryError::InvalidFlags)
+        );
+        assert_eq!(
+            memory.madvise(u64::MAX & !(GUEST_PAGE_SIZE - 1), GUEST_PAGE_SIZE * 2, 0),
+            Err(GuestMemoryError::InvalidLength)
+        );
     }
 }

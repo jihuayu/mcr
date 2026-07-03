@@ -45,8 +45,9 @@ use mcr_task::{
     INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
-    FileTimes, LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
+    FdReadiness, FdTable, FileKind, FileRef, FileTimes, LinuxFileAttr, LinuxFsKind, LinuxStatfs,
+    OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -58,6 +59,22 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_RUSAGE_SELF: i32 = 0;
+const LINUX_RUSAGE_CHILDREN: i32 = -1;
+const LINUX_RUSAGE_THREAD: i32 = 1;
+const LINUX_PR_GET_DUMPABLE: u64 = 3;
+const LINUX_PR_SET_DUMPABLE: u64 = 4;
+const LINUX_PR_SET_NAME: u64 = 15;
+const LINUX_PR_GET_NAME: u64 = 16;
+const LINUX_PR_SET_TIMERSLACK: u64 = 29;
+const LINUX_PR_GET_TIMERSLACK: u64 = 30;
+const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
+const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
+const LINUX_PR_SET_THP_DISABLE: u64 = 41;
+const LINUX_PR_GET_THP_DISABLE: u64 = 42;
+const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
+const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
+const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_UTIME_NOW: i64 = 0x3fffffff;
 const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
@@ -67,6 +84,23 @@ const LINUX_GRND_SUPPORTED_FLAGS: u64 = LINUX_GRND_NONBLOCK | LINUX_GRND_RANDOM;
 const LINUX_EFD_NONBLOCK: u32 = mcr_vfs::O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u32 = mcr_vfs::O_CLOEXEC;
 const LINUX_EFD_SUPPORTED_FLAGS: u32 = LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC;
+const LINUX_AT_EACCESS: u32 = 0x200;
+const LINUX_FACCESSAT2_SUPPORTED_FLAGS: u32 =
+    LINUX_AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const LINUX_CLOSE_RANGE_SUPPORTED_FLAGS: u32 = 0;
+const LINUX_OPEN_HOW_SIZE: usize = 24;
+const LINUX_OPEN_HOW_MAX_SIZE: usize = 4096;
+const LINUX_STATFS_SIZE: usize = 120;
+const LINUX_EXT_SUPER_MAGIC: u64 = 0xef53;
+const LINUX_TMPFS_MAGIC: u64 = 0x0102_1994;
+const LINUX_STATFS_BLOCK_SIZE: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 pub trait GuestMemoryAccess {
     fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryAccessError>;
@@ -660,14 +694,19 @@ where
             mcr_sys::Syscall::Stat => self.sys_stat(request),
             mcr_sys::Syscall::Fstat => self.sys_fstat(request),
             mcr_sys::Syscall::Lstat => self.sys_lstat(request),
+            mcr_sys::Syscall::Statfs => self.sys_statfs(request),
+            mcr_sys::Syscall::Fstatfs => self.sys_fstatfs(request),
             mcr_sys::Syscall::Newfstatat => self.sys_newfstatat(request),
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
+            mcr_sys::Syscall::Faccessat2 => self.sys_faccessat2(request),
+            mcr_sys::Syscall::Openat2 => self.sys_openat2(request),
             mcr_sys::Syscall::Readlink => self.sys_readlink(request),
             mcr_sys::Syscall::Readlinkat => self.sys_readlinkat(request),
             mcr_sys::Syscall::Getdents64 => self.sys_getdents64(request),
             mcr_sys::Syscall::Pipe => self.sys_pipe(request),
             mcr_sys::Syscall::Pipe2 => self.sys_pipe2(request),
+            mcr_sys::Syscall::CloseRange => self.sys_close_range(request),
             mcr_sys::Syscall::Dup => self.sys_dup(request),
             mcr_sys::Syscall::Dup2 => self.sys_dup2(request),
             mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
@@ -1178,6 +1217,22 @@ where
         Ok(fd as u64)
     }
 
+    fn sys_openat2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let how = read_open_how(self.memory(), arg(request, 2), usize_arg(request, 3)?)?;
+        if how.resolve != 0 {
+            return Err(LinuxErrno::ENOSYS);
+        }
+        let dirfd = arg_i32(request, 0);
+        let path = self.read_path(arg(request, 1))?;
+        let flags = u32::try_from(how.flags).map_err(|_| LinuxErrno::EINVAL)?;
+        let mode = u32::try_from(how.mode).map_err(|_| LinuxErrno::EINVAL)?;
+        let fd = self
+            .vfs
+            .openat(dirfd, &path, OpenFlags::new(flags), mode)
+            .map_err(vfs_errno)?;
+        Ok(fd as u64)
+    }
+
     fn sys_open(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 0))?;
         let flags = arg_u32(request, 1);
@@ -1258,6 +1313,35 @@ where
         Ok(0)
     }
 
+    fn sys_close_range(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        if arg_u32(request, 2) & !LINUX_CLOSE_RANGE_SUPPORTED_FLAGS != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.close_fd_range(arg_u32(request, 0), arg_u32(request, 1), |runtime, file| {
+            runtime.close_unshared_file_resources(file)
+        })
+    }
+
+    fn close_fd_range(
+        &mut self,
+        first: u32,
+        last: u32,
+        mut close_resource: impl FnMut(&mut Self, &FileRef) -> Result<(), LinuxErrno>,
+    ) -> Result<u64, LinuxErrno> {
+        let Some((first, last)) = fd_range_bounds(first, last)? else {
+            return Ok(0);
+        };
+        let fds = self.vfs.fds().fds_in_range(first, last);
+        for fd in fds {
+            match self.vfs.close_with_file(fd) {
+                Ok(file) => close_resource(self, &file)?,
+                Err(VfsError::BadFd) => {}
+                Err(error) => return Err(vfs_errno(error)),
+            }
+        }
+        Ok(0)
+    }
+
     fn close_unshared_file_resources(&mut self, file: &FileRef) -> Result<(), LinuxErrno> {
         if file.kind() == FileKind::Socket {
             let socket_id = match file.inode().backend() {
@@ -1284,6 +1368,19 @@ where
     fn sys_fstat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let attr = self.vfs.fstat(arg_i32(request, 0)).map_err(vfs_errno)?;
         self.write_stat(arg(request, 1), attr)?;
+        Ok(0)
+    }
+
+    fn sys_statfs(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let statfs = self.vfs.statfs(&path).map_err(vfs_errno)?;
+        self.write_statfs(arg(request, 1), statfs)?;
+        Ok(0)
+    }
+
+    fn sys_fstatfs(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let statfs = self.vfs.fstatfs(arg_i32(request, 0)).map_err(vfs_errno)?;
+        self.write_statfs(arg(request, 1), statfs)?;
         Ok(0)
     }
 
@@ -1331,6 +1428,23 @@ where
         let path = self.read_path(arg(request, 0))?;
         self.vfs
             .access(&path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_faccessat2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 1))?;
+        let flags = arg_u32(request, 3);
+        if flags & !LINUX_FACCESSAT2_SUPPORTED_FLAGS != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.vfs
+            .faccessat2(
+                arg_i32(request, 0),
+                &path,
+                arg_u32(request, 2),
+                flags & !LINUX_AT_EACCESS,
+            )
             .map_err(vfs_errno)?;
         Ok(0)
     }
@@ -1721,6 +1835,12 @@ where
             .write_bytes(addr, &encode_linux_statx(attr))
             .map_err(memory_errno)
     }
+
+    fn write_statfs(&mut self, addr: u64, statfs: LinuxStatfs) -> Result<(), LinuxErrno> {
+        self.memory
+            .write_bytes(addr, &encode_linux_statfs(statfs))
+            .map_err(memory_errno)
+    }
 }
 
 fn outcome(result: Result<u64, LinuxErrno>) -> SyscallOutcome {
@@ -1748,6 +1868,18 @@ fn optional_linux_id(value: u32) -> Option<u32> {
 
 fn usize_arg(request: &SyscallRequest, index: usize) -> Result<usize, LinuxErrno> {
     usize::try_from(arg(request, index)).map_err(|_| LinuxErrno::EINVAL)
+}
+
+fn fd_range_bounds(first: u32, last: u32) -> Result<Option<(Fd, Fd)>, LinuxErrno> {
+    if first > last {
+        return Err(LinuxErrno::EINVAL);
+    }
+    if first > i32::MAX as u32 {
+        return Ok(None);
+    }
+    let first = Fd::try_from(first).map_err(|_| LinuxErrno::EINVAL)?;
+    let last = Fd::try_from(last.min(i32::MAX as u32)).map_err(|_| LinuxErrno::EINVAL)?;
+    Ok(Some((first, last)))
 }
 
 fn vfs_errno(error: VfsError) -> LinuxErrno {
@@ -1981,6 +2113,25 @@ fn encode_linux_stat(attr: LinuxFileAttr) -> [u8; 144] {
     bytes[96..104].copy_from_slice(&stat.st_mtime_nsec.to_le_bytes());
     bytes[104..112].copy_from_slice(&stat.st_ctime.to_le_bytes());
     bytes[112..120].copy_from_slice(&stat.st_ctime_nsec.to_le_bytes());
+    bytes
+}
+
+fn encode_linux_statfs(statfs: LinuxStatfs) -> [u8; LINUX_STATFS_SIZE] {
+    let mut bytes = [0; LINUX_STATFS_SIZE];
+    let magic = match statfs.kind {
+        LinuxFsKind::ExtLike => LINUX_EXT_SUPER_MAGIC,
+        LinuxFsKind::TmpfsLike => LINUX_TMPFS_MAGIC,
+    };
+    bytes[0..8].copy_from_slice(&magic.to_le_bytes());
+    bytes[8..8 + 8].copy_from_slice(&statfs.block_size.to_le_bytes());
+    bytes[16..24].copy_from_slice(&statfs.blocks.to_le_bytes());
+    bytes[24..32].copy_from_slice(&statfs.blocks_free.to_le_bytes());
+    bytes[32..40].copy_from_slice(&statfs.blocks_available.to_le_bytes());
+    bytes[40..48].copy_from_slice(&statfs.files.to_le_bytes());
+    bytes[48..56].copy_from_slice(&statfs.files_free.to_le_bytes());
+    bytes[56..64].copy_from_slice(&1u64.to_le_bytes());
+    bytes[64..72].copy_from_slice(&statfs.name_max.to_le_bytes());
+    bytes[72..80].copy_from_slice(&LINUX_STATFS_BLOCK_SIZE.to_le_bytes());
     bytes
 }
 
@@ -3143,10 +3294,14 @@ impl FileSyscalls for RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let outcome = if matches!(request.syscall, mcr_sys::Syscall::Close) {
-            outcome(self.close_process_fd(arg_i32(request, 0)))
-        } else {
-            self.files.dispatch_file(request)
+        let outcome = match request.syscall {
+            mcr_sys::Syscall::Close => outcome(self.close_process_fd(arg_i32(request, 0))),
+            mcr_sys::Syscall::CloseRange => outcome(self.close_process_fd_range(
+                arg_u32(request, 0),
+                arg_u32(request, 1),
+                arg_u32(request, 2),
+            )),
+            _ => self.files.dispatch_file(request),
         };
         if matches!(outcome.result, SyscallReturn::Success(_)) {
             if let Err(errno) = self.store_selected_process_fds(pid) {
@@ -3195,6 +3350,12 @@ impl TimeSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::ClockGettime => {
                 outcome(self.clock_gettime(arg(request, 0), arg(request, 1)))
             }
+            mcr_sys::Syscall::ClockGetres => {
+                outcome(self.clock_getres(arg(request, 0), arg(request, 1)))
+            }
+            mcr_sys::Syscall::Gettimeofday => {
+                outcome(self.gettimeofday(arg(request, 0), arg(request, 1)))
+            }
             mcr_sys::Syscall::Nanosleep => {
                 outcome(self.nanosleep(arg(request, 0), arg(request, 1)))
             }
@@ -3238,6 +3399,7 @@ impl EventSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::EpollCreate1 => self.dispatch_epoll_create1(request),
             mcr_sys::Syscall::EpollCtl => self.dispatch_epoll_ctl(request),
             mcr_sys::Syscall::EpollWait => self.dispatch_epoll_wait(request),
+            mcr_sys::Syscall::EpollPwait2 => self.dispatch_epoll_pwait2(request),
             _ => SyscallOutcome::unsupported(),
         }
     }
@@ -3249,6 +3411,17 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
+            mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
+            mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
+            mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
+            mcr_sys::Syscall::Sysinfo => self.dispatch_sysinfo(request),
+            mcr_sys::Syscall::Prctl => self.dispatch_prctl(request),
+            mcr_sys::Syscall::Prlimit64 => self.dispatch_prlimit64(request),
+            mcr_sys::Syscall::Getcpu => self.dispatch_getcpu(request),
+            mcr_sys::Syscall::Membarrier => self.dispatch_membarrier(request),
+            mcr_sys::Syscall::Rseq | mcr_sys::Syscall::Clone3 => {
+                SyscallOutcome::errno(LinuxErrno::ENOSYS)
+            }
             mcr_sys::Syscall::Fork | mcr_sys::Syscall::Vfork | mcr_sys::Syscall::Clone => {
                 self.dispatch_fork_like(request)
             }
@@ -3276,6 +3449,32 @@ impl RuntimeSubsystems {
             _ => return Err(LinuxErrno::EINVAL),
         };
         write_guest_timespec(self.files.memory_mut(), timespec_addr, timespec)?;
+        Ok(0)
+    }
+
+    fn clock_getres(&mut self, clock_id: u64, timespec_addr: u64) -> Result<u64, LinuxErrno> {
+        validate_clock_id(clock_id)?;
+        if timespec_addr != 0 {
+            write_guest_timespec(
+                self.files.memory_mut(),
+                timespec_addr,
+                LinuxTimespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                },
+            )?;
+        }
+        Ok(0)
+    }
+
+    fn gettimeofday(&mut self, timeval_addr: u64, timezone_addr: u64) -> Result<u64, LinuxErrno> {
+        if timeval_addr != 0 {
+            let now = linux_timespec_from_system_time(mcr_win::system_time().map_err(time_errno)?);
+            write_guest_timeval(self.files.memory_mut(), timeval_addr, now)?;
+        }
+        if timezone_addr != 0 {
+            write_guest_timezone_utc(self.files.memory_mut(), timezone_addr)?;
+        }
         Ok(0)
     }
 
@@ -3452,6 +3651,251 @@ impl RuntimeSubsystems {
         }
     }
 
+    fn dispatch_sched_yield(&mut self) -> SyscallOutcome {
+        std::thread::yield_now();
+        SyscallOutcome::success(0)
+    }
+
+    fn dispatch_getrlimit(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.write_rlimit(arg(request, 0), arg(request, 1)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_getrusage(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let who = arg(request, 0) as i32;
+        let outcome = outcome(self.write_rusage(who, arg(request, 1)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_sysinfo(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.write_sysinfo(arg(request, 0)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_prctl(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.prctl(
+            arg(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+            arg(request, 4),
+        ));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_prlimit64(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.prlimit64(
+            request.context.pid,
+            arg(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+        ));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_getcpu(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.getcpu(arg(request, 0), arg(request, 1)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn dispatch_membarrier(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        outcome(self.membarrier(arg(request, 0), arg(request, 1), arg(request, 2)))
+    }
+
+    fn write_rlimit(&mut self, resource: u64, addr: u64) -> Result<u64, LinuxErrno> {
+        if addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        let (soft, hard) = fixed_rlimit(resource)?;
+        write_guest_rlimit(self.files.memory_mut(), addr, soft, hard)?;
+        Ok(0)
+    }
+
+    fn write_rusage(&mut self, who: i32, addr: u64) -> Result<u64, LinuxErrno> {
+        if !matches!(
+            who,
+            LINUX_RUSAGE_SELF | LINUX_RUSAGE_CHILDREN | LINUX_RUSAGE_THREAD
+        ) {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        write_zeroed(self.files.memory_mut(), addr, 144)?;
+        Ok(0)
+    }
+
+    fn write_sysinfo(&mut self, addr: u64) -> Result<u64, LinuxErrno> {
+        if addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        write_guest_sysinfo(self.files.memory_mut(), addr)?;
+        Ok(0)
+    }
+
+    fn prctl(
+        &mut self,
+        option: u64,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+        arg5: u64,
+    ) -> Result<u64, LinuxErrno> {
+        match option {
+            LINUX_PR_GET_DUMPABLE => Ok(1),
+            LINUX_PR_SET_DUMPABLE => match arg2 {
+                0 | 1 => Ok(0),
+                _ => Err(LinuxErrno::EINVAL),
+            },
+            LINUX_PR_GET_NAME => {
+                if arg2 == 0 {
+                    return Err(LinuxErrno::EFAULT);
+                }
+                let mut name = [0; 16];
+                name[..3].copy_from_slice(b"mcr");
+                self.files
+                    .memory_mut()
+                    .write_bytes(arg2, &name)
+                    .map_err(memory_errno)?;
+                Ok(0)
+            }
+            LINUX_PR_SET_NAME => {
+                if arg2 == 0 {
+                    return Err(LinuxErrno::EFAULT);
+                }
+                let mut name = [0; 16];
+                self.files
+                    .memory()
+                    .read_bytes(arg2, &mut name)
+                    .map_err(memory_errno)?;
+                Ok(0)
+            }
+            LINUX_PR_GET_TIMERSLACK => Ok(50_000),
+            LINUX_PR_SET_TIMERSLACK => Ok(0),
+            LINUX_PR_GET_NO_NEW_PRIVS => Ok(0),
+            LINUX_PR_SET_NO_NEW_PRIVS => {
+                if arg2 == 1 && arg3 == 0 && arg4 == 0 && arg5 == 0 {
+                    Ok(0)
+                } else {
+                    Err(LinuxErrno::EINVAL)
+                }
+            }
+            LINUX_PR_GET_THP_DISABLE => Ok(0),
+            LINUX_PR_SET_THP_DISABLE => match arg2 {
+                0 | 1 => Ok(0),
+                _ => Err(LinuxErrno::EINVAL),
+            },
+            LINUX_PR_SET_VMA if arg2 == LINUX_PR_SET_VMA_ANON_NAME => Ok(0),
+            _ => Err(LinuxErrno::EINVAL),
+        }
+    }
+
+    fn prlimit64(
+        &mut self,
+        current_pid: mcr_sys::GuestPid,
+        raw_pid: u64,
+        resource: u64,
+        new_limit_addr: u64,
+        old_limit_addr: u64,
+    ) -> Result<u64, LinuxErrno> {
+        if raw_pid != 0 && raw_pid != u64::from(current_pid) {
+            return Err(LinuxErrno::ESRCH);
+        }
+        let (soft, hard) = fixed_rlimit(resource)?;
+        if old_limit_addr != 0 {
+            write_guest_rlimit(self.files.memory_mut(), old_limit_addr, soft, hard)?;
+        }
+        if new_limit_addr != 0 {
+            let (requested_soft, requested_hard) =
+                read_guest_rlimit(self.files.memory(), new_limit_addr)?;
+            if requested_soft > requested_hard {
+                return Err(LinuxErrno::EINVAL);
+            }
+        }
+        Ok(0)
+    }
+
+    fn getcpu(&mut self, cpu_addr: u64, node_addr: u64) -> Result<u64, LinuxErrno> {
+        if cpu_addr != 0 {
+            self.files
+                .memory_mut()
+                .write_bytes(cpu_addr, &0u32.to_le_bytes())
+                .map_err(memory_errno)?;
+        }
+        if node_addr != 0 {
+            self.files
+                .memory_mut()
+                .write_bytes(node_addr, &0u32.to_le_bytes())
+                .map_err(memory_errno)?;
+        }
+        Ok(0)
+    }
+
+    fn membarrier(&mut self, command: u64, flags: u64, _cpu_id: u64) -> Result<u64, LinuxErrno> {
+        if flags != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if command == LINUX_MEMBARRIER_CMD_QUERY {
+            return Ok(0);
+        }
+        Err(LinuxErrno::ENOSYS)
+    }
+
     fn materialize_selected_memory_at_guest_addresses(&mut self) -> Result<(), LinuxErrno> {
         let snapshot = self
             .files
@@ -3589,6 +4033,29 @@ impl RuntimeSubsystems {
             .close_with_file(fd)
             .map_err(vfs_errno)?;
         self.close_unshared_process_file_resources(&file)?;
+        Ok(0)
+    }
+
+    fn close_process_fd_range(
+        &mut self,
+        first: u32,
+        last: u32,
+        flags: u32,
+    ) -> Result<u64, LinuxErrno> {
+        if flags & !LINUX_CLOSE_RANGE_SUPPORTED_FLAGS != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let Some((first, last)) = fd_range_bounds(first, last)? else {
+            return Ok(0);
+        };
+        let fds = self.files.vfs().fds().fds_in_range(first, last);
+        for fd in fds {
+            match self.files.vfs_mut().close_with_file(fd) {
+                Ok(file) => self.close_unshared_process_file_resources(&file)?,
+                Err(VfsError::BadFd) => {}
+                Err(error) => return Err(vfs_errno(error)),
+            }
+        }
         Ok(0)
     }
 
@@ -4255,6 +4722,35 @@ impl RuntimeSubsystems {
         outcome
     }
 
+    fn dispatch_epoll_pwait2(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        if arg(request, 4) != 0 || arg(request, 5) != 0 {
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
+        }
+        let maxevents = match usize_arg(request, 2) {
+            Ok(maxevents) => maxevents,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match read_futex_timeout(self.files.memory(), arg(request, 3)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let outcome =
+            outcome(self.epoll_wait(arg_i32(request, 0), arg(request, 1), maxevents, timeout));
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+        }
+        outcome
+    }
+
     fn epoll_create1(&mut self, flags: u32) -> Result<u64, LinuxErrno> {
         if flags & !LINUX_EPOLL_CLOEXEC != 0 {
             return Err(LinuxErrno::EINVAL);
@@ -4578,6 +5074,29 @@ fn read_guest_timespec(
     })
 }
 
+fn read_open_how(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+    size: usize,
+) -> Result<LinuxOpenHow, LinuxErrno> {
+    if addr == 0 {
+        return Err(LinuxErrno::EFAULT);
+    }
+    if !(LINUX_OPEN_HOW_SIZE..=LINUX_OPEN_HOW_MAX_SIZE).contains(&size) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let mut bytes = vec![0; size];
+    memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
+    if bytes[LINUX_OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(LinuxOpenHow {
+        flags: u64::from_le_bytes(bytes[0..8].try_into().expect("open_how flags")),
+        mode: u64::from_le_bytes(bytes[8..16].try_into().expect("open_how mode")),
+        resolve: u64::from_le_bytes(bytes[16..24].try_into().expect("open_how resolve")),
+    })
+}
+
 fn write_guest_uname(
     memory: &mut impl GuestMemoryAccess,
     addr: u64,
@@ -4622,6 +5141,128 @@ fn write_guest_timespec(
             &timespec.tv_nsec.to_le_bytes(),
         )
         .map_err(memory_errno)
+}
+
+fn validate_clock_id(clock_id: u64) -> Result<(), LinuxErrno> {
+    match clock_id {
+        LINUX_CLOCK_REALTIME
+        | LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_REALTIME_COARSE
+        | LINUX_CLOCK_MONOTONIC_COARSE
+        | LINUX_CLOCK_BOOTTIME => Ok(()),
+        _ => Err(LinuxErrno::EINVAL),
+    }
+}
+
+fn write_guest_timeval(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    timespec: LinuxTimespec,
+) -> Result<(), LinuxErrno> {
+    let usec = timespec.tv_nsec / 1_000;
+    memory
+        .write_bytes(addr, &timespec.tv_sec.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?,
+            &usec.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn write_guest_timezone_utc(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &0i32.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(4).ok_or(LinuxErrno::EFAULT)?,
+            &0i32.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn fixed_rlimit(resource: u64) -> Result<(u64, u64), LinuxErrno> {
+    const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+    const SOFT_STACK_LIMIT: u64 = 8 * 1024 * 1024;
+    const OPEN_FILE_LIMIT: u64 = 1024;
+    match resource {
+        0 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        1 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        2 => Ok((0, LINUX_RLIM_INFINITY)),
+        3 => Ok((SOFT_STACK_LIMIT, LINUX_RLIM_INFINITY)),
+        4 => Ok((0, LINUX_RLIM_INFINITY)),
+        5 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        6 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        7 => Ok((OPEN_FILE_LIMIT, OPEN_FILE_LIMIT)),
+        8 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        9 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        10 => Ok((0, 0)),
+        11 => Ok((0, 0)),
+        12 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        13 => Ok((0, 0)),
+        14 => Ok((0, 0)),
+        15 => Ok((0, 0)),
+        _ => Err(LinuxErrno::EINVAL),
+    }
+}
+
+fn write_guest_rlimit(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    soft: u64,
+    hard: u64,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &soft.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?,
+            &hard.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn read_guest_rlimit(memory: &impl GuestMemoryAccess, addr: u64) -> Result<(u64, u64), LinuxErrno> {
+    Ok((
+        read_guest_u64(memory, addr)?,
+        read_guest_u64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?,
+    ))
+}
+
+fn write_zeroed(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    len: usize,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &vec![0; len])
+        .map_err(memory_errno)
+}
+
+fn write_guest_sysinfo(memory: &mut impl GuestMemoryAccess, addr: u64) -> Result<(), LinuxErrno> {
+    let mut bytes = [0; 112];
+    bytes[0..8].copy_from_slice(&3600i64.to_le_bytes());
+    bytes[8..16].copy_from_slice(&0u64.to_le_bytes());
+    bytes[16..24].copy_from_slice(&0u64.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(512 * 1024 * 1024u64).to_le_bytes());
+    bytes[40..48].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
+    bytes[48..56].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
+    bytes[56..64].copy_from_slice(&0u64.to_le_bytes());
+    bytes[64..72].copy_from_slice(&0u64.to_le_bytes());
+    bytes[72..80].copy_from_slice(&(32u64 * 1024).to_le_bytes());
+    bytes[80..82].copy_from_slice(&1u16.to_le_bytes());
+    bytes[88..96].copy_from_slice(&(512 * 1024 * 1024u64).to_le_bytes());
+    bytes[96..104].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
+    bytes[104..108].copy_from_slice(&(4096u32).to_le_bytes());
+    memory.write_bytes(addr, &bytes).map_err(memory_errno)
 }
 
 fn read_pollfd(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxPollfd, LinuxErrno> {
@@ -5020,6 +5661,172 @@ mod tests {
     }
 
     #[test]
+    fn openat2_degrades_simple_open_how_to_openat() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        runtime
+            .memory_mut()
+            .write(0x2000, &u64::from(O_RDONLY).to_le_bytes());
+        runtime.memory_mut().write(0x2008, &0u64.to_le_bytes());
+        runtime.memory_mut().write(0x2010, &0u64.to_le_bytes());
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat2,
+                [AT_FDCWD as u64, 0x1000, 0x2000, 24, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+
+        runtime.memory_mut().write(0x2010, &1u64.to_le_bytes());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat2,
+                [AT_FDCWD as u64, 0x1000, 0x2000, 24, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat2,
+                [AT_FDCWD as u64, 0x1000, 0x2000, 16, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn statfs_and_fstatfs_write_fixed_linux_layouts() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Statfs, [0x1000, 0x3000, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u64_at(runtime.memory(), 0x3000), LINUX_EXT_SUPER_MAGIC);
+        assert_eq!(u64_at(runtime.memory(), 0x3000 + 8), 4096);
+        assert_eq!(u64_at(runtime.memory(), 0x3000 + 64), 255);
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDONLY), 0, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fstatfs, [3, 0x3100, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u64_at(runtime.memory(), 0x3100), LINUX_EXT_SUPER_MAGIC);
+    }
+
+    #[test]
+    fn faccessat2_degrades_simple_flags_to_access_semantics() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        runtime.memory_mut().write_cstr(0x1100, "file");
+        runtime.memory_mut().write_cstr(0x1200, "");
+        runtime.memory_mut().write_cstr(0x1300, "/tmp");
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Faccessat2,
+                [AT_FDCWD as u64, 0x1000, u64::from(mcr_vfs::R_OK), 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [
+                    AT_FDCWD as u64,
+                    0x1300,
+                    u64::from(O_RDONLY | O_DIRECTORY),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Faccessat2,
+                [3, 0x1100, u64::from(mcr_vfs::R_OK), 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Faccessat2,
+                [
+                    3,
+                    0x1200,
+                    u64::from(mcr_vfs::R_OK),
+                    u64::from(AT_EMPTY_PATH),
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Faccessat2,
+                [AT_FDCWD as u64, 0x1000, 0, 0x8000_0000, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn close_range_closes_fds_and_ignores_missing_entries() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDONLY), 0, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDONLY), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::CloseRange,
+                [4, u64::from(u32::MAX), 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert!(runtime.vfs().fds().get(3).is_ok());
+        assert!(runtime.vfs().fds().get(4).is_err());
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::CloseRange, [5, 4, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
     fn close_releases_socket_table_entry_after_vfs_fd() {
         let transport = runtime_socket_transport();
         let mut runtime = RuntimeFileSystem::with_socket_transport(
@@ -5066,6 +5873,77 @@ mod tests {
             dispatch_network(&mut runtime, Syscall::Sendto, [3, 0x2000, 0, 0, 0, 0],),
             SyscallReturn::Errno(LinuxErrno::EBADF)
         );
+    }
+
+    #[test]
+    fn close_range_releases_socket_and_epoll_resources() {
+        let transport = runtime_socket_transport();
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(4)
+        );
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::CloseRange, [3, 4, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert!(runtime.vfs().fds().get(3).is_err());
+        assert!(runtime.vfs().fds().get(4).is_err());
+        let socket_id = SocketId::new(1).unwrap();
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .files
+                .sockets()
+                .socket(socket_id)
+                .unwrap()
+                .state(),
+            SocketState::Closed
+        );
+        let epoll_wait =
+            runtime.dispatch_syscall(context(Syscall::EpollWait, [4, 0x402200, 4, 0, 0, 0]));
+        assert_eq!(epoll_wait.result, SyscallReturn::Errno(LinuxErrno::EBADF));
     }
 
     #[test]
@@ -6517,6 +7395,74 @@ mod tests {
             epoll_event_from_memory(runtime.memory(), 0x402200),
             (LINUX_EPOLLIN | LINUX_EPOLLOUT, 0x51)
         );
+    }
+
+    #[test]
+    fn epoll_pwait2_reuses_epoll_wait_without_sigmask() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        let write_fd = i32_from_memory(runtime.memory(), 0x402004);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(5)
+        );
+        write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 0x71);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_ADD),
+                        read_fd as u64,
+                        0x402100,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_timespec(runtime.memory_mut(), 0x402300, 0, 0);
+        let empty = runtime.dispatch_syscall(context(
+            Syscall::EpollPwait2,
+            [5, 0x402200, 4, 0x402300, 0, 0],
+        ));
+        assert_eq!(empty.result, SyscallReturn::Success(0));
+
+        runtime.memory_mut().write(0x402400, b"x").unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Write,
+                    [write_fd as u64, 0x402400, 1, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(1)
+        );
+        let ready = runtime.dispatch_syscall(context(
+            Syscall::EpollPwait2,
+            [5, 0x402200, 4, 0x402300, 0, 0],
+        ));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(
+            epoll_event_from_memory(runtime.memory(), 0x402200),
+            (LINUX_EPOLLIN, 0x71)
+        );
+
+        let sigmask = runtime.dispatch_syscall(context(
+            Syscall::EpollPwait2,
+            [5, 0x402200, 4, 0x402300, 0x402500, 8],
+        ));
+        assert_eq!(sigmask.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
     }
 
     #[test]
@@ -8192,16 +9138,28 @@ mod tests {
         i32::from_le_bytes(bytes)
     }
 
+    fn u64_from_guest(memory: &GuestMemory, addr: u64) -> u64 {
+        let mut bytes = [0; 8];
+        memory.read(addr, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    fn i64_from_guest(memory: &GuestMemory, addr: u64) -> i64 {
+        let mut bytes = [0; 8];
+        memory.read(addr, &mut bytes).unwrap();
+        i64::from_le_bytes(bytes)
+    }
+
     fn u32_from_guest(memory: &GuestMemory, addr: u64) -> u32 {
         let mut bytes = [0; 4];
         memory.read(addr, &mut bytes).unwrap();
         u32::from_le_bytes(bytes)
     }
 
-    fn u64_from_guest(memory: &GuestMemory, addr: u64) -> u64 {
-        let mut bytes = [0; 8];
+    fn u16_from_guest(memory: &GuestMemory, addr: u64) -> u16 {
+        let mut bytes = [0; 2];
         memory.read(addr, &mut bytes).unwrap();
-        u64::from_le_bytes(bytes)
+        u16::from_le_bytes(bytes)
     }
 
     fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {
@@ -9296,6 +10254,341 @@ mod tests {
             runtime.tracer().events(),
             [SyscallTraceEvent::Enter(_), SyscallTraceEvent::Exit(_)]
         ));
+    }
+
+    #[test]
+    fn task_time_resource_fake_syscalls_write_compat_structs() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::SchedYield, [0; 6]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let gettimeofday = runtime.dispatch_syscall(context(
+            Syscall::Gettimeofday,
+            [0x402000, 0x402020, 0, 0, 0, 0],
+        ));
+        assert_eq!(gettimeofday.result, SyscallReturn::Success(0));
+        assert!(u64_from_guest(runtime.memory(), 0x402000) > 0);
+        assert!(u64_from_guest(runtime.memory(), 0x402008) < 1_000_000);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402020), 0);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402024), 0);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Gettimeofday, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let clock_getres =
+            runtime.dispatch_syscall(context(Syscall::ClockGetres, [1, 0x402040, 0, 0, 0, 0]));
+        assert_eq!(clock_getres.result, SyscallReturn::Success(0));
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402040), 0);
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402048), 1_000_000);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::ClockGetres, [99, 0x402040, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        let getrlimit =
+            runtime.dispatch_syscall(context(Syscall::Getrlimit, [7, 0x402100, 0, 0, 0, 0]));
+        assert_eq!(getrlimit.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402100), 1024);
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402108), 1024);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Getrlimit, [99, 0x402100, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        runtime.memory_mut().write(0x402180, &[0xaa; 144]).unwrap();
+        let getrusage =
+            runtime.dispatch_syscall(context(Syscall::Getrusage, [0, 0x402180, 0, 0, 0, 0]));
+        assert_eq!(getrusage.result, SyscallReturn::Success(0));
+        let mut rusage = [0xaa; 144];
+        runtime.memory().read(0x402180, &mut rusage).unwrap();
+        assert_eq!(rusage, [0; 144]);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Getrusage, [9, 0x402180, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        let sysinfo =
+            runtime.dispatch_syscall(context(Syscall::Sysinfo, [0x402300, 0, 0, 0, 0, 0]));
+        assert_eq!(sysinfo.result, SyscallReturn::Success(0));
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402300), 3600);
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402320),
+            512 * 1024 * 1024
+        );
+        assert_eq!(u16_from_guest(runtime.memory(), 0x402350), 1);
+    }
+
+    #[test]
+    fn task_time_resource_fake_syscalls_handle_limits_prctl_cpu_and_fallbacks() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        runtime
+            .memory_mut()
+            .write(0x402000, &512u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402008, &1024u64.to_le_bytes())
+            .unwrap();
+        let prlimit64 = runtime.dispatch_syscall(context(
+            Syscall::Prlimit64,
+            [0, 7, 0x402000, 0x402100, 0, 0],
+        ));
+        assert_eq!(prlimit64.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402100), 1024);
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402108), 1024);
+
+        runtime
+            .memory_mut()
+            .write(0x402000, &2048u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Prlimit64, [0, 7, 0x402000, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Prlimit64, [999, 7, 0, 0x402100, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Prctl,
+                    [LINUX_PR_GET_DUMPABLE, 0, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(1)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Prctl,
+                    [LINUX_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Prctl,
+                    [LINUX_PR_GET_NAME, 0x402200, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let mut name = [0; 4];
+        runtime.memory().read(0x402200, &mut name).unwrap();
+        assert_eq!(&name, b"mcr\0");
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Prctl, [0xffff, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        let getcpu =
+            runtime.dispatch_syscall(context(Syscall::Getcpu, [0x402300, 0x402304, 0, 0, 0, 0]));
+        assert_eq!(getcpu.result, SyscallReturn::Success(0));
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402300), 0);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402304), 0);
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Membarrier, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Membarrier, [1, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Membarrier, [0, 1, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Rseq, [0x402000, 32, 0, 0x53053053, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Clone3, [0x402000, 88, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn runtime_dispatches_fake_syscall_compat_behaviors() {
+        let mut runtime = Runtime::with_tracer_and_vfs(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            InMemorySyscallTracer::new(),
+        )
+        .unwrap();
+
+        let gettimeofday = runtime.dispatch_syscall(context(
+            Syscall::Gettimeofday,
+            [0x402000, 0x402020, 0, 0, 0, 0],
+        ));
+        assert_eq!(gettimeofday.result, SyscallReturn::Success(0));
+        assert!(u64_from_guest(runtime.memory(), 0x402000) > 0);
+        assert!(u64_from_guest(runtime.memory(), 0x402008) < 1_000_000);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402020), 0);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402024), 0);
+
+        let getrlimit =
+            runtime.dispatch_syscall(context(Syscall::Getrlimit, [7, 0x402100, 0, 0, 0, 0]));
+        assert_eq!(getrlimit.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402100), 1024);
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402108), 1024);
+
+        let sysinfo =
+            runtime.dispatch_syscall(context(Syscall::Sysinfo, [0x402200, 0, 0, 0, 0, 0]));
+        assert_eq!(sysinfo.result, SyscallReturn::Success(0));
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402200), 3600);
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402220),
+            512 * 1024 * 1024
+        );
+        assert_eq!(u16_from_guest(runtime.memory(), 0x402250), 1);
+
+        let getcpu =
+            runtime.dispatch_syscall(context(Syscall::Getcpu, [0x402300, 0x402304, 0, 0, 0, 0]));
+        assert_eq!(getcpu.result, SyscallReturn::Success(0));
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402300), 0);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402304), 0);
+
+        runtime
+            .memory_mut()
+            .write(0x402400, b"/tmp/file\0")
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402500, &u64::from(O_RDONLY).to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402508, &0u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402510, &0u64.to_le_bytes())
+            .unwrap();
+        let openat2 = runtime.dispatch_syscall(context(
+            Syscall::Openat2,
+            [AT_FDCWD as u64, 0x402400, 0x402500, 24, 0, 0],
+        ));
+        assert_eq!(openat2.result, SyscallReturn::Success(3));
+
+        let faccessat2 = runtime.dispatch_syscall(context(
+            Syscall::Faccessat2,
+            [AT_FDCWD as u64, 0x402400, u64::from(mcr_vfs::R_OK), 0, 0, 0],
+        ));
+        assert_eq!(faccessat2.result, SyscallReturn::Success(0));
+
+        let statfs =
+            runtime.dispatch_syscall(context(Syscall::Statfs, [0x402400, 0x402600, 0, 0, 0, 0]));
+        assert_eq!(statfs.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402600), 0xef53);
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402608), 4096);
+
+        let fstatfs =
+            runtime.dispatch_syscall(context(Syscall::Fstatfs, [3, 0x402700, 0, 0, 0, 0]));
+        assert_eq!(fstatfs.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402700), 0xef53);
+
+        let close_range =
+            runtime.dispatch_syscall(context(Syscall::CloseRange, [3, 3, 0, 0, 0, 0]));
+        assert_eq!(close_range.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Fstatfs, [3, 0x402800, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EBADF)
+        );
+
+        assert!(runtime.tracer().events().iter().any(|event| matches!(
+            event,
+            SyscallTraceEvent::Exit(exit)
+                if exit.syscall == Syscall::Openat2
+                    && exit.result == SyscallReturn::Success(3)
+        )));
+    }
+
+    #[test]
+    fn runtime_unimplemented_fake_syscalls_return_enosys_and_trace_args() {
+        for (syscall, args, decoded_field) in [
+            (
+                Syscall::Rseq,
+                [0x402000, 32, 0, 0x53053053, 0, 0],
+                ("rseq", "0x402000"),
+            ),
+            (
+                Syscall::Clone3,
+                [0x402000, 88, 0, 0, 0, 0],
+                ("cl_args", "0x402000"),
+            ),
+        ] {
+            let mut runtime = Runtime::with_tracer(
+                test_program("/bin/app", 0x401000),
+                InMemorySyscallTracer::new(),
+            )
+            .unwrap();
+
+            let result = runtime.dispatch_syscall(context(syscall, args));
+
+            assert_eq!(
+                result.result,
+                SyscallReturn::Errno(LinuxErrno::ENOSYS),
+                "{syscall}"
+            );
+            match runtime.tracer().events() {
+                [
+                    SyscallTraceEvent::Enter(enter),
+                    SyscallTraceEvent::Exit(exit),
+                ] => {
+                    assert_eq!(enter.syscall, syscall);
+                    assert_eq!(exit.syscall, syscall);
+                    assert_eq!(exit.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+                    assert!(
+                        exit.decoded
+                            .iter()
+                            .any(|field| field.name == decoded_field.0
+                                && field.value == decoded_field.1),
+                        "{syscall} should preserve decoded argument {decoded_field:?}"
+                    );
+                }
+                other => panic!("expected enter and exit trace for {syscall}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

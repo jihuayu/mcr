@@ -102,6 +102,12 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Writev, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Access, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pipe, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::SchedYield, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Madvise, SyscallSubsystem::Memory),
+    SyscallDescriptor::new(Syscall::Gettimeofday, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::Getrlimit, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getrusage, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Sysinfo, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getuid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getgid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Setuid, SyscallSubsystem::Task),
@@ -114,6 +120,10 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Setsid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Setreuid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Setregid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getpgid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getsid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Statfs, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Fstatfs, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Nanosleep, SyscallSubsystem::Time),
     SyscallDescriptor::new(Syscall::Dup, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Dup2, SyscallSubsystem::File),
@@ -155,12 +165,14 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Chmod, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Chown, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Umask, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Prctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::ArchPrctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Futex, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getdents64, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::SetTidAddress, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::ClockGettime, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::ClockGetres, SyscallSubsystem::Time),
     SyscallDescriptor::new(Syscall::ExitGroup, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::EpollWait, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::EpollCtl, SyscallSubsystem::Event),
@@ -180,9 +192,18 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::EpollCreate1, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Dup3, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pipe2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Prlimit64, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Getcpu, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Renameat2, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Getrandom, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::Membarrier, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Statx, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Rseq, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Clone3, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::CloseRange, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Openat2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Faccessat2, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::EpollPwait2, SyscallSubsystem::Event),
 ];
 
 #[must_use]
@@ -491,6 +512,11 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             ]
         }
         Syscall::Close | Syscall::Dup => vec![decimal_field("fd", arg(0))],
+        Syscall::CloseRange => vec![
+            decimal_field("first", arg(0)),
+            decimal_field("last", arg(1)),
+            hex_field("flags", arg(2)),
+        ],
         Syscall::Dup2 => vec![
             decimal_field("oldfd", arg(0)),
             decimal_field("newfd", arg(1)),
@@ -517,13 +543,27 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("flags", arg(2)),
             octal_field("mode", arg(3)),
         ],
+        Syscall::Openat2 => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("how", arg(2)),
+            decimal_field("size", arg(3)),
+        ],
         Syscall::Stat | Syscall::Lstat | Syscall::Access | Syscall::Readlink => {
             vec![hex_field("path_ptr", arg(0)), hex_field("buf", arg(1))]
         }
+        Syscall::Statfs => vec![hex_field("path_ptr", arg(0)), hex_field("buf", arg(1))],
+        Syscall::Fstatfs => vec![decimal_field("fd", arg(0)), hex_field("buf", arg(1))],
         Syscall::Newfstatat | Syscall::Readlinkat => vec![
             signed_field("dirfd", arg(0)),
             hex_field("path_ptr", arg(1)),
             hex_field("buf", arg(2)),
+            hex_field("flags", arg(3)),
+        ],
+        Syscall::Faccessat2 => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("mode", arg(2)),
             hex_field("flags", arg(3)),
         ],
         Syscall::Statx => vec![
@@ -610,6 +650,11 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             decimal_field("length", arg(1)),
             hex_field("prot_or_flags", arg(2)),
         ],
+        Syscall::Madvise => vec![
+            hex_field("addr", arg(0)),
+            decimal_field("length", arg(1)),
+            decimal_field("advice", arg(2)),
+        ],
         Syscall::Brk => vec![hex_field("addr", arg(0))],
         Syscall::Exit | Syscall::ExitGroup => vec![decimal_field("status", arg(0))],
         Syscall::Getpid
@@ -621,19 +666,30 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         | Syscall::Getgid
         | Syscall::Getegid
         | Syscall::Setsid
+        | Syscall::SchedYield
         | Syscall::RtSigreturn => Vec::new(),
         Syscall::Setuid | Syscall::Setgid => vec![decimal_field("id", arg(0))],
         Syscall::Setreuid | Syscall::Setregid => {
             vec![decimal_field("rid", arg(0)), decimal_field("eid", arg(1))]
         }
         Syscall::Setpgid => vec![decimal_field("pid", arg(0)), decimal_field("pgid", arg(1))],
+        Syscall::Getpgid | Syscall::Getsid => vec![signed_field("pid", arg(0))],
         Syscall::Uname => vec![hex_field("buf", arg(0))],
+        Syscall::Sysinfo => vec![hex_field("info", arg(0))],
+        Syscall::Prctl => vec![
+            decimal_field("option", arg(0)),
+            hex_field("arg2", arg(1)),
+            hex_field("arg3", arg(2)),
+            hex_field("arg4", arg(3)),
+            hex_field("arg5", arg(4)),
+        ],
         Syscall::ArchPrctl => vec![hex_field("code", arg(0)), hex_field("addr", arg(1))],
         Syscall::Execve => vec![
             hex_field("path_ptr", arg(0)),
             hex_field("argv_ptr", arg(1)),
             hex_field("envp_ptr", arg(2)),
         ],
+        Syscall::Clone3 => vec![hex_field("cl_args", arg(0)), decimal_field("size", arg(1))],
         Syscall::Clone => vec![
             hex_field("flags", arg(0)),
             hex_field("child_stack", arg(1)),
@@ -648,6 +704,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("options", arg(2)),
             hex_field("rusage", arg(3)),
         ],
+        Syscall::Getrusage => vec![signed_field("who", arg(0)), hex_field("usage", arg(1))],
         Syscall::Kill => vec![signed_field("pid", arg(0)), decimal_field("sig", arg(1))],
         Syscall::Tgkill => vec![
             signed_field("tgid", arg(0)),
@@ -678,14 +735,41 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("uaddr2", arg(4)),
             decimal_field("val3", arg(5)),
         ],
+        Syscall::Rseq => vec![
+            hex_field("rseq", arg(0)),
+            decimal_field("rseq_len", arg(1)),
+            hex_field("flags", arg(2)),
+            hex_field("sig", arg(3)),
+        ],
         Syscall::ClockGettime => {
             vec![decimal_field("clockid", arg(0)), hex_field("tp", arg(1))]
         }
+        Syscall::ClockGetres => {
+            vec![decimal_field("clockid", arg(0)), hex_field("res", arg(1))]
+        }
+        Syscall::Gettimeofday => vec![hex_field("tv", arg(0)), hex_field("tz", arg(1))],
         Syscall::Nanosleep => vec![hex_field("req", arg(0)), hex_field("rem", arg(1))],
         Syscall::Getrandom => vec![
             hex_field("buf", arg(0)),
             decimal_field("buflen", arg(1)),
             hex_field("flags", arg(2)),
+        ],
+        Syscall::Getrlimit => vec![decimal_field("resource", arg(0)), hex_field("rlim", arg(1))],
+        Syscall::Prlimit64 => vec![
+            signed_field("pid", arg(0)),
+            decimal_field("resource", arg(1)),
+            hex_field("new_limit", arg(2)),
+            hex_field("old_limit", arg(3)),
+        ],
+        Syscall::Getcpu => vec![
+            hex_field("cpu", arg(0)),
+            hex_field("node", arg(1)),
+            hex_field("tcache", arg(2)),
+        ],
+        Syscall::Membarrier => vec![
+            decimal_field("cmd", arg(0)),
+            hex_field("flags", arg(1)),
+            signed_field("cpu_id", arg(2)),
         ],
         Syscall::Socket => vec![
             decimal_field("domain", arg(0)),
@@ -767,6 +851,14 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("events", arg(1)),
             decimal_field("maxevents", arg(2)),
             signed_field("timeout", arg(3)),
+        ],
+        Syscall::EpollPwait2 => vec![
+            decimal_field("epfd", arg(0)),
+            hex_field("events", arg(1)),
+            decimal_field("maxevents", arg(2)),
+            hex_field("timeout", arg(3)),
+            hex_field("sigmask", arg(4)),
+            decimal_field("sigsetsize", arg(5)),
         ],
         Syscall::Unknown(_) => (0..6)
             .map(|index| hex_field(format!("arg{index}"), arg(index)))
@@ -853,6 +945,36 @@ mod tests {
                 Some(SyscallSubsystem::File)
             );
         }
+
+        for (syscall, subsystem) in [
+            (Syscall::SchedYield, SyscallSubsystem::Task),
+            (Syscall::Madvise, SyscallSubsystem::Memory),
+            (Syscall::Gettimeofday, SyscallSubsystem::Time),
+            (Syscall::Getrlimit, SyscallSubsystem::Task),
+            (Syscall::Getrusage, SyscallSubsystem::Task),
+            (Syscall::Sysinfo, SyscallSubsystem::Task),
+            (Syscall::Getpgid, SyscallSubsystem::Task),
+            (Syscall::Getsid, SyscallSubsystem::Task),
+            (Syscall::Statfs, SyscallSubsystem::File),
+            (Syscall::Fstatfs, SyscallSubsystem::File),
+            (Syscall::Prctl, SyscallSubsystem::Task),
+            (Syscall::ClockGetres, SyscallSubsystem::Time),
+            (Syscall::Prlimit64, SyscallSubsystem::Task),
+            (Syscall::Getcpu, SyscallSubsystem::Task),
+            (Syscall::Membarrier, SyscallSubsystem::Task),
+            (Syscall::Rseq, SyscallSubsystem::Task),
+            (Syscall::Clone3, SyscallSubsystem::Task),
+            (Syscall::CloseRange, SyscallSubsystem::File),
+            (Syscall::Openat2, SyscallSubsystem::File),
+            (Syscall::Faccessat2, SyscallSubsystem::File),
+            (Syscall::EpollPwait2, SyscallSubsystem::Event),
+        ] {
+            assert_eq!(
+                syscall_descriptor(syscall).map(|descriptor| descriptor.subsystem),
+                Some(subsystem),
+                "{syscall} should route to {subsystem:?}"
+            );
+        }
     }
 
     #[test]
@@ -866,6 +988,150 @@ mod tests {
                 descriptor.syscall
             );
             assert_eq!(syscall_descriptor(descriptor.syscall), Some(descriptor));
+        }
+    }
+
+    #[test]
+    fn decodes_fake_syscall_fields() {
+        for (syscall, args, expected) in [
+            (Syscall::SchedYield, [1, 2, 3, 4, 5, 6], &[][..]),
+            (
+                Syscall::Madvise,
+                [0x1000, 4096, 1, 0, 0, 0],
+                &[("addr", "0x1000"), ("length", "4096"), ("advice", "1")][..],
+            ),
+            (
+                Syscall::Gettimeofday,
+                [0x2000, 0x3000, 0, 0, 0, 0],
+                &[("tv", "0x2000"), ("tz", "0x3000")][..],
+            ),
+            (
+                Syscall::Getrlimit,
+                [7, 0x4000, 0, 0, 0, 0],
+                &[("resource", "7"), ("rlim", "0x4000")][..],
+            ),
+            (
+                Syscall::Getrusage,
+                [u64::MAX, 0x5000, 0, 0, 0, 0],
+                &[("who", "-1"), ("usage", "0x5000")][..],
+            ),
+            (
+                Syscall::Sysinfo,
+                [0x6000, 0, 0, 0, 0, 0],
+                &[("info", "0x6000")][..],
+            ),
+            (
+                Syscall::Getpgid,
+                [123, 0, 0, 0, 0, 0],
+                &[("pid", "123")][..],
+            ),
+            (Syscall::Getsid, [123, 0, 0, 0, 0, 0], &[("pid", "123")][..]),
+            (
+                Syscall::Statfs,
+                [0x7000, 0x8000, 0, 0, 0, 0],
+                &[("path_ptr", "0x7000"), ("buf", "0x8000")][..],
+            ),
+            (
+                Syscall::Fstatfs,
+                [3, 0x9000, 0, 0, 0, 0],
+                &[("fd", "3"), ("buf", "0x9000")][..],
+            ),
+            (
+                Syscall::Prctl,
+                [1, 2, 3, 4, 5, 0],
+                &[
+                    ("option", "1"),
+                    ("arg2", "0x2"),
+                    ("arg3", "0x3"),
+                    ("arg4", "0x4"),
+                    ("arg5", "0x5"),
+                ][..],
+            ),
+            (
+                Syscall::ClockGetres,
+                [1, 0xa000, 0, 0, 0, 0],
+                &[("clockid", "1"), ("res", "0xa000")][..],
+            ),
+            (
+                Syscall::Prlimit64,
+                [123, 7, 0xb000, 0xc000, 0, 0],
+                &[
+                    ("pid", "123"),
+                    ("resource", "7"),
+                    ("new_limit", "0xb000"),
+                    ("old_limit", "0xc000"),
+                ][..],
+            ),
+            (
+                Syscall::Getcpu,
+                [0xd000, 0xe000, 0xf000, 0, 0, 0],
+                &[("cpu", "0xd000"), ("node", "0xe000"), ("tcache", "0xf000")][..],
+            ),
+            (
+                Syscall::Membarrier,
+                [1, 2, u64::MAX, 0, 0, 0],
+                &[("cmd", "1"), ("flags", "0x2"), ("cpu_id", "-1")][..],
+            ),
+            (
+                Syscall::Rseq,
+                [0x1000, 32, 0, 0x53053053, 0, 0],
+                &[
+                    ("rseq", "0x1000"),
+                    ("rseq_len", "32"),
+                    ("flags", "0x0"),
+                    ("sig", "0x53053053"),
+                ][..],
+            ),
+            (
+                Syscall::Clone3,
+                [0x1100, 88, 0, 0, 0, 0],
+                &[("cl_args", "0x1100"), ("size", "88")][..],
+            ),
+            (
+                Syscall::CloseRange,
+                [3, 9, 1, 0, 0, 0],
+                &[("first", "3"), ("last", "9"), ("flags", "0x1")][..],
+            ),
+            (
+                Syscall::Openat2,
+                [u64::MAX - 99, 0x1200, 0x1300, 24, 0, 0],
+                &[
+                    ("dirfd", "-100"),
+                    ("path_ptr", "0x1200"),
+                    ("how", "0x1300"),
+                    ("size", "24"),
+                ][..],
+            ),
+            (
+                Syscall::Faccessat2,
+                [u64::MAX - 99, 0x1400, 4, 0x100, 0, 0],
+                &[
+                    ("dirfd", "-100"),
+                    ("path_ptr", "0x1400"),
+                    ("mode", "0x4"),
+                    ("flags", "0x100"),
+                ][..],
+            ),
+            (
+                Syscall::EpollPwait2,
+                [5, 0x1500, 64, 0x1600, 0x1700, 8],
+                &[
+                    ("epfd", "5"),
+                    ("events", "0x1500"),
+                    ("maxevents", "64"),
+                    ("timeout", "0x1600"),
+                    ("sigmask", "0x1700"),
+                    ("sigsetsize", "8"),
+                ][..],
+            ),
+        ] {
+            let decoded = super::decode_syscall_fields(syscall, crate::SyscallArgs::new(args));
+            let decoded: Vec<_> = decoded
+                .iter()
+                .map(|field| (field.name.as_str(), field.value.as_str()))
+                .collect();
+
+            assert_eq!(decoded, expected, "{syscall}");
         }
     }
 

@@ -56,6 +56,12 @@ pub enum Syscall {
     Writev,
     Access,
     Pipe,
+    SchedYield,
+    Madvise,
+    Gettimeofday,
+    Getrlimit,
+    Getrusage,
+    Sysinfo,
     Getuid,
     Getgid,
     Setuid,
@@ -68,6 +74,10 @@ pub enum Syscall {
     Setsid,
     Setreuid,
     Setregid,
+    Getpgid,
+    Getsid,
+    Statfs,
+    Fstatfs,
     Nanosleep,
     Dup,
     Dup2,
@@ -109,12 +119,14 @@ pub enum Syscall {
     Chmod,
     Chown,
     Umask,
+    Prctl,
     ArchPrctl,
     Gettid,
     Futex,
     Getdents64,
     SetTidAddress,
     ClockGettime,
+    ClockGetres,
     ExitGroup,
     EpollWait,
     EpollCtl,
@@ -134,9 +146,18 @@ pub enum Syscall {
     Accept4,
     Dup3,
     Pipe2,
+    Prlimit64,
+    Getcpu,
     Renameat2,
     Getrandom,
+    Membarrier,
     Statx,
+    Rseq,
+    Clone3,
+    CloseRange,
+    Openat2,
+    Faccessat2,
+    EpollPwait2,
     Unknown(SyscallNumber),
 }
 
@@ -162,6 +183,12 @@ impl Syscall {
     pub const WRITEV: SyscallNumber = SyscallNumber::new(20);
     pub const ACCESS: SyscallNumber = SyscallNumber::new(21);
     pub const PIPE: SyscallNumber = SyscallNumber::new(22);
+    pub const SCHED_YIELD: SyscallNumber = SyscallNumber::new(24);
+    pub const MADVISE: SyscallNumber = SyscallNumber::new(28);
+    pub const GETTIMEOFDAY: SyscallNumber = SyscallNumber::new(96);
+    pub const GETRLIMIT: SyscallNumber = SyscallNumber::new(97);
+    pub const GETRUSAGE: SyscallNumber = SyscallNumber::new(98);
+    pub const SYSINFO: SyscallNumber = SyscallNumber::new(99);
     pub const GETUID: SyscallNumber = SyscallNumber::new(102);
     pub const GETGID: SyscallNumber = SyscallNumber::new(104);
     pub const SETUID: SyscallNumber = SyscallNumber::new(105);
@@ -174,6 +201,10 @@ impl Syscall {
     pub const SETSID: SyscallNumber = SyscallNumber::new(112);
     pub const SETREUID: SyscallNumber = SyscallNumber::new(113);
     pub const SETREGID: SyscallNumber = SyscallNumber::new(114);
+    pub const GETPGID: SyscallNumber = SyscallNumber::new(121);
+    pub const GETSID: SyscallNumber = SyscallNumber::new(124);
+    pub const STATFS: SyscallNumber = SyscallNumber::new(137);
+    pub const FSTATFS: SyscallNumber = SyscallNumber::new(138);
     pub const NANOSLEEP: SyscallNumber = SyscallNumber::new(35);
     pub const DUP: SyscallNumber = SyscallNumber::new(32);
     pub const DUP2: SyscallNumber = SyscallNumber::new(33);
@@ -215,12 +246,14 @@ impl Syscall {
     pub const CHMOD: SyscallNumber = SyscallNumber::new(90);
     pub const CHOWN: SyscallNumber = SyscallNumber::new(92);
     pub const UMASK: SyscallNumber = SyscallNumber::new(95);
+    pub const PRCTL: SyscallNumber = SyscallNumber::new(157);
     pub const ARCH_PRCTL: SyscallNumber = SyscallNumber::new(158);
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
     pub const FUTEX: SyscallNumber = SyscallNumber::new(202);
     pub const GETDENTS64: SyscallNumber = SyscallNumber::new(217);
     pub const SET_TID_ADDRESS: SyscallNumber = SyscallNumber::new(218);
     pub const CLOCK_GETTIME: SyscallNumber = SyscallNumber::new(228);
+    pub const CLOCK_GETRES: SyscallNumber = SyscallNumber::new(229);
     pub const EXIT_GROUP: SyscallNumber = SyscallNumber::new(231);
     pub const EPOLL_WAIT: SyscallNumber = SyscallNumber::new(232);
     pub const EPOLL_CTL: SyscallNumber = SyscallNumber::new(233);
@@ -240,9 +273,18 @@ impl Syscall {
     pub const ACCEPT4: SyscallNumber = SyscallNumber::new(288);
     pub const DUP3: SyscallNumber = SyscallNumber::new(292);
     pub const PIPE2: SyscallNumber = SyscallNumber::new(293);
+    pub const PRLIMIT64: SyscallNumber = SyscallNumber::new(302);
+    pub const GETCPU: SyscallNumber = SyscallNumber::new(309);
     pub const RENAMEAT2: SyscallNumber = SyscallNumber::new(316);
     pub const GETRANDOM: SyscallNumber = SyscallNumber::new(318);
+    pub const MEMBARRIER: SyscallNumber = SyscallNumber::new(324);
     pub const STATX: SyscallNumber = SyscallNumber::new(332);
+    pub const RSEQ: SyscallNumber = SyscallNumber::new(334);
+    pub const CLONE3: SyscallNumber = SyscallNumber::new(435);
+    pub const CLOSE_RANGE: SyscallNumber = SyscallNumber::new(436);
+    pub const OPENAT2: SyscallNumber = SyscallNumber::new(437);
+    pub const FACCESSAT2: SyscallNumber = SyscallNumber::new(439);
+    pub const EPOLL_PWAIT2: SyscallNumber = SyscallNumber::new(441);
 
     #[must_use]
     pub const fn from_number(number: SyscallNumber) -> Self {
@@ -268,6 +310,8 @@ impl Syscall {
             20 => Self::Writev,
             21 => Self::Access,
             22 => Self::Pipe,
+            24 => Self::SchedYield,
+            28 => Self::Madvise,
             32 => Self::Dup,
             33 => Self::Dup2,
             35 => Self::Nanosleep,
@@ -309,6 +353,10 @@ impl Syscall {
             90 => Self::Chmod,
             92 => Self::Chown,
             95 => Self::Umask,
+            96 => Self::Gettimeofday,
+            97 => Self::Getrlimit,
+            98 => Self::Getrusage,
+            99 => Self::Sysinfo,
             102 => Self::Getuid,
             104 => Self::Getgid,
             105 => Self::Setuid,
@@ -321,12 +369,18 @@ impl Syscall {
             112 => Self::Setsid,
             113 => Self::Setreuid,
             114 => Self::Setregid,
+            121 => Self::Getpgid,
+            124 => Self::Getsid,
+            137 => Self::Statfs,
+            138 => Self::Fstatfs,
+            157 => Self::Prctl,
             158 => Self::ArchPrctl,
             186 => Self::Gettid,
             202 => Self::Futex,
             217 => Self::Getdents64,
             218 => Self::SetTidAddress,
             228 => Self::ClockGettime,
+            229 => Self::ClockGetres,
             231 => Self::ExitGroup,
             232 => Self::EpollWait,
             233 => Self::EpollCtl,
@@ -346,9 +400,18 @@ impl Syscall {
             291 => Self::EpollCreate1,
             292 => Self::Dup3,
             293 => Self::Pipe2,
+            302 => Self::Prlimit64,
+            309 => Self::Getcpu,
             316 => Self::Renameat2,
             318 => Self::Getrandom,
+            324 => Self::Membarrier,
             332 => Self::Statx,
+            334 => Self::Rseq,
+            435 => Self::Clone3,
+            436 => Self::CloseRange,
+            437 => Self::Openat2,
+            439 => Self::Faccessat2,
+            441 => Self::EpollPwait2,
             _ => Self::Unknown(number),
         }
     }
@@ -377,6 +440,12 @@ impl Syscall {
             Self::Writev => Self::WRITEV,
             Self::Access => Self::ACCESS,
             Self::Pipe => Self::PIPE,
+            Self::SchedYield => Self::SCHED_YIELD,
+            Self::Madvise => Self::MADVISE,
+            Self::Gettimeofday => Self::GETTIMEOFDAY,
+            Self::Getrlimit => Self::GETRLIMIT,
+            Self::Getrusage => Self::GETRUSAGE,
+            Self::Sysinfo => Self::SYSINFO,
             Self::Getuid => Self::GETUID,
             Self::Getgid => Self::GETGID,
             Self::Setuid => Self::SETUID,
@@ -389,6 +458,10 @@ impl Syscall {
             Self::Setsid => Self::SETSID,
             Self::Setreuid => Self::SETREUID,
             Self::Setregid => Self::SETREGID,
+            Self::Getpgid => Self::GETPGID,
+            Self::Getsid => Self::GETSID,
+            Self::Statfs => Self::STATFS,
+            Self::Fstatfs => Self::FSTATFS,
             Self::Nanosleep => Self::NANOSLEEP,
             Self::Dup => Self::DUP,
             Self::Dup2 => Self::DUP2,
@@ -430,12 +503,14 @@ impl Syscall {
             Self::Chmod => Self::CHMOD,
             Self::Chown => Self::CHOWN,
             Self::Umask => Self::UMASK,
+            Self::Prctl => Self::PRCTL,
             Self::ArchPrctl => Self::ARCH_PRCTL,
             Self::Gettid => Self::GETTID,
             Self::Futex => Self::FUTEX,
             Self::Getdents64 => Self::GETDENTS64,
             Self::SetTidAddress => Self::SET_TID_ADDRESS,
             Self::ClockGettime => Self::CLOCK_GETTIME,
+            Self::ClockGetres => Self::CLOCK_GETRES,
             Self::ExitGroup => Self::EXIT_GROUP,
             Self::EpollWait => Self::EPOLL_WAIT,
             Self::EpollCtl => Self::EPOLL_CTL,
@@ -455,9 +530,18 @@ impl Syscall {
             Self::EpollCreate1 => Self::EPOLL_CREATE1,
             Self::Dup3 => Self::DUP3,
             Self::Pipe2 => Self::PIPE2,
+            Self::Prlimit64 => Self::PRLIMIT64,
+            Self::Getcpu => Self::GETCPU,
             Self::Renameat2 => Self::RENAMEAT2,
             Self::Getrandom => Self::GETRANDOM,
+            Self::Membarrier => Self::MEMBARRIER,
             Self::Statx => Self::STATX,
+            Self::Rseq => Self::RSEQ,
+            Self::Clone3 => Self::CLONE3,
+            Self::CloseRange => Self::CLOSE_RANGE,
+            Self::Openat2 => Self::OPENAT2,
+            Self::Faccessat2 => Self::FACCESSAT2,
+            Self::EpollPwait2 => Self::EPOLL_PWAIT2,
             Self::Unknown(number) => number,
         }
     }
@@ -486,6 +570,12 @@ impl Syscall {
             Self::Writev => "writev",
             Self::Access => "access",
             Self::Pipe => "pipe",
+            Self::SchedYield => "sched_yield",
+            Self::Madvise => "madvise",
+            Self::Gettimeofday => "gettimeofday",
+            Self::Getrlimit => "getrlimit",
+            Self::Getrusage => "getrusage",
+            Self::Sysinfo => "sysinfo",
             Self::Getuid => "getuid",
             Self::Getgid => "getgid",
             Self::Setuid => "setuid",
@@ -498,6 +588,10 @@ impl Syscall {
             Self::Setsid => "setsid",
             Self::Setreuid => "setreuid",
             Self::Setregid => "setregid",
+            Self::Getpgid => "getpgid",
+            Self::Getsid => "getsid",
+            Self::Statfs => "statfs",
+            Self::Fstatfs => "fstatfs",
             Self::Nanosleep => "nanosleep",
             Self::Dup => "dup",
             Self::Dup2 => "dup2",
@@ -539,12 +633,14 @@ impl Syscall {
             Self::Chmod => "chmod",
             Self::Chown => "chown",
             Self::Umask => "umask",
+            Self::Prctl => "prctl",
             Self::ArchPrctl => "arch_prctl",
             Self::Gettid => "gettid",
             Self::Futex => "futex",
             Self::Getdents64 => "getdents64",
             Self::SetTidAddress => "set_tid_address",
             Self::ClockGettime => "clock_gettime",
+            Self::ClockGetres => "clock_getres",
             Self::ExitGroup => "exit_group",
             Self::EpollWait => "epoll_wait",
             Self::EpollCtl => "epoll_ctl",
@@ -564,9 +660,18 @@ impl Syscall {
             Self::EpollCreate1 => "epoll_create1",
             Self::Dup3 => "dup3",
             Self::Pipe2 => "pipe2",
+            Self::Prlimit64 => "prlimit64",
+            Self::Getcpu => "getcpu",
             Self::Renameat2 => "renameat2",
             Self::Getrandom => "getrandom",
+            Self::Membarrier => "membarrier",
             Self::Statx => "statx",
+            Self::Rseq => "rseq",
+            Self::Clone3 => "clone3",
+            Self::CloseRange => "close_range",
+            Self::Openat2 => "openat2",
+            Self::Faccessat2 => "faccessat2",
+            Self::EpollPwait2 => "epoll_pwait2",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -601,6 +706,34 @@ mod tests {
         assert_eq!(Syscall::from_number(Syscall::STATX), Syscall::Statx);
         assert_eq!(Syscall::ExitGroup.number().raw(), 231);
         assert_eq!(Syscall::ClockGettime.name(), "clock_gettime");
+
+        for (number, syscall, name) in [
+            (Syscall::SCHED_YIELD, Syscall::SchedYield, "sched_yield"),
+            (Syscall::MADVISE, Syscall::Madvise, "madvise"),
+            (Syscall::GETTIMEOFDAY, Syscall::Gettimeofday, "gettimeofday"),
+            (Syscall::GETRLIMIT, Syscall::Getrlimit, "getrlimit"),
+            (Syscall::GETRUSAGE, Syscall::Getrusage, "getrusage"),
+            (Syscall::SYSINFO, Syscall::Sysinfo, "sysinfo"),
+            (Syscall::GETPGID, Syscall::Getpgid, "getpgid"),
+            (Syscall::GETSID, Syscall::Getsid, "getsid"),
+            (Syscall::STATFS, Syscall::Statfs, "statfs"),
+            (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
+            (Syscall::PRCTL, Syscall::Prctl, "prctl"),
+            (Syscall::CLOCK_GETRES, Syscall::ClockGetres, "clock_getres"),
+            (Syscall::PRLIMIT64, Syscall::Prlimit64, "prlimit64"),
+            (Syscall::GETCPU, Syscall::Getcpu, "getcpu"),
+            (Syscall::MEMBARRIER, Syscall::Membarrier, "membarrier"),
+            (Syscall::RSEQ, Syscall::Rseq, "rseq"),
+            (Syscall::CLONE3, Syscall::Clone3, "clone3"),
+            (Syscall::CLOSE_RANGE, Syscall::CloseRange, "close_range"),
+            (Syscall::OPENAT2, Syscall::Openat2, "openat2"),
+            (Syscall::FACCESSAT2, Syscall::Faccessat2, "faccessat2"),
+            (Syscall::EPOLL_PWAIT2, Syscall::EpollPwait2, "epoll_pwait2"),
+        ] {
+            assert_eq!(Syscall::from_number(number), syscall);
+            assert_eq!(syscall.number(), number);
+            assert_eq!(syscall.name(), name);
+        }
     }
 
     #[test]

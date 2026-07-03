@@ -848,6 +848,8 @@ impl GuestKernel {
             Syscall::Getpgrp => {
                 SyscallOutcome::success(u64::from(task_process(self, task.pid).pgid))
             }
+            Syscall::Getpgid => self.getpgid_current(task.pid, arg(request, 0)),
+            Syscall::Getsid => self.getsid_current(task.pid, arg(request, 0)),
             Syscall::Getuid | Syscall::Geteuid | Syscall::Getgid | Syscall::Getegid => {
                 SyscallOutcome::success(0)
             }
@@ -981,6 +983,36 @@ impl GuestKernel {
         process.sid = current_pid;
         process.pgid = current_pid;
         SyscallOutcome::success(current_pid.into())
+    }
+
+    fn getpgid_current(&self, current_pid: GuestPid, raw_pid: u64) -> SyscallOutcome {
+        let pid = if raw_pid == 0 {
+            current_pid
+        } else {
+            match GuestPid::try_from(raw_pid) {
+                Ok(pid) => pid,
+                Err(_) => return SyscallOutcome::errno(LinuxErrno::ESRCH),
+            }
+        };
+        let Some(process) = self.processes.get(&pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        SyscallOutcome::success(u64::from(process.pgid))
+    }
+
+    fn getsid_current(&self, current_pid: GuestPid, raw_pid: u64) -> SyscallOutcome {
+        let pid = if raw_pid == 0 {
+            current_pid
+        } else {
+            match GuestPid::try_from(raw_pid) {
+                Ok(pid) => pid,
+                Err(_) => return SyscallOutcome::errno(LinuxErrno::ESRCH),
+            }
+        };
+        let Some(process) = self.processes.get(&pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        SyscallOutcome::success(u64::from(process.sid))
     }
 
     pub fn fork_current_with_child_regs(
@@ -1927,6 +1959,46 @@ mod tests {
         assert_eq!(
             kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
             ExitState::Exited { status: 44 }
+        );
+    }
+
+    #[test]
+    fn getpgid_and_getsid_report_guest_process_groups_and_sessions() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getpgid, [0; 6]),
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_PID))
+        );
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getsid, [0; 6]),
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_PID))
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Fork, [0; 6]),
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Setpgid, [2, 2, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getpgid, [2, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getsid, [2, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_PID))
+        );
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getpgid, [999, 0, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Getsid, [999, 0, 0, 0, 0, 0]),
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
         );
     }
 
