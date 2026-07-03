@@ -989,15 +989,18 @@ where
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
-        if let Some(datagram_address) = address {
-            if self.socket_is_udp_datagram(socket_id)? {
-                let buffer = self.read_iovec_bytes(&iovecs)?;
-                let count = self
-                    .sockets
+        if self.socket_is_udp_datagram(socket_id)? {
+            let buffer = self.read_iovec_bytes(&iovecs)?;
+            let count = if let Some(datagram_address) = address {
+                self.sockets
                     .send_to(socket_id, &buffer, datagram_address)
-                    .map_err(net_errno)?;
-                return Ok(count as u64);
-            }
+                    .map_err(net_errno)?
+            } else {
+                self.sockets
+                    .send_connected(socket_id, &buffer)
+                    .map_err(net_errno)?
+            };
+            return Ok(count as u64);
         }
 
         let mut total = 0u64;
@@ -8121,6 +8124,58 @@ mod tests {
     }
 
     #[test]
+    fn connected_datagram_sendto_and_recvfrom_use_connected_peer() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"dns!");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(53));
+        runtime.memory_mut().write(0x2000, b"query");
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_DGRAM),
+                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Sendto,
+                [3, 0x2000, 5, u64::from(LINUX_MSG_NOSIGNAL), 0, 0],
+            ),
+            SyscallReturn::Success(5)
+        );
+        assert_eq!(transport.sent_bytes(), b"query");
+
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Recvfrom, [3, 0x2100, 8, 0, 0, 0],),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 4), b"dns!");
+    }
+
+    #[test]
     fn runtime_dispatch_routes_datagram_socket_io_through_transport() {
         let transport = runtime_socket_transport();
         transport.push_incoming(b"dns!");
@@ -8275,6 +8330,55 @@ mod tests {
         );
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 8), SOCKADDR_IN_LEN as u32);
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
+    }
+
+    #[test]
+    fn connected_datagram_sendmsg_moves_one_datagram_from_iovecs() {
+        let transport = runtime_socket_transport();
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(53));
+        runtime.memory_mut().write(0x2000, b"dn");
+        runtime.memory_mut().write(0x2010, b"s?");
+        runtime.memory_mut().write_iovec(0x3000, 0x2000, 2);
+        runtime.memory_mut().write_iovec(0x3010, 0x2010, 2);
+        runtime.memory_mut().write_msghdr(0x4000, 0, 0, 0x3000, 2);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_DGRAM),
+                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Sendmsg,
+                [3, 0x4000, u64::from(LINUX_MSG_NOSIGNAL), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_calls(), vec![b"dns?".to_vec()]);
     }
 
     #[test]

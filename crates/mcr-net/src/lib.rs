@@ -1153,7 +1153,7 @@ impl GuestSocketTable {
     pub fn send_connected(&mut self, id: SocketId, buffer: &[u8]) -> Result<usize, SocketError> {
         {
             let socket = self.socket(id)?;
-            validate_connected_stream_io(socket, SocketOperation::Send)?;
+            validate_connected_io(socket, SocketOperation::Send)?;
             if socket.shutdown.write {
                 return Err(SocketError::invalid_state(
                     SocketOperation::Send,
@@ -1177,7 +1177,7 @@ impl GuestSocketTable {
     ) -> Result<usize, SocketError> {
         {
             let socket = self.socket(id)?;
-            validate_connected_stream_io(socket, SocketOperation::Recv)?;
+            validate_connected_io(socket, SocketOperation::Recv)?;
             if socket.shutdown.read {
                 return Err(SocketError::invalid_state(
                     SocketOperation::Recv,
@@ -1681,6 +1681,40 @@ fn validate_connected_stream_io(
             operation,
             LinuxErrno::FunctionNotImplemented,
             "only connected TCP stream socket I/O is implemented",
+        ));
+    }
+
+    match socket.state {
+        SocketState::Connected { .. } => Ok(()),
+        SocketState::Created
+        | SocketState::Bound(_)
+        | SocketState::Connecting(_)
+        | SocketState::Listening(_) => Err(SocketError::invalid_state(
+            operation,
+            LinuxErrno::NotConnected,
+            "socket is not connected",
+        )),
+        SocketState::Closed => Err(SocketError::BadSocket { id: socket.id }),
+    }
+}
+
+fn validate_connected_io(
+    socket: &GuestSocket,
+    operation: SocketOperation,
+) -> Result<(), SocketError> {
+    if socket.socket_type == SocketType::Stream
+        && socket.effective_protocol() == SocketProtocol::Tcp
+    {
+        return validate_connected_stream_io(socket, operation);
+    }
+
+    if socket.socket_type != SocketType::Datagram
+        || socket.effective_protocol() != SocketProtocol::Udp
+    {
+        return Err(SocketError::unsupported(
+            operation,
+            LinuxErrno::FunctionNotImplemented,
+            "only connected TCP stream and UDP datagram socket I/O is implemented",
         ));
     }
 
@@ -2338,6 +2372,38 @@ mod tests {
             .expect("recv connected");
         assert_eq!(count, 4);
         assert_eq!(&buffer[..count], b"pong");
+    }
+
+    #[test]
+    fn connected_udp_socket_handle_sends_and_receives_bytes() {
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket_with_handle(
+                SocketSpec::new(
+                    SocketDomain::Inet,
+                    SocketType::Datagram,
+                    SocketProtocol::Udp,
+                )
+                .expect("udp spec"),
+                Box::new(FakeHostSocketHandle::with_incoming(b"dns!")),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([1, 1, 1, 1], 53);
+
+        table.connect(datagram, peer).expect("connect handle");
+        assert_eq!(
+            table
+                .send_connected(datagram, b"dns?")
+                .expect("send connected"),
+            4
+        );
+
+        let mut buffer = [0; 8];
+        let count = table
+            .recv_connected(datagram, &mut buffer)
+            .expect("recv connected");
+        assert_eq!(count, 4);
+        assert_eq!(&buffer[..count], b"dns!");
     }
 
     #[test]
