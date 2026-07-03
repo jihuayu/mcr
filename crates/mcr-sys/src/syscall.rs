@@ -54,6 +54,7 @@ pub enum Syscall {
     RtSigprocmask,
     RtSigreturn,
     Ioctl,
+    Pread64,
     Readv,
     Writev,
     Access,
@@ -183,6 +184,7 @@ impl Syscall {
     pub const RT_SIGPROCMASK: SyscallNumber = SyscallNumber::new(14);
     pub const RT_SIGRETURN: SyscallNumber = SyscallNumber::new(15);
     pub const IOCTL: SyscallNumber = SyscallNumber::new(16);
+    pub const PREAD64: SyscallNumber = SyscallNumber::new(17);
     pub const READV: SyscallNumber = SyscallNumber::new(19);
     pub const WRITEV: SyscallNumber = SyscallNumber::new(20);
     pub const ACCESS: SyscallNumber = SyscallNumber::new(21);
@@ -310,6 +312,7 @@ impl Syscall {
             14 => Self::RtSigprocmask,
             15 => Self::RtSigreturn,
             16 => Self::Ioctl,
+            17 => Self::Pread64,
             19 => Self::Readv,
             20 => Self::Writev,
             21 => Self::Access,
@@ -444,6 +447,7 @@ impl Syscall {
             Self::RtSigprocmask => Self::RT_SIGPROCMASK,
             Self::RtSigreturn => Self::RT_SIGRETURN,
             Self::Ioctl => Self::IOCTL,
+            Self::Pread64 => Self::PREAD64,
             Self::Readv => Self::READV,
             Self::Writev => Self::WRITEV,
             Self::Access => Self::ACCESS,
@@ -576,6 +580,7 @@ impl Syscall {
             Self::RtSigprocmask => "rt_sigprocmask",
             Self::RtSigreturn => "rt_sigreturn",
             Self::Ioctl => "ioctl",
+            Self::Pread64 => "pread64",
             Self::Readv => "readv",
             Self::Writev => "writev",
             Self::Access => "access",
@@ -718,6 +723,7 @@ mod tests {
         assert_eq!(Syscall::ClockGettime.name(), "clock_gettime");
 
         for (number, syscall, name) in [
+            (Syscall::PREAD64, Syscall::Pread64, "pread64"),
             (Syscall::FSYNC, Syscall::Fsync, "fsync"),
             (Syscall::FDATASYNC, Syscall::Fdatasync, "fdatasync"),
             (Syscall::SCHED_YIELD, Syscall::SchedYield, "sched_yield"),
