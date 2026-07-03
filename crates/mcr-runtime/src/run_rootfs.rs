@@ -1045,12 +1045,7 @@ mod tests {
             RunRootfsError::GuestRun(error) => assert_eq!(error.linux_errno(), LinuxErrno::ENOEXEC),
             other => panic!("expected detailed guest runtime error, got {other:?}"),
         }
-        assert!(
-            error
-                .to_string()
-                .contains("guest block did not terminate at syscall"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("before syscall"), "{error}");
     }
 
     fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {
