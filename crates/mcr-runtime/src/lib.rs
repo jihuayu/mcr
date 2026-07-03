@@ -1174,6 +1174,14 @@ where
         let raw = self.vfs.socket_id_for_fd(fd).map_err(vfs_errno)?;
         SocketId::new(raw).ok_or(LinuxErrno::EBADF)
     }
+
+    fn socket_id_for_fd_or_none(&self, fd: Fd) -> Result<Option<SocketId>, LinuxErrno> {
+        match self.vfs.socket_id_for_fd(fd) {
+            Ok(raw) => Ok(SocketId::new(raw)),
+            Err(VfsError::NotSocket) => Ok(None),
+            Err(error) => Err(vfs_errno(error)),
+        }
+    }
 }
 
 impl<M> RuntimeFileSystem<M>
@@ -1224,7 +1232,13 @@ where
         let addr = arg(request, 1);
         let len = usize_arg(request, 2)?;
         let mut buffer = vec![0; len];
-        let count = self.vfs.read(fd, &mut buffer).map_err(vfs_errno)?;
+        let count = if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+            self.sockets
+                .recv_connected(socket_id, &mut buffer)
+                .map_err(net_errno)?
+        } else {
+            self.vfs.read(fd, &mut buffer).map_err(vfs_errno)?
+        };
         self.memory
             .write_bytes(addr, &buffer[..count])
             .map_err(memory_errno)?;
@@ -1239,13 +1253,23 @@ where
         self.memory
             .read_bytes(addr, &mut buffer)
             .map_err(memory_errno)?;
-        let count = self.vfs.write(fd, &buffer).map_err(vfs_errno)?;
+        let count = if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+            self.sockets
+                .send_connected(socket_id, &buffer)
+                .map_err(net_errno)?
+        } else {
+            self.vfs.write(fd, &buffer).map_err(vfs_errno)?
+        };
         Ok(count as u64)
     }
 
     fn sys_readv(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let fd = arg_i32(request, 0);
         let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
+        if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+            return self.recv_connected_into_iovecs(socket_id, &iov);
+        }
+
         let mut total = 0u64;
         for item in iov {
             let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
@@ -1265,6 +1289,26 @@ where
     fn sys_writev(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let fd = arg_i32(request, 0);
         let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
+        if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+            let mut total = 0u64;
+            for item in iov {
+                let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                let mut buffer = vec![0; len];
+                self.memory
+                    .read_bytes(item.iov_base, &mut buffer)
+                    .map_err(memory_errno)?;
+                let count = self
+                    .sockets
+                    .send_connected(socket_id, &buffer)
+                    .map_err(net_errno)?;
+                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+                if count < len {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+
         let mut total = 0u64;
         for item in iov {
             let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
@@ -7743,6 +7787,108 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(runtime.memory().read(0x2100, 4), b"pong");
+    }
+
+    #[test]
+    fn connected_socket_read_and_write_use_stream_io() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write(0x2000, b"ping");
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Write, [3, 0x2000, 4, 0, 0, 0]),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_bytes(), b"ping");
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Read, [3, 0x2100, 8, 0, 0, 0]),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 4), b"pong");
+    }
+
+    #[test]
+    fn connected_socket_readv_and_writev_use_stream_io() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"abcdef");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write(0x2000, b"ab");
+        runtime.memory_mut().write(0x2010, b"cd");
+        runtime.memory_mut().write_iovec(0x3000, 0x2000, 2);
+        runtime.memory_mut().write_iovec(0x3010, 0x2010, 2);
+        runtime.memory_mut().write_iovec(0x5000, 0x6000, 3);
+        runtime.memory_mut().write_iovec(0x5010, 0x6010, 3);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Writev, [3, 0x3000, 2, 0, 0, 0]),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(transport.sent_bytes(), b"abcd");
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Readv, [3, 0x5000, 2, 0, 0, 0]),
+            SyscallReturn::Success(6)
+        );
+        assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
+        assert_eq!(runtime.memory().read(0x6010, 3), b"def");
     }
 
     #[test]
