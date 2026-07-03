@@ -76,7 +76,7 @@ Phase 2 syscalls:
 | Task lifecycle | `clone` thread subset, `fork`/`vfork` fast-path behavior, `wait4`, `set_tid_address`, `set_robust_list` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `tgkill` |
 | Sync | `futex` `WAIT`/`WAKE` for process-private futexes |
-| Network | `socket`, `connect`, `bind`, `listen`, `accept`, `sendmsg`, `recvmsg`, `getsockopt`, `setsockopt`, `shutdown` |
+| Network | TCP-first `socket`, `connect`, selected `bind`/`listen`/`accept`, stream `sendmsg`/`recvmsg`, `getsockopt`, `setsockopt`, `shutdown` |
 | Events | `poll`, `ppoll`, `epoll_create1`, `epoll_ctl`, `epoll_wait` |
 | File mutation | `mkdirat`, `unlinkat`, `renameat2`, `symlinkat`, `linkat`, `ftruncate`, `getcwd`, `chdir`, `umask` |
 
@@ -124,6 +124,21 @@ Required semantics:
 - full copy-on-write `fork` without immediate exec is explicitly not required for Phase 2 unless needed by a smoke workload;
 - `wait4` observes guest child exit state;
 - signals can be skeletal but must support common install, mask, interrupt, and termination paths.
+
+## Guest TLS And `arch_prctl`
+
+Guest thread-local storage is Linux ABI state, not host Rust TLS.
+
+Required Phase 2 behavior:
+
+- support `ARCH_SET_FS` and `ARCH_GET_FS` for per-task FS base state;
+- preserve FS base across syscall dispatch and task scheduling;
+- reset FS base on `execve` according to the newly loaded image and dynamic linker path;
+- copy or initialize FS base intentionally for the supported `fork`/`vfork`/`clone` paths;
+- make same-ISA native execution and any re-emitted guest code observe guest FS-relative memory accesses;
+- return explicit Linux errors for unsupported `arch_prctl` operations.
+
+Rust `thread_local!`, host thread-local APIs, and host TLS slots may be used only as implementation details. They must not become guest-visible TLS semantics.
 
 ## Futex And Synchronization
 
@@ -200,18 +215,28 @@ MCR uses host networking and virtualizes the guest socket ABI.
 
 Phase 2 networking includes:
 
-- AF_INET and AF_INET6 TCP client sockets;
-- DNS resolution compatible with common libc resolver flows;
-- selected server-side bind/listen/accept behavior for local smoke tests;
-- AF_UNIX if available on the target Windows version;
-- `getsockopt` and `setsockopt` cases required by curl/git/language runtimes.
+- AF_INET and AF_INET6 `SOCK_STREAM` TCP client sockets;
+- connected stream `sendto`, `recvfrom`, `sendmsg`, and `recvmsg` behavior over the MCR fd table;
+- selected loopback `bind`, `listen`, and `accept` behavior only when needed by smoke tests;
+- DNS through `/etc/hosts` plus one bounded resolver path, either UDP-to-resolver support or a DNS proxy/intercept implemented by MCR;
+- `getsockopt` and `setsockopt` cases required by curl/git/language runtimes;
+- explicit unsupported results for raw sockets, packet sockets, network namespaces, and UDP behavior outside the DNS path.
 
-`poll` and `epoll` expose Linux readiness semantics over Windows host mechanisms.
+Rust `std::net` and Windows networking APIs are valid host backends, but Linux-visible fd allocation, socket flags, sockaddr layout, errno mapping, nonblocking behavior, and close-on-exec state remain owned by MCR.
+
+`poll` and `epoll` expose a level-trigger Linux readiness subset over Windows host mechanisms.
+
+Phase 2 eventing includes:
+
+- readiness for TCP sockets, pipes, stdio, proc/dev virtual nodes, and internal runtime wakeups;
+- `POLLIN`, `POLLOUT`, `POLLERR`, `POLLHUP`, and matching epoll event bits needed by the smoke matrix;
+- timeout behavior for `poll`, `ppoll`, and `epoll_wait`;
+- explicit `EINVAL` or documented Linux-compatible errors for edge-triggered epoll, one-shot watches, exclusive watches, signal-mask waits beyond the supported subset, and unsupported fd types.
 
 Implementation order:
 
-1. Build a simple readiness model with Winsock and `WSAPoll`.
-2. Feed socket, pipe, procfs, and internal wakeups into one runtime ready queue.
+1. Build a simple level-trigger readiness model with Winsock/`std::net` helpers and `WSAPoll` where useful.
+2. Feed socket, pipe, procfs/devfs, stdio, and internal wakeups into one runtime ready queue.
 3. Implement `epoll_create1`, `epoll_ctl`, and `epoll_wait` over that ready queue.
 4. Defer IOCP optimization until after Phase 2 smoke tests are stable.
 
