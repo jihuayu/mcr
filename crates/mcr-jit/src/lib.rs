@@ -1279,6 +1279,11 @@ where
             registers.rsp = registers.rsp.wrapping_add(8);
             Ok(Some(target))
         }
+        DecodedFlowControl::IndirectBranch if instruction.code() == Code::Jmp_rm64 => {
+            let target = read_operand_u64(registers, memory, &instruction, 0)?;
+            block_offset(block, target)?;
+            Ok(Some(target))
+        }
         DecodedFlowControl::IndirectBranch
         | DecodedFlowControl::Call
         | DecodedFlowControl::Return
@@ -2296,6 +2301,40 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x430012);
+    }
+
+    #[test]
+    fn execution_core_follows_indirect_register_jump_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0x13, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov rax,0x430013
+                0xff, 0xe0, // jmp rax
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x430000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall behind indirect jump");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x43001a);
     }
 
     #[test]
