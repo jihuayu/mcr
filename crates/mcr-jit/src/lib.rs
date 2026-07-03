@@ -1305,6 +1305,22 @@ where
             write_operand_u8(registers, memory, &instruction, 0, result)?;
             flags.set_sub_result(0, u64::from(lhs), u64::from(result), 8);
         }
+        Code::Not_rm64 => {
+            let value = !read_operand_u64(registers, memory, &instruction, 0)?;
+            write_operand_u64(registers, memory, &instruction, 0, value)?;
+        }
+        Code::Not_rm32 => {
+            let value = !read_operand_u32(registers, memory, &instruction, 0)?;
+            write_operand_u32(registers, memory, &instruction, 0, value)?;
+        }
+        Code::Not_rm16 => {
+            let value = !read_operand_u16(registers, memory, &instruction, 0)?;
+            write_operand_u16(registers, memory, &instruction, 0, value)?;
+        }
+        Code::Not_rm8 => {
+            let value = !read_operand_u8(registers, memory, &instruction, 0)?;
+            write_operand_u8(registers, memory, &instruction, 0, value)?;
+        }
         Code::Movq_xmm_rm64
             if instruction.op0_register() == Register::XMM0
                 && instruction.op1_kind() == OpKind::Register =>
@@ -3506,6 +3522,33 @@ mod tests {
         assert_eq!(trap.registers().r12, u64::MAX - 7);
         assert_eq!(u32::from_le_bytes(memory.read(0x713c08)), u32::MAX - 2);
         assert_eq!(trap.site().rip, 0x469176);
+    }
+
+    #[test]
+    fn execution_core_inverts_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xf7, 0xd0, // not rax
+                0xf7, 0x53, 0x08, // not dword ptr [rbx+8]
+                0x0f, 0x05, // syscall
+            ],
+            0x469178,
+        );
+        let registers = GuestRegisters {
+            rax: 0x0f0f,
+            rbx: 0x713e00,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x713e08, &0x00ff_00ff_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute not operands before syscall");
+
+        assert_eq!(trap.registers().rax, !0x0f0f_u64);
+        assert_eq!(u32::from_le_bytes(memory.read(0x713e08)), !0x00ff_00ff_u32);
+        assert_eq!(trap.site().rip, 0x46917e);
     }
 
     #[test]
