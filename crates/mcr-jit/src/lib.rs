@@ -1133,10 +1133,27 @@ where
             let rhs = immediate_as_u64(&instruction)?;
             flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
         }
+        Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u64(memory, rip, address)?;
+            let rhs = immediate_as_u64(&instruction)?;
+            flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
+        }
         Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8 | Code::Cmp_EAX_imm32
             if instruction.op0_kind() == OpKind::Register =>
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = immediate_as_u32(&instruction)?;
+            flags.set_sub_result(
+                u64::from(lhs),
+                u64::from(rhs),
+                u64::from(lhs.wrapping_sub(rhs)),
+                32,
+            );
+        }
+        Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8 if instruction.op0_kind() == OpKind::Memory => {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u32(memory, rip, address)?;
             let rhs = immediate_as_u32(&instruction)?;
             flags.set_sub_result(
                 u64::from(lhs),
@@ -3565,6 +3582,34 @@ mod tests {
 
         assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
         assert_eq!(trap.site().rip, 0x47009e);
+    }
+
+    #[test]
+    fn execution_core_uses_memory_cmp_immediate_for_branch() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x83, 0x7b, 0x10, 0x07, // cmp qword ptr [rbx+0x10],7
+                0x75, 0x07, // jne exit
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+            ],
+            0x4700c0,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x714000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x714010, &7_u64.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute memory cmp immediate before branch");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x4700cc);
     }
 
     #[test]
