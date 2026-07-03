@@ -1554,6 +1554,13 @@ where
 
     fn sys_fcntl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let args = FcntlSyscallArgs::new(arg_i32(request, 0), arg_u32(request, 1), arg(request, 2));
+        if args.cmd == mcr_vfs::F_SETFL
+            && let Ok(socket_id) = self.socket_id_for_fd(args.fd)
+        {
+            self.sockets
+                .set_nonblocking(socket_id, args.arg as u32 & mcr_vfs::O_NONBLOCK != 0)
+                .map_err(net_errno)?;
+        }
         self.vfs
             .fcntl(args.fd, args.cmd, args.arg)
             .map_err(vfs_errno)
@@ -8747,6 +8754,68 @@ mod tests {
     }
 
     #[test]
+    fn fcntl_setfl_propagates_socket_nonblocking_to_host_handle() {
+        let transport = runtime_socket_transport();
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        runtime.memory_mut().write(0x2000, &ipv4_sockaddr(443));
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x2000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert!(!transport.nonblocking());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [
+                    3,
+                    u64::from(mcr_vfs::F_SETFL),
+                    u64::from(O_NONBLOCK),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert!(transport.nonblocking());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(F_GETFL), 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(u64::from(O_RDWR | O_NONBLOCK))
+        );
+    }
+
+    #[test]
     fn bind_listen_and_getsockname_round_trip_ipv4_sockaddr() {
         let mut runtime = runtime_with_bound_ipv4_socket(8080);
 
@@ -9196,6 +9265,10 @@ mod tests {
             self.state.borrow_mut().connect_would_block_once = true;
         }
 
+        fn nonblocking(&self) -> bool {
+            self.state.borrow().nonblocking
+        }
+
         fn poll_timeouts(&self) -> Vec<Option<Duration>> {
             self.state.borrow().poll_timeouts.clone()
         }
@@ -9219,6 +9292,7 @@ mod tests {
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
         connect_would_block_once: bool,
+        nonblocking: bool,
         accepted: Vec<(Rc<RefCell<TestSocketState>>, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
@@ -9271,6 +9345,11 @@ mod tests {
             }
             let (accepted, peer) = state.accepted.remove(0);
             Ok((Box::new(TestSocketHandle { state: accepted }), peer))
+        }
+
+        fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), mcr_net::HostIoError> {
+            self.state.borrow_mut().nonblocking = nonblocking;
+            Ok(())
         }
 
         fn connect(&mut self, address: SocketAddress) -> Result<(), mcr_net::HostIoError> {

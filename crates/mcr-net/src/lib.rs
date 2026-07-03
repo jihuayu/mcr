@@ -483,6 +483,7 @@ pub trait HostSocketHandle: fmt::Debug {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
+    fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError>;
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError>;
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError>;
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
@@ -560,6 +561,12 @@ impl HostSocketHandle for WinHostSocketHandle {
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
         let (socket, peer) = self.socket.accept().map_err(HostIoError::from)?;
         Ok((Box::new(Self { socket }), SocketAddress::from(peer)))
+    }
+
+    fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError> {
+        self.socket
+            .set_nonblocking(nonblocking)
+            .map_err(HostIoError::from)
     }
 
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
@@ -1018,6 +1025,22 @@ impl GuestSocketTable {
             )),
             SocketState::Closed => Err(SocketError::BadSocket { id }),
         }
+    }
+
+    pub fn set_nonblocking(&mut self, id: SocketId, nonblocking: bool) -> Result<(), SocketError> {
+        let socket = self.socket(id)?;
+        if socket.flags.nonblocking == nonblocking {
+            return Ok(());
+        }
+
+        if let Some(entry) = self.host_handles.get_mut(&id) {
+            entry
+                .handle
+                .set_nonblocking(nonblocking)
+                .map_err(SocketError::from_host)?;
+        }
+        self.socket_mut(id)?.flags.nonblocking = nonblocking;
+        Ok(())
     }
 
     pub fn connect(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
@@ -1813,6 +1836,7 @@ mod tests {
         accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
+        nonblocking: bool,
     }
 
     impl FakeHostSocketHandle {
@@ -1883,6 +1907,11 @@ mod tests {
             }
             let (handle, address) = self.accepted.remove(0);
             Ok((Box::new(handle), address))
+        }
+
+        fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError> {
+            self.nonblocking = nonblocking;
+            Ok(())
         }
 
         fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
@@ -2376,6 +2405,28 @@ mod tests {
                 .expect("SO_ERROR is consumed"),
             0
         );
+    }
+
+    #[test]
+    fn set_nonblocking_updates_socket_flags() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::default()),
+            )
+            .expect("socket with handle");
+
+        table
+            .set_nonblocking(stream, true)
+            .expect("set host nonblocking");
+        assert!(table.socket(stream).expect("socket").flags().nonblocking);
+
+        table
+            .set_nonblocking(stream, false)
+            .expect("clear host nonblocking");
+        assert!(!table.socket(stream).expect("socket").flags().nonblocking);
     }
 
     #[test]
