@@ -574,7 +574,7 @@ impl SameIsaExecutionCore {
         const MAX_CONTROL_FLOW_STEPS: usize = 256;
 
         let mut registers = registers;
-        let mut current_rip = block.rip();
+        let mut current_rip = registers.rip;
         let mut flags = GuestFlags::from_registers(&registers);
         for _ in 0..MAX_CONTROL_FLOW_STEPS {
             let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
@@ -2341,6 +2341,35 @@ mod tests {
     }
 
     #[test]
+    fn execution_core_starts_at_register_rip_inside_guest_block() {
+        let block = GuestBlock::new(
+            &[
+                0x0f, 0x0b, // ud2 padding before current rip
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x430100,
+        );
+        let mut registers = GuestRegisters {
+            rip: 0x430102,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute syscall from register rip inside loaded guest block");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 4242);
+        assert_eq!(registers.rip, 0x430109);
+    }
+
+    #[test]
     fn execution_core_follows_indirect_register_jump_to_syscall() {
         let block = GuestBlock::new(
             &[
@@ -3246,7 +3275,10 @@ mod tests {
     #[test]
     fn execution_core_returns_error_when_block_has_no_syscall() {
         let block = GuestBlock::new(&[0x90], 0x420000);
-        let mut registers = GuestRegisters::default();
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
         let mut trampoline = TrampolineCore::new(1, 1, |_| LinuxErrno::ENOSYS.raw() as u64);
 
         let error = SameIsaExecutionCore::new()
