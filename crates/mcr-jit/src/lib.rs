@@ -238,6 +238,7 @@ pub struct GuestRegisters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GuestFlags {
     carry: bool,
+    parity: bool,
     zero: bool,
     sign: bool,
     overflow: bool,
@@ -1046,6 +1047,42 @@ where
         Code::Sar_rm32_1 | Code::Sar_rm32_imm8 | Code::Sar_rm32_CL => {
             execute_shift_u32(registers, flags, memory, &instruction, ShiftOp::Sar)?;
         }
+        Code::Cmovo_r64_rm64
+        | Code::Cmovno_r64_rm64
+        | Code::Cmovb_r64_rm64
+        | Code::Cmovae_r64_rm64
+        | Code::Cmove_r64_rm64
+        | Code::Cmovne_r64_rm64
+        | Code::Cmovbe_r64_rm64
+        | Code::Cmova_r64_rm64
+        | Code::Cmovs_r64_rm64
+        | Code::Cmovns_r64_rm64
+        | Code::Cmovp_r64_rm64
+        | Code::Cmovnp_r64_rm64
+        | Code::Cmovl_r64_rm64
+        | Code::Cmovge_r64_rm64
+        | Code::Cmovle_r64_rm64
+        | Code::Cmovg_r64_rm64 => {
+            execute_cmov_u64(registers, flags, memory, &instruction)?;
+        }
+        Code::Cmovo_r32_rm32
+        | Code::Cmovno_r32_rm32
+        | Code::Cmovb_r32_rm32
+        | Code::Cmovae_r32_rm32
+        | Code::Cmove_r32_rm32
+        | Code::Cmovne_r32_rm32
+        | Code::Cmovbe_r32_rm32
+        | Code::Cmova_r32_rm32
+        | Code::Cmovs_r32_rm32
+        | Code::Cmovns_r32_rm32
+        | Code::Cmovp_r32_rm32
+        | Code::Cmovnp_r32_rm32
+        | Code::Cmovl_r32_rm32
+        | Code::Cmovge_r32_rm32
+        | Code::Cmovle_r32_rm32
+        | Code::Cmovg_r32_rm32 => {
+            execute_cmov_u32(registers, flags, memory, &instruction)?;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1199,6 +1236,7 @@ where
 
 impl GuestFlags {
     const RFLAGS_CARRY: u64 = 1;
+    const RFLAGS_PARITY: u64 = 1 << 2;
     const RFLAGS_ZERO: u64 = 1 << 6;
     const RFLAGS_SIGN: u64 = 1 << 7;
     const RFLAGS_OVERFLOW: u64 = 1 << 11;
@@ -1206,6 +1244,7 @@ impl GuestFlags {
     const fn from_registers(registers: &GuestRegisters) -> Self {
         Self {
             carry: registers.rflags & Self::RFLAGS_CARRY != 0,
+            parity: registers.rflags & Self::RFLAGS_PARITY != 0,
             zero: registers.rflags & Self::RFLAGS_ZERO != 0,
             sign: registers.rflags & Self::RFLAGS_SIGN != 0,
             overflow: registers.rflags & Self::RFLAGS_OVERFLOW != 0,
@@ -1267,6 +1306,7 @@ impl GuestFlags {
     fn set_zero_sign(&mut self, result: u64, bits: u32) {
         self.zero = result == 0;
         self.sign = result & sign_bit(bits) != 0;
+        self.parity = (result as u8).count_ones() % 2 == 0;
     }
 }
 
@@ -1421,6 +1461,8 @@ fn branch_taken(instruction: &Instruction, flags: GuestFlags) -> Result<bool, Ex
         Code::Jae_rel8_64 | Code::Jae_rel32_64 => Ok(!flags.carry),
         Code::Ja_rel8_64 | Code::Ja_rel32_64 => Ok(!flags.carry && !flags.zero),
         Code::Jbe_rel8_64 | Code::Jbe_rel32_64 => Ok(flags.carry || flags.zero),
+        Code::Jp_rel8_64 | Code::Jp_rel32_64 => Ok(flags.parity),
+        Code::Jnp_rel8_64 | Code::Jnp_rel32_64 => Ok(!flags.parity),
         _ => Err(ExecutionError::MissingSyscall {
             terminator: BlockTerminator::ControlFlow {
                 rip: instruction.ip(),
@@ -1615,6 +1657,66 @@ fn apply_shift(lhs: u64, count: u32, bits: u32, operation: ShiftOp) -> u64 {
         }
     };
     mask_to_width(result, bits)
+}
+
+fn execute_cmov_u64<M>(
+    registers: &mut GuestRegisters,
+    flags: &GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    if condition_satisfied(instruction.code(), *flags)? {
+        let value = read_operand_u64(registers, memory, instruction, 1)?;
+        write_reg64(registers, instruction.op0_register(), value)?;
+    }
+    Ok(())
+}
+
+fn execute_cmov_u32<M>(
+    registers: &mut GuestRegisters,
+    flags: &GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    if condition_satisfied(instruction.code(), *flags)? {
+        let value = read_operand_u32(registers, memory, instruction, 1)?;
+        write_reg32(registers, instruction.op0_register(), value)?;
+    }
+    Ok(())
+}
+
+fn condition_satisfied(code: Code, flags: GuestFlags) -> Result<bool, ExecutionError> {
+    match code {
+        Code::Cmovo_r32_rm32 | Code::Cmovo_r64_rm64 => Ok(flags.overflow),
+        Code::Cmovno_r32_rm32 | Code::Cmovno_r64_rm64 => Ok(!flags.overflow),
+        Code::Cmovb_r32_rm32 | Code::Cmovb_r64_rm64 => Ok(flags.carry),
+        Code::Cmovae_r32_rm32 | Code::Cmovae_r64_rm64 => Ok(!flags.carry),
+        Code::Cmove_r32_rm32 | Code::Cmove_r64_rm64 => Ok(flags.zero),
+        Code::Cmovne_r32_rm32 | Code::Cmovne_r64_rm64 => Ok(!flags.zero),
+        Code::Cmovbe_r32_rm32 | Code::Cmovbe_r64_rm64 => Ok(flags.carry || flags.zero),
+        Code::Cmova_r32_rm32 | Code::Cmova_r64_rm64 => Ok(!flags.carry && !flags.zero),
+        Code::Cmovs_r32_rm32 | Code::Cmovs_r64_rm64 => Ok(flags.sign),
+        Code::Cmovns_r32_rm32 | Code::Cmovns_r64_rm64 => Ok(!flags.sign),
+        Code::Cmovp_r32_rm32 | Code::Cmovp_r64_rm64 => Ok(flags.parity),
+        Code::Cmovnp_r32_rm32 | Code::Cmovnp_r64_rm64 => Ok(!flags.parity),
+        Code::Cmovl_r32_rm32 | Code::Cmovl_r64_rm64 => Ok(flags.sign != flags.overflow),
+        Code::Cmovge_r32_rm32 | Code::Cmovge_r64_rm64 => Ok(flags.sign == flags.overflow),
+        Code::Cmovle_r32_rm32 | Code::Cmovle_r64_rm64 => {
+            Ok(flags.zero || flags.sign != flags.overflow)
+        }
+        Code::Cmovg_r32_rm32 | Code::Cmovg_r64_rm64 => {
+            Ok(!flags.zero && flags.sign == flags.overflow)
+        }
+        _ => Err(ExecutionError::MissingSyscall {
+            terminator: BlockTerminator::Invalid { rip: 0 },
+        }),
+    }
 }
 
 fn effective_address(
@@ -2846,6 +2948,35 @@ mod tests {
         assert_eq!(trap.registers().rax, 0x10);
         assert_eq!(trap.registers().rdi, 0xffff_ffff_ffff_fff0);
         assert_eq!(trap.site().rip, 0x469198);
+    }
+
+    #[test]
+    fn execution_core_executes_conditional_move_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0x31, 0xc0, // xor rax,rax
+                0x48, 0x0f, 0x44, 0xc7, // cmove rax,rdi
+                0x48, 0x0f, 0x45, 0xd6, // cmovne rdx,rsi
+                0x0f, 0x05, // syscall
+            ],
+            0x4691c0,
+        );
+        let registers = GuestRegisters {
+            rdx: 0x1111,
+            rsi: 0x2222,
+            rdi: 0x3333,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute conditional moves before syscall");
+
+        assert_eq!(trap.registers().rax, 0x3333);
+        assert_eq!(trap.registers().rdx, 0x1111);
+        assert_eq!(trap.site().rip, 0x4691cb);
     }
 
     #[test]
