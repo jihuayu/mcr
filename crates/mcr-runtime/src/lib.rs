@@ -2275,8 +2275,6 @@ fn dispatch_guest_task_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
-    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
-
     let task = dispatcher
         .subsystems()
         .tasks
@@ -2292,12 +2290,12 @@ where
     }
 
     let before_rip = gpr.rip();
-    let block = {
+    let (block_rip, block) = {
         let memory = dispatcher
             .subsystems()
             .memory_for_process(pid)
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-        read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
+        read_guest_executable_window(memory, before_rip)?
     };
     let trap = {
         let memory = dispatcher
@@ -2305,7 +2303,7 @@ where
             .memory_for_process_mut(pid)
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
-            GuestBlock::new(&block, before_rip),
+            GuestBlock::new(&block, block_rip),
             registers_from_gpr(gpr),
             memory,
         )?
@@ -2339,11 +2337,10 @@ where
     ))
 }
 
-fn read_guest_block(
+fn read_guest_executable_window(
     memory: &GuestMemory,
     rip: u64,
-    max_len: usize,
-) -> Result<Vec<u8>, GuestMemoryError> {
+) -> Result<(u64, Vec<u8>), GuestMemoryError> {
     let Some(vma) = memory.vma_containing(rip) else {
         return Err(GuestMemoryError::NotMapped);
     };
@@ -2351,11 +2348,10 @@ fn read_guest_block(
         return Err(GuestMemoryError::AccessDenied);
     }
 
-    let len = usize::try_from((vma.end() - rip).min(max_len as u64))
-        .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+    let len = usize::try_from(vma.len()).map_err(|_| GuestMemoryError::RegionTooLarge)?;
     let mut bytes = vec![0; len];
-    memory.read(rip, &mut bytes)?;
-    Ok(bytes)
+    memory.read(vma.start(), &mut bytes)?;
+    Ok((vma.start(), bytes))
 }
 
 fn registers_from_gpr(value: GprState) -> GuestRegisters {
@@ -7331,6 +7327,33 @@ mod tests {
     }
 
     #[test]
+    fn guest_run_loop_follows_control_flow_across_executable_window() {
+        let mut code = vec![0; 0x2002];
+        code[0..5].copy_from_slice(&[
+            0xe9, 0xfb, 0x1f, 0x00, 0x00, // jmp 0x403000
+        ]);
+        code[0x2000..0x2002].copy_from_slice(&[
+            0x0f, 0x05, // syscall
+        ]);
+        let mut runtime = Runtime::new(test_program_with_executable_code(
+            "/bin/app", 0x401000, &code,
+        ))
+        .unwrap();
+        set_initial_syscall_regs(
+            &mut runtime,
+            0x401000,
+            Syscall::ExitGroup,
+            [7, 0, 0, 0, 0, 0],
+        );
+
+        let status = runtime
+            .run_guest_until_exit()
+            .expect("guest run follows branch outside the first page");
+
+        assert_eq!(status, 7);
+    }
+
+    #[test]
     fn guest_run_loop_schedules_child_when_parent_waits() {
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
@@ -8159,6 +8182,40 @@ mod tests {
         ))
     }
 
+    fn test_program_with_executable_code(path: &str, entrypoint: u64, code: &[u8]) -> GuestProgram {
+        let executable_len = align_up_for_test(code.len() as u64);
+        let executable_base = entrypoint & !0xfff;
+        GuestProgram::new(GuestExecutable::new(
+            path.as_bytes().to_vec(),
+            Elf64Builder::new()
+                .entrypoint(entrypoint)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    executable_base,
+                    executable_len,
+                    executable_len,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x1000 + executable_len,
+                    executable_base + executable_len,
+                    0x08,
+                    0x100,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R,
+                    0,
+                    executable_base + executable_len + 0x1000,
+                    0x100,
+                    0x100,
+                ))
+                .data_at(0x1000, code.to_vec())
+                .data_at(0x1000 + executable_len, vec![0; 0x08])
+                .build(),
+        ))
+    }
+
     fn test_program_bytes_with_entry_code(entrypoint: u64, code: &[u8]) -> Vec<u8> {
         Elf64Builder::new()
             .entrypoint(entrypoint)
@@ -8186,6 +8243,10 @@ mod tests {
             .data_at(0x1000 + (entrypoint & 0xfff), code.to_vec())
             .data_at(0x2000, vec![0; 0x08])
             .build()
+    }
+
+    fn align_up_for_test(value: u64) -> u64 {
+        (value + 0xfff) & !0xfff
     }
 
     fn test_program_bytes_with_marker(entrypoint: u64, marker: u8) -> Vec<u8> {
