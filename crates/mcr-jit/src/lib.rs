@@ -1159,6 +1159,21 @@ where
         | Code::Setg_rm8 => {
             execute_setcc_u8(registers, flags, memory, &instruction)?;
         }
+        Code::Bt_rm64_r64 | Code::Bt_rm64_imm8 if instruction.op0_kind() == OpKind::Register => {
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_operand_or_immediate_u64(registers, memory, &instruction, 1)?;
+            flags.carry = lhs & (1_u64 << (rhs & 63)) != 0;
+        }
+        Code::Bt_rm32_r32 | Code::Bt_rm32_imm8 if instruction.op0_kind() == OpKind::Register => {
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_operand_or_immediate_u32(registers, memory, &instruction, 1)?;
+            flags.carry = lhs & (1_u32 << (rhs & 31)) != 0;
+        }
+        Code::Bt_rm16_r16 | Code::Bt_rm16_imm8 if instruction.op0_kind() == OpKind::Register => {
+            let lhs = read_reg16(registers, instruction.op0_register())?;
+            let rhs = read_operand_or_immediate_u16(registers, memory, &instruction, 1)?;
+            flags.carry = lhs & (1_u16 << (rhs & 15)) != 0;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -2050,8 +2065,25 @@ where
     M: GuestMemoryOperandAccess,
 {
     match instruction.op_kind(operand) {
+        OpKind::Immediate8 => Ok(u32::from(instruction.immediate8())),
         OpKind::Immediate8to32 | OpKind::Immediate32 => immediate_as_u32(instruction),
         _ => read_operand_u32(registers, memory, instruction, operand),
+    }
+}
+
+fn read_operand_or_immediate_u16<M>(
+    registers: &GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+    operand: u32,
+) -> Result<u16, ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    match instruction.op_kind(operand) {
+        OpKind::Immediate8 => Ok(u16::from(instruction.immediate8())),
+        OpKind::Immediate8to16 | OpKind::Immediate16 => immediate_as_u16(instruction),
+        _ => read_operand_u16(registers, memory, instruction, operand),
     }
 }
 
@@ -2065,6 +2097,7 @@ where
     M: GuestMemoryOperandAccess,
 {
     match instruction.op_kind(operand) {
+        OpKind::Immediate8 => Ok(u64::from(instruction.immediate8())),
         OpKind::Immediate8to64 | OpKind::Immediate32to64 | OpKind::Immediate64 => {
             immediate_as_u64(instruction)
         }
@@ -3921,6 +3954,36 @@ mod tests {
         assert_eq!(trap.registers().rax, 1);
         assert_eq!(trap.registers().rdx, 0xff00);
         assert_eq!(trap.site().rip, 0x47010d);
+    }
+
+    #[test]
+    fn execution_core_uses_bit_test_carry_for_branch() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov rax,0x20
+                0x48, 0x0f, 0xa3, 0xf8, // bt rax,rdi
+                0x73, 0x07, // jae exit
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+            ],
+            0x470140,
+        );
+        let registers = GuestRegisters {
+            rdi: 5,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute bit test before branch");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x470155);
     }
 
     #[test]
