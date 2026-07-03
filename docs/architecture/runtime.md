@@ -213,6 +213,10 @@ Phase 2 requires:
 
 MCR uses host networking and virtualizes the guest socket ABI.
 
+The detailed network architecture is documented in
+[Network ABI design](networking.md). This runtime section records only the
+Phase 2 contract and subsystem placement.
+
 The long-term networking boundary is Linux/POSIX socket syscall ABI
 compatibility on top of Windows user-mode networking. It is not a thin
 `winsock2.h` portability wrapper. Guest code sees Linux-style

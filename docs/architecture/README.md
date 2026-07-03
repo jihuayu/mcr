@@ -125,6 +125,9 @@ The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-i
 - Windows adapters stay below subsystem policy; they do not decide guest path, pid, signal, or fd semantics.
 - Through Phase 2, process-private futex relies on the one-host-process-per-container model.
 - The networking architecture targets Linux/POSIX socket syscall ABI compatibility, not a source-level Winsock wrapper. Phase 2 still gates on the smaller TCP/DNS subset unless a task explicitly expands it.
+- Detailed networking rules live in [Network ABI design](networking.md), including
+  the guest fd/object model, Winsock lifecycle, syscall mappings, readiness
+  strategy, socket options, close semantics, and deferred IOCP backend.
 - Through Phase 2, `poll` and `epoll` are level-trigger only; unsupported flags must fail intentionally instead of being accepted silently.
 - Unsupported syscalls must be tracked and tested as unsupported behavior, not silently ignored.
 - Build steps must call the same runtime executor as user-visible `run-rootfs` workloads.

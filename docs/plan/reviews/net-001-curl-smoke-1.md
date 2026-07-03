@@ -11,18 +11,23 @@ Date: 2026-07-03
 ## Findings
 
 - `curl --version` now completes under native execution instead of hanging in guest cleanup.
-- `curl -fsSL https://example.com` no longer times out after socket nonblocking propagation, but
-  it still fails DNS resolution with curl exit code 6.
-- The current failing stderr is:
+- After the connected UDP and nonblocking Winsock fixes, guest DNS now reaches an
+  address for `example.com` instead of failing with exit code 6.
+- `curl -v https://example.com -o NUL` and the DNS-bypassed
+  `--resolve example.com:443:93.184.216.34` path now reach TCP connect
+  readiness but still exit 7.
+- The current failing stderr shape is:
 
 ```text
-curl: (6) Could not resolve host: example.com (Could not contact DNS servers)
+*   Trying 198.18.0.94:443...
+* connect to 198.18.0.94 port 443 failed: No error information
+curl: (7) Failed to connect to example.com port 443 after ... ms: Could not connect to server
 ```
 
-- A DNS-bypassed probe reported by the parallel worker using
-  `--resolve example.com:443:93.184.216.34` reaches the TCP connect path but exits 7 with an
-  immediate connect failure. That means net-001 still has at least two remaining integration
-  risks: libc DNS server contact and outbound TCP connect completion for the smoke target.
+- Temporary diagnostics showed `poll(fd, POLLOUT)` returning `POLLOUT` and
+  `getsockopt(SO_ERROR)` returning `0`, so the next risk is the exact
+  guest-visible connect/readiness/address-query sequence curl uses after the
+  socket becomes writable.
 
 ## Validation
 
@@ -39,12 +44,14 @@ Observed local smoke results:
 
 ```text
 curl --version: EXIT=0 elapsed=00:00:01.7393748
-curl example.com: EXIT=6 elapsed=00:00:01.7535207
+curl example.com: EXIT=7
 ```
 
 ## Next
 
-- Trace the guest DNS UDP path from libc/c-ares through `sendto`/`poll`/`recvfrom` and verify the
-  runtime actually contacts the configured resolver from `/etc/resolv.conf`.
-- After DNS returns an address, trace the TCP client connect path for the public smoke endpoint,
-  including nonblocking `connect`, readiness, and `SO_ERROR` consumption.
+- Trace the TCP client path after writable readiness, especially `connect`
+  retry, `getsockopt(SO_ERROR)`, `getsockname`, `getpeername`, returned
+  `pollfd.revents`, and socket state transitions.
+- Keep DNS regression coverage for connected UDP `connect` plus `sendto(NULL)`,
+  but the active blocker is now outbound TCP connect completion as observed by
+  curl.
