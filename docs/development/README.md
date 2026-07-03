@@ -111,6 +111,21 @@ running ignored integration smokes. Metadata-only fixtures use `required=false`
 so normal unit tests can validate the contract without downloading large rootfs
 archives.
 
+Materialize the default local Alpine fixture with:
+
+```powershell
+python3 scripts/materialize-alpine-rootfs.py
+```
+
+The materializer downloads the latest stable Alpine minirootfs, verifies the
+release SHA-256 digest, extracts it to `tests/fixtures/rootfs/alpine-rootfs`,
+and adds `curl`, `git`, and CA certificates without requiring Docker, Podman, or
+a host `apk` binary. Rebuild an existing ignored fixture with:
+
+```powershell
+python3 scripts/materialize-alpine-rootfs.py --force
+```
+
 Smoke tests use `SmokeCommand` plus `GoldenOutput` assertions. A smoke remains
 `#[ignore]` until the owning runtime integration task enables the corresponding
 command from the table below.
