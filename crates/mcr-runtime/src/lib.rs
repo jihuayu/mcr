@@ -3444,7 +3444,7 @@ impl RuntimeSubsystems {
         epfd: Fd,
         events_addr: u64,
         maxevents: usize,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<u64, LinuxErrno> {
         const MAX_EPOLL_EVENTS: usize = 4096;
         if maxevents == 0 || maxevents > MAX_EPOLL_EVENTS {
@@ -3459,20 +3459,9 @@ impl RuntimeSubsystems {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut ready = Vec::new();
-        for watch in watches {
-            let poll_events = epoll_events_to_poll_events(watch.events);
-            let revents = self.epoll_watch_revents(watch.fd, poll_events)?;
-            let epoll_events = poll_revents_to_epoll_events(revents, watch.events);
-            if epoll_events != 0 {
-                ready.push(LinuxEpollEvent {
-                    events: epoll_events,
-                    data: watch.data,
-                });
-                if ready.len() == maxevents {
-                    break;
-                }
-            }
+        let mut ready = self.epoll_ready_events(&watches, maxevents, Some(Duration::ZERO))?;
+        if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {
+            ready = self.epoll_ready_events(&watches, maxevents, timeout)?;
         }
 
         for (index, event) in ready.iter().enumerate() {
@@ -3484,8 +3473,37 @@ impl RuntimeSubsystems {
         Ok(ready.len() as u64)
     }
 
-    fn epoll_watch_revents(&mut self, fd: Fd, events: i16) -> Result<i16, LinuxErrno> {
-        match self.poll_fd_revents(fd, events, Some(Duration::ZERO)) {
+    fn epoll_ready_events(
+        &mut self,
+        watches: &[EpollWatch],
+        maxevents: usize,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<LinuxEpollEvent>, LinuxErrno> {
+        let mut ready = Vec::new();
+        for watch in watches {
+            let poll_events = epoll_events_to_poll_events(watch.events);
+            let revents = self.epoll_watch_revents(watch.fd, poll_events, timeout)?;
+            let epoll_events = poll_revents_to_epoll_events(revents, watch.events);
+            if epoll_events != 0 {
+                ready.push(LinuxEpollEvent {
+                    events: epoll_events,
+                    data: watch.data,
+                });
+                if ready.len() == maxevents {
+                    break;
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    fn epoll_watch_revents(
+        &mut self,
+        fd: Fd,
+        events: i16,
+        timeout: Option<Duration>,
+    ) -> Result<i16, LinuxErrno> {
+        match self.poll_fd_revents(fd, events, timeout) {
             Ok(revents) if revents & LINUX_POLLNVAL != 0 => Ok(LINUX_POLLERR | LINUX_POLLHUP),
             Ok(revents) => Ok(revents),
             Err(errno) => Err(errno),
@@ -5326,6 +5344,72 @@ mod tests {
     }
 
     #[test]
+    fn epoll_wait_passes_timeout_to_socket_transport_after_readiness_probe() {
+        let transport = runtime_socket_transport();
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(4)
+        );
+        write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 0x52);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [4, u64::from(LINUX_EPOLL_CTL_ADD), 3, 0x402100, 0, 0,],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let ready =
+            runtime.dispatch_syscall(context(Syscall::EpollWait, [4, 0x402200, 4, 25, 0, 0]));
+
+        assert_eq!(ready.result, SyscallReturn::Success(0));
+        assert_eq!(
+            transport.poll_timeouts(),
+            vec![Some(Duration::ZERO), Some(Duration::from_millis(25))]
+        );
+    }
+
+    #[test]
     fn connected_socket_sendto_and_recvfrom_move_guest_buffers() {
         let transport = runtime_socket_transport();
         transport.push_incoming(b"pong");
@@ -6539,6 +6623,10 @@ mod tests {
             self.state.borrow_mut().connect_would_block_once = true;
         }
 
+        fn poll_timeouts(&self) -> Vec<Option<Duration>> {
+            self.state.borrow().poll_timeouts.clone()
+        }
+
         fn push_accepted(&self, peer: SocketAddress, incoming: &[u8]) {
             self.state.borrow_mut().accepted.push((
                 Rc::new(RefCell::new(TestSocketState {
@@ -6560,6 +6648,7 @@ mod tests {
         accepted: Vec<(Rc<RefCell<TestSocketState>>, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
+        poll_timeouts: Vec<Option<Duration>>,
     }
 
     #[derive(Clone, Debug)]
@@ -6682,8 +6771,9 @@ mod tests {
         fn poll(
             &mut self,
             interest: SocketEvents,
-            _timeout: Option<Duration>,
+            timeout: Option<Duration>,
         ) -> Result<SocketEvents, mcr_net::HostIoError> {
+            self.state.borrow_mut().poll_timeouts.push(timeout);
             let state = self.state.borrow();
             Ok(SocketEvents {
                 readable: interest.readable && !state.incoming.is_empty(),
