@@ -1174,6 +1174,64 @@ where
             let rhs = read_operand_or_immediate_u16(registers, memory, &instruction, 1)?;
             flags.carry = lhs & (1_u16 << (rhs & 15)) != 0;
         }
+        Code::Div_rm64 => {
+            let divisor = read_operand_u64(registers, memory, &instruction, 0)?;
+            if divisor == 0 {
+                return Err(x86_exception(rip));
+            }
+            let dividend = (u128::from(registers.rdx) << 64) | u128::from(registers.rax);
+            let quotient = dividend / u128::from(divisor);
+            let remainder = dividend % u128::from(divisor);
+            if quotient > u128::from(u64::MAX) {
+                return Err(x86_exception(rip));
+            }
+            registers.rax = quotient as u64;
+            registers.rdx = remainder as u64;
+        }
+        Code::Div_rm32 => {
+            let divisor = read_operand_u32(registers, memory, &instruction, 0)?;
+            if divisor == 0 {
+                return Err(x86_exception(rip));
+            }
+            let dividend = (u64::from(read_reg32(registers, Register::EDX)?) << 32)
+                | u64::from(read_reg32(registers, Register::EAX)?);
+            let quotient = dividend / u64::from(divisor);
+            let remainder = dividend % u64::from(divisor);
+            if quotient > u64::from(u32::MAX) {
+                return Err(x86_exception(rip));
+            }
+            write_reg32(registers, Register::EAX, quotient as u32)?;
+            write_reg32(registers, Register::EDX, remainder as u32)?;
+        }
+        Code::Div_rm16 => {
+            let divisor = read_operand_u16(registers, memory, &instruction, 0)?;
+            if divisor == 0 {
+                return Err(x86_exception(rip));
+            }
+            let dividend = (u32::from(read_reg16(registers, Register::DX)?) << 16)
+                | u32::from(read_reg16(registers, Register::AX)?);
+            let quotient = dividend / u32::from(divisor);
+            let remainder = dividend % u32::from(divisor);
+            if quotient > u32::from(u16::MAX) {
+                return Err(x86_exception(rip));
+            }
+            write_reg16(registers, Register::AX, quotient as u16)?;
+            write_reg16(registers, Register::DX, remainder as u16)?;
+        }
+        Code::Div_rm8 => {
+            let divisor = read_operand_u8(registers, memory, &instruction, 0)?;
+            if divisor == 0 {
+                return Err(x86_exception(rip));
+            }
+            let dividend = read_reg16(registers, Register::AX)?;
+            let quotient = dividend / u16::from(divisor);
+            let remainder = dividend % u16::from(divisor);
+            if quotient > u16::from(u8::MAX) {
+                return Err(x86_exception(rip));
+            }
+            write_reg8(registers, Register::AL, quotient as u8)?;
+            write_reg8(registers, Register::AH, remainder as u8)?;
+        }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -1484,6 +1542,15 @@ const fn sign_bit(bits: u32) -> u64 {
 fn sign_extend_u64(value: u64, bits: u32) -> u64 {
     let shift = 64 - bits;
     ((value << shift) as i64 >> shift) as u64
+}
+
+const fn x86_exception(rip: u64) -> ExecutionError {
+    ExecutionError::MissingSyscall {
+        terminator: BlockTerminator::ControlFlow {
+            rip,
+            flow: DecodedFlowControl::Exception,
+        },
+    }
 }
 
 fn block_from_rip(block: GuestBlock<'_>, rip: u64) -> Result<GuestBlock<'_>, ExecutionError> {
@@ -3984,6 +4051,33 @@ mod tests {
 
         assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
         assert_eq!(trap.site().rip, 0x470155);
+    }
+
+    #[test]
+    fn execution_core_executes_unsigned_division() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0x11, 0x00, 0x00, 0x00, // mov eax,17
+                0x31, 0xd2, // xor edx,edx
+                0xf7, 0xf1, // div ecx
+                0x0f, 0x05, // syscall
+            ],
+            0x470180,
+        );
+        let registers = GuestRegisters {
+            rcx: 5,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute unsigned division before syscall");
+
+        assert_eq!(trap.registers().rax, 3);
+        assert_eq!(trap.registers().rdx, 2);
+        assert_eq!(trap.site().rip, 0x470189);
     }
 
     #[test]
