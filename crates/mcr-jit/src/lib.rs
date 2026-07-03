@@ -1365,6 +1365,18 @@ where
         Code::Stosb_m8_AL => {
             execute_stos(registers, memory, rip, instruction.has_rep_prefix(), 1)?;
         }
+        Code::Movsq_m64_m64 => {
+            execute_movs(registers, memory, rip, instruction.has_rep_prefix(), 8)?;
+        }
+        Code::Movsd_m32_m32 => {
+            execute_movs(registers, memory, rip, instruction.has_rep_prefix(), 4)?;
+        }
+        Code::Movsw_m16_m16 => {
+            execute_movs(registers, memory, rip, instruction.has_rep_prefix(), 2)?;
+        }
+        Code::Movsb_m8_m8 => {
+            execute_movs(registers, memory, rip, instruction.has_rep_prefix(), 1)?;
+        }
         Code::Movq_xmm_rm64
             if instruction.op0_register() == Register::XMM0
                 && instruction.op1_kind() == OpKind::Register =>
@@ -2171,6 +2183,45 @@ where
         } else {
             registers.rdi.wrapping_add(step)
         };
+    }
+    if has_rep_prefix {
+        registers.rcx = 0;
+    }
+    Ok(())
+}
+
+fn execute_movs<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    rip: u64,
+    has_rep_prefix: bool,
+    width: usize,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let count = if has_rep_prefix { registers.rcx } else { 1 };
+    let step = width as u64;
+    let direction_down = registers.rflags & (1 << 10) != 0;
+
+    for _ in 0..count {
+        let mut bytes = [0; 8];
+        memory
+            .read_memory_operand(registers.rsi, &mut bytes[..width])
+            .map_err(|error| ExecutionError::MemoryOperand {
+                rip,
+                address: registers.rsi,
+                access: GuestMemoryOperandAccessKind::Read,
+                error,
+            })?;
+        write_memory_bytes(memory, rip, registers.rdi, &bytes[..width])?;
+        if direction_down {
+            registers.rsi = registers.rsi.wrapping_sub(step);
+            registers.rdi = registers.rdi.wrapping_sub(step);
+        } else {
+            registers.rsi = registers.rsi.wrapping_add(step);
+            registers.rdi = registers.rdi.wrapping_add(step);
+        }
     }
     if has_rep_prefix {
         registers.rcx = 0;
@@ -3697,6 +3748,37 @@ mod tests {
         assert_eq!(trap.registers().rcx, 0);
         assert_eq!(trap.registers().rdi, 0x715818);
         assert_eq!(trap.site().rip, 0x469193);
+    }
+
+    #[test]
+    fn execution_core_executes_movs() {
+        let block = GuestBlock::new(
+            &[
+                0xa4, // movsb byte ptr es:[rdi],byte ptr [rsi]
+                0xf3, 0xa4, // rep movsb byte ptr es:[rdi],byte ptr [rsi]
+                0x0f, 0x05, // syscall
+            ],
+            0x469198,
+        );
+        let registers = GuestRegisters {
+            rcx: 3,
+            rdi: 0x716000,
+            rsi: 0x716100,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x716000, &[0; 4]);
+        memory.write(0x716100, &[1, 2, 3, 4]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute movs before syscall");
+
+        assert_eq!(memory.read::<4>(0x716000), [1, 2, 3, 4]);
+        assert_eq!(trap.registers().rcx, 0);
+        assert_eq!(trap.registers().rdi, 0x716004);
+        assert_eq!(trap.registers().rsi, 0x716104);
+        assert_eq!(trap.site().rip, 0x46919b);
     }
 
     #[test]
