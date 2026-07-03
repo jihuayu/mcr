@@ -154,18 +154,26 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Phase 2 workload matrix |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Phase 2 workload matrix |
 
-Phase 2 network contracts are opt-in. Normal `cargo test -p mcr-testkit` must
-not require network access, GitHub access, CA certificates, or a materialized
-rootfs. The ignored network tests additionally skip unless `MCR_BIN` is set and
-`alpine-rootfs` is extracted in the fixture root. Run them explicitly with:
+Phase 2 shell and network contracts are opt-in. Normal `cargo test -p
+mcr-testkit` must not require network access, GitHub access, CA certificates, or
+a materialized rootfs. The ignored shell tests additionally skip unless
+`MCR_BIN` is set and `alpine-rootfs` is extracted in the fixture root. Run them
+explicitly with:
+
+```powershell
+MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored shell_smoke_contract
+```
+
+The ignored network tests use the same `MCR_BIN` and materialized-rootfs gate,
+plus public network access. Run them explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored network_smoke_contract
 ```
 
 Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
-`/bin/sh`, `-c`, and the public network command. They do not execute the command
-string through the host shell.
+`/bin/sh`, `-c`, and the guest command. They do not execute the command string
+through the host shell.
 
 ## Task And Commit Policy
 
