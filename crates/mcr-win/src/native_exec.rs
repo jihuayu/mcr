@@ -76,8 +76,6 @@ mod linux_x86_64 {
     use super::{HostCpuRegisters, NativeExecutionError};
 
     const ARCH_GET_FS: libc::c_ulong = 0x1003;
-    const ARCH_SET_FS: libc::c_ulong = 0x1002;
-
     #[repr(C)]
     struct NativeExecutionState {
         landing_rsp: u64,
@@ -236,7 +234,7 @@ mod linux_x86_64 {
             let action = action.assume_init_mut();
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_SIGINFO;
-            action.sa_sigaction = native_signal_handler as usize;
+            action.sa_sigaction = native_signal_handler as *const () as usize;
             if libc::sigaction(signal, action, old.as_mut_ptr()) != 0 {
                 return Err(NativeExecutionError::SignalHandler(signal));
             }
