@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+libc = "0.2"
+
 [lints.rust]
 unsafe_code = { level = "allow", priority = 1 }
 unsafe_op_in_unsafe_fn = "deny"

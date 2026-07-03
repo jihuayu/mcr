@@ -194,7 +194,7 @@ def materialize_rootfs(
 
     tmp_dir = rootfs_dir.with_name(f"{rootfs_dir.name}.tmp")
     if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
+        remove_tree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
     try:
@@ -215,11 +215,11 @@ def materialize_rootfs(
         if rootfs_dir.exists():
             if not force:
                 raise MaterializeError(f"{rootfs_dir} already exists; use --force to replace it")
-            shutil.rmtree(rootfs_dir)
+            remove_tree(rootfs_dir)
         tmp_dir.replace(rootfs_dir)
     except Exception:
         if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+            remove_tree(tmp_dir)
         raise
 
     print(f"materialized {ROOTFS_NAME} at {rootfs_dir}")
@@ -342,7 +342,7 @@ def link_worktree_rootfs(
                     f"{rootfs_dir} already exists; use --force to replace it with "
                     f"a symlink to {cached_rootfs_dir}"
                 )
-            shutil.rmtree(rootfs_dir)
+            remove_tree(rootfs_dir)
         else:
             if not force:
                 raise MaterializeError(
@@ -702,9 +702,10 @@ def validate_rootfs(rootfs_dir: Path, *, require_network_packages: bool) -> None
     tmp_dir = rootfs_dir / "tmp"
     if not tmp_dir.is_dir():
         raise MaterializeError(f"{rootfs_dir} is missing writable tmp directory")
-    mode = stat.S_IMODE(tmp_dir.stat().st_mode)
-    if mode != 0o1777:
-        raise MaterializeError(f"{tmp_dir} must have mode 1777, found {mode:o}")
+    if os.name != "nt":
+        mode = stat.S_IMODE(tmp_dir.stat().st_mode)
+        if mode != 0o1777:
+            raise MaterializeError(f"{tmp_dir} must have mode 1777, found {mode:o}")
 
 
 def rootfs_path_exists(rootfs_dir: Path, relative_path: str) -> bool:
@@ -848,9 +849,23 @@ def ensure_no_symlink_parent(root: Path, parent: Path) -> None:
 def remove_existing(path: Path) -> None:
     if os.path.lexists(path):
         if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
+            remove_tree(path)
         else:
             path.unlink()
+
+
+def remove_tree(path: Path) -> None:
+    def onexc(function, target, error):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            function(target)
+        except OSError as retry_error:
+            raise retry_error from error
+
+    try:
+        shutil.rmtree(path, onexc=onexc)
+    except TypeError:
+        shutil.rmtree(path, onerror=lambda function, target, _: onexc(function, target, _))
 
 
 def chmod_best_effort(path: Path, mode: int) -> None:

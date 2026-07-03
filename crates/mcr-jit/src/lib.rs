@@ -480,6 +480,11 @@ pub enum ExecutionError {
         access: GuestMemoryOperandAccessKind,
         error: GuestMemoryOperandError,
     },
+    NativeFault {
+        signal: i32,
+        rip: u64,
+        address: u64,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -508,6 +513,14 @@ impl fmt::Display for ExecutionError {
             } => write!(
                 f,
                 "guest memory {access:?} fault at rip 0x{rip:016x}, address 0x{address:016x}: {error:?}"
+            ),
+            Self::NativeFault {
+                signal,
+                rip,
+                address,
+            } => write!(
+                f,
+                "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}"
             ),
         }
     }

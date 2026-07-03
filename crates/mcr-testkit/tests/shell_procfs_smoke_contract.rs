@@ -62,7 +62,7 @@ impl ShellSmokeContext {
         }
 
         Ok(Some(Self {
-            mcr,
+            mcr: resolve_mcr_bin(mcr, &fixtures),
             rootfs: rootfs_path,
         }))
     }
@@ -75,6 +75,23 @@ impl ShellSmokeContext {
             .arg("-c")
             .arg(contract.script)
     }
+}
+
+fn resolve_mcr_bin(mcr: OsString, fixtures: &FixtureRoot) -> OsString {
+    let path = PathBuf::from(&mcr);
+    if path.is_absolute() {
+        return mcr;
+    }
+
+    let Some(workspace) = fixtures.path().parent().and_then(std::path::Path::parent) else {
+        return mcr;
+    };
+    let candidate = workspace.join(&path);
+    if candidate.exists() {
+        return candidate.into_os_string();
+    }
+
+    mcr
 }
 
 #[test]

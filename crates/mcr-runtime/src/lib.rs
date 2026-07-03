@@ -29,14 +29,14 @@ use mcr_sys::{
     LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
     LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT,
     LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
-    LINUX_FUTEX_WAKE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP,
-    LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LinuxEpollEvent, LinuxErrno,
-    LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx, LinuxStatxTimestamp,
-    LinuxTimespec, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
-    PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs,
-    SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult,
-    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
-    SyscallTracer, TimeSyscalls, TraceField,
+    LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL,
+    LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
+    LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx,
+    LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
+    NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
+    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
+    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
+    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
@@ -44,7 +44,7 @@ use mcr_task::{
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
-    LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    FileTimes, LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -56,6 +56,8 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_UTIME_NOW: i64 = 0x3fffffff;
+const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
 const LINUX_GRND_NONBLOCK: u64 = 0x0001;
 const LINUX_GRND_RANDOM: u64 = 0x0002;
@@ -642,6 +644,7 @@ where
 {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let result = match request.syscall {
+            mcr_sys::Syscall::Open => self.sys_open(request),
             mcr_sys::Syscall::Openat => self.sys_openat(request),
             mcr_sys::Syscall::Read => self.sys_read(request),
             mcr_sys::Syscall::Write => self.sys_write(request),
@@ -649,7 +652,9 @@ where
             mcr_sys::Syscall::Writev => self.sys_writev(request),
             mcr_sys::Syscall::Close => self.sys_close(request),
             mcr_sys::Syscall::Lseek => self.sys_lseek(request),
+            mcr_sys::Syscall::Stat => self.sys_stat(request),
             mcr_sys::Syscall::Fstat => self.sys_fstat(request),
+            mcr_sys::Syscall::Lstat => self.sys_lstat(request),
             mcr_sys::Syscall::Newfstatat => self.sys_newfstatat(request),
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
@@ -663,12 +668,21 @@ where
             mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
             mcr_sys::Syscall::Fcntl => self.sys_fcntl(request),
             mcr_sys::Syscall::Ioctl => self.sys_ioctl(request),
+            mcr_sys::Syscall::Mkdir => self.sys_mkdir(request),
             mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
+            mcr_sys::Syscall::Rmdir => self.sys_rmdir(request),
+            mcr_sys::Syscall::Unlink => self.sys_unlink(request),
             mcr_sys::Syscall::Unlinkat => self.sys_unlinkat(request),
+            mcr_sys::Syscall::Rename => self.sys_rename(request),
             mcr_sys::Syscall::Renameat2 => self.sys_renameat2(request),
+            mcr_sys::Syscall::Symlink => self.sys_symlink(request),
             mcr_sys::Syscall::Symlinkat => self.sys_symlinkat(request),
+            mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Chmod => self.sys_chmod(request),
+            mcr_sys::Syscall::Chown => self.sys_chown(request),
+            mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
             mcr_sys::Syscall::Chdir => self.sys_chdir(request),
             mcr_sys::Syscall::Umask => self.sys_umask(request),
@@ -1148,6 +1162,17 @@ where
         Ok(fd as u64)
     }
 
+    fn sys_open(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let flags = arg_u32(request, 1);
+        let mode = arg_u32(request, 2);
+        let fd = self
+            .vfs
+            .openat(mcr_vfs::AT_FDCWD, &path, OpenFlags::new(flags), mode)
+            .map_err(vfs_errno)?;
+        Ok(fd as u64)
+    }
+
     fn sys_read(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let fd = arg_i32(request, 0);
         let addr = arg(request, 1);
@@ -1242,6 +1267,26 @@ where
 
     fn sys_fstat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let attr = self.vfs.fstat(arg_i32(request, 0)).map_err(vfs_errno)?;
+        self.write_stat(arg(request, 1), attr)?;
+        Ok(0)
+    }
+
+    fn sys_stat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let attr = self
+            .vfs
+            .newfstatat(mcr_vfs::AT_FDCWD, &path, 0)
+            .map_err(vfs_errno)?;
+        self.write_stat(arg(request, 1), attr)?;
+        Ok(0)
+    }
+
+    fn sys_lstat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let attr = self
+            .vfs
+            .newfstatat(mcr_vfs::AT_FDCWD, &path, mcr_vfs::AT_SYMLINK_NOFOLLOW)
+            .map_err(vfs_errno)?;
         self.write_stat(arg(request, 1), attr)?;
         Ok(0)
     }
@@ -1386,6 +1431,14 @@ where
         Ok(0)
     }
 
+    fn sys_mkdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .mkdirat(mcr_vfs::AT_FDCWD, &path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_unlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 1))?;
         let flags = arg_u32(request, 2);
@@ -1394,6 +1447,31 @@ where
         }
         self.vfs
             .unlinkat(arg_i32(request, 0), &path, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rmdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, AT_REMOVEDIR)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_unlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, 0)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rename(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .renameat2(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
             .map_err(vfs_errno)?;
         Ok(0)
     }
@@ -1422,6 +1500,15 @@ where
         Ok(0)
     }
 
+    fn sys_symlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let target = self.read_path(arg(request, 0))?;
+        let linkpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .symlinkat(&target, mcr_vfs::AT_FDCWD, &linkpath)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_linkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let oldpath = self.read_path(arg(request, 1))?;
         let newpath = self.read_path(arg(request, 3))?;
@@ -1441,6 +1528,15 @@ where
         Ok(0)
     }
 
+    fn sys_link(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .linkat(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_ftruncate(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let length = arg(request, 1) as i64;
         if length < 0 {
@@ -1450,6 +1546,76 @@ where
             .ftruncate(arg_i32(request, 0), length as u64)
             .map_err(vfs_errno)?;
         Ok(0)
+    }
+
+    fn sys_chmod(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chmod(&path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_chown(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chown(
+                &path,
+                optional_linux_id(arg_u32(request, 1)),
+                optional_linux_id(arg_u32(request, 2)),
+            )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_utimensat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let flags = arg_u32(request, 3);
+        if flags & !(mcr_vfs::AT_SYMLINK_NOFOLLOW | mcr_vfs::AT_EMPTY_PATH) != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let path = self.read_path(arg(request, 1))?;
+        let times = self.utimensat_times(arg_i32(request, 0), &path, arg(request, 2), flags)?;
+        self.vfs
+            .utimensat(arg_i32(request, 0), &path, times, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn utimensat_times(
+        &self,
+        dirfd: Fd,
+        path: &str,
+        times_ptr: u64,
+        flags: u32,
+    ) -> Result<FileTimes, LinuxErrno> {
+        let current = self
+            .vfs
+            .newfstatat(dirfd, path, flags)
+            .map_err(vfs_errno)
+            .ok();
+        let now = linux_timespec_from_system_time(std::time::SystemTime::now());
+        if times_ptr == 0 {
+            return Ok(FileTimes {
+                atime_sec: now.tv_sec,
+                atime_nsec: now.tv_nsec,
+                mtime_sec: now.tv_sec,
+                mtime_nsec: now.tv_nsec,
+            });
+        }
+
+        let atime = read_guest_timespec(&self.memory, times_ptr)?;
+        let mtime = read_guest_timespec(
+            &self.memory,
+            times_ptr.checked_add(16).ok_or(LinuxErrno::EFAULT)?,
+        )?;
+        let atime = resolve_utimensat_time(atime, now, current, true)?;
+        let mtime = resolve_utimensat_time(mtime, now, current, false)?;
+        Ok(FileTimes {
+            atime_sec: atime.tv_sec,
+            atime_nsec: atime.tv_nsec,
+            mtime_sec: mtime.tv_sec,
+            mtime_nsec: mtime.tv_nsec,
+        })
     }
 
     fn sys_getcwd(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1535,6 +1701,10 @@ fn arg_i32(request: &SyscallRequest, index: usize) -> Fd {
 
 fn arg_u32(request: &SyscallRequest, index: usize) -> u32 {
     arg(request, index) as u32
+}
+
+fn optional_linux_id(value: u32) -> Option<u32> {
+    (value != u32::MAX).then_some(value)
 }
 
 fn usize_arg(request: &SyscallRequest, index: usize) -> Result<usize, LinuxErrno> {
@@ -1954,6 +2124,10 @@ impl Runtime {
         run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
     }
 
+    pub fn enable_native_execution(&mut self) {
+        self.dispatcher.subsystems_mut().enable_native_execution();
+    }
+
     pub fn into_kernel(self) -> GuestKernel {
         self.dispatcher.into_parts().0.tasks
     }
@@ -2027,6 +2201,10 @@ where
 
     pub fn run_guest_until_exit(&mut self) -> Result<i32, GuestRunError> {
         run_guest_until_exit_with_dispatcher(&mut self.dispatcher)
+    }
+
+    pub fn enable_native_execution(&mut self) {
+        self.dispatcher.subsystems_mut().enable_native_execution();
     }
 
     pub fn into_parts(self) -> (GuestKernel, T) {
@@ -2128,6 +2306,20 @@ impl From<ExecutionError> for GuestExecutionError {
     }
 }
 
+fn memory_error_from_errno(errno: LinuxErrno) -> GuestMemoryError {
+    if errno == LinuxErrno::ENOMEM {
+        GuestMemoryError::OutOfMemory
+    } else if errno == LinuxErrno::EACCES {
+        GuestMemoryError::AccessDenied
+    } else if errno == LinuxErrno::EEXIST {
+        GuestMemoryError::AddressInUse
+    } else if errno == LinuxErrno::ESRCH || errno == LinuxErrno::ENOENT {
+        GuestMemoryError::NotMapped
+    } else {
+        GuestMemoryError::InvalidAddress
+    }
+}
+
 #[derive(Debug)]
 pub enum GuestRunError {
     MissingInitialProcess,
@@ -2212,6 +2404,7 @@ where
             .subsystems_mut()
             .resume_waiting_tasks()
             .map_err(|errno| GuestRunError::WaitResume { errno })?;
+        dispatcher.subsystems_mut().resume_fd_waiters();
         let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
         if runnable_tids.is_empty() {
             return Err(GuestRunError::NoRunnableTasks);
@@ -2292,6 +2485,14 @@ where
     }
 
     let before_rip = gpr.rip();
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    if dispatcher.subsystems().native_execution {
+        return dispatch_native_guest_task_with_dispatcher(dispatcher, tid, pid, gpr, before_rip);
+    }
+
     let block = {
         let memory = dispatcher
             .subsystems()
@@ -2337,6 +2538,271 @@ where
         final_regs.rax(),
         task.state(),
     ))
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn dispatch_native_guest_task_with_dispatcher<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    gpr: GprState,
+    before_rip: u64,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    dispatcher
+        .subsystems_mut()
+        .select_memory_for_process(pid)
+        .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?;
+    let native_fp = dispatcher
+        .subsystems()
+        .native_fp(tid)
+        .copied()
+        .unwrap_or_default();
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
+    {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        let Some(vma) = memory.vma_containing(before_rip) else {
+            return Err(GuestExecutionError::Memory(GuestMemoryError::NotMapped));
+        };
+        if !vma.protection().execute {
+            return Err(GuestExecutionError::Memory(GuestMemoryError::AccessDenied));
+        }
+        let patches = patch_executable_syscalls(memory, fs_base)?;
+        let mut native_registers = host_registers_from_gpr(gpr);
+        native_registers.xmm = native_fp.xmm;
+        native_registers.mxcsr = native_fp.mxcsr;
+        let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
+        restore_executable_syscalls(memory, patches)?;
+        native_result.map_err(native_execution_error)?;
+        dispatcher.subsystems_mut().set_native_fp(
+            tid,
+            mcr_win::HostFloatingPointState {
+                xmm: native_registers.xmm,
+                mxcsr: native_registers.mxcsr,
+            },
+        );
+
+        let mut registers = guest_registers_from_host(native_registers);
+        let site = mcr_jit::SyscallSite {
+            rip: registers.rip,
+            next_rip: registers.rip + 2,
+        };
+        let syscall_registers = registers.syscall_registers();
+        if is_fork_like_syscall_number(syscall_registers.rax) {
+            let mut child_registers = registers;
+            child_registers.apply_syscall_return(0, site.next_rip);
+            dispatcher.subsystems_mut().pending_fork_child_regs =
+                Some(gpr_from_registers(child_registers));
+        }
+        let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+        if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+            && let Some((fd, write)) =
+                blocking_fd_wait(syscall_registers.rax, syscall_registers.rdi)
+        {
+            dispatcher
+                .subsystems_mut()
+                .tasks
+                .block_task_for_fd(tid, fd, write)
+                .map_err(|_| GuestExecutionError::MissingTask(tid))?;
+            let task = dispatcher
+                .subsystems_mut()
+                .tasks
+                .task_mut(tid)
+                .ok_or(GuestExecutionError::MissingTask(tid))?;
+            let blocked_regs = gpr_from_registers(registers);
+            task.set_regs(blocked_regs);
+            return Ok(GuestExecutionStep::new(
+                tid,
+                before_rip,
+                blocked_regs.rip(),
+                blocked_regs.rax(),
+                task.state(),
+            ));
+        }
+        registers.apply_syscall_return(dispatch_result.encoded_rax, site.next_rip);
+
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        let blocked_for_wait = matches!(task.state(), TaskState::WaitingForChild { .. });
+        let final_regs = if task.regs() == gpr || blocked_for_wait {
+            let updated_regs = gpr_from_registers(registers);
+            task.set_regs(updated_regs);
+            updated_regs
+        } else {
+            task.regs()
+        };
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            final_regs.rip(),
+            final_regs.rax(),
+            task.state(),
+        ));
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+struct ExecutableSyscallPatch {
+    address: u64,
+    bytes: Vec<u8>,
+}
+
+fn patch_executable_syscalls(
+    memory: &mut GuestMemory,
+    fs_base: u64,
+) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = fs_base;
+
+    let executable_ranges = memory
+        .vmas()
+        .filter(|vma| vma.protection().execute)
+        .map(|vma| (vma.start(), vma.end()))
+        .collect::<Vec<_>>();
+    let mut patches = Vec::new();
+    for (start, end) in executable_ranges {
+        let len = usize::try_from(end - start)
+            .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+        let mut bytes = vec![0; len];
+        memory.read(start, &mut bytes)?;
+        for offset in 0..bytes.len() {
+            if bytes
+                .get(offset..offset.saturating_add(2))
+                .is_some_and(|window| window == [0x0f, 0x05])
+            {
+                let address = start + offset as u64;
+                let old = memory.patch_code(address, &[0xcc, 0x90])?;
+                patches.push(ExecutableSyscallPatch {
+                    address,
+                    bytes: old,
+                });
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(replacement) = fs_relative_patch(&bytes[offset..], fs_base) {
+                let address = start + offset as u64;
+                let _ = memory.patch_code(address, &replacement)?;
+            }
+        }
+    }
+    Ok(patches)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
+    if fs_base == 0
+        || bytes.len() < 9
+        || bytes[0] != 0x64
+        || bytes[1] & 0xf8 != 0x48
+        || !matches!(bytes[2], 0x8b | 0x2b)
+        || bytes[3] & 0xc7 != 0x04
+        || bytes[4] != 0x25
+    {
+        return None;
+    }
+
+    let displacement = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    let absolute = if displacement >= 0 {
+        fs_base.checked_add(displacement as u64)?
+    } else {
+        fs_base.checked_sub(displacement.unsigned_abs() as u64)?
+    };
+    if absolute > i32::MAX as u64 {
+        return None;
+    }
+
+    let absolute = (absolute as u32).to_le_bytes();
+    Some([
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        absolute[0],
+        absolute[1],
+        absolute[2],
+        absolute[3],
+        0x90,
+    ])
+}
+
+fn restore_executable_syscalls(
+    memory: &mut GuestMemory,
+    patches: Vec<ExecutableSyscallPatch>,
+) -> Result<(), GuestExecutionError> {
+    for patch in patches {
+        memory.patch_code(patch.address, &patch.bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn is_fork_like_syscall_number(number: u64) -> bool {
+    number == mcr_sys::Syscall::Fork.number().raw()
+        || number == mcr_sys::Syscall::Vfork.number().raw()
+        || number == mcr_sys::Syscall::Clone.number().raw()
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
+    if syscall_number == mcr_sys::Syscall::Read.number().raw()
+        || syscall_number == mcr_sys::Syscall::Readv.number().raw()
+    {
+        Some((fd as Fd, false))
+    } else if syscall_number == mcr_sys::Syscall::Write.number().raw()
+        || syscall_number == mcr_sys::Syscall::Writev.number().raw()
+    {
+        Some((fd as Fd, true))
+    } else {
+        None
+    }
+}
+
+fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
+    match error {
+        mcr_win::NativeExecutionError::GuestFault {
+            signal,
+            rip,
+            address,
+        } => GuestExecutionError::Execution(ExecutionError::NativeFault {
+            signal,
+            rip,
+            address,
+        }),
+        mcr_win::NativeExecutionError::UnsupportedHost
+        | mcr_win::NativeExecutionError::SignalHandler(_)
+        | mcr_win::NativeExecutionError::HostFs => {
+            GuestExecutionError::Execution(ExecutionError::NativeFault {
+                signal: 0,
+                rip: 0,
+                address: 0,
+            })
+        }
+    }
 }
 
 fn read_guest_block(
@@ -2393,6 +2859,62 @@ fn gpr_from_registers(value: GuestRegisters) -> GprState {
     )
 }
 
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn host_registers_from_gpr(value: GprState) -> mcr_win::HostCpuRegisters {
+    mcr_win::HostCpuRegisters {
+        rax: value.rax(),
+        rbx: value.rbx(),
+        rcx: value.rcx(),
+        rdx: value.rdx(),
+        rsi: value.rsi(),
+        rdi: value.rdi(),
+        rbp: value.rbp(),
+        rsp: value.rsp(),
+        r8: value.r8(),
+        r9: value.r9(),
+        r10: value.r10(),
+        r11: value.r11(),
+        r12: value.r12(),
+        r13: value.r13(),
+        r14: value.r14(),
+        r15: value.r15(),
+        rip: value.rip(),
+        rflags: value.rflags(),
+        xmm: mcr_win::HostXmmRegisters::default(),
+        mxcsr: mcr_win::DEFAULT_MXCSR,
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn guest_registers_from_host(value: mcr_win::HostCpuRegisters) -> GuestRegisters {
+    GuestRegisters {
+        rax: value.rax,
+        rbx: value.rbx,
+        rcx: value.rcx,
+        rdx: value.rdx,
+        rsi: value.rsi,
+        rdi: value.rdi,
+        rbp: value.rbp,
+        rsp: value.rsp,
+        r8: value.r8,
+        r9: value.r9,
+        r10: value.r10,
+        r11: value.r11,
+        r12: value.r12,
+        r13: value.r13,
+        r14: value.r14,
+        r15: value.r15,
+        rip: value.rip,
+        rflags: value.rflags,
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
@@ -2403,6 +2925,9 @@ pub struct RuntimeSubsystems {
     selected_fds_pid: mcr_sys::GuestPid,
     futexes: FutexRegistry,
     epolls: EpollRegistry,
+    native_execution: bool,
+    native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
+    pending_fork_child_regs: Option<GprState>,
 }
 
 impl RuntimeSubsystems {
@@ -2432,6 +2957,9 @@ impl RuntimeSubsystems {
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
+            native_execution: false,
+            native_fp: BTreeMap::new(),
+            pending_fork_child_regs: None,
         })
     }
 
@@ -2458,7 +2986,22 @@ impl RuntimeSubsystems {
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
+            native_execution: false,
+            native_fp: BTreeMap::new(),
+            pending_fork_child_regs: None,
         })
+    }
+
+    pub const fn enable_native_execution(&mut self) {
+        self.native_execution = true;
+    }
+
+    fn native_fp(&self, tid: mcr_sys::GuestTid) -> Option<&mcr_win::HostFloatingPointState> {
+        self.native_fp.get(&tid)
+    }
+
+    fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
+        self.native_fp.insert(tid, state);
     }
 
     fn default_vfs() -> VirtualFileSystem {
@@ -2631,6 +3174,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
         match request.syscall {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
+            mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
             mcr_sys::Syscall::Fork | mcr_sys::Syscall::Vfork | mcr_sys::Syscall::Clone => {
                 self.dispatch_fork_like(request)
             }
@@ -2770,7 +3314,13 @@ impl RuntimeSubsystems {
 
     fn select_memory_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         if pid == self.selected_memory_pid {
+            if self.native_execution && !self.files.memory().uses_fixed_guest_host_addresses() {
+                self.materialize_selected_memory_at_guest_addresses()?;
+            }
             return Ok(());
+        }
+        if self.native_execution {
+            return self.select_native_memory_for_process(pid);
         }
         if self.tasks.process(self.selected_memory_pid).is_some() {
             let selected = self
@@ -2785,6 +3335,66 @@ impl RuntimeSubsystems {
         *self.files.memory_mut() = memory;
         self.selected_memory_pid = pid;
         Ok(())
+    }
+
+    fn select_native_memory_for_process(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+    ) -> Result<(), LinuxErrno> {
+        let selected_pid = self.selected_memory_pid;
+        let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
+            Some(
+                self.files
+                    .memory()
+                    .try_clone_runtime()
+                    .map_err(|error| error.errno())?,
+            )
+        } else {
+            None
+        };
+        let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+        self.drop_selected_memory_allocations();
+        match target_snapshot.try_clone_runtime_at_guest_addresses() {
+            Ok(memory) => {
+                if let Some(snapshot) = selected_snapshot {
+                    self.process_memory.insert(selected_pid, snapshot);
+                }
+                *self.files.memory_mut() = memory;
+                self.selected_memory_pid = pid;
+                Ok(())
+            }
+            Err(error) => {
+                self.process_memory.insert(pid, target_snapshot);
+                if let Some(snapshot) = selected_snapshot {
+                    let restored = snapshot
+                        .try_clone_runtime_at_guest_addresses()
+                        .map_err(|restore_error| restore_error.errno())?;
+                    self.process_memory.insert(selected_pid, snapshot);
+                    *self.files.memory_mut() = restored;
+                }
+                Err(error.errno())
+            }
+        }
+    }
+
+    fn materialize_selected_memory_at_guest_addresses(&mut self) -> Result<(), LinuxErrno> {
+        let snapshot = self
+            .files
+            .memory()
+            .try_clone_runtime()
+            .map_err(|error| error.errno())?;
+        self.drop_selected_memory_allocations();
+        let memory = snapshot
+            .try_clone_runtime_at_guest_addresses()
+            .map_err(|error| error.errno())?;
+        *self.files.memory_mut() = memory;
+        Ok(())
+    }
+
+    fn drop_selected_memory_allocations(&mut self) {
+        let empty = self.files.memory().empty_clone_layout();
+        let selected = std::mem::replace(self.files.memory_mut(), empty);
+        drop(selected);
     }
 
     fn store_selected_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -2841,6 +3451,33 @@ impl RuntimeSubsystems {
         self.close_unshared_process_sockets(pid)?;
         self.drop_process_memory(pid)?;
         self.drop_process_fds(pid)
+    }
+
+    fn fork_native_fp(&mut self, parent_tid: mcr_sys::GuestTid, child_pid: mcr_sys::GuestPid) {
+        let Some(state) = self.native_fp.get(&parent_tid).copied() else {
+            return;
+        };
+        let child_tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == child_pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for child_tid in child_tids {
+            self.native_fp.insert(child_tid, state);
+        }
+    }
+
+    fn drop_native_fp_for_process(&mut self, pid: mcr_sys::GuestPid) {
+        let tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for tid in tids {
+            self.native_fp.remove(&tid);
+        }
     }
 
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -2977,17 +3614,93 @@ impl RuntimeSubsystems {
     fn drop_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         if pid == self.selected_memory_pid {
             if pid != mcr_task::INITIAL_GUEST_PID {
-                let memory = self
-                    .process_memory
-                    .remove(&mcr_task::INITIAL_GUEST_PID)
-                    .ok_or(LinuxErrno::ESRCH)?;
-                *self.files.memory_mut() = memory;
-                self.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
+                self.restore_initial_memory_after_selected_drop()?;
             }
         } else {
             self.process_memory.remove(&pid);
         }
         Ok(())
+    }
+
+    fn restore_initial_memory_after_selected_drop(&mut self) -> Result<(), LinuxErrno> {
+        let memory = self
+            .process_memory
+            .remove(&mcr_task::INITIAL_GUEST_PID)
+            .ok_or(LinuxErrno::ESRCH)?;
+        if self.native_execution {
+            self.drop_selected_memory_allocations();
+            let memory = memory
+                .try_clone_runtime_at_guest_addresses()
+                .map_err(|error| error.errno())?;
+            *self.files.memory_mut() = memory;
+        } else {
+            *self.files.memory_mut() = memory;
+        }
+        self.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
+        Ok(())
+    }
+
+    fn dispatch_rt_sigprocmask(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.rt_sigprocmask(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    fn rt_sigprocmask(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let pid = request.context.pid;
+        self.select_memory_for_process(pid)?;
+        let args = mcr_sys::RtSigprocmaskSyscallArgs::new(
+            arg_u32(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+        );
+        if args.sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if !args.supported_how() {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let set = if args.set == 0 {
+            0
+        } else {
+            read_guest_u64(self.files.memory(), args.set)?
+        };
+        let current_mask = self
+            .tasks
+            .process(pid)
+            .ok_or(LinuxErrno::ESRCH)?
+            .signals()
+            .blocked();
+        if args.oldset != 0 {
+            self.files
+                .memory_mut()
+                .write_bytes(args.oldset, &current_mask.to_le_bytes())
+                .map_err(memory_errno)?;
+        }
+        let kernel_request = SyscallRequest::from_guest_context(GuestContext::new(
+            request.context.pid,
+            request.context.tid,
+            mcr_sys::SyscallRegisters {
+                rax: request.number.raw(),
+                rdi: u64::from(args.how),
+                rsi: set,
+                rdx: 0,
+                r10: args.sigsetsize,
+                r8: 0,
+                r9: 0,
+                rip: request.context.rip,
+            },
+        ));
+        let outcome = self.tasks.dispatch_for_current_task(&kernel_request);
+        match outcome.result {
+            SyscallReturn::Success(_) => {
+                self.store_selected_process_memory(pid)?;
+                Ok(())
+            }
+            SyscallReturn::Errno(errno) => Err(errno),
+        }
     }
 
     fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -3000,7 +3713,16 @@ impl RuntimeSubsystems {
             return outcome;
         }
         match request.syscall {
+            mcr_sys::Syscall::Uname => {
+                if let Err(errno) = self.write_uname(arg(request, 0)) {
+                    return SyscallOutcome::errno(errno);
+                }
+                if let Err(errno) = self.store_selected_process_memory(pid) {
+                    return SyscallOutcome::errno(errno);
+                }
+            }
             mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup => {
+                self.drop_native_fp_for_process(pid);
                 if let Err(errno) = self.drop_process_resources(pid) {
                     return SyscallOutcome::errno(errno);
                 }
@@ -3025,9 +3747,30 @@ impl RuntimeSubsystems {
         let completed = self.tasks.resume_waiting_tasks();
         for wait in &completed {
             self.write_wait_status(*wait)?;
+            self.drop_native_fp_for_process(wait.waited().pid());
             self.drop_process_resources(wait.waited().pid())?;
         }
         Ok(completed)
+    }
+
+    fn resume_fd_waiters(&mut self) {
+        let selected_pid = self.selected_fds_pid;
+        let selected_fds = self.files.vfs().fds().clone();
+        let process_fds = self.process_fds.clone();
+        self.tasks.resume_fd_waiters(|pid, fd, write| {
+            let fds = if pid == selected_pid {
+                Some(&selected_fds)
+            } else {
+                process_fds.get(&pid)
+            };
+            fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
+                .unwrap_or(true)
+        });
+    }
+
+    fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
+        let uts = self.tasks.uname_value();
+        write_guest_uname(self.files.memory_mut(), addr, &uts)
     }
 
     fn write_wait_status_from_outcome(
@@ -3071,7 +3814,15 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let outcome = self.tasks.dispatch_for_current_task(request);
+        let pending_child_regs = self.pending_fork_child_regs.take();
+        let outcome = if self.native_execution {
+            match pending_child_regs {
+                Some(child_regs) => self.dispatch_native_fork_like_task(request, child_regs),
+                None => self.tasks.dispatch_for_current_task(request),
+            }
+        } else {
+            self.tasks.dispatch_for_current_task(request)
+        };
         if !matches!(outcome.result, SyscallReturn::Success(_)) {
             return outcome;
         }
@@ -3083,6 +3834,7 @@ impl RuntimeSubsystems {
                 self.process_memory.insert(child_pid, memory);
                 self.process_fds
                     .insert(child_pid, self.files.vfs().fds().clone());
+                self.fork_native_fp(request.context.tid, child_pid);
                 outcome
             }
             Err(error) => {
@@ -3094,6 +3846,33 @@ impl RuntimeSubsystems {
                     .ok();
                 SyscallOutcome::errno(error.errno())
             }
+        }
+    }
+
+    fn dispatch_native_fork_like_task(
+        &mut self,
+        request: &SyscallRequest,
+        child_regs: GprState,
+    ) -> SyscallOutcome {
+        match request.syscall {
+            mcr_sys::Syscall::Fork => self
+                .tasks
+                .fork_current_with_child_regs(request.context.tid, child_regs),
+            mcr_sys::Syscall::Vfork => self
+                .tasks
+                .vfork_current_with_child_regs(request.context.tid, child_regs),
+            mcr_sys::Syscall::Clone => self.tasks.clone_current_with_child_regs(
+                request.context.tid,
+                mcr_sys::CloneSyscallArgs::new(
+                    arg(request, 0),
+                    arg(request, 1),
+                    arg(request, 2),
+                    arg(request, 3),
+                    arg(request, 4),
+                ),
+                child_regs,
+            ),
+            _ => SyscallOutcome::unsupported(),
         }
     }
 
@@ -3138,6 +3917,7 @@ impl RuntimeSubsystems {
             }
         }
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
+        self.native_fp.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
@@ -3149,9 +3929,16 @@ impl RuntimeSubsystems {
             .process(pid)
             .ok_or(LinuxErrno::ESRCH)?
             .image()
-            .memory();
-        let memory = GuestMemory::from_image(image).map_err(|error| error.errno())?;
-        *self.memory_for_process_mut(pid).ok_or(LinuxErrno::ESRCH)? = memory;
+            .memory()
+            .clone();
+        if pid == self.selected_memory_pid {
+            self.drop_selected_memory_allocations();
+            let memory = GuestMemory::from_image(&image).map_err(|error| error.errno())?;
+            *self.files.memory_mut() = memory;
+        } else {
+            let memory = GuestMemory::from_image(&image).map_err(|error| error.errno())?;
+            *self.memory_for_process_mut(pid).ok_or(LinuxErrno::ESRCH)? = memory;
+        }
         Ok(())
     }
 
@@ -3538,6 +4325,33 @@ fn linux_timespec_from_duration(duration: Duration) -> Result<LinuxTimespec, Lin
     })
 }
 
+fn resolve_utimensat_time(
+    requested: LinuxTimespec,
+    now: LinuxTimespec,
+    current: Option<LinuxFileAttr>,
+    atime: bool,
+) -> Result<LinuxTimespec, LinuxErrno> {
+    match requested.tv_nsec {
+        LINUX_UTIME_NOW => Ok(now),
+        LINUX_UTIME_OMIT => {
+            let current = current.ok_or(LinuxErrno::ENOENT)?;
+            if atime {
+                Ok(LinuxTimespec {
+                    tv_sec: current.atime_sec,
+                    tv_nsec: current.atime_nsec,
+                })
+            } else {
+                Ok(LinuxTimespec {
+                    tv_sec: current.mtime_sec,
+                    tv_nsec: current.mtime_nsec,
+                })
+            }
+        }
+        0..=999_999_999 if requested.tv_sec >= 0 => Ok(requested),
+        _ => Err(LinuxErrno::EINVAL),
+    }
+}
+
 fn read_required_timespec_duration(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -3560,6 +4374,36 @@ fn read_guest_timespec(
         tv_sec: read_guest_i64(memory, addr)?,
         tv_nsec: read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?,
     })
+}
+
+fn write_guest_uname(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    uts: &LinuxUtsname,
+) -> Result<(), LinuxErrno> {
+    if addr == 0 {
+        return Err(LinuxErrno::EFAULT);
+    }
+    memory
+        .write_bytes(addr, &encode_linux_uname(uts))
+        .map_err(memory_errno)
+}
+
+fn encode_linux_uname(uts: &LinuxUtsname) -> [u8; std::mem::size_of::<LinuxUtsname>()] {
+    let mut bytes = [0; std::mem::size_of::<LinuxUtsname>()];
+    let mut offset = 0;
+    for field in [
+        &uts.sysname,
+        &uts.nodename,
+        &uts.release,
+        &uts.version,
+        &uts.machine,
+        &uts.domainname,
+    ] {
+        bytes[offset..offset + field.len()].copy_from_slice(field);
+        offset += field.len();
+    }
+    bytes
 }
 
 fn write_guest_timespec(
@@ -3678,6 +4522,17 @@ fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
         revents |= LINUX_POLLHUP;
     }
     revents
+}
+
+fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno> {
+    let readiness = fds
+        .poll_readiness(&mcr_vfs::PathTree::new(), fd)
+        .map_err(vfs_errno)?;
+    Ok(if write {
+        readiness.writable || readiness.hang_up || readiness.error
+    } else {
+        readiness.readable || readiness.hang_up || readiness.error
+    })
 }
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
@@ -5957,6 +6812,43 @@ mod tests {
             ),
             SyscallReturn::Success(0)
         );
+
+        runtime.memory_mut().write(0x2000, &10i64.to_le_bytes());
+        runtime.memory_mut().write(0x2008, &20i64.to_le_bytes());
+        runtime.memory_mut().write(0x2010, &30i64.to_le_bytes());
+        runtime.memory_mut().write(0x2018, &40i64.to_le_bytes());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Utimensat,
+                [AT_FDCWD as u64, 0x1200, 0x2000, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        let touched = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(touched.atime_sec, 10);
+        assert_eq!(touched.atime_nsec, 20);
+        assert_eq!(touched.mtime_sec, 30);
+        assert_eq!(touched.mtime_nsec, 40);
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chmod, [0x1200, 0o600, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chown, [0x1200, 1000, 1001, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        let owned = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(owned.mode & 0o777, 0o600);
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 1001);
     }
 
     #[test]
@@ -7017,6 +7909,32 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 9 }
         );
+    }
+
+    #[test]
+    fn guest_registers_round_trip_preserves_argument_register_order() {
+        let registers = GuestRegisters {
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsi: 5,
+            rdi: 6,
+            rbp: 7,
+            rsp: 8,
+            r8: 9,
+            r9: 10,
+            r10: 11,
+            r11: 12,
+            r12: 13,
+            r13: 14,
+            r14: 15,
+            r15: 16,
+            rip: 17,
+            rflags: 18,
+        };
+
+        assert_eq!(registers_from_gpr(gpr_from_registers(registers)), registers);
     }
 
     #[test]

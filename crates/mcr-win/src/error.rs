@@ -277,6 +277,11 @@ pub(crate) fn last_windows_error(operation: HostOperation) -> HostError {
     HostError::with_code(operation, windows_kind(code), HostErrorCode::Windows(code))
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn last_os_error(operation: HostOperation) -> HostError {
+    HostError::from_io(operation, io::Error::last_os_error())
+}
+
 #[cfg(windows)]
 pub(crate) fn windows_error(operation: HostOperation, code: u32) -> HostError {
     HostError::with_code(operation, windows_kind(code), HostErrorCode::Windows(code))

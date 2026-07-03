@@ -15,7 +15,9 @@ pub enum MemoryProtection {
 pub struct HostMemory {
     #[cfg(windows)]
     ptr: std::ptr::NonNull<u8>,
-    #[cfg(not(windows))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    ptr: std::ptr::NonNull<u8>,
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
     storage: Box<[u8]>,
     len: usize,
 }
@@ -28,6 +30,19 @@ impl HostMemory {
         }
 
         allocate_platform(size, protection)
+    }
+
+    /// Reserves and commits a host allocation at a requested virtual address when supported.
+    pub fn allocate_at(
+        address: usize,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> HostResult<Self> {
+        if address == 0 || size == 0 {
+            return Err(HostError::invalid_input(HostOperation::AllocateMemory));
+        }
+
+        allocate_at_platform(address, size, protection)
     }
 
     /// Changes protection for the whole allocation.
@@ -68,7 +83,11 @@ impl HostMemory {
         {
             self.ptr.as_ptr()
         }
-        #[cfg(not(windows))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.ptr.as_ptr()
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
         {
             self.storage.as_ptr()
         }
@@ -80,7 +99,11 @@ impl HostMemory {
         {
             self.ptr.as_ptr()
         }
-        #[cfg(not(windows))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.ptr.as_ptr()
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
         {
             self.storage.as_mut_ptr()
         }
@@ -93,7 +116,12 @@ impl HostMemory {
             // SAFETY: `HostMemory` owns `ptr..ptr+len` until `Drop`.
             unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
         }
-        #[cfg(not(windows))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // SAFETY: `HostMemory` owns `ptr..ptr+len` until `Drop`.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
         {
             &self.storage
         }
@@ -106,9 +134,24 @@ impl HostMemory {
             // SAFETY: `HostMemory` owns `ptr..ptr+len` and `&mut self` guarantees exclusivity.
             unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
         }
-        #[cfg(not(windows))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // SAFETY: `HostMemory` owns `ptr..ptr+len` and `&mut self` guarantees exclusivity.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
         {
             &mut self.storage
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for HostMemory {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was returned by `mmap` and is released once here.
+        unsafe {
+            let _ = libc::munmap(self.ptr.as_ptr().cast(), self.len);
         }
     }
 }
@@ -129,7 +172,13 @@ unsafe impl Send for HostMemory {}
 #[cfg(windows)]
 unsafe impl Sync for HostMemory {}
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe impl Send for HostMemory {}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe impl Sync for HostMemory {}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 fn allocate_platform(size: usize, _protection: MemoryProtection) -> HostResult<HostMemory> {
     Ok(HostMemory {
         storage: vec![0; size].into_boxed_slice(),
@@ -137,13 +186,85 @@ fn allocate_platform(size: usize, _protection: MemoryProtection) -> HostResult<H
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+fn allocate_at_platform(
+    _address: usize,
+    size: usize,
+    protection: MemoryProtection,
+) -> HostResult<HostMemory> {
+    allocate_platform(size, protection)
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 fn protect_platform(
     _memory: &HostMemory,
     _offset: usize,
     _len: usize,
     _protection: MemoryProtection,
 ) -> HostResult<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn allocate_platform(size: usize, protection: MemoryProtection) -> HostResult<HostMemory> {
+    mmap_allocate(
+        std::ptr::null_mut(),
+        size,
+        protection,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn allocate_at_platform(
+    address: usize,
+    size: usize,
+    protection: MemoryProtection,
+) -> HostResult<HostMemory> {
+    mmap_allocate(
+        address as *mut std::ffi::c_void,
+        size,
+        protection,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn mmap_allocate(
+    address: *mut std::ffi::c_void,
+    size: usize,
+    protection: MemoryProtection,
+    flags: i32,
+) -> HostResult<HostMemory> {
+    // SAFETY: The arguments are validated by callers; `mmap` returns an owned mapping on success.
+    let ptr = unsafe { libc::mmap(address, size, protection.to_unix(), flags, -1, 0) };
+    if ptr == libc::MAP_FAILED {
+        return Err(crate::error::last_os_error(HostOperation::AllocateMemory));
+    }
+    let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
+        return Err(HostError::invalid_input(HostOperation::AllocateMemory));
+    };
+    Ok(HostMemory { ptr, len: size })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn protect_platform(
+    memory: &HostMemory,
+    offset: usize,
+    len: usize,
+    protection: MemoryProtection,
+) -> HostResult<()> {
+    // SAFETY: The checked range is inside the allocation owned by `memory`.
+    let ok = unsafe {
+        libc::mprotect(
+            memory.ptr.as_ptr().wrapping_add(offset).cast(),
+            len,
+            protection.to_unix(),
+        )
+    };
+    if ok != 0 {
+        return Err(crate::error::last_os_error(HostOperation::ProtectMemory));
+    }
     Ok(())
 }
 
@@ -154,6 +275,31 @@ fn allocate_platform(size: usize, protection: MemoryProtection) -> HostResult<Ho
     let ptr = unsafe {
         VirtualAlloc(
             std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            protect,
+        )
+    };
+    let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
+        return Err(crate::error::last_windows_error(
+            HostOperation::AllocateMemory,
+        ));
+    };
+
+    Ok(HostMemory { ptr, len: size })
+}
+
+#[cfg(windows)]
+fn allocate_at_platform(
+    address: usize,
+    size: usize,
+    protection: MemoryProtection,
+) -> HostResult<HostMemory> {
+    let protect = protection.to_windows();
+    // SAFETY: The caller requested this address; Windows validates availability and alignment.
+    let ptr = unsafe {
+        VirtualAlloc(
+            address as *mut std::ffi::c_void,
             size,
             MEM_RESERVE | MEM_COMMIT,
             protect,
@@ -191,6 +337,19 @@ fn protect_platform(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl MemoryProtection {
+    const fn to_unix(self) -> i32 {
+        match self {
+            Self::NoAccess => libc::PROT_NONE,
+            Self::ReadOnly => libc::PROT_READ,
+            Self::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
+            Self::ExecuteRead => libc::PROT_READ | libc::PROT_EXEC,
+            Self::ExecuteReadWrite => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        }
+    }
 }
 
 #[cfg(windows)]

@@ -986,6 +986,14 @@ pub struct MetadataSidecar {
     attr: LinuxFileAttr,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileTimes {
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+}
+
 impl MetadataSidecar {
     pub fn new(attr: LinuxFileAttr) -> Self {
         Self { attr }
@@ -997,6 +1005,16 @@ impl MetadataSidecar {
 
     pub fn set_mode(&mut self, mode: u32) {
         self.attr.mode = (self.attr.mode & S_IFMT) | (mode & 0o7777);
+        self.touch_ctime();
+    }
+
+    pub fn set_owner(&mut self, uid: Option<u32>, gid: Option<u32>) {
+        if let Some(uid) = uid {
+            self.attr.uid = uid;
+        }
+        if let Some(gid) = gid {
+            self.attr.gid = gid;
+        }
         self.touch_ctime();
     }
 
@@ -1015,6 +1033,14 @@ impl MetadataSidecar {
 
     pub fn decrement_link_count(&mut self) {
         self.attr.nlink = self.attr.nlink.saturating_sub(1);
+        self.touch_ctime();
+    }
+
+    pub fn set_times(&mut self, times: FileTimes) {
+        self.attr.atime_sec = times.atime_sec;
+        self.attr.atime_nsec = times.atime_nsec;
+        self.attr.mtime_sec = times.mtime_sec;
+        self.attr.mtime_nsec = times.mtime_nsec;
         self.touch_ctime();
     }
 
@@ -1435,20 +1461,6 @@ impl PipeNode {
 
     fn state(&self) -> MutexGuard<'_, PipeState> {
         self.inner.state.lock().expect("pipe mutex poisoned")
-    }
-
-    fn wait_readable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
-        self.inner
-            .readable
-            .wait(state)
-            .expect("pipe mutex poisoned while waiting for readable state")
-    }
-
-    fn wait_writable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
-        self.inner
-            .writable
-            .wait(state)
-            .expect("pipe mutex poisoned while waiting for writable state")
     }
 
     fn notify_readable(&self) {
@@ -3024,6 +3036,56 @@ impl VirtualFileSystem {
         self.newfstatat(dirfd, path, flags)
     }
 
+    pub fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()> {
+        let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
+        self.tree
+            .lookup_path_mut(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?
+            .metadata
+            .set_mode(mode);
+        Ok(())
+    }
+
+    pub fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>) -> VfsResult<()> {
+        let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
+        self.tree
+            .lookup_path_mut(resolved.guest_path())
+            .ok_or(VfsError::NoEntry)?
+            .metadata
+            .set_owner(uid, gid);
+        Ok(())
+    }
+
+    pub fn utimensat(
+        &mut self,
+        dirfd: Fd,
+        path: &str,
+        times: FileTimes,
+        flags: u32,
+    ) -> VfsResult<()> {
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        let inode_id = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            self.fds.get(dirfd)?.inode_id()
+        } else {
+            let options = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                ResolveOptions::NOFOLLOW_FINAL
+            } else {
+                ResolveOptions::FOLLOW
+            };
+            self.resolve_at(dirfd, path, options, false)?
+                .inode()
+                .ok_or(VfsError::NoEntry)?
+        };
+        self.tree
+            .lookup_inode_mut(inode_id)
+            .ok_or(VfsError::NoEntry)?
+            .metadata
+            .set_times(times);
+        Ok(())
+    }
+
     pub fn access(&self, path: &str, mode: u32) -> VfsResult<()> {
         if path.is_empty() {
             return Err(VfsError::NoEntry);
@@ -3595,10 +3657,7 @@ fn pipe_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
     let pipe = pipe_node(entry.file())?;
     let mut state = pipe.state();
     while state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
-        if entry.flags().nonblock() {
-            return Err(VfsError::WouldBlock);
-        }
-        state = pipe.wait_readable(state);
+        return Err(VfsError::WouldBlock);
     }
     let count = state.read(buffer);
     if count > 0 {
@@ -3614,10 +3673,7 @@ fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
         return Err(VfsError::BrokenPipe);
     }
     while state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
-        if entry.flags().nonblock() {
-            return Err(VfsError::WouldBlock);
-        }
-        state = pipe.wait_writable(state);
+        return Err(VfsError::WouldBlock);
     }
     let count = state.write(buffer)?;
     if count > 0 {
@@ -4562,6 +4618,31 @@ mod tests {
         assert!(after.ctime_nsec > before.ctime_nsec);
         assert!(after.mtime_nsec > before.mtime_nsec);
         vfs.close(fd).unwrap();
+
+        vfs.utimensat(
+            AT_FDCWD,
+            "renamed",
+            FileTimes {
+                atime_sec: 10,
+                atime_nsec: 20,
+                mtime_sec: 30,
+                mtime_nsec: 40,
+            },
+            0,
+        )
+        .unwrap();
+        let touched = vfs.newfstatat(AT_FDCWD, "renamed", 0).unwrap();
+        assert_eq!(touched.atime_sec, 10);
+        assert_eq!(touched.atime_nsec, 20);
+        assert_eq!(touched.mtime_sec, 30);
+        assert_eq!(touched.mtime_nsec, 40);
+
+        vfs.chmod("renamed", 0o600).unwrap();
+        vfs.chown("renamed", Some(1000), Some(1001)).unwrap();
+        let owned = vfs.newfstatat(AT_FDCWD, "renamed", 0).unwrap();
+        assert_eq!(owned.mode & 0o777, 0o600);
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 1001);
     }
 
     #[test]

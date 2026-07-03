@@ -9,7 +9,7 @@ depends-on: [integ-002, net-002]
 
 ## Objective
 
-Connect guest socket syscalls, DNS, socket fd integration, and poll/epoll readiness into shell-driven `curl` and `git` smoke tests.
+Connect the Phase 2 TCP-client socket subset, bounded DNS, socket fd integration, and level-trigger poll/epoll readiness into shell-driven `curl` and `git` smoke tests.
 
 ## Context
 
@@ -42,4 +42,6 @@ mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/
 
 - External-network tests are intentional acceptance gates for this task; keep normal workspace tests deterministic by making the corresponding testkit contracts ignored or environment-gated.
 - `alpine-rootfs` must include `curl`, `git`, CA certificates, and writable `/tmp` before this task is marked done.
-- Network namespaces, port publishing, and raw sockets remain unsupported.
+- The smoke success criteria must stay within AF_INET/AF_INET6 TCP client flows plus the documented DNS path.
+- Network namespaces, port publishing, raw sockets, packet sockets, and general UDP behavior remain unsupported.
+- Any unsupported epoll flags encountered by curl/git must be rejected or documented with Linux-compatible errno behavior before the smoke is considered stable.
