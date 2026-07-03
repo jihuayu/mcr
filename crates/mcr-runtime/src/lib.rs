@@ -2617,8 +2617,11 @@ where
         }
         let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
         if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
-            && let Some((fd, write)) =
-                blocking_fd_wait(syscall_registers.rax, syscall_registers.rdi)
+            && let Some((fd, write)) = blocking_fd_wait(
+                dispatcher.subsystems().files.vfs().fds(),
+                syscall_registers.rax,
+                syscall_registers.rdi,
+            )
         {
             dispatcher
                 .subsystems_mut()
@@ -2775,15 +2778,20 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
+fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
+    let fd = fd as Fd;
+    if fds.get(fd).is_ok_and(|entry| entry.flags().nonblock()) {
+        return None;
+    }
+
     if syscall_number == mcr_sys::Syscall::Read.number().raw()
         || syscall_number == mcr_sys::Syscall::Readv.number().raw()
     {
-        Some((fd as Fd, false))
+        Some((fd, false))
     } else if syscall_number == mcr_sys::Syscall::Write.number().raw()
         || syscall_number == mcr_sys::Syscall::Writev.number().raw()
     {
-        Some((fd as Fd, true))
+        Some((fd, true))
     } else {
         None
     }
@@ -6181,6 +6189,26 @@ mod tests {
         let invalid =
             runtime.dispatch_syscall(context(Syscall::Eventfd2, [0, 0x8000_0000, 0, 0, 0, 0]));
         assert_eq!(invalid.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    #[test]
+    fn native_blocking_fd_wait_ignores_nonblocking_descriptors() {
+        let mut vfs = sample_vfs();
+        let blocking = vfs.eventfd(0, OpenFlags::new(0)).unwrap();
+        let nonblocking = vfs.eventfd(0, OpenFlags::new(mcr_vfs::O_NONBLOCK)).unwrap();
+
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::Read.number().raw(), blocking as u64),
+            Some((blocking, false))
+        );
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::Read.number().raw(), nonblocking as u64),
+            None
+        );
     }
 
     #[test]
