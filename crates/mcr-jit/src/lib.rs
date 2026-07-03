@@ -1110,9 +1110,19 @@ where
             let rhs = immediate_as_u8(&instruction)?;
             flags.set_logic_result(u64::from(lhs & rhs), 8);
         }
+        Code::Test_AL_imm8 => {
+            let lhs = read_reg8(registers, Register::AL)?;
+            let rhs = instruction.immediate8();
+            flags.set_logic_result(u64::from(lhs & rhs), 8);
+        }
         Code::Test_rm16_imm16 | Code::Test_rm16_imm16_F7r1 => {
             let lhs = read_operand_u16(registers, memory, &instruction, 0)?;
             let rhs = immediate_as_u16(&instruction)?;
+            flags.set_logic_result(u64::from(lhs & rhs), 16);
+        }
+        Code::Test_AX_imm16 => {
+            let lhs = read_reg16(registers, Register::AX)?;
+            let rhs = instruction.immediate16();
             flags.set_logic_result(u64::from(lhs & rhs), 16);
         }
         Code::Nopd | Code::Nopq => {}
@@ -2586,6 +2596,37 @@ mod tests {
 
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 9);
+    }
+
+    #[test]
+    fn execution_core_evaluates_accumulator_test_immediates() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax,3
+                0xa8, 0x01, // test al,1
+                0x74, 0x07, // je skipped
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x469000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(11).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute accumulator test immediate");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 11);
     }
 
     #[test]
