@@ -10538,6 +10538,43 @@ mod tests {
     }
 
     #[test]
+    fn set_tid_address_returns_current_guest_tid() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let set_tid =
+            runtime.dispatch_syscall(context(Syscall::SetTidAddress, [0x402000, 0, 0, 0, 0, 0]));
+
+        assert_eq!(
+            set_tid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .clear_child_tid(),
+            Some(0x402000)
+        );
+
+        let clear_tid =
+            runtime.dispatch_syscall(context(Syscall::SetTidAddress, [0, 0, 0, 0, 0, 0]));
+
+        assert_eq!(
+            clear_tid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(INITIAL_GUEST_TID)
+                .unwrap()
+                .clear_child_tid(),
+            None
+        );
+    }
+
+    #[test]
     fn guest_run_loop_returns_existing_exit_status() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         let exit = runtime.dispatch_syscall(context(Syscall::ExitGroup, [9, 0, 0, 0, 0, 0]));
