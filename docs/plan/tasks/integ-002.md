@@ -1,7 +1,7 @@
 ---
 id: integ-002
 scope: phase2-integration
-status: blocked
+status: done
 depends-on: [task-002, task-003, vfs-004]
 ---
 
