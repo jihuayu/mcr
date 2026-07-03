@@ -497,7 +497,7 @@ mod windows_x86_64 {
         }
 
         if record.exception_code == EXCEPTION_BREAKPOINT {
-            registers.rip = registers.rip.saturating_sub(1);
+            registers.rip = record.exception_address as usize as u64;
             state.fault_code = 0;
         } else {
             state.fault_code = record.exception_code;
@@ -843,3 +843,27 @@ pub use linux_x86_64::execute_x86_64_until_trap;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use windows_x86_64::execute_x86_64_until_trap;
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod tests {
+    use crate::{HostCpuRegisters, HostMemory, MemoryProtection, execute_x86_64_until_trap};
+
+    #[test]
+    fn windows_breakpoint_trap_reports_breakpoint_address() {
+        let mut code =
+            HostMemory::allocate(4096, MemoryProtection::ExecuteReadWrite).expect("code memory");
+        code.as_mut_slice()[..3].copy_from_slice(&[0xcc, 0x90, 0xc3]);
+        let stack = HostMemory::allocate(4096, MemoryProtection::ReadWrite).expect("stack memory");
+        let code_addr = code.as_ptr() as u64;
+        let stack_top = stack.as_ptr() as u64 + stack.len() as u64;
+        let mut registers = HostCpuRegisters {
+            rip: code_addr,
+            rsp: stack_top,
+            ..HostCpuRegisters::default()
+        };
+
+        execute_x86_64_until_trap(&mut registers, 0).expect("int3 should trap");
+
+        assert_eq!(registers.rip, code_addr);
+    }
+}
