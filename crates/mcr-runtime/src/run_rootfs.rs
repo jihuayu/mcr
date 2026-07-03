@@ -135,6 +135,7 @@ pub enum RunRootfsError {
     },
     Vfs(mcr_vfs::VfsError),
     Linux(LinuxErrno),
+    GuestRun(crate::GuestRunError),
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -166,6 +167,7 @@ impl fmt::Display for RunRootfsError {
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Vfs(error) => write!(formatter, "{error}"),
             Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
+            Self::GuestRun(error) => write!(formatter, "guest runtime error: {error}"),
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
             }
@@ -184,6 +186,7 @@ impl std::error::Error for RunRootfsError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Vfs(error) => Some(error),
+            Self::GuestRun(error) => Some(error),
             Self::Linux(_) => None,
             Self::InvalidGuestPath(_)
             | Self::InvalidUtf8(_)
@@ -242,7 +245,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
-        Err(error) => Err(run_rootfs_linux_errno(error.linux_errno())),
+        Err(error) => Err(RunRootfsError::GuestRun(error)),
     }
 }
 
@@ -1038,10 +1041,16 @@ mod tests {
         )
         .expect_err("synthetic busybox should not fall back to the MVP emulator by default");
 
-        match error {
-            RunRootfsError::Linux(errno) => assert_eq!(errno, LinuxErrno::ENOEXEC),
-            other => panic!("expected guest runtime ENOEXEC, got {other:?}"),
+        match &error {
+            RunRootfsError::GuestRun(error) => assert_eq!(error.linux_errno(), LinuxErrno::ENOEXEC),
+            other => panic!("expected detailed guest runtime error, got {other:?}"),
         }
+        assert!(
+            error
+                .to_string()
+                .contains("guest block did not terminate at syscall"),
+            "{error}"
+        );
     }
 
     fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {
