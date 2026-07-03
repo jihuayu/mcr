@@ -175,6 +175,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Utimensat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Ppoll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::SetRobustList, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Eventfd2, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Accept4, SyscallSubsystem::Network),
     SyscallDescriptor::new(Syscall::EpollCreate1, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Dup3, SyscallSubsystem::File),
@@ -753,6 +754,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("sigmask", arg(3)),
             decimal_field("sigsetsize", arg(4)),
         ],
+        Syscall::Eventfd2 => vec![decimal_field("initval", arg(0)), hex_field("flags", arg(1))],
         Syscall::EpollCreate1 => vec![hex_field("flags", arg(0))],
         Syscall::EpollCtl => vec![
             decimal_field("epfd", arg(0)),

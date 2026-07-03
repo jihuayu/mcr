@@ -64,6 +64,9 @@ const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 const LINUX_GRND_NONBLOCK: u64 = 0x0001;
 const LINUX_GRND_RANDOM: u64 = 0x0002;
 const LINUX_GRND_SUPPORTED_FLAGS: u64 = LINUX_GRND_NONBLOCK | LINUX_GRND_RANDOM;
+const LINUX_EFD_NONBLOCK: u32 = mcr_vfs::O_NONBLOCK;
+const LINUX_EFD_CLOEXEC: u32 = mcr_vfs::O_CLOEXEC;
+const LINUX_EFD_SUPPORTED_FLAGS: u32 = LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC;
 
 pub trait GuestMemoryAccess {
     fn read_bytes(&self, addr: u64, buffer: &mut [u8]) -> Result<(), GuestMemoryAccessError>;
@@ -3189,6 +3192,7 @@ impl EventSyscalls for RuntimeSubsystems {
         match request.syscall {
             mcr_sys::Syscall::Poll => self.dispatch_poll(request),
             mcr_sys::Syscall::Ppoll => self.dispatch_ppoll(request),
+            mcr_sys::Syscall::Eventfd2 => self.dispatch_eventfd2(request),
             mcr_sys::Syscall::EpollCreate1 => self.dispatch_epoll_create1(request),
             mcr_sys::Syscall::EpollCtl => self.dispatch_epoll_ctl(request),
             mcr_sys::Syscall::EpollWait => self.dispatch_epoll_wait(request),
@@ -4142,6 +4146,32 @@ impl RuntimeSubsystems {
             return SyscallOutcome::errno(errno);
         }
         outcome
+    }
+
+    fn dispatch_eventfd2(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.eventfd2(arg(request, 0), arg_u32(request, 1)));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_fds(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
+    fn eventfd2(&mut self, initial: u64, flags: u32) -> Result<u64, LinuxErrno> {
+        if flags & !LINUX_EFD_SUPPORTED_FLAGS != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let fd = self
+            .files
+            .vfs_mut()
+            .eventfd(initial, OpenFlags::new(flags))
+            .map_err(vfs_errno)?;
+        Ok(fd as u64)
     }
 
     fn dispatch_epoll_ctl(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -6095,6 +6125,65 @@ mod tests {
     }
 
     #[test]
+    fn eventfd2_allocates_counter_fd_for_event_wakeups() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let eventfd = runtime.dispatch_syscall(context(
+            Syscall::Eventfd2,
+            [
+                0,
+                u64::from(LINUX_EFD_CLOEXEC | LINUX_EFD_NONBLOCK),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(eventfd.result, SyscallReturn::Success(3));
+        assert!(runtime.vfs().fds().cloexec(3).unwrap());
+
+        write_pollfd(
+            runtime.memory_mut(),
+            0x402100,
+            3,
+            LINUX_POLLIN | LINUX_POLLOUT,
+        );
+        let empty = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(empty.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLOUT);
+
+        let empty_read =
+            runtime.dispatch_syscall(context(Syscall::Read, [3, 0x402200, 8, 0, 0, 0]));
+        assert_eq!(empty_read.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+
+        runtime
+            .memory_mut()
+            .write(0x402300, &9u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Write, [3, 0x402300, 8, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(8)
+        );
+        write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLIN);
+        let ready = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(pollfd_revents(runtime.memory(), 0x402100), LINUX_POLLIN);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Read, [3, 0x402200, 8, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(8)
+        );
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402200), 9);
+
+        let invalid =
+            runtime.dispatch_syscall(context(Syscall::Eventfd2, [0, 0x8000_0000, 0, 0, 0, 0]));
+        assert_eq!(invalid.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+    }
+
+    #[test]
     fn epoll_wait_reports_pipe_readiness_level_triggered() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         assert_eq!(
@@ -8033,6 +8122,12 @@ mod tests {
         let mut bytes = [0; 4];
         memory.read(addr, &mut bytes).unwrap();
         u32::from_le_bytes(bytes)
+    }
+
+    fn u64_from_guest(memory: &GuestMemory, addr: u64) -> u64 {
+        let mut bytes = [0; 8];
+        memory.read(addr, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
     }
 
     fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {

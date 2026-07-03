@@ -85,6 +85,7 @@ const MIN_PIPE_CAPACITY: usize = 4096;
 const ROOT_INODE_ID: InodeId = 1;
 const FIRST_SOCKET_INODE_ID: InodeId = 1 << 59;
 const FIRST_EPOLL_INODE_ID: InodeId = (1 << 59) + (1 << 58);
+const FIRST_EVENTFD_INODE_ID: InodeId = (1 << 59) + (1 << 57);
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
 
@@ -1357,6 +1358,7 @@ pub enum InodeBackend {
     Pipe(PipeNode),
     Socket(SocketNode),
     Epoll(EpollNode),
+    Eventfd(EventfdNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1596,6 +1598,91 @@ impl EpollNode {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct EventfdNode {
+    id: u64,
+    inner: Arc<Mutex<EventfdState>>,
+}
+
+impl PartialEq for EventfdNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for EventfdNode {}
+
+impl EventfdNode {
+    pub fn new(id: u64, initial: u64) -> Self {
+        Self {
+            id,
+            inner: Arc::new(Mutex::new(EventfdState::new(initial))),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn state(&self) -> MutexGuard<'_, EventfdState> {
+        self.inner.lock().expect("eventfd mutex poisoned")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventfdState {
+    counter: u64,
+}
+
+impl EventfdState {
+    const MAX_COUNTER: u64 = u64::MAX - 1;
+
+    const fn new(counter: u64) -> Self {
+        Self { counter }
+    }
+
+    const fn readable(&self) -> bool {
+        self.counter > 0
+    }
+
+    const fn writable(&self) -> bool {
+        self.counter < Self::MAX_COUNTER
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> VfsResult<usize> {
+        if buffer.len() < 8 {
+            return Err(VfsError::InvalidPath);
+        }
+        if self.counter == 0 {
+            return Err(VfsError::WouldBlock);
+        }
+
+        let value = self.counter;
+        self.counter = 0;
+        buffer[..8].copy_from_slice(&value.to_le_bytes());
+        Ok(8)
+    }
+
+    fn write(&mut self, buffer: &[u8]) -> VfsResult<usize> {
+        if buffer.len() < 8 {
+            return Err(VfsError::InvalidPath);
+        }
+        let value = u64::from_le_bytes(buffer[..8].try_into().expect("eventfd value length"));
+        if value == u64::MAX {
+            return Err(VfsError::InvalidPath);
+        }
+        let Some(next) = self.counter.checked_add(value) else {
+            return Err(VfsError::WouldBlock);
+        };
+        if next > Self::MAX_COUNTER {
+            return Err(VfsError::WouldBlock);
+        }
+
+        self.counter = next;
+        Ok(8)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRef {
     inode: Arc<Inode>,
@@ -1641,6 +1728,7 @@ pub enum FileKind {
     PipeWrite,
     Socket,
     Epoll,
+    Eventfd,
     Stdio(StdioKind),
 }
 
@@ -1904,6 +1992,7 @@ pub struct FdTable {
     entries: BTreeMap<Fd, FdEntry>,
     cloexec: HashSet<Fd>,
     next_pipe_id: u64,
+    next_eventfd_id: u64,
     stdio: StdioCapture,
 }
 
@@ -1917,6 +2006,7 @@ impl Clone for FdTable {
             entries,
             cloexec: self.cloexec.clone(),
             next_pipe_id: self.next_pipe_id,
+            next_eventfd_id: self.next_eventfd_id,
             stdio: self.stdio.clone(),
         }
     }
@@ -1936,6 +2026,7 @@ impl FdTable {
             entries: BTreeMap::new(),
             cloexec: HashSet::new(),
             next_pipe_id: 1,
+            next_eventfd_id: 1,
             stdio: StdioCapture::default(),
         }
     }
@@ -2045,6 +2136,29 @@ impl FdTable {
             FileRef::new(inode, FileKind::Epoll),
             flags.cloexec(),
             OpenFlags::new(O_RDONLY | (flags.raw() & O_CLOEXEC)),
+            None,
+        )
+    }
+
+    pub fn eventfd(&mut self, initial: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        let access_mode = flags.access_mode();
+        if flags.raw() & !(O_ACCMODE | O_CLOEXEC | O_NONBLOCK) != 0
+            || (access_mode != 0 && access_mode != O_RDWR)
+        {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let eventfd_id = self.allocate_eventfd_id()?;
+        let inode = Arc::new(Inode::new(
+            eventfd_inode_id(eventfd_id)?,
+            InodeBackend::Eventfd(EventfdNode::new(eventfd_id, initial)),
+        ));
+        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        self.insert_entry(
+            fd,
+            FileRef::new(inode, FileKind::Eventfd),
+            flags.cloexec(),
+            OpenFlags::new(O_RDWR | (flags.raw() & O_NONBLOCK)),
             None,
         )
     }
@@ -2238,7 +2352,7 @@ impl FdTable {
             FileKind::PipeRead | FileKind::PipeWrite => {
                 Ok(pipe_node(entry.file())?.state().available())
             }
-            FileKind::Socket | FileKind::Epoll => Ok(0),
+            FileKind::Socket | FileKind::Epoll | FileKind::Eventfd => Ok(0),
             FileKind::Stdio(_) => Ok(0),
         }
     }
@@ -2294,6 +2408,15 @@ impl FdTable {
                 hang_up: false,
                 error: false,
             },
+            FileKind::Eventfd => {
+                let state = eventfd_node(entry.file())?.state();
+                FdReadiness {
+                    readable: state.readable(),
+                    writable: state.writable(),
+                    hang_up: false,
+                    error: false,
+                }
+            }
         })
     }
 
@@ -2395,6 +2518,7 @@ impl FdTable {
             FileKind::PipeWrite => Err(VfsError::BadFd),
             FileKind::Socket => Err(VfsError::BadFd),
             FileKind::Epoll => Err(VfsError::BadFd),
+            FileKind::Eventfd => eventfd_read(entry, buffer),
             FileKind::Directory => Err(VfsError::IsDirectory),
             FileKind::Stdio(StdioKind::Stdin) => Ok(0),
             FileKind::Stdio(_) => Err(VfsError::BadFd),
@@ -2455,6 +2579,7 @@ impl FdTable {
             | FileKind::PipeWrite
             | FileKind::Socket
             | FileKind::Epoll
+            | FileKind::Eventfd
             | FileKind::Directory
             | FileKind::Stdio(_) => Err(VfsError::BadFd),
         }
@@ -2509,6 +2634,7 @@ impl FdTable {
             FileKind::PipeWrite => pipe_write(entry, buffer),
             FileKind::Socket => Err(VfsError::BadFd),
             FileKind::Epoll => Err(VfsError::BadFd),
+            FileKind::Eventfd => eventfd_write(entry, buffer),
             FileKind::Stdio(kind) => stdio.write(kind, buffer),
         }
     }
@@ -2528,6 +2654,7 @@ impl FdTable {
                 | FileKind::PipeWrite
                 | FileKind::Socket
                 | FileKind::Epoll
+                | FileKind::Eventfd
                 | FileKind::Stdio(_)
         ) {
             return Err(VfsError::NotSeekable);
@@ -2545,6 +2672,7 @@ impl FdTable {
             FileKind::PipeRead | FileKind::PipeWrite => unreachable!(),
             FileKind::Socket => unreachable!(),
             FileKind::Epoll => unreachable!(),
+            FileKind::Eventfd => unreachable!(),
             FileKind::Stdio(_) => unreachable!(),
         };
         let base = match whence {
@@ -2652,6 +2780,12 @@ impl FdTable {
         Ok(id)
     }
 
+    fn allocate_eventfd_id(&mut self) -> VfsResult<u64> {
+        let id = self.next_eventfd_id;
+        self.next_eventfd_id = self.next_eventfd_id.checked_add(1).ok_or(VfsError::BadFd)?;
+        Ok(id)
+    }
+
     fn proc_fd_children(&self) -> Vec<DirectoryChild> {
         self.entries
             .keys()
@@ -2663,6 +2797,13 @@ impl FdTable {
                 })
             })
             .collect()
+    }
+}
+
+fn eventfd_node(file: &FileRef) -> VfsResult<&EventfdNode> {
+    match file.inode().backend() {
+        InodeBackend::Eventfd(eventfd) => Ok(eventfd),
+        _ => Err(VfsError::BadFd),
     }
 }
 
@@ -2929,6 +3070,10 @@ impl VirtualFileSystem {
 
     pub fn insert_epoll(&mut self, epoll_id: u64, flags: OpenFlags) -> VfsResult<Fd> {
         self.fds.insert_epoll(epoll_id, flags)
+    }
+
+    pub fn eventfd(&mut self, initial: u64, flags: OpenFlags) -> VfsResult<Fd> {
+        self.fds.eventfd(initial, flags)
     }
 
     pub fn socket_id_for_fd(&self, fd: Fd) -> VfsResult<u64> {
@@ -3549,6 +3694,10 @@ impl VirtualFileSystem {
                 "anon_inode:[eventpoll:{}]",
                 entry.inode_id()
             ))),
+            FileKind::Eventfd => Ok(Cow::Owned(format!(
+                "anon_inode:[eventfd:{}]",
+                entry.inode_id()
+            ))),
             FileKind::Stdio(kind) => Ok(Cow::Owned(format!("/dev/{}", kind.name()))),
         }
     }
@@ -3594,6 +3743,7 @@ fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
         FileKind::PipeRead | FileKind::PipeWrite => LinuxFileAttr::fifo(file.inode().id()),
         FileKind::Socket => LinuxFileAttr::socket(file.inode().id()),
         FileKind::Epoll => LinuxFileAttr::regular(file.inode().id(), 0o600, 0),
+        FileKind::Eventfd => LinuxFileAttr::regular(file.inode().id(), 0o600, 0),
         FileKind::Dev(_) => LinuxFileAttr::character_device(file.inode().id(), 0o666),
         FileKind::Regular | FileKind::Directory | FileKind::Symlink => {
             LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
@@ -3682,6 +3832,14 @@ fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
     Ok(count)
 }
 
+fn eventfd_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
+    eventfd_node(entry.file())?.state().read(buffer)
+}
+
+fn eventfd_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
+    eventfd_node(entry.file())?.state().write(buffer)
+}
+
 fn pipe_node(file: &FileRef) -> VfsResult<&PipeNode> {
     match file.inode().backend() {
         InodeBackend::Pipe(pipe) => Ok(pipe),
@@ -3698,6 +3856,12 @@ fn socket_inode_id(socket_id: u64) -> VfsResult<InodeId> {
 fn epoll_inode_id(epoll_id: u64) -> VfsResult<InodeId> {
     FIRST_EPOLL_INODE_ID
         .checked_add(epoll_id)
+        .ok_or(VfsError::BadFd)
+}
+
+fn eventfd_inode_id(eventfd_id: u64) -> VfsResult<InodeId> {
+    FIRST_EVENTFD_INODE_ID
+        .checked_add(eventfd_id)
         .ok_or(VfsError::BadFd)
 }
 
@@ -3886,6 +4050,36 @@ mod tests {
             table.insert_exact(-1, regular_file(1), false).unwrap_err(),
             VfsError::BadFd
         );
+    }
+
+    #[test]
+    fn eventfd_reads_writes_and_reports_readiness() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .eventfd(0, OpenFlags::new(O_CLOEXEC | O_NONBLOCK))
+            .unwrap();
+        assert!(vfs.fds().cloexec(fd).unwrap());
+        assert_eq!(
+            vfs.fds().get(fd).unwrap().flags().raw(),
+            O_RDWR | O_NONBLOCK
+        );
+
+        let ready = vfs.poll_readiness(fd).unwrap();
+        assert!(!ready.readable);
+        assert!(ready.writable);
+
+        let mut read_buffer = [0; 8];
+        assert_eq!(
+            vfs.read(fd, &mut read_buffer).unwrap_err(),
+            VfsError::WouldBlock
+        );
+        assert_eq!(vfs.write(fd, &7u64.to_le_bytes()).unwrap(), 8);
+        let ready = vfs.poll_readiness(fd).unwrap();
+        assert!(ready.readable);
+        assert!(ready.writable);
+        assert_eq!(vfs.read(fd, &mut read_buffer).unwrap(), 8);
+        assert_eq!(u64::from_le_bytes(read_buffer), 7);
+        assert!(!vfs.poll_readiness(fd).unwrap().readable);
     }
 
     #[test]

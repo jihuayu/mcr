@@ -129,6 +129,7 @@ pub enum Syscall {
     Utimensat,
     Ppoll,
     SetRobustList,
+    Eventfd2,
     EpollCreate1,
     Accept4,
     Dup3,
@@ -234,6 +235,7 @@ impl Syscall {
     pub const UTIMENSAT: SyscallNumber = SyscallNumber::new(280);
     pub const PPOLL: SyscallNumber = SyscallNumber::new(271);
     pub const SET_ROBUST_LIST: SyscallNumber = SyscallNumber::new(273);
+    pub const EVENTFD2: SyscallNumber = SyscallNumber::new(290);
     pub const EPOLL_CREATE1: SyscallNumber = SyscallNumber::new(291);
     pub const ACCEPT4: SyscallNumber = SyscallNumber::new(288);
     pub const DUP3: SyscallNumber = SyscallNumber::new(292);
@@ -340,6 +342,7 @@ impl Syscall {
             273 => Self::SetRobustList,
             280 => Self::Utimensat,
             288 => Self::Accept4,
+            290 => Self::Eventfd2,
             291 => Self::EpollCreate1,
             292 => Self::Dup3,
             293 => Self::Pipe2,
@@ -447,6 +450,7 @@ impl Syscall {
             Self::Utimensat => Self::UTIMENSAT,
             Self::Ppoll => Self::PPOLL,
             Self::SetRobustList => Self::SET_ROBUST_LIST,
+            Self::Eventfd2 => Self::EVENTFD2,
             Self::Accept4 => Self::ACCEPT4,
             Self::EpollCreate1 => Self::EPOLL_CREATE1,
             Self::Dup3 => Self::DUP3,
@@ -555,6 +559,7 @@ impl Syscall {
             Self::Utimensat => "utimensat",
             Self::Ppoll => "ppoll",
             Self::SetRobustList => "set_robust_list",
+            Self::Eventfd2 => "eventfd2",
             Self::Accept4 => "accept4",
             Self::EpollCreate1 => "epoll_create1",
             Self::Dup3 => "dup3",
@@ -592,6 +597,7 @@ mod tests {
         assert_eq!(Syscall::from_number(Syscall::OPENAT), Syscall::Openat);
         assert_eq!(Syscall::from_number(Syscall::SENDTO), Syscall::Sendto);
         assert_eq!(Syscall::from_number(Syscall::ACCEPT4), Syscall::Accept4);
+        assert_eq!(Syscall::from_number(Syscall::EVENTFD2), Syscall::Eventfd2);
         assert_eq!(Syscall::from_number(Syscall::STATX), Syscall::Statx);
         assert_eq!(Syscall::ExitGroup.number().raw(), 231);
         assert_eq!(Syscall::ClockGettime.name(), "clock_gettime");
