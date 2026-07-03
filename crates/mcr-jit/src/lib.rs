@@ -1453,6 +1453,25 @@ where
             let value = read_memory_u64(memory, rip, effective_address(registers, &instruction)?)?;
             xmm[index] = u128::from(value);
         }
+        Code::Movdqa_xmm_xmmm128
+            if instruction.op1_kind() == OpKind::Memory
+                && xmm_index(instruction.op0_register()).is_some() =>
+        {
+            let index = xmm_index(instruction.op0_register()).expect("guarded xmm register");
+            let address = effective_address(registers, &instruction)?;
+            let mut bytes = [0; 16];
+            read_memory_bytes(memory, rip, address, &mut bytes)?;
+            xmm[index] = u128::from_le_bytes(bytes);
+        }
+        Code::Movdqa_xmm_xmmm128
+            if instruction.op1_kind() == OpKind::Register
+                && xmm_index(instruction.op0_register()).is_some()
+                && xmm_index(instruction.op1_register()).is_some() =>
+        {
+            let dest = xmm_index(instruction.op0_register()).expect("guarded xmm register");
+            let src = xmm_index(instruction.op1_register()).expect("guarded xmm register");
+            xmm[dest] = xmm[src];
+        }
         Code::Punpcklqdq_xmm_xmmm128
             if xmm_index(instruction.op0_register()).is_some()
                 && xmm_index(instruction.op1_register()).is_some() =>
@@ -1464,6 +1483,18 @@ where
             xmm[dest] = low_dest | (low_src << 64);
         }
         Code::Movups_xmmm128_xmm
+            if instruction.op0_kind() == OpKind::Memory
+                && xmm_index(instruction.op1_register()).is_some() =>
+        {
+            let index = xmm_index(instruction.op1_register()).expect("guarded xmm register");
+            write_memory_bytes(
+                memory,
+                rip,
+                effective_address(registers, &instruction)?,
+                &xmm[index].to_le_bytes(),
+            )?;
+        }
+        Code::Movdqa_xmmm128_xmm
             if instruction.op0_kind() == OpKind::Memory
                 && xmm_index(instruction.op1_register()).is_some() =>
         {
@@ -2893,6 +2924,25 @@ where
     write_memory_bytes(memory, rip, address, &value.to_le_bytes())
 }
 
+fn read_memory_bytes<M>(
+    memory: &mut M,
+    rip: u64,
+    address: u64,
+    bytes: &mut [u8],
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    memory
+        .read_memory_operand(address, bytes)
+        .map_err(|error| ExecutionError::MemoryOperand {
+            rip,
+            address,
+            access: GuestMemoryOperandAccessKind::Read,
+            error,
+        })
+}
+
 fn write_memory_bytes<M>(
     memory: &mut M,
     rip: u64,
@@ -4163,6 +4213,37 @@ mod tests {
 
         assert_eq!(memory.read::<16>(0x714020), [0; 16]);
         assert_eq!(trap.site().rip, 0x46918e);
+    }
+
+    #[test]
+    fn execution_core_loads_xmm_with_movdqa_for_vector_store() {
+        let block = GuestBlock::new(
+            &[
+                0x66, 0x0f, 0x6f, 0x44, 0x24, 0x20, // movdqa xmm0,[rsp+0x20]
+                0x0f, 0x11, 0x03, // movups [rbx],xmm0
+                0x0f, 0x05, // syscall
+            ],
+            0x4691a0,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x714080,
+            rsp: 0x715000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let expected = [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+            0x2e, 0x2f,
+        ];
+        let mut memory = TestGuestMemory::with_bytes(0x714080, &[0; 16]);
+        memory.write(0x715020, &expected);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("load movdqa before vector store");
+
+        assert_eq!(memory.read::<16>(0x714080), expected);
+        assert_eq!(trap.site().rip, 0x4691a9);
     }
 
     #[test]
