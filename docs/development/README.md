@@ -175,6 +175,24 @@ Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
 `/bin/sh`, `-c`, and the guest command. They do not execute the command string
 through the host shell.
 
+Linux x86-64 guest smokes must be treated as x86_64-host validation. Do not
+expand `mcr-jit` into a broad x86 interpreter to make those smokes pass on an
+ARM developer machine. Use the manual `x86_64 Runtime Smokes` GitHub Actions
+workflow for the required proof:
+
+```powershell
+gh workflow run x86-runtime-smoke.yml -f suite=shell
+gh workflow run x86-runtime-smoke.yml -f suite=network
+```
+
+For local ARM development, run the same commands inside an x86_64 VM/container.
+On Docker Desktop or another QEMU-enabled runtime, this shape is sufficient:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work rust:1-bookworm \
+  bash -lc 'python3 scripts/materialize-alpine-rootfs.py --force && cargo build -p mcr-cli && MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test shell_procfs_smoke_contract -- --ignored shell_smoke_contract --nocapture'
+```
+
 ## Task And Commit Policy
 
 Implementation work follows task files in `docs/plan/tasks/`.

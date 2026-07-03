@@ -1,0 +1,50 @@
+name: x86_64 Runtime Smokes
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Smoke suite to run
+        required: true
+        default: shell
+        type: choice
+        options:
+          - shell
+          - network
+          - all
+
+jobs:
+  windows-x86-64:
+    name: Windows x86_64 guest smokes
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select Rust toolchain
+        run: rustup default stable
+
+      - name: Materialize Alpine rootfs
+        shell: pwsh
+        run: python scripts/materialize-alpine-rootfs.py --force
+
+      - name: Build mcr CLI
+        run: cargo build -p mcr-cli
+
+      - name: Run shell smokes
+        if: ${{ inputs.suite == 'shell' || inputs.suite == 'all' }}
+        shell: pwsh
+        run: |
+          $env:MCR_BIN = (Resolve-Path target/debug/mcr.exe).Path
+          cargo test -p mcr-testkit --test shell_procfs_smoke_contract -- --ignored shell_smoke_contract --nocapture
+
+      - name: Run network smokes
+        if: ${{ inputs.suite == 'network' || inputs.suite == 'all' }}
+        shell: pwsh
+        run: |
+          $env:MCR_BIN = (Resolve-Path target/debug/mcr.exe).Path
+          cargo test -p mcr-testkit --test network_smoke_contract -- --ignored network_smoke_contract --nocapture

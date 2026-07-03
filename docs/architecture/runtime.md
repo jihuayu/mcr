@@ -30,6 +30,11 @@ MVP acceptance can use static BusyBox first. Dynamic Alpine support becomes requ
 ## JIT And Syscall Interception
 
 The first implementation should prefer same-ISA re-emission over cross-architecture emulation.
+The runtime is not expected to grow into a full x86-64 instruction interpreter
+to make x86 guests pass on non-x86 hosts. When a smoke requires Linux x86-64
+guest execution, validate it on a Windows x86-64 runner or in an x86-64
+VM/container, including QEMU-backed environments when the developer host is
+ARM.
 
 Required behavior:
 
@@ -41,6 +46,9 @@ Required behavior:
 - report unsupported or invalid instruction paths with crash diagnostics.
 
 The JIT layer does not implement syscall semantics. It only controls execution and preserves guest CPU state.
+Small decoded-instruction helpers may exist for unit coverage and trampoline
+bookkeeping, but adding broad instruction semantics as a cross-architecture
+emulation strategy is outside this plan.
 
 ## Syscall Dispatcher
 
