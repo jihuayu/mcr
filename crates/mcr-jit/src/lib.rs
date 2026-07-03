@@ -578,7 +578,7 @@ impl SameIsaExecutionCore {
     where
         M: GuestMemoryOperandAccess,
     {
-        const MAX_CONTROL_FLOW_STEPS: usize = 256;
+        const MAX_CONTROL_FLOW_STEPS: usize = 4096;
 
         let mut registers = registers;
         let mut current_rip = registers.rip;
@@ -3615,7 +3615,7 @@ mod tests {
     #[test]
     fn execution_core_allows_long_linearized_control_flow_to_syscall() {
         let mut bytes = Vec::new();
-        for _ in 0..40 {
+        for _ in 0..300 {
             bytes.extend_from_slice(&[
                 0x39, 0xc0, // cmp eax,eax
                 0x75, 0x00, // jne next
@@ -3634,6 +3634,6 @@ mod tests {
             .expect("execute realistic libc startup control-flow run before syscall");
 
         assert_eq!(trap.registers().rax, 0);
-        assert_eq!(trap.site().rip, 0x4810a0);
+        assert_eq!(trap.site().rip, 0x4814b0);
     }
 }
