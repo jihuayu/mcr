@@ -89,6 +89,9 @@ mod windows_x86_64 {
         landing_rip: u64,
         registers: *mut HostCpuRegisters,
         host_fs: u64,
+        guest_fs: u64,
+        fs_restore_rip: u64,
+        fs_restore_attempts: u32,
         fault_code: u32,
         fault_address: u64,
     }
@@ -270,6 +273,9 @@ mod windows_x86_64 {
             landing_rip: 0,
             registers,
             host_fs: 0,
+            guest_fs: fs_base,
+            fs_restore_rip: 0,
+            fs_restore_attempts: 0,
             fault_code: 0,
             fault_address: 0,
         };
@@ -355,17 +361,23 @@ mod windows_x86_64 {
         registers.rip = context.rip;
         registers.rflags = u64::from(context.eflags);
 
+        let fault_address = if record.exception_code == EXCEPTION_ACCESS_VIOLATION
+            && record.number_parameters >= 2
+        {
+            record.exception_information[1] as u64
+        } else {
+            record.exception_address as usize as u64
+        };
+        if should_retry_guest_fs_access(state, context.rip, fault_address) {
+            write_fs_base(state.guest_fs);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         if record.exception_code == EXCEPTION_BREAKPOINT {
             state.fault_code = 0;
         } else {
             state.fault_code = record.exception_code;
-            state.fault_address = if record.exception_code == EXCEPTION_ACCESS_VIOLATION
-                && record.number_parameters >= 2
-            {
-                record.exception_information[1] as u64
-            } else {
-                record.exception_address as usize as u64
-            };
+            state.fault_address = fault_address;
             if record.exception_code != EXCEPTION_ILLEGAL_INSTRUCTION
                 && record.exception_code != EXCEPTION_ACCESS_VIOLATION
             {
@@ -376,6 +388,51 @@ mod windows_x86_64 {
         context.rip = state.landing_rip;
         context.rsp = state.landing_rsp;
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    fn should_retry_guest_fs_access(
+        state: &mut NativeExecutionState,
+        rip: u64,
+        fault_address: u64,
+    ) -> bool {
+        const LOW_NULL_PAGE_END: u64 = 0x1000;
+        const MAX_FS_RESTORE_ATTEMPTS: u32 = 32;
+
+        if state.guest_fs == 0
+            || fault_address >= LOW_NULL_PAGE_END
+            || !instruction_has_fs_prefix(rip)
+        {
+            return false;
+        }
+
+        if state.fs_restore_rip == rip {
+            if state.fs_restore_attempts >= MAX_FS_RESTORE_ATTEMPTS {
+                return false;
+            }
+            state.fs_restore_attempts += 1;
+        } else {
+            state.fs_restore_rip = rip;
+            state.fs_restore_attempts = 1;
+        }
+        true
+    }
+
+    fn instruction_has_fs_prefix(rip: u64) -> bool {
+        if rip < 0x1000 {
+            return false;
+        }
+
+        // SAFETY: Native execution reaches this helper for a data access fault from guest code.
+        // The faulting instruction pointer is in executable guest memory mapped readable by the
+        // runtime.
+        unsafe { std::ptr::read(rip as *const u8) == 0x64 }
+    }
+
+    fn write_fs_base(fs_base: u64) {
+        // SAFETY: The native executor already requires FSGSBASE instructions on Windows x86-64.
+        unsafe {
+            core::arch::asm!("wrfsbase {0}", in(reg) fs_base, options(nostack, preserves_flags));
+        }
     }
 
     #[link(name = "kernel32")]
@@ -416,6 +473,35 @@ mod windows_x86_64 {
 
             execute_x86_64_until_trap(&mut registers, tls.as_ptr() as u64)
                 .expect("guest int3 trap");
+
+            assert_eq!(registers.rax, expected);
+        }
+
+        #[test]
+        fn native_execution_recovers_guest_fs_base_after_reset() {
+            let mut tls = HostMemory::allocate(4096, MemoryProtection::ReadWrite).unwrap();
+            let expected = 0xfeed_face_cafe_beef_u64;
+            tls.as_mut_slice()[..8].copy_from_slice(&expected.to_le_bytes());
+
+            let mut code = HostMemory::allocate(4096, MemoryProtection::ExecuteReadWrite).unwrap();
+            code.as_mut_slice()[..17].copy_from_slice(&[
+                0x31, 0xc0, // xor eax, eax
+                0xf3, 0x48, 0x0f, 0xae, 0xd0, // wrfsbase rax
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00,
+                0x00, // mov rax, qword ptr fs:0
+                0xcc, // int3
+            ]);
+
+            let stack = HostMemory::allocate(4096, MemoryProtection::ReadWrite).unwrap();
+            let mut registers = HostCpuRegisters {
+                rip: code.as_ptr() as u64,
+                rsp: stack.as_ptr() as u64 + stack.len() as u64 - 16,
+                rflags: 0x202,
+                ..HostCpuRegisters::default()
+            };
+
+            execute_x86_64_until_trap(&mut registers, tls.as_ptr() as u64)
+                .expect("guest int3 trap after FS-base restore");
 
             assert_eq!(registers.rax, expected);
         }
