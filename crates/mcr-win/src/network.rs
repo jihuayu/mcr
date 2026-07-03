@@ -777,9 +777,8 @@ impl SocketEvents {
         if self.writable {
             events |= POLLOUT;
         }
-        if self.priority {
-            events |= POLLPRI;
-        }
+        // WSAPoll rejects POLLPRI for ordinary TCP connect checks on Windows. The runtime does
+        // not implement Linux OOB/priority-band socket data yet, so keep this interest local.
         events
     }
 
@@ -1246,6 +1245,50 @@ mod tests {
         let mut buffer = [0; 4];
         assert_eq!(server.recv(&mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"ping");
+
+        server.shutdown(HostShutdown::Both).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tcp_poll_ignores_priority_interest_for_write_readiness() {
+        let stack = NetworkStack::start().unwrap();
+        let listener = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let local = listener.local_addr().unwrap();
+
+        let client = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        client.connect(local).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut poll = [SocketPoll::new(
+            &client,
+            SocketEvents {
+                writable: true,
+                priority: true,
+                ..SocketEvents::default()
+            },
+        )];
+
+        assert_eq!(
+            stack
+                .poll(&mut poll, Some(std::time::Duration::from_millis(50)))
+                .unwrap(),
+            1
+        );
+        assert!(poll[0].readiness.writable);
+        assert!(!poll[0].readiness.priority);
 
         server.shutdown(HostShutdown::Both).unwrap();
     }
