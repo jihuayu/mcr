@@ -2303,11 +2303,30 @@ where
             .subsystems_mut()
             .memory_for_process_mut(pid)
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-        SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
+        match SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, block_rip),
             registers_from_gpr(gpr, tls),
             memory,
-        )?
+        ) {
+            Ok(trap) => trap,
+            Err(ExecutionError::ControlFlowExit { registers, .. }) => {
+                let task = dispatcher
+                    .subsystems_mut()
+                    .tasks
+                    .task_mut(tid)
+                    .ok_or(GuestExecutionError::MissingInitialTask)?;
+                let updated_regs = gpr_from_registers(registers);
+                task.set_regs(updated_regs);
+                return Ok(GuestExecutionStep::new(
+                    tid,
+                    before_rip,
+                    updated_regs.rip(),
+                    updated_regs.rax(),
+                    task.state(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
     let dispatch_result = dispatcher.dispatch(GuestContext::new(
         pid,
@@ -7121,6 +7140,72 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 0x7f }
         );
+    }
+
+    #[test]
+    fn guest_execution_continues_after_cross_window_control_flow() {
+        let program = GuestProgram::new(GuestExecutable::new(
+            b"/bin/app".to_vec(),
+            Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x400000, 0x1000, 0x1000))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x2000,
+                    0x402000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x3000,
+                    0x403000,
+                    0x08,
+                    0x100,
+                ))
+                .data_at(
+                    0x1000,
+                    vec![
+                        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,getpid
+                        0xe9, 0xf6, 0x0f, 0x00, 0x00, // jmp 0x402000
+                    ],
+                )
+                .data_at(0x2000, vec![0x0f, 0x05])
+                .data_at(0x3000, vec![0; 0x08])
+                .build(),
+        ));
+        let mut runtime = Runtime::with_tracer(program, InMemorySyscallTracer::new()).unwrap();
+
+        let cross_window_step = runtime
+            .dispatch_guest_execution()
+            .expect("cross-window jump advances rip");
+
+        assert_eq!(cross_window_step.before_rip(), 0x401000);
+        assert_eq!(cross_window_step.after_rip(), 0x402000);
+        assert_eq!(
+            cross_window_step.encoded_rax(),
+            Syscall::Getpid.number().raw()
+        );
+        assert!(runtime.tracer().events().is_empty());
+
+        let syscall_step = runtime
+            .dispatch_guest_execution()
+            .expect("next executable window dispatches syscall");
+
+        assert_eq!(syscall_step.before_rip(), 0x402000);
+        assert_eq!(syscall_step.after_rip(), 0x402002);
+        assert_eq!(syscall_step.encoded_rax(), u64::from(INITIAL_GUEST_PID));
+        assert!(matches!(
+            runtime.tracer().events(),
+            [SyscallTraceEvent::Enter(_), SyscallTraceEvent::Exit(_)]
+        ));
     }
 
     #[test]

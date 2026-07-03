@@ -481,6 +481,10 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionError {
     Decode(DecodeError),
+    ControlFlowExit {
+        rip: u64,
+        registers: GuestRegisters,
+    },
     MissingSyscall {
         terminator: BlockTerminator,
     },
@@ -496,6 +500,10 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(error) => error.fmt(f),
+            Self::ControlFlowExit { rip, .. } => write!(
+                f,
+                "guest block exited executable window at guest rip 0x{rip:016x}"
+            ),
             Self::MissingSyscall {
                 terminator:
                     BlockTerminator::ControlFlow {
@@ -588,7 +596,16 @@ impl SameIsaExecutionCore {
         let mut flags = GuestFlags::from_registers(&registers);
         let mut xmm = [0_u128; 16];
         for _ in 0..MAX_CONTROL_FLOW_STEPS {
-            let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
+            let current_block = match block_from_rip(block, current_rip) {
+                Ok(block) => block,
+                Err(ExecutionError::MissingSyscall {
+                    terminator: BlockTerminator::Invalid { rip },
+                }) => {
+                    return Err(ExecutionError::ControlFlowExit { rip, registers });
+                }
+                Err(error) => return Err(error),
+            };
+            let decoded = self.decode_block(current_block)?;
             let syscall_site = decoded.syscall_site();
             for instruction in decoded.instructions() {
                 if Some(instruction.rip) == syscall_site.map(|site| site.rip) {
@@ -1847,12 +1864,10 @@ where
                 });
             }
             let target = instruction.near_branch_target();
-            block_offset(block, target)?;
             Ok(Some(target))
         }
         DecodedFlowControl::Call if instruction.code() == Code::Call_rel32_64 => {
             let target = instruction.near_branch_target();
-            block_offset(block, target)?;
             let next_rsp = registers.rsp.wrapping_sub(8);
             write_memory_u64(memory, instruction.ip(), next_rsp, instruction.next_ip())?;
             registers.rsp = next_rsp;
@@ -1860,7 +1875,6 @@ where
         }
         DecodedFlowControl::Call if instruction.code() == Code::Call_rm64 => {
             let target = read_operand_u64(registers, memory, &instruction, 0)?;
-            block_offset(block, target)?;
             let next_rsp = registers.rsp.wrapping_sub(8);
             write_memory_u64(memory, instruction.ip(), next_rsp, instruction.next_ip())?;
             registers.rsp = next_rsp;
@@ -1868,13 +1882,11 @@ where
         }
         DecodedFlowControl::Return if instruction.code() == Code::Retnq => {
             let target = read_memory_u64(memory, instruction.ip(), registers.rsp)?;
-            block_offset(block, target)?;
             registers.rsp = registers.rsp.wrapping_add(8);
             Ok(Some(target))
         }
         DecodedFlowControl::IndirectBranch if instruction.code() == Code::Jmp_rm64 => {
             let target = read_operand_u64(registers, memory, &instruction, 0)?;
-            block_offset(block, target)?;
             Ok(Some(target))
         }
         DecodedFlowControl::IndirectBranch
@@ -3291,6 +3303,37 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x430012);
+    }
+
+    #[test]
+    fn execution_core_returns_control_flow_exit_outside_block() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // mov rax,39
+                0xe9, 0x00, 0x10, 0x00, 0x00, // jmp outside loaded window
+            ],
+            0x430200,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+
+        let error = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap(block, registers)
+            .expect_err("cross-window branch should return control-flow exit");
+
+        assert_eq!(
+            error,
+            ExecutionError::ControlFlowExit {
+                rip: 0x43120c,
+                registers: GuestRegisters {
+                    rax: Syscall::Getpid.number().raw(),
+                    rip: 0x43120c,
+                    ..GuestRegisters::default()
+                },
+            }
+        );
     }
 
     #[test]
