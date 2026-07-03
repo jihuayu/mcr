@@ -3019,6 +3019,12 @@ struct ExecutableSyscallPatch {
     address: u64,
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+struct FsRelativePatch {
+    original: [u8; 9],
+}
+
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -3027,6 +3033,8 @@ struct ExecutableSyscallPatch {
 struct NativePatchCache {
     fs_base: u64,
     scanned_ranges: Vec<(u64, u64)>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fs_relative_patches: BTreeMap<u64, FsRelativePatch>,
 }
 
 #[cfg(any(
@@ -3036,23 +3044,24 @@ struct NativePatchCache {
 impl NativePatchCache {
     fn invalidate(&mut self) {
         self.scanned_ranges.clear();
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        self.fs_relative_patches.clear();
     }
 
     fn invalidate_range(&mut self, start: u64, end: u64) {
         self.scanned_ranges.retain(|(range_start, range_end)| {
             !ranges_overlap(start, end, *range_start, *range_end)
         });
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        self.fs_relative_patches
+            .retain(|address, _| !(*address >= start && *address < end));
     }
 }
 
 fn find_executable_syscall_patches(
     memory: &mut GuestMemory,
-    fs_base: u64,
     skipped_ranges: &[(u64, u64)],
 ) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    let _ = fs_base;
-
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
@@ -3073,10 +3082,31 @@ fn find_executable_syscall_patches(
                 let address = start + offset as u64;
                 patches.push(ExecutableSyscallPatch { address });
             }
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            if let Some(replacement) = fs_relative_patch(&bytes[offset..], fs_base) {
-                let address = start + offset as u64;
-                let _ = memory.patch_code(address, &replacement)?;
+        }
+    }
+    Ok(patches)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn find_executable_fs_relative_patches(
+    memory: &mut GuestMemory,
+    skipped_ranges: &[(u64, u64)],
+) -> Result<Vec<(u64, FsRelativePatch)>, GuestExecutionError> {
+    let executable_ranges = memory
+        .vmas()
+        .filter(|vma| vma.protection().execute)
+        .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
+        .map(|vma| (vma.start(), vma.end()))
+        .collect::<Vec<_>>();
+    let mut patches = Vec::new();
+    for (start, end) in executable_ranges {
+        let len = usize::try_from(end - start)
+            .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+        let mut bytes = vec![0; len];
+        memory.read(start, &mut bytes)?;
+        for offset in 0..bytes.len() {
+            if let Some(original) = fs_relative_original(&bytes[offset..]) {
+                patches.push((start + offset as u64, FsRelativePatch { original }));
             }
         }
     }
@@ -3085,12 +3115,24 @@ fn find_executable_syscall_patches(
 
 fn patch_executable_syscalls(
     memory: &mut GuestMemory,
-    fs_base: u64,
     skipped_ranges: &[(u64, u64)],
 ) -> Result<(), GuestExecutionError> {
-    let patches = find_executable_syscall_patches(memory, fs_base, skipped_ranges)?;
+    let patches = find_executable_syscall_patches(memory, skipped_ranges)?;
     for patch in patches {
         memory.patch_code(patch.address, &[0xcc, 0x90])?;
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn apply_fs_relative_patches(
+    memory: &mut GuestMemory,
+    fs_base: u64,
+    patches: &BTreeMap<u64, FsRelativePatch>,
+) -> Result<(), GuestExecutionError> {
+    for (address, patch) in patches {
+        let bytes = fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original);
+        memory.patch_code(*address, &bytes)?;
     }
     Ok(())
 }
@@ -3106,9 +3148,8 @@ fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
-    if fs_base == 0
-        || bytes.len() < 9
+fn fs_relative_original(bytes: &[u8]) -> Option<[u8; 9]> {
+    if bytes.len() < 9
         || bytes[0] != 0x64
         || bytes[1] & 0xf8 != 0x48
         || !matches!(bytes[2], 0x8b | 0x2b)
@@ -3118,7 +3159,16 @@ fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
         return None;
     }
 
-    let displacement = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    Some(bytes[..9].try_into().expect("slice length checked"))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_replacement(original: [u8; 9], fs_base: u64) -> Option<[u8; 9]> {
+    if fs_base == 0 {
+        return None;
+    }
+
+    let displacement = i32::from_le_bytes([original[5], original[6], original[7], original[8]]);
     let absolute = if displacement >= 0 {
         fs_base.checked_add(displacement as u64)?
     } else {
@@ -3130,10 +3180,10 @@ fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
 
     let absolute = (absolute as u32).to_le_bytes();
     Some([
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
+        original[1],
+        original[2],
+        original[3],
+        original[4],
         absolute[0],
         absolute[1],
         absolute[2],
@@ -3430,19 +3480,30 @@ impl RuntimeSubsystems {
         fs_base: u64,
     ) -> Result<(), GuestExecutionError> {
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
-        if cache.fs_base != fs_base {
-            cache = NativePatchCache {
-                fs_base,
-                scanned_ranges: Vec::new(),
-            };
-        }
         let scanned_ranges = cache.scanned_ranges.clone();
-        patch_executable_syscalls(
-            self.memory_for_process_mut(pid)
-                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?,
-            fs_base,
-            &scanned_ranges,
-        )?;
+        {
+            let memory = self
+                .memory_for_process_mut(pid)
+                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+            patch_executable_syscalls(memory, &scanned_ranges)?;
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                let mut added_fs_patch = false;
+                for (address, patch) in
+                    find_executable_fs_relative_patches(memory, &scanned_ranges)?
+                {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        cache.fs_relative_patches.entry(address)
+                    {
+                        entry.insert(patch);
+                        added_fs_patch = true;
+                    }
+                }
+                if cache.fs_base != fs_base || added_fs_patch {
+                    apply_fs_relative_patches(memory, fs_base, &cache.fs_relative_patches)?;
+                }
+            }
+        }
         let scanned_now = self
             .memory_for_process(pid)
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
@@ -3450,6 +3511,7 @@ impl RuntimeSubsystems {
             .filter(|vma| vma.protection().execute)
             .map(|vma| (vma.start(), vma.end()))
             .collect::<Vec<_>>();
+        cache.fs_base = fs_base;
         cache.scanned_ranges = scanned_now;
         self.native_patch_caches.insert(pid, cache);
         Ok(())
@@ -4703,6 +4765,9 @@ impl RuntimeSubsystems {
                 self.process_memory.insert(child_pid, memory);
                 self.process_fds
                     .insert(child_pid, self.files.vfs().fds().clone());
+                if let Some(cache) = self.native_patch_caches.get(&pid).cloned() {
+                    self.native_patch_caches.insert(child_pid, cache);
+                }
                 self.fork_native_fp(request.context.tid, child_pid);
                 outcome
             }
@@ -10990,6 +11055,49 @@ mod tests {
     }
 
     #[test]
+    fn native_fork_keeps_parent_and_child_memory_isolated() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax,fork
+                0x0f, 0x05, // syscall
+                0x85, 0xc0, // test eax,eax
+                0x75, 0x19, // jne parent
+                0x48, 0xbb, 0x00, 0x20, 0x40, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov rbx,0x402000
+                0xc7, 0x03, b'c', b'h', b'l', b'd', // mov dword ptr [rbx],"chld"
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x31, 0xff, // xor edi,edi
+                0x0f, 0x05, // syscall
+                0x48, 0xbb, 0x00, 0x20, 0x40, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov rbx,0x402000
+                0xc7, 0x03, b'p', b'a', b'r', b'e', // mov dword ptr [rbx],"pare"
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x31, 0xff, // xor edi,edi
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        runtime.enable_native_execution();
+        runtime.memory_mut().write(0x402000, b"parent").unwrap();
+
+        let fork = runtime
+            .dispatch_guest_execution()
+            .expect("parent native fork syscall executes");
+        assert_eq!(fork.encoded_rax(), 2);
+
+        let child = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, 2)
+            .expect("child native branch exits");
+        assert_eq!(child.task_state(), TaskState::Exited { status: 0 });
+
+        let mut parent_bytes = [0; 6];
+        runtime.memory().read(0x402000, &mut parent_bytes).unwrap();
+
+        assert_eq!(&parent_bytes, b"parent");
+    }
+
+    #[test]
     fn runtime_execve_reads_filename_argv_envp_from_guest_memory_and_vfs() {
         let mut tree = PathTree::new();
         tree.create_dir("/bin").unwrap();
@@ -11610,6 +11718,40 @@ mod tests {
                 .scanned_ranges
                 .iter()
                 .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_tls_accesses_per_base() {
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7010_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
         );
     }
 
