@@ -7736,6 +7736,32 @@ mod tests {
     }
 
     #[test]
+    fn guest_registers_round_trip_preserves_argument_register_order() {
+        let registers = GuestRegisters {
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsi: 5,
+            rdi: 6,
+            rbp: 7,
+            rsp: 8,
+            r8: 9,
+            r9: 10,
+            r10: 11,
+            r11: 12,
+            r12: 13,
+            r13: 14,
+            r14: 15,
+            r15: 16,
+            rip: 17,
+            rflags: 18,
+        };
+
+        assert_eq!(registers_from_gpr(gpr_from_registers(registers)), registers);
+    }
+
+    #[test]
     fn guest_execution_dispatch_advances_registers_and_exposes_exit_state() {
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
