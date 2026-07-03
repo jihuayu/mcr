@@ -1126,14 +1126,14 @@ where
                 32,
             );
         }
-        Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8
+        Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8 | Code::Cmp_RAX_imm32
             if instruction.op0_kind() == OpKind::Register =>
         {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = immediate_as_u64(&instruction)?;
             flags.set_sub_result(lhs, rhs, lhs.wrapping_sub(rhs), 64);
         }
-        Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8
+        Code::Cmp_rm32_imm32 | Code::Cmp_rm32_imm8 | Code::Cmp_EAX_imm32
             if instruction.op0_kind() == OpKind::Register =>
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
@@ -3536,6 +3536,35 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x470018);
+    }
+
+    #[test]
+    fn execution_core_uses_accumulator_cmp_immediate_for_branch() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0xf0, 0xff, 0xff, 0x6f, 0x00, 0x00, 0x00,
+                0x00, // mov rax,0x6ffffff0
+                0x48, 0x3d, 0xf0, 0xff, 0xff, 0x6f, // cmp rax,0x6ffffff0
+                0x74, 0x07, // je success
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x470080,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute accumulator cmp immediate before branch");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x47009e);
     }
 
     #[test]
