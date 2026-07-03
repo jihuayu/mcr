@@ -1040,7 +1040,9 @@ where
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
 
-        let total = if message.msg_name != 0 || message.msg_namelen != 0 {
+        let total = if (message.msg_name != 0 || message.msg_namelen != 0)
+            && self.socket_is_udp_datagram(socket_id)?
+        {
             let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
                 let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
                 total.checked_add(len).ok_or(LinuxErrno::EINVAL)
@@ -1057,40 +1059,13 @@ where
                 message.msg_namelen,
                 address,
             )?;
-            let mut consumed = 0usize;
-            for iovec in iovecs {
-                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                let remaining = count.saturating_sub(consumed);
-                let write_len = len.min(remaining);
-                if write_len > 0 {
-                    self.memory
-                        .write_bytes(iovec.iov_base, &buffer[consumed..consumed + write_len])
-                        .map_err(memory_errno)?;
-                }
-                consumed += write_len;
-                if consumed >= count {
-                    break;
-                }
-            }
+            self.write_iovec_bytes(&iovecs, &buffer[..count])?;
             count as u64
         } else {
-            let mut total = 0u64;
-            for iovec in iovecs {
-                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                let mut buffer = vec![0; len];
-                let count = self
-                    .sockets
-                    .recv_connected(socket_id, &mut buffer)
-                    .map_err(net_errno)?;
-                self.memory
-                    .write_bytes(iovec.iov_base, &buffer[..count])
-                    .map_err(memory_errno)?;
-                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-                if count < len {
-                    break;
-                }
+            if message.msg_name != 0 {
+                write_msghdr_namelen(&mut self.memory, args.msg, 0)?;
             }
-            total
+            self.recv_connected_into_iovecs(socket_id, &iovecs)?
         };
         self.memory
             .write_bytes(args.msg + 48, &0u32.to_le_bytes())
@@ -1818,6 +1793,49 @@ where
         Ok(buffer)
     }
 
+    fn write_iovec_bytes(&mut self, iovecs: &[LinuxIovec], bytes: &[u8]) -> Result<(), LinuxErrno> {
+        let mut consumed = 0usize;
+        for iovec in iovecs {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let remaining = bytes.len().saturating_sub(consumed);
+            let write_len = len.min(remaining);
+            if write_len > 0 {
+                self.memory
+                    .write_bytes(iovec.iov_base, &bytes[consumed..consumed + write_len])
+                    .map_err(memory_errno)?;
+            }
+            consumed += write_len;
+            if consumed >= bytes.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn recv_connected_into_iovecs(
+        &mut self,
+        socket_id: SocketId,
+        iovecs: &[LinuxIovec],
+    ) -> Result<u64, LinuxErrno> {
+        let mut total = 0u64;
+        for iovec in iovecs {
+            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let mut buffer = vec![0; len];
+            let count = self
+                .sockets
+                .recv_connected(socket_id, &mut buffer)
+                .map_err(net_errno)?;
+            self.memory
+                .write_bytes(iovec.iov_base, &buffer[..count])
+                .map_err(memory_errno)?;
+            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+            if count < len {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     fn socket_is_udp_datagram(&self, id: SocketId) -> Result<bool, LinuxErrno> {
         let socket = self.sockets.socket(id).map_err(net_errno)?;
         Ok(socket.socket_type() == SocketType::Datagram
@@ -2048,6 +2066,16 @@ fn write_socket_address_to_msghdr_name(
     let actual_len = u32::try_from(encoded.len()).expect("sockaddr length fits socklen_t");
     memory
         .write_bytes(msghdr + 8, &actual_len.to_le_bytes())
+        .map_err(memory_errno)
+}
+
+fn write_msghdr_namelen(
+    memory: &mut impl GuestMemoryAccess,
+    msghdr: u64,
+    namelen: u32,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(msghdr + 8, &namelen.to_le_bytes())
         .map_err(memory_errno)
 }
 
@@ -7760,6 +7788,59 @@ mod tests {
         );
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
+    }
+
+    #[test]
+    fn connected_stream_recvmsg_ignores_name_buffer() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+        runtime.memory_mut().write(0x1000, &ipv4_sockaddr(8080));
+        runtime.memory_mut().write_iovec(0x3000, 0x4000, 4);
+        runtime.memory_mut().write(0x5000, &[0xaa; SOCKADDR_IN_LEN]);
+        runtime
+            .memory_mut()
+            .write_msghdr(0x5100, 0x5000, SOCKADDR_IN_LEN as u32, 0x3000, 1);
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_TCP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Connect,
+                [3, 0x1000, SOCKADDR_IN_LEN as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Recvmsg, [3, 0x5100, 0, 0, 0, 0],),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x4000, 4), b"pong");
+        assert_eq!(
+            runtime.memory().read(0x5000, SOCKADDR_IN_LEN),
+            [0xaa; SOCKADDR_IN_LEN]
+        );
+        assert_eq!(u32_at(runtime.memory(), 0x5100 + 8), 0);
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
     }
 
