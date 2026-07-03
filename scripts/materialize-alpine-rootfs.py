@@ -351,9 +351,16 @@ def link_worktree_rootfs(
                 )
             rootfs_dir.unlink()
 
-    target = os.path.relpath(cached_rootfs_dir, rootfs_dir.parent)
+    target = symlink_target(cached_rootfs_dir, rootfs_dir.parent)
     os.symlink(target, rootfs_dir, target_is_directory=True)
     print(f"linked {rootfs_dir} -> {target}")
+
+
+def symlink_target(target: Path, start: Path) -> str:
+    try:
+        return os.path.relpath(target, start)
+    except ValueError:
+        return str(target)
 
 
 def same_path(left: Path, right: Path) -> bool:
