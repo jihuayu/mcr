@@ -189,9 +189,16 @@ For local ARM development, run the same commands inside an x86_64 VM/container.
 On Docker Desktop or another QEMU-enabled runtime, this shape is sufficient:
 
 ```sh
-docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work rust:1-bookworm \
-  bash -lc 'python3 scripts/materialize-alpine-rootfs.py --force && cargo build -p mcr-cli && MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test shell_procfs_smoke_contract -- --ignored shell_smoke_contract --nocapture'
+docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
+  -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  rust:1-bookworm \
+  bash -c 'python3 scripts/materialize-alpine-rootfs.py --force && cargo build -p mcr-cli && MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test shell_procfs_smoke_contract -- --ignored shell_smoke_contract --nocapture'
 ```
+
+If an x86_64 runner or QEMU container still reports `guest block did not
+terminate at syscall` for an Alpine smoke, treat it as an execution-layer gap.
+The fix is native same-ISA execution/re-emission on x86_64, not adding enough
+decoded instruction cases to approximate a full CPU.
 
 ## Task And Commit Policy
 
