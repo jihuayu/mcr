@@ -386,6 +386,40 @@ mod windows_x86_64 {
         ) -> *mut c_void;
         fn RemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::{HostMemory, MemoryProtection};
+
+        use super::*;
+
+        #[test]
+        fn native_execution_applies_guest_fs_base() {
+            let mut tls = HostMemory::allocate(4096, MemoryProtection::ReadWrite).unwrap();
+            let expected = 0x1234_5678_90ab_cdef_u64;
+            tls.as_mut_slice()[..8].copy_from_slice(&expected.to_le_bytes());
+
+            let mut code = HostMemory::allocate(4096, MemoryProtection::ExecuteReadWrite).unwrap();
+            code.as_mut_slice()[..10].copy_from_slice(&[
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00,
+                0x00, // mov rax, qword ptr fs:0
+                0xcc, // int3
+            ]);
+
+            let stack = HostMemory::allocate(4096, MemoryProtection::ReadWrite).unwrap();
+            let mut registers = HostCpuRegisters {
+                rip: code.as_ptr() as u64,
+                rsp: stack.as_ptr() as u64 + stack.len() as u64 - 16,
+                rflags: 0x202,
+                ..HostCpuRegisters::default()
+            };
+
+            execute_x86_64_until_trap(&mut registers, tls.as_ptr() as u64)
+                .expect("guest int3 trap");
+
+            assert_eq!(registers.rax, expected);
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
