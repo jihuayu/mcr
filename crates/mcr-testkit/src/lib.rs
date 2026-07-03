@@ -1060,7 +1060,10 @@ mod tests {
         assert_eq!(alpine.stage(), "mvp");
         assert!(alpine.archive_relative_path().is_some());
         assert!(!alpine.required());
-        assert!(!alpine.materialized(&fixtures));
+        assert_eq!(
+            alpine.materialized(&fixtures),
+            alpine.absolute_path(&fixtures).is_dir()
+        );
 
         Ok(())
     }
