@@ -1116,6 +1116,7 @@ where
             flags.set_logic_result(u64::from(lhs & rhs), 16);
         }
         Code::Nopd | Code::Nopq => {}
+        _ if instruction.mnemonic() == Mnemonic::Nop => {}
         _ => {
             return Err(ExecutionError::MissingSyscall {
                 terminator: BlockTerminator::ControlFlow {
@@ -2554,6 +2555,37 @@ mod tests {
         );
         assert_eq!(registers.rax, 7);
         assert_eq!(registers.rip, 0x460037);
+    }
+
+    #[test]
+    fn execution_core_ignores_multibyte_nops() {
+        let block = GuestBlock::new(
+            &[
+                0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nop dword ptr [rax]
+                0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00,
+                0x00, // nop word ptr cs:[rax+rax]
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x468000,
+        );
+        let mut registers = GuestRegisters {
+            rip: block.rip(),
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(9).encode_u64()
+        });
+
+        SameIsaExecutionCore::new()
+            .execute_until_syscall(block, &mut registers, &mut trampoline)
+            .expect("execute through musl-style multi-byte nops");
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(registers.rax, 9);
     }
 
     #[test]
