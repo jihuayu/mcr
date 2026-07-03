@@ -1273,6 +1273,14 @@ where
             registers.rsp = next_rsp;
             Ok(Some(target))
         }
+        DecodedFlowControl::Call if instruction.code() == Code::Call_rm64 => {
+            let target = read_operand_u64(registers, memory, &instruction, 0)?;
+            block_offset(block, target)?;
+            let next_rsp = registers.rsp.wrapping_sub(8);
+            write_memory_u64(memory, instruction.ip(), next_rsp, instruction.next_ip())?;
+            registers.rsp = next_rsp;
+            Ok(Some(target))
+        }
         DecodedFlowControl::Return if instruction.code() == Code::Retnq => {
             let target = read_memory_u64(memory, instruction.ip(), registers.rsp)?;
             block_offset(block, target)?;
@@ -2335,6 +2343,45 @@ mod tests {
         assert_eq!(captured_number, Some(Syscall::GETPID));
         assert_eq!(registers.rax, 4242);
         assert_eq!(registers.rip, 0x43001a);
+    }
+
+    #[test]
+    fn execution_core_follows_indirect_register_call_and_return_to_syscall() {
+        let block = GuestBlock::new(
+            &[
+                0x48, 0xb8, 0x13, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov rax,0x430013
+                0xff, 0xd0, // call rax
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,60
+                0xc3, // ret
+            ],
+            0x430000,
+        );
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            rsp: 0x700000,
+            rflags: 0x246,
+            ..GuestRegisters::default()
+        };
+        let mut captured_number = None;
+        let mut trampoline = TrampolineCore::new(42, 43, |context: mcr_sys::GuestContext| {
+            captured_number = Some(context.registers.number());
+            SyscallReturn::success(4242).encode_u64()
+        });
+        let mut memory = TestGuestMemory::with_bytes(0x6ffff8, &[0; 8]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute syscall behind indirect call");
+        let mut trapped_registers = trap.registers();
+        trampoline.enter_syscall(&mut trapped_registers, trap.site());
+
+        assert_eq!(captured_number, Some(Syscall::GETPID));
+        assert_eq!(trapped_registers.rax, 4242);
+        assert_eq!(trapped_registers.rip, 0x430013);
+        assert_eq!(memory.read_u64(0x6ffff8), 0x43000c);
     }
 
     #[test]
