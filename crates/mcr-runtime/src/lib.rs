@@ -33,12 +33,13 @@ use mcr_sys::{
     LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
     LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
-    LINUX_POLLPRI, LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat,
-    LinuxStatx, LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
-    NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
-    SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
-    SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
-    SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
+    LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LinuxEpollEvent, LinuxErrno, LinuxIovec,
+    LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec,
+    LinuxUtsname, MemorySyscalls, NetworkSyscalls, NoopSyscallTracer, Pipe2SyscallArgs,
+    PipeSyscallArgs, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs,
+    SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs, SyscallDispatchResult,
+    SyscallDispatcher, SyscallOutcome, SyscallRequest, SyscallReturn, SyscallTraceEvent,
+    SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProgram,
@@ -5570,11 +5571,11 @@ fn poll_revents_to_epoll_events(revents: i16, interest: u32) -> u32 {
 
 fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
     let mut revents = 0;
-    if readiness.readable && events & (LINUX_POLLIN | LINUX_POLLPRI) != 0 {
-        revents |= LINUX_POLLIN;
+    if readiness.readable && events & LINUX_POLL_READ_NORMAL != 0 {
+        revents |= events & LINUX_POLL_READ_NORMAL;
     }
-    if readiness.writable && events & LINUX_POLLOUT != 0 {
-        revents |= LINUX_POLLOUT;
+    if readiness.writable && events & LINUX_POLL_WRITE_NORMAL != 0 {
+        revents |= events & LINUX_POLL_WRITE_NORMAL;
     }
     if readiness.error {
         revents |= LINUX_POLLERR;
@@ -5584,6 +5585,9 @@ fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
     }
     revents
 }
+
+const LINUX_POLL_READ_NORMAL: i16 = LINUX_POLLIN | LINUX_POLLRDNORM;
+const LINUX_POLL_WRITE_NORMAL: i16 = LINUX_POLLOUT | LINUX_POLLWRNORM;
 
 fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno> {
     let readiness = fds
@@ -5598,8 +5602,8 @@ fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno>
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
     SocketEvents {
-        readable: events & LINUX_POLLIN != 0,
-        writable: events & LINUX_POLLOUT != 0,
+        readable: events & LINUX_POLL_READ_NORMAL != 0,
+        writable: events & LINUX_POLL_WRITE_NORMAL != 0,
         priority: events & LINUX_POLLPRI != 0,
         error: false,
         hang_up: false,
@@ -5609,11 +5613,11 @@ fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
 
 fn poll_revents_from_socket_events(readiness: SocketEvents, events: i16) -> i16 {
     let mut revents = 0;
-    if readiness.readable && events & LINUX_POLLIN != 0 {
-        revents |= LINUX_POLLIN;
+    if readiness.readable && events & LINUX_POLL_READ_NORMAL != 0 {
+        revents |= events & LINUX_POLL_READ_NORMAL;
     }
-    if readiness.writable && events & LINUX_POLLOUT != 0 {
-        revents |= LINUX_POLLOUT;
+    if readiness.writable && events & LINUX_POLL_WRITE_NORMAL != 0 {
+        revents |= events & LINUX_POLL_WRITE_NORMAL;
     }
     if readiness.priority && events & LINUX_POLLPRI != 0 {
         revents |= LINUX_POLLPRI;
@@ -5819,11 +5823,11 @@ mod tests {
         LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
         LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS,
         LINUX_MAP_FIXED, LINUX_MAP_PRIVATE, LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN,
-        LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE,
-        LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE,
-        LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM,
-        LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn,
-        SyscallTraceEvent,
+        LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
+        LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR,
+        LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
+        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+        LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -7112,6 +7116,62 @@ mod tests {
         assert_eq!(
             pollfd_revents(runtime.memory(), 0x402100),
             LINUX_POLLIN | LINUX_POLLOUT
+        );
+    }
+
+    #[test]
+    fn poll_reports_socket_normal_band_aliases() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_pollfd(
+            runtime.memory_mut(),
+            0x402100,
+            3,
+            LINUX_POLLRDNORM | LINUX_POLLOUT | LINUX_POLLWRNORM | LINUX_POLLPRI,
+        );
+
+        let result = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 1, 0, 0, 0, 0]));
+
+        assert_eq!(result.result, SyscallReturn::Success(1));
+        assert_eq!(
+            pollfd_revents(runtime.memory(), 0x402100),
+            LINUX_POLLRDNORM | LINUX_POLLOUT | LINUX_POLLWRNORM
         );
     }
 
