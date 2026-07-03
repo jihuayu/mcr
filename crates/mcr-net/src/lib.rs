@@ -1687,12 +1687,14 @@ fn apply_socket_options(
             HostSocketOptionValue::Bool(options.reuse_addr),
         )
         .map_err(HostIoError::from)?;
-    socket
-        .set_option(
-            HostSocketOptionName::KeepAlive,
-            HostSocketOptionValue::Bool(options.keep_alive),
-        )
-        .map_err(HostIoError::from)?;
+    if spec.effective_protocol() == SocketProtocol::Tcp {
+        socket
+            .set_option(
+                HostSocketOptionName::KeepAlive,
+                HostSocketOptionValue::Bool(options.keep_alive),
+            )
+            .map_err(HostIoError::from)?;
+    }
     socket
         .set_option(
             HostSocketOptionName::SendBufferSize,
@@ -2493,5 +2495,60 @@ mod tests {
             5
         );
         assert_eq!(&buffer, b"serve");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_host_transport_moves_udp_dns_like_datagrams() {
+        let stack = NetworkStack::start().expect("network stack");
+        let server = stack
+            .open_socket(
+                AddressFamily::Inet,
+                SocketKind::Datagram,
+                HostSocketProtocol::Udp,
+            )
+            .expect("server UDP socket");
+        server
+            .bind("127.0.0.1:0".parse().expect("loopback bind"))
+            .unwrap();
+        let server_addr = SocketAddress::from(server.local_addr().expect("server local addr"));
+
+        let mut table = GuestSocketTable::with_transport(
+            WinHostSocketTransport::new().expect("host transport"),
+        );
+        let client = table
+            .create_socket_from_spec(
+                SocketSpec::new(
+                    SocketDomain::Inet,
+                    SocketType::Datagram,
+                    SocketProtocol::Udp,
+                )
+                .expect("udp spec"),
+            )
+            .expect("client socket");
+
+        assert_eq!(
+            table
+                .send_to(client, b"dns?", server_addr)
+                .expect("send DNS query"),
+            4
+        );
+
+        let mut query = [0; 16];
+        let (query_len, client_addr) = server.recv_from(&mut query).expect("server recv");
+        assert_eq!(&query[..query_len], b"dns?");
+        assert_eq!(client_addr.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        assert_eq!(
+            server.send_to(b"dns!", client_addr).expect("server send"),
+            4
+        );
+        let mut response = [0; 16];
+        let (response_len, response_addr) = table
+            .recv_from(client, &mut response)
+            .expect("client recv DNS response");
+
+        assert_eq!(&response[..response_len], b"dns!");
+        assert_eq!(response_addr, server_addr);
     }
 }
