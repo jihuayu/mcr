@@ -2771,12 +2771,19 @@ where
         if !vma.protection().execute {
             return Err(GuestExecutionError::Memory(GuestMemoryError::AccessDenied));
         }
-        let patches = patch_executable_syscalls(memory, fs_base)?;
+    }
+    dispatcher
+        .subsystems_mut()
+        .ensure_native_patch_cache(pid, fs_base)?;
+    {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         let mut native_registers = host_registers_from_gpr(gpr);
         native_registers.xmm = native_fp.xmm;
         native_registers.mxcsr = native_fp.mxcsr;
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
-        restore_executable_syscalls(memory, patches)?;
         let stack_words = native_fault_stack_words(memory, native_registers.rsp);
         native_result
             .map_err(|error| native_execution_error(error, native_registers, stack_words))?;
@@ -2857,14 +2864,41 @@ where
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
+#[derive(Clone, Copy, Debug)]
 struct ExecutableSyscallPatch {
     address: u64,
-    bytes: Vec<u8>,
 }
 
-fn patch_executable_syscalls(
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug, Default)]
+struct NativePatchCache {
+    fs_base: u64,
+    scanned_ranges: Vec<(u64, u64)>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+impl NativePatchCache {
+    fn invalidate(&mut self) {
+        self.scanned_ranges.clear();
+    }
+
+    fn invalidate_range(&mut self, start: u64, end: u64) {
+        self.scanned_ranges.retain(|(range_start, range_end)| {
+            !ranges_overlap(start, end, *range_start, *range_end)
+        });
+    }
+}
+
+fn find_executable_syscall_patches(
     memory: &mut GuestMemory,
     fs_base: u64,
+    skipped_ranges: &[(u64, u64)],
 ) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     let _ = fs_base;
@@ -2872,6 +2906,7 @@ fn patch_executable_syscalls(
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
+        .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
         .map(|vma| (vma.start(), vma.end()))
         .collect::<Vec<_>>();
     let mut patches = Vec::new();
@@ -2886,11 +2921,7 @@ fn patch_executable_syscalls(
                 .is_some_and(|window| window == [0x0f, 0x05])
             {
                 let address = start + offset as u64;
-                let old = memory.patch_code(address, &[0xcc, 0x90])?;
-                patches.push(ExecutableSyscallPatch {
-                    address,
-                    bytes: old,
-                });
+                patches.push(ExecutableSyscallPatch { address });
             }
             #[cfg(all(windows, target_arch = "x86_64"))]
             if let Some(replacement) = fs_relative_patch(&bytes[offset..], fs_base) {
@@ -2900,6 +2931,28 @@ fn patch_executable_syscalls(
         }
     }
     Ok(patches)
+}
+
+fn patch_executable_syscalls(
+    memory: &mut GuestMemory,
+    fs_base: u64,
+    skipped_ranges: &[(u64, u64)],
+) -> Result<(), GuestExecutionError> {
+    let patches = find_executable_syscall_patches(memory, fs_base, skipped_ranges)?;
+    for patch in patches {
+        memory.patch_code(patch.address, &[0xcc, 0x90])?;
+    }
+    Ok(())
+}
+
+fn range_is_covered(start: u64, end: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges
+        .iter()
+        .any(|(range_start, range_end)| start >= *range_start && end <= *range_end)
+}
+
+fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
+    left_start < right_end && right_start < left_end
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -2937,16 +2990,6 @@ fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
         absolute[3],
         0x90,
     ])
-}
-
-fn restore_executable_syscalls(
-    memory: &mut GuestMemory,
-    patches: Vec<ExecutableSyscallPatch>,
-) -> Result<(), GuestExecutionError> {
-    for patch in patches {
-        memory.patch_code(patch.address, &patch.bytes)?;
-    }
-    Ok(())
 }
 
 #[cfg(any(
@@ -3151,6 +3194,7 @@ pub struct RuntimeSubsystems {
     epolls: EpollRegistry,
     native_execution: bool,
     native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
+    native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
     pending_fork_child_regs: Option<GprState>,
 }
 
@@ -3183,6 +3227,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            native_patch_caches: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
@@ -3212,6 +3257,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            native_patch_caches: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
@@ -3226,6 +3272,58 @@ impl RuntimeSubsystems {
 
     fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
         self.native_fp.insert(tid, state);
+    }
+
+    fn ensure_native_patch_cache(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        fs_base: u64,
+    ) -> Result<(), GuestExecutionError> {
+        let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
+        if cache.fs_base != fs_base {
+            cache = NativePatchCache {
+                fs_base,
+                scanned_ranges: Vec::new(),
+            };
+        }
+        let scanned_ranges = cache.scanned_ranges.clone();
+        patch_executable_syscalls(
+            self.memory_for_process_mut(pid)
+                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?,
+            fs_base,
+            &scanned_ranges,
+        )?;
+        let scanned_now = self
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
+            .vmas()
+            .filter(|vma| vma.protection().execute)
+            .map(|vma| (vma.start(), vma.end()))
+            .collect::<Vec<_>>();
+        cache.scanned_ranges = scanned_now;
+        self.native_patch_caches.insert(pid, cache);
+        Ok(())
+    }
+
+    fn invalidate_native_patch_cache(&mut self, pid: mcr_sys::GuestPid) {
+        if let Some(cache) = self.native_patch_caches.get_mut(&pid) {
+            cache.invalidate();
+        }
+    }
+
+    fn invalidate_native_patch_cache_range(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        start: u64,
+        len: u64,
+    ) {
+        let Some(end) = start.checked_add(len) else {
+            self.invalidate_native_patch_cache(pid);
+            return;
+        };
+        if let Some(cache) = self.native_patch_caches.get_mut(&pid) {
+            cache.invalidate_range(start, end);
+        }
     }
 
     fn default_vfs() -> VirtualFileSystem {
@@ -3336,6 +3434,20 @@ impl MemorySyscalls for RuntimeSubsystems {
             && let Err(errno) = self.store_selected_process_memory(pid)
         {
             return SyscallOutcome::errno(errno);
+        }
+        if let SyscallReturn::Success(result) = outcome.result {
+            match request.syscall {
+                mcr_sys::Syscall::Mmap => {
+                    self.invalidate_native_patch_cache_range(pid, result, arg(request, 1));
+                }
+                mcr_sys::Syscall::Munmap | mcr_sys::Syscall::Mprotect => {
+                    self.invalidate_native_patch_cache_range(pid, arg(request, 0), arg(request, 1));
+                }
+                mcr_sys::Syscall::Brk => {
+                    self.invalidate_native_patch_cache(pid);
+                }
+                _ => {}
+            }
         }
         outcome
     }
@@ -3897,6 +4009,7 @@ impl RuntimeSubsystems {
     }
 
     fn materialize_selected_memory_at_guest_addresses(&mut self) -> Result<(), LinuxErrno> {
+        let pid = self.selected_memory_pid;
         let snapshot = self
             .files
             .memory()
@@ -3907,13 +4020,16 @@ impl RuntimeSubsystems {
             .try_clone_runtime_at_guest_addresses()
             .map_err(|error| error.errno())?;
         *self.files.memory_mut() = memory;
+        self.invalidate_native_patch_cache(pid);
         Ok(())
     }
 
     fn drop_selected_memory_allocations(&mut self) {
+        let pid = self.selected_memory_pid;
         let empty = self.files.memory().empty_clone_layout();
         let selected = std::mem::replace(self.files.memory_mut(), empty);
         drop(selected);
+        self.invalidate_native_patch_cache(pid);
     }
 
     fn store_selected_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -3997,6 +4113,10 @@ impl RuntimeSubsystems {
         for tid in tids {
             self.native_fp.remove(&tid);
         }
+    }
+
+    fn drop_native_patch_cache_for_process(&mut self, pid: mcr_sys::GuestPid) {
+        self.invalidate_native_patch_cache(pid);
     }
 
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -4161,6 +4281,7 @@ impl RuntimeSubsystems {
         } else {
             self.process_memory.remove(&pid);
         }
+        self.drop_native_patch_cache_for_process(pid);
         Ok(())
     }
 
@@ -4179,6 +4300,7 @@ impl RuntimeSubsystems {
             *self.files.memory_mut() = memory;
         }
         self.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
+        self.invalidate_native_patch_cache(self.selected_memory_pid);
         Ok(())
     }
 
@@ -4461,6 +4583,7 @@ impl RuntimeSubsystems {
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
         self.native_fp.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
+        self.invalidate_native_patch_cache(request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
     }
@@ -5601,8 +5724,8 @@ mod tests {
         LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
         LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS,
         LINUX_MAP_FIXED, LINUX_MAP_PRIVATE, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL,
-        LINUX_POLLOUT, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR,
-        LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
+        LINUX_POLLOUT, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR,
+        LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
         LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
         LINUX_TCP_NODELAY, Syscall, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
     };
@@ -9156,6 +9279,12 @@ mod tests {
         u32::from_le_bytes(bytes)
     }
 
+    fn guest_bytes(memory: &GuestMemory, addr: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory.read(addr, &mut bytes).unwrap();
+        bytes
+    }
+
     fn u16_from_guest(memory: &GuestMemory, addr: u64) -> u16 {
         let mut bytes = [0; 2];
         memory.read(addr, &mut bytes).unwrap();
@@ -10589,6 +10718,81 @@ mod tests {
                 other => panic!("expected enter and exit trace for {syscall}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn native_patch_cache_scans_only_new_executable_ranges() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[0x0f, 0x05, 0x90],
+        ))
+        .unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .scanned_ranges
+                .len(),
+            1
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+
+        runtime
+            .memory_mut()
+            .patch_code(0x401000, &[0x0f, 0x05])
+            .unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, 2),
+            [0x0f, 0x05],
+            "cached executable ranges should not be rescanned on every syscall"
+        );
+
+        runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0x600000,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime.memory_mut().write(0x600000, &[0x0f, 0x05]).unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x600000, 2), [0xcc, 0x90]);
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .scanned_ranges
+                .iter()
+                .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
+        );
     }
 
     #[test]
