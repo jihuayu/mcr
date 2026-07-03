@@ -170,7 +170,7 @@ impl fmt::Display for RunRootfsError {
             Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
             Self::GuestRun(error) => {
                 write!(formatter, "guest runtime error: {error}")?;
-                write_native_fault_registers(formatter, error)
+                write_native_fault_details(formatter, error)
             }
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
@@ -203,11 +203,11 @@ impl std::error::Error for RunRootfsError {
     }
 }
 
-fn write_native_fault_registers(
+fn write_native_fault_details(
     formatter: &mut fmt::Formatter<'_>,
     error: &crate::GuestRunError,
 ) -> fmt::Result {
-    let Some(registers) = native_fault_registers(error) else {
+    let Some((registers, stack_words)) = native_fault_details(error) else {
         return Ok(());
     };
     write!(
@@ -220,14 +220,32 @@ fn write_native_fault_registers(
         registers.rsi,
         registers.rdi,
         registers.rsp
-    )
+    )?;
+    if stack_words.is_empty() {
+        return Ok(());
+    }
+    write!(formatter, "\nfault stack words:")?;
+    for word in stack_words {
+        write!(
+            formatter,
+            " [0x{:016x}]=0x{:016x}",
+            word.address, word.value
+        )?;
+    }
+    Ok(())
 }
 
-fn native_fault_registers(error: &crate::GuestRunError) -> Option<mcr_jit::GuestRegisters> {
+fn native_fault_details(
+    error: &crate::GuestRunError,
+) -> Option<(mcr_jit::GuestRegisters, &[mcr_jit::NativeFaultStackWord])> {
     match error {
         crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
-            ExecutionError::NativeFault { registers, .. },
-        )) => Some(*registers),
+            ExecutionError::NativeFault {
+                registers,
+                stack_words,
+                ..
+            },
+        )) => Some((*registers, stack_words)),
         _ => None,
     }
 }
@@ -1098,6 +1116,10 @@ mod tests {
                     rsp: 0x1001_ffb58,
                     ..mcr_jit::GuestRegisters::default()
                 },
+                stack_words: vec![mcr_jit::NativeFaultStackWord {
+                    address: 0x1001_ffb58,
+                    value: 0x7000_004d_1234,
+                }],
             }),
         ));
         let rendered = error.to_string();
@@ -1106,6 +1128,11 @@ mod tests {
         assert!(rendered.contains("rax=0xffffffffffffffff"));
         assert!(rendered.contains("rdi=0x000000000009139b"));
         assert!(rendered.contains("rsp=0x00000001001ffb58"));
+        assert!(rendered.contains("fault stack words:"));
+        assert!(
+            rendered.contains("[0x00000001001ffb58]=0x00007000004d1234"),
+            "{rendered}"
+        );
     }
 
     fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {

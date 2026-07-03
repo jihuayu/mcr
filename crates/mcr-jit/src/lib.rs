@@ -485,7 +485,14 @@ pub enum ExecutionError {
         rip: u64,
         address: u64,
         registers: GuestRegisters,
+        stack_words: Vec<NativeFaultStackWord>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeFaultStackWord {
+    pub address: u64,
+    pub value: u64,
 }
 
 impl fmt::Display for ExecutionError {
@@ -520,6 +527,7 @@ impl fmt::Display for ExecutionError {
                 rip,
                 address,
                 registers: _,
+                stack_words: _,
             } => write!(
                 f,
                 "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}"

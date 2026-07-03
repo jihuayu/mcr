@@ -18,7 +18,9 @@ pub use memory::{
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
-use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore};
+use mcr_jit::{
+    ExecutionError, GuestBlock, GuestRegisters, NativeFaultStackWord, SameIsaExecutionCore,
+};
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
     SocketOptionName, SocketSpec,
@@ -2587,7 +2589,9 @@ where
         native_registers.mxcsr = native_fp.mxcsr;
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
         restore_executable_syscalls(memory, patches)?;
-        native_result.map_err(|error| native_execution_error(error, native_registers))?;
+        let stack_words = native_fault_stack_words(memory, native_registers.rsp);
+        native_result
+            .map_err(|error| native_execution_error(error, native_registers, stack_words))?;
         dispatcher.subsystems_mut().set_native_fp(
             tid,
             mcr_win::HostFloatingPointState {
@@ -2785,6 +2789,7 @@ fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
 fn native_execution_error(
     error: mcr_win::NativeExecutionError,
     registers: mcr_win::HostCpuRegisters,
+    stack_words: Vec<NativeFaultStackWord>,
 ) -> GuestExecutionError {
     match error {
         mcr_win::NativeExecutionError::GuestFault {
@@ -2796,6 +2801,7 @@ fn native_execution_error(
             rip,
             address,
             registers: guest_registers_from_host(registers),
+            stack_words,
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
         | mcr_win::NativeExecutionError::SignalHandler(_)
@@ -2805,9 +2811,26 @@ fn native_execution_error(
                 rip: 0,
                 address: 0,
                 registers: GuestRegisters::default(),
+                stack_words: Vec::new(),
             })
         }
     }
+}
+
+fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultStackWord> {
+    const STACK_WORDS: usize = 8;
+
+    (0..STACK_WORDS)
+        .filter_map(|index| {
+            let address = rsp.checked_add((index * 8) as u64)?;
+            let mut bytes = [0; 8];
+            memory.read(address, &mut bytes).ok()?;
+            Some(NativeFaultStackWord {
+                address,
+                value: u64::from_le_bytes(bytes),
+            })
+        })
+        .collect()
 }
 
 fn read_guest_block(
