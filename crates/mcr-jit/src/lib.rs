@@ -229,6 +229,9 @@ fn is_nonterminating_exception_instruction(instruction: &Instruction) -> bool {
             | Code::Xchg_rm16_r16
             | Code::Xchg_rm32_r32
             | Code::Xchg_rm64_r64
+            | Code::Xchg_r16_AX
+            | Code::Xchg_r32_EAX
+            | Code::Xchg_r64_RAX
     )
 }
 
@@ -1260,13 +1263,13 @@ where
         Code::Xchg_rm8_r8 => {
             execute_xchg_u8(registers, memory, &instruction)?;
         }
-        Code::Xchg_rm16_r16 => {
+        Code::Xchg_rm16_r16 | Code::Xchg_r16_AX => {
             execute_xchg_u16(registers, memory, &instruction)?;
         }
-        Code::Xchg_rm32_r32 => {
+        Code::Xchg_rm32_r32 | Code::Xchg_r32_EAX => {
             execute_xchg_u32(registers, memory, &instruction)?;
         }
-        Code::Xchg_rm64_r64 => {
+        Code::Xchg_rm64_r64 | Code::Xchg_r64_RAX => {
             execute_xchg_u64(registers, memory, &instruction)?;
         }
         Code::Bt_rm64_r64 | Code::Bt_rm64_imm8 if instruction.op0_kind() == OpKind::Register => {
@@ -4449,6 +4452,31 @@ mod tests {
         assert_eq!(trap.registers().rdi, 0x1234_5678);
         assert_eq!(u32::from_le_bytes(memory.read(0x715204)), u32::MAX);
         assert_eq!(trap.site().rip, 0x46928f);
+
+        let register_block = GuestBlock::new(
+            &[
+                0x48, 0xbb, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                0x11, // mov rbx,0x1122334455667788
+                0x48, 0xb8, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa,
+                0x99, // mov rax,0x99aabbccddeeff00
+                0x48, 0x93, // xchg rax,rbx
+                0x0f, 0x05, // syscall
+            ],
+            0x4692a0,
+        );
+        let registers = GuestRegisters {
+            rip: register_block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(register_block, registers, &mut memory)
+            .expect("execute register xchg before syscall");
+
+        assert_eq!(trap.registers().rax, 0x1122_3344_5566_7788);
+        assert_eq!(trap.registers().rbx, 0x99aa_bbcc_ddee_ff00);
+        assert_eq!(trap.site().rip, 0x4692b6);
     }
 
     #[test]
