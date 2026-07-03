@@ -288,7 +288,7 @@ pub struct RuntimeDiagnostics {
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
     memory_vmas: Vec<DiagnosticMemoryVma>,
-    initial_task_tls: Option<DiagnosticTls>,
+    tasks: Vec<DiagnosticTask>,
     last_syscall: Option<DiagnosticSyscall>,
 }
 
@@ -327,9 +327,10 @@ impl RuntimeDiagnostics {
                         .collect()
                 })
                 .unwrap_or_default(),
-            initial_task_tls: kernel
-                .task(mcr_task::INITIAL_GUEST_TID)
-                .map(|task| DiagnosticTls::from_guest_tls(task.tls())),
+            tasks: kernel
+                .tasks()
+                .map(DiagnosticTask::from_guest_task)
+                .collect(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
         }
     }
@@ -360,13 +361,61 @@ impl RuntimeDiagnostics {
     }
 
     #[must_use]
-    pub const fn initial_task_tls(&self) -> Option<DiagnosticTls> {
-        self.initial_task_tls
+    pub fn tasks(&self) -> &[DiagnosticTask] {
+        &self.tasks
+    }
+
+    #[must_use]
+    pub fn initial_task_tls(&self) -> Option<DiagnosticTls> {
+        self.tasks
+            .iter()
+            .find(|task| task.tid() == mcr_task::INITIAL_GUEST_TID)
+            .map(DiagnosticTask::tls)
     }
 
     #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticTask {
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    state: mcr_task::TaskState,
+    tls: DiagnosticTls,
+}
+
+impl DiagnosticTask {
+    #[must_use]
+    pub fn from_guest_task(task: &mcr_task::GuestTask) -> Self {
+        Self {
+            tid: task.tid(),
+            pid: task.pid(),
+            state: task.state(),
+            tls: DiagnosticTls::from_guest_tls(task.tls()),
+        }
+    }
+
+    #[must_use]
+    pub const fn tid(&self) -> mcr_sys::GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> mcr_sys::GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> mcr_task::TaskState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn tls(&self) -> DiagnosticTls {
+        self.tls
     }
 }
 
@@ -8765,6 +8814,11 @@ mod tests {
             0x7000_1234
         );
         assert_eq!(diagnostics.initial_task_tls().unwrap().gs_base(), 0);
+        assert_eq!(diagnostics.tasks().len(), 1);
+        assert_eq!(diagnostics.tasks()[0].tid(), INITIAL_GUEST_TID);
+        assert_eq!(diagnostics.tasks()[0].pid(), INITIAL_GUEST_PID);
+        assert_eq!(diagnostics.tasks()[0].state(), TaskState::Runnable);
+        assert_eq!(diagnostics.tasks()[0].tls().fs_base(), 0x7000_1234);
         assert!(diagnostics.vmas().iter().any(|vma| {
             vma.start() <= 0x401000
                 && 0x401000 < vma.end()
@@ -8785,6 +8839,50 @@ mod tests {
         assert_eq!(last.args(), [0; 6]);
         assert_eq!(last.result(), Some(SyscallReturn::Success(1)));
         assert_eq!(last.rip(), 0x401234);
+    }
+
+    #[test]
+    fn diagnostics_capture_all_task_tls_states() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::ArchPrctl,
+                    [ARCH_SET_FS, 0x7000_1111, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Fork, [0; 6]))
+                .result,
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context_for(
+                    2,
+                    2,
+                    Syscall::ArchPrctl,
+                    [ARCH_SET_FS, 0x7000_2222, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let diagnostics = runtime.diagnostics();
+        assert_eq!(diagnostics.tasks().len(), 2);
+        assert_eq!(diagnostics.tasks()[0].tid(), INITIAL_GUEST_TID);
+        assert_eq!(diagnostics.tasks()[0].pid(), INITIAL_GUEST_PID);
+        assert_eq!(diagnostics.tasks()[0].state(), TaskState::Runnable);
+        assert_eq!(diagnostics.tasks()[0].tls().fs_base(), 0x7000_1111);
+        assert_eq!(diagnostics.tasks()[1].tid(), 2);
+        assert_eq!(diagnostics.tasks()[1].pid(), 2);
+        assert_eq!(diagnostics.tasks()[1].state(), TaskState::Runnable);
+        assert_eq!(diagnostics.tasks()[1].tls().fs_base(), 0x7000_2222);
     }
 
     #[test]

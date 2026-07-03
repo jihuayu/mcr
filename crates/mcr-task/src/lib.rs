@@ -824,6 +824,11 @@ impl GuestKernel {
         self.tasks.get_mut(&tid)
     }
 
+    #[must_use]
+    pub fn tasks(&self) -> impl Iterator<Item = &GuestTask> {
+        self.tasks.values()
+    }
+
     pub fn dispatch_for_current_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let tid = request.context.tid;
         let Some(task) = self.tasks.get(&tid) else {

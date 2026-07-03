@@ -294,6 +294,18 @@ fn write_guest_run_diagnostics(
             tls.gs_base()
         )?;
     }
+    for task in diagnostics.tasks() {
+        let tls = task.tls();
+        write!(
+            formatter,
+            "\ntask TLS: tid={} pid={} state={} fs_base=0x{:016x} gs_base=0x{:016x}",
+            task.tid(),
+            task.pid(),
+            format_diagnostic_task_state(task.state()),
+            tls.fs_base(),
+            tls.gs_base()
+        )?;
+    }
     if let Some(rip) = native_fault_rip(error) {
         write!(formatter, "\nfault rip: 0x{rip:016x}")?;
         if let Some(vma) = diagnostics
@@ -327,6 +339,14 @@ fn write_guest_run_diagnostics(
         }
     }
     Ok(())
+}
+
+fn format_diagnostic_task_state(state: mcr_task::TaskState) -> String {
+    match state {
+        mcr_task::TaskState::Runnable => "runnable".to_string(),
+        mcr_task::TaskState::WaitingForChild { .. } => "waiting_for_child".to_string(),
+        mcr_task::TaskState::Exited { status } => format!("exited({status})"),
+    }
 }
 
 fn native_fault_rip(error: &crate::GuestRunError) -> Option<u64> {
@@ -1211,6 +1231,9 @@ mod tests {
 
         assert!(rendered.contains("diagnostics: executable=/usr/bin/curl"));
         assert!(rendered.contains("last syscall: getpid#39 rip=0x0000000000401234"));
+        assert!(
+            rendered.contains("task TLS: tid=1 pid=1 state=runnable fs_base=0x0000000000000000")
+        );
         assert!(rendered.contains("fault rip: 0x0000000000401010"));
         assert!(rendered.contains("vma=[0x0000000000401000..0x0000000000402000)"));
         assert!(rendered.contains("kind=anonymous"));
