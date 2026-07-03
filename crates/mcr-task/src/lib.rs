@@ -395,6 +395,7 @@ impl GprState {
 pub enum TaskState {
     Runnable,
     WaitingForChild { args: Wait4SyscallArgs },
+    WaitingForFd { fd: i32, write: bool },
     Exited { status: i32 },
 }
 
@@ -824,7 +825,6 @@ impl GuestKernel {
         self.tasks.get_mut(&tid)
     }
 
-    #[must_use]
     pub fn tasks(&self) -> impl Iterator<Item = &GuestTask> {
         self.tasks.values()
     }
@@ -1219,7 +1219,9 @@ impl GuestKernel {
             .values()
             .filter_map(|task| match task.state {
                 TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
-                TaskState::Runnable | TaskState::Exited { .. } => None,
+                TaskState::Runnable | TaskState::WaitingForFd { .. } | TaskState::Exited { .. } => {
+                    None
+                }
             })
             .collect();
         let mut completed = Vec::new();
@@ -1237,6 +1239,30 @@ impl GuestKernel {
             completed.push(CompletedWait::new(tid, parent_pid, args, waited));
         }
         completed
+    }
+
+    pub fn block_task_for_fd(
+        &mut self,
+        tid: GuestTid,
+        fd: i32,
+        write: bool,
+    ) -> Result<(), TaskError> {
+        let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
+        task.state = TaskState::WaitingForFd { fd, write };
+        Ok(())
+    }
+
+    pub fn resume_fd_waiters<F>(&mut self, mut ready: F)
+    where
+        F: FnMut(GuestPid, i32, bool) -> bool,
+    {
+        for task in self.tasks.values_mut() {
+            if let TaskState::WaitingForFd { fd, write } = task.state
+                && ready(task.pid, fd, write)
+            {
+                task.state = TaskState::Runnable;
+            }
+        }
     }
 
     pub fn rt_sigaction_current(

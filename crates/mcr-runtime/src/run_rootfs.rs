@@ -2,7 +2,6 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mcr_jit::ExecutionError;
 use mcr_net::WinHostSocketTransport;
 use mcr_sys::LinuxErrno;
 use mcr_vfs::{
@@ -10,7 +9,7 @@ use mcr_vfs::{
     VirtualFileSystem,
 };
 
-use crate::{RuntimeDiagnostics, RuntimeFileSystem};
+use crate::RuntimeFileSystem;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRootfsConfig {
@@ -137,10 +136,6 @@ pub enum RunRootfsError {
     Vfs(mcr_vfs::VfsError),
     Linux(LinuxErrno),
     GuestRun(crate::GuestRunError),
-    GuestRunDiagnostics {
-        error: crate::GuestRunError,
-        diagnostics: RuntimeDiagnostics,
-    },
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -173,10 +168,6 @@ impl fmt::Display for RunRootfsError {
             Self::Vfs(error) => write!(formatter, "{error}"),
             Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
             Self::GuestRun(error) => write!(formatter, "guest runtime error: {error}"),
-            Self::GuestRunDiagnostics { error, diagnostics } => {
-                write!(formatter, "guest runtime error: {error}")?;
-                write_guest_run_diagnostics(formatter, error, diagnostics)
-            }
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
             }
@@ -196,7 +187,6 @@ impl std::error::Error for RunRootfsError {
             Self::Io { source, .. } => Some(source),
             Self::Vfs(error) => Some(error),
             Self::GuestRun(error) => Some(error),
-            Self::GuestRunDiagnostics { error, .. } => Some(error),
             Self::Linux(_) => None,
             Self::InvalidGuestPath(_)
             | Self::InvalidUtf8(_)
@@ -256,182 +246,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
-        Err(error) => Err(RunRootfsError::GuestRunDiagnostics {
-            diagnostics: runtime.diagnostics(),
-            error,
-        }),
-    }
-}
-
-fn write_guest_run_diagnostics(
-    formatter: &mut fmt::Formatter<'_>,
-    error: &crate::GuestRunError,
-    diagnostics: &RuntimeDiagnostics,
-) -> fmt::Result {
-    write!(
-        formatter,
-        "\ndiagnostics: executable={}",
-        bytes_lossy(diagnostics.executable_path())
-    )?;
-    if let Some(last) = diagnostics.last_syscall() {
-        write!(
-            formatter,
-            "\nlast syscall: {}#{} rip=0x{:016x} args={:?} result={:?}",
-            last.name(),
-            last.number(),
-            last.rip(),
-            last.args(),
-            last.result()
-        )?;
-    } else {
-        write!(formatter, "\nlast syscall: <none>")?;
-    }
-    if let Some(tls) = diagnostics.initial_task_tls() {
-        write!(
-            formatter,
-            "\ninitial task TLS: fs_base=0x{:016x} gs_base=0x{:016x}",
-            tls.fs_base(),
-            tls.gs_base()
-        )?;
-    }
-    for task in diagnostics.tasks() {
-        let tls = task.tls();
-        write!(
-            formatter,
-            "\ntask TLS: tid={} pid={} state={} fs_base=0x{:016x} gs_base=0x{:016x}",
-            task.tid(),
-            task.pid(),
-            format_diagnostic_task_state(task.state()),
-            tls.fs_base(),
-            tls.gs_base()
-        )?;
-    }
-    if let Some(rip) = native_fault_rip(error) {
-        write!(formatter, "\nfault rip: 0x{rip:016x}")?;
-        if let Some(vma) = diagnostics
-            .memory_vmas()
-            .iter()
-            .find(|vma| vma.start() <= rip && rip < vma.end())
-        {
-            write!(
-                formatter,
-                " in vma=[0x{:016x}..0x{:016x}) perms={} kind={}",
-                vma.start(),
-                vma.end(),
-                format_diagnostic_permissions(vma.permissions()),
-                format_diagnostic_memory_vma_kind(vma.kind(), diagnostics)
-            )?;
-        } else if let Some(vma) = diagnostics
-            .vmas()
-            .iter()
-            .find(|vma| vma.start() <= rip && rip < vma.end())
-        {
-            write!(
-                formatter,
-                " in image_vma=[0x{:016x}..0x{:016x}) perms={} kind={}",
-                vma.start(),
-                vma.end(),
-                format_diagnostic_permissions(vma.permissions()),
-                format_diagnostic_vma_kind(vma.kind())
-            )?;
-        } else {
-            write!(formatter, " in vma=<unmapped>")?;
-        }
-    }
-    if let Some(registers) = native_fault_registers(error) {
-        write!(
-            formatter,
-            "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rsp=0x{:016x}",
-            registers.rax,
-            registers.rbx,
-            registers.rcx,
-            registers.rdx,
-            registers.rsi,
-            registers.rdi,
-            registers.rsp
-        )?;
-    }
-    Ok(())
-}
-
-fn format_diagnostic_task_state(state: mcr_task::TaskState) -> String {
-    match state {
-        mcr_task::TaskState::Runnable => "runnable".to_string(),
-        mcr_task::TaskState::WaitingForChild { .. } => "waiting_for_child".to_string(),
-        mcr_task::TaskState::Exited { status } => format!("exited({status})"),
-    }
-}
-
-fn native_fault_rip(error: &crate::GuestRunError) -> Option<u64> {
-    match error {
-        crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
-            ExecutionError::NativeFault { rip, .. },
-        )) => Some(*rip),
-        _ => None,
-    }
-}
-
-fn native_fault_registers(error: &crate::GuestRunError) -> Option<mcr_jit::GuestRegisters> {
-    match error {
-        crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
-            ExecutionError::NativeFault { registers, .. },
-        )) => Some(*registers),
-        _ => None,
-    }
-}
-
-fn format_diagnostic_permissions(permissions: crate::DiagnosticPermissions) -> String {
-    [
-        if permissions.read() { 'r' } else { '-' },
-        if permissions.write() { 'w' } else { '-' },
-        if permissions.execute() { 'x' } else { '-' },
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn format_diagnostic_vma_kind(kind: &crate::DiagnosticVmaKind) -> String {
-    match kind {
-        crate::DiagnosticVmaKind::ElfLoad {
-            program_header_index,
-            file_offset,
-            file_size,
-        } => format!(
-            "elf_load(phdr={program_header_index}, file_offset=0x{file_offset:x}, file_size=0x{file_size:x})"
-        ),
-        crate::DiagnosticVmaKind::InterpreterLoad {
-            path,
-            program_header_index,
-            file_offset,
-            file_size,
-        } => format!(
-            "interpreter_load(path={}, phdr={program_header_index}, file_offset=0x{file_offset:x}, file_size=0x{file_size:x})",
-            bytes_lossy(path)
-        ),
-        crate::DiagnosticVmaKind::Stack => "stack".to_owned(),
-    }
-}
-
-fn format_diagnostic_memory_vma_kind(
-    kind: &crate::DiagnosticMemoryVmaKind,
-    diagnostics: &RuntimeDiagnostics,
-) -> String {
-    match kind {
-        crate::DiagnosticMemoryVmaKind::Anonymous => "anonymous".to_owned(),
-        crate::DiagnosticMemoryVmaKind::Heap => "heap".to_owned(),
-        crate::DiagnosticMemoryVmaKind::FileBacked {
-            fd,
-            path,
-            offset,
-            shared,
-        } => {
-            let path = path
-                .as_deref()
-                .or_else(|| diagnostics.fd_path(*fd))
-                .map(bytes_lossy)
-                .unwrap_or_else(|| "<unknown>".to_owned());
-            format!("file_backed(fd={fd}, path={path}, offset=0x{offset:x}, shared={shared})")
-        }
+        Err(error) => Err(RunRootfsError::GuestRun(error)),
     }
 }
 
@@ -965,11 +780,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mcr_sys::{
-        GuestContext, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall,
-        SyscallRegisters,
-    };
-    use mcr_task::{GuestExecutable, GuestProgram, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
+    use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
     use mcr_vfs::{AT_FDCWD, O_RDONLY};
 
@@ -1235,67 +1046,8 @@ mod tests {
             RunRootfsError::GuestRun(error) => {
                 assert_ne!(error.linux_errno(), LinuxErrno::ENOSYS);
             }
-            RunRootfsError::GuestRunDiagnostics { error, diagnostics } => {
-                assert_ne!(error.linux_errno(), LinuxErrno::ENOSYS);
-                assert_eq!(diagnostics.executable_path(), b"/bin/busybox");
-            }
             other => panic!("expected detailed guest runtime error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn guest_run_error_reports_fault_vma_and_last_syscall() {
-        let program = GuestProgram::new(GuestExecutable::new(
-            b"/usr/bin/curl".to_vec(),
-            TestRootfs::static_elf_bytes(),
-        ))
-        .with_args([b"/usr/bin/curl".to_vec(), b"--version".to_vec()])
-        .with_env([b"PATH=/usr/bin".to_vec()]);
-        let mut runtime = crate::RuntimeWithTracer::with_diagnostics(program).unwrap();
-        runtime.dispatch_syscall(test_context(Syscall::Getpid, [0; 6]));
-        let diagnostics = runtime.diagnostics();
-        let error = crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
-            mcr_jit::ExecutionError::NativeFault {
-                signal: -1073741819,
-                rip: 0x401010,
-                address: 0,
-                registers: mcr_jit::GuestRegisters {
-                    rdi: 0x9139b,
-                    rsp: 0x7000_2000,
-                    ..mcr_jit::GuestRegisters::default()
-                },
-            },
-        ));
-        let error = RunRootfsError::GuestRunDiagnostics { error, diagnostics };
-        let rendered = error.to_string();
-
-        assert!(rendered.contains("diagnostics: executable=/usr/bin/curl"));
-        assert!(rendered.contains("last syscall: getpid#39 rip=0x0000000000401234"));
-        assert!(
-            rendered.contains("task TLS: tid=1 pid=1 state=runnable fs_base=0x0000000000000000")
-        );
-        assert!(rendered.contains("fault rip: 0x0000000000401010"));
-        assert!(rendered.contains("fault registers:"));
-        assert!(rendered.contains("rdi=0x000000000009139b"));
-        assert!(rendered.contains("vma=[0x0000000000401000..0x0000000000402000)"));
-        assert!(rendered.contains("kind=anonymous"));
-    }
-
-    fn test_context(syscall: Syscall, args: [u64; 6]) -> GuestContext {
-        GuestContext::new(
-            INITIAL_GUEST_PID,
-            INITIAL_GUEST_TID,
-            SyscallRegisters {
-                rax: syscall.number().raw(),
-                rdi: args[0],
-                rsi: args[1],
-                rdx: args[2],
-                r10: args[3],
-                r8: args[4],
-                r9: args[5],
-                rip: 0x401234,
-            },
-        )
     }
 
     fn emulated_config(rootfs: &TestRootfs, program: &[u8]) -> RunRootfsConfig {
@@ -1332,11 +1084,7 @@ mod tests {
         }
 
         fn write_static_elf(&self, guest_path: &str) {
-            self.write_file(guest_path, &Self::static_elf_bytes());
-        }
-
-        fn static_elf_bytes() -> Vec<u8> {
-            Elf64Builder::new()
+            let elf = Elf64Builder::new()
                 .entrypoint(0x401000)
                 .program_header(Elf64ProgramHeader::load(
                     PF_R | PF_X,
@@ -1354,7 +1102,8 @@ mod tests {
                 ))
                 .data_at(0x200, vec![0x90; 0x20])
                 .data_at(0x2000, vec![0; 0x08])
-                .build()
+                .build();
+            self.write_file(guest_path, &elf);
         }
 
         fn write_guest_syscall_elf(&self, guest_path: &str, stdout: &[u8], status: u32) {

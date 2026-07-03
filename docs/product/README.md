@@ -25,7 +25,7 @@ The current plan completes two stages:
 | Stage | Product result | Required user-visible proof |
 |---|---|---|
 | MVP | Static ELF and BusyBox/Alpine commands run from a Linux rootfs. | `mcr run-rootfs alpine-rootfs /bin/busybox echo hello`, `ls /`, and `cat /etc/os-release` succeed. |
-| Phase 2 | Shell, common `fork+exec`, networking, and minimal `/proc` make common development tools usable. | `alpine sh -c`, `curl`, `git clone`, `node -v`, `python -V`, `go version`, and `cargo --version` smoke tests succeed. |
+| Phase 2 | Shell, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc` make common development tools usable. | `alpine sh -c`, `curl`, `git clone`, `node -v`, `python -V`, `go version`, and `cargo --version` smoke tests succeed under the documented ABI subset. |
 
 ## Supported Workloads
 
@@ -38,7 +38,8 @@ MVP workloads:
 Phase 2 workloads:
 
 - Alpine shell command execution with pipes and fd duplication;
-- outbound TCP clients such as `curl`, `wget`, and `git`;
+- outbound AF_INET/AF_INET6 TCP clients such as `curl`, `wget`, and `git`;
+- DNS paths needed by those clients through `/etc/hosts` plus a bounded resolver implementation or DNS proxy;
 - language runtime discovery and package fetch paths for Node.js, Python, Go, and Rust;
 - basic local development tools that do not require privileged kernel features.
 
@@ -52,7 +53,9 @@ These are not part of the current delivery plan:
 | Docker compatibility | Docker Engine API, Compose, volumes, full logs/stats/events/inspect behavior. |
 | Security | Strong isolation, hostile-code sandboxing, multi-tenant execution, seccomp-equivalent policy. |
 | Kernel features | systemd, kernel modules, eBPF, KVM, full cgroup v2, full mount namespaces, netns, iptables/nftables. |
-| Device and IO | raw block devices, TUN/TAP, GPU, raw sockets, database-grade fsync and mmap consistency guarantees. |
+| Networking | raw sockets, packet sockets, full UDP semantics outside the DNS path, network namespaces, firewalling, port publishing, transparent VPN/proxy behavior. |
+| Eventing | edge-triggered epoll, `EPOLLONESHOT`, `EPOLLEXCLUSIVE`, signal-integrated waits beyond the documented shell/tool subset. |
+| Device and IO | raw block devices, TUN/TAP, GPU, tty/pty completeness, database-grade fsync and mmap consistency guarantees. |
 | Architecture | Linux arm64 guest, transparent cross-architecture execution, Windows containers. |
 
 ## Success Criteria
@@ -69,7 +72,8 @@ Phase 2 is complete when:
 
 - shell form execution works through the common `fork+exec+wait4` path;
 - `pipe`, `dup`, `fcntl`, process-private `futex`, and a usable signals skeleton are present;
-- outbound TCP, DNS, and `poll`/`epoll` compatibility cover `curl`, `git`, and package-manager fetch paths;
+- outbound TCP, bounded DNS, and level-trigger `poll`/`epoll` compatibility cover `curl`, `git`, and package-manager fetch paths;
+- guest thread-local storage is supported through per-task `ARCH_SET_FS`/`ARCH_GET_FS` FS-base state, not host Rust TLS;
 - `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/environ`, `/proc/self/fd`, `/dev/null`, `/dev/zero`, and `/dev/urandom` exist;
 - fixed smoke tests for Alpine shell, network tools, and language runtimes pass.
 

@@ -87,6 +87,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Close, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Stat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Fstat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Lstat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Poll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Lseek, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Mmap, SyscallSubsystem::Memory),
@@ -144,7 +145,15 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Getdents, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Getcwd, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Chdir, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Rename, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Mkdir, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Rmdir, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Link, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Unlink, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Symlink, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Readlink, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Chmod, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Chown, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Umask, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::ArchPrctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
@@ -163,6 +172,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Linkat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Symlinkat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Readlinkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Utimensat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Ppoll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::SetRobustList, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Accept4, SyscallSubsystem::Network),
@@ -506,7 +516,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("flags", arg(2)),
             octal_field("mode", arg(3)),
         ],
-        Syscall::Stat | Syscall::Access | Syscall::Readlink => {
+        Syscall::Stat | Syscall::Lstat | Syscall::Access | Syscall::Readlink => {
             vec![hex_field("path_ptr", arg(0)), hex_field("buf", arg(1))]
         }
         Syscall::Newfstatat | Syscall::Readlinkat => vec![
@@ -526,6 +536,29 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             decimal_field("fd", arg(0)),
             hex_field("dirent", arg(1)),
             decimal_field("count", arg(2)),
+        ],
+        Syscall::Mkdir => vec![hex_field("path_ptr", arg(0)), octal_field("mode", arg(1))],
+        Syscall::Rmdir => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Symlink => vec![
+            hex_field("target_ptr", arg(0)),
+            hex_field("linkpath_ptr", arg(1)),
+        ],
+        Syscall::Link | Syscall::Rename => vec![
+            hex_field("oldpath_ptr", arg(0)),
+            hex_field("newpath_ptr", arg(1)),
+        ],
+        Syscall::Unlink => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Chmod => vec![hex_field("path_ptr", arg(0)), octal_field("mode", arg(1))],
+        Syscall::Chown => vec![
+            hex_field("path_ptr", arg(0)),
+            decimal_field("uid", arg(1)),
+            decimal_field("gid", arg(2)),
+        ],
+        Syscall::Utimensat => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("times", arg(2)),
+            hex_field("flags", arg(3)),
         ],
         Syscall::Mkdirat | Syscall::Unlinkat => vec![
             signed_field("dirfd", arg(0)),

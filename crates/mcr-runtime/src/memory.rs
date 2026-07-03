@@ -75,7 +75,6 @@ pub enum GuestVmaKind {
         fd: i32,
         offset: i64,
         shared: bool,
-        path: Option<Vec<u8>>,
     },
 }
 
@@ -356,26 +355,6 @@ impl GuestMemory {
     pub fn vma_containing(&self, address: u64) -> Option<&GuestVma> {
         let (_, vma) = self.vmas.range(..=address).next_back()?;
         vma.contains(address).then_some(vma)
-    }
-
-    pub fn set_file_backed_path(
-        &mut self,
-        address: u64,
-        path: Option<Vec<u8>>,
-    ) -> Result<(), GuestMemoryError> {
-        let vma = self
-            .vmas
-            .get_mut(&address)
-            .ok_or(GuestMemoryError::NotMapped)?;
-        let GuestVmaKind::FileBacked {
-            path: existing_path,
-            ..
-        } = &mut vma.kind
-        else {
-            return Err(GuestMemoryError::InvalidAddress);
-        };
-        *existing_path = path;
-        Ok(())
     }
 
     pub fn mmap(&mut self, args: MmapSyscallArgs) -> Result<u64, GuestMemoryError> {
@@ -1297,7 +1276,6 @@ fn mmap_kind(args: MmapSyscallArgs) -> Result<GuestVmaKind, GuestMemoryError> {
         fd: args.fd,
         offset: args.offset,
         shared: args.flags & LINUX_MAP_SHARED != 0,
-        path: None,
     })
 }
 
@@ -1711,8 +1689,7 @@ mod tests {
             GuestVmaKind::FileBacked {
                 fd: 3,
                 offset: 0,
-                shared: true,
-                path: None
+                shared: true
             }
         ));
         let mut byte = [1];

@@ -41,6 +41,7 @@ pub enum Syscall {
     Close,
     Stat,
     Fstat,
+    Lstat,
     Poll,
     Lseek,
     Mmap,
@@ -98,7 +99,15 @@ pub enum Syscall {
     Getdents,
     Getcwd,
     Chdir,
+    Mkdir,
+    Rmdir,
+    Link,
+    Unlink,
+    Rename,
     Readlink,
+    Symlink,
+    Chmod,
+    Chown,
     Umask,
     ArchPrctl,
     Gettid,
@@ -117,6 +126,7 @@ pub enum Syscall {
     Linkat,
     Symlinkat,
     Readlinkat,
+    Utimensat,
     Ppoll,
     SetRobustList,
     EpollCreate1,
@@ -136,6 +146,7 @@ impl Syscall {
     pub const CLOSE: SyscallNumber = SyscallNumber::new(3);
     pub const STAT: SyscallNumber = SyscallNumber::new(4);
     pub const FSTAT: SyscallNumber = SyscallNumber::new(5);
+    pub const LSTAT: SyscallNumber = SyscallNumber::new(6);
     pub const POLL: SyscallNumber = SyscallNumber::new(7);
     pub const LSEEK: SyscallNumber = SyscallNumber::new(8);
     pub const MMAP: SyscallNumber = SyscallNumber::new(9);
@@ -193,7 +204,15 @@ impl Syscall {
     pub const GETDENTS: SyscallNumber = SyscallNumber::new(78);
     pub const GETCWD: SyscallNumber = SyscallNumber::new(79);
     pub const CHDIR: SyscallNumber = SyscallNumber::new(80);
+    pub const MKDIR: SyscallNumber = SyscallNumber::new(83);
+    pub const RMDIR: SyscallNumber = SyscallNumber::new(84);
+    pub const RENAME: SyscallNumber = SyscallNumber::new(82);
     pub const READLINK: SyscallNumber = SyscallNumber::new(89);
+    pub const SYMLINK: SyscallNumber = SyscallNumber::new(88);
+    pub const LINK: SyscallNumber = SyscallNumber::new(86);
+    pub const UNLINK: SyscallNumber = SyscallNumber::new(87);
+    pub const CHMOD: SyscallNumber = SyscallNumber::new(90);
+    pub const CHOWN: SyscallNumber = SyscallNumber::new(92);
     pub const UMASK: SyscallNumber = SyscallNumber::new(95);
     pub const ARCH_PRCTL: SyscallNumber = SyscallNumber::new(158);
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
@@ -212,6 +231,7 @@ impl Syscall {
     pub const LINKAT: SyscallNumber = SyscallNumber::new(265);
     pub const SYMLINKAT: SyscallNumber = SyscallNumber::new(266);
     pub const READLINKAT: SyscallNumber = SyscallNumber::new(267);
+    pub const UTIMENSAT: SyscallNumber = SyscallNumber::new(280);
     pub const PPOLL: SyscallNumber = SyscallNumber::new(271);
     pub const SET_ROBUST_LIST: SyscallNumber = SyscallNumber::new(273);
     pub const EPOLL_CREATE1: SyscallNumber = SyscallNumber::new(291);
@@ -231,6 +251,7 @@ impl Syscall {
             3 => Self::Close,
             4 => Self::Stat,
             5 => Self::Fstat,
+            6 => Self::Lstat,
             7 => Self::Poll,
             8 => Self::Lseek,
             9 => Self::Mmap,
@@ -276,7 +297,15 @@ impl Syscall {
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
+            82 => Self::Rename,
+            83 => Self::Mkdir,
+            84 => Self::Rmdir,
+            86 => Self::Link,
+            87 => Self::Unlink,
+            88 => Self::Symlink,
             89 => Self::Readlink,
+            90 => Self::Chmod,
+            92 => Self::Chown,
             95 => Self::Umask,
             102 => Self::Getuid,
             104 => Self::Getgid,
@@ -309,6 +338,7 @@ impl Syscall {
             267 => Self::Readlinkat,
             271 => Self::Ppoll,
             273 => Self::SetRobustList,
+            280 => Self::Utimensat,
             288 => Self::Accept4,
             291 => Self::EpollCreate1,
             292 => Self::Dup3,
@@ -329,6 +359,7 @@ impl Syscall {
             Self::Close => Self::CLOSE,
             Self::Stat => Self::STAT,
             Self::Fstat => Self::FSTAT,
+            Self::Lstat => Self::LSTAT,
             Self::Poll => Self::POLL,
             Self::Lseek => Self::LSEEK,
             Self::Mmap => Self::MMAP,
@@ -386,7 +417,15 @@ impl Syscall {
             Self::Getdents => Self::GETDENTS,
             Self::Getcwd => Self::GETCWD,
             Self::Chdir => Self::CHDIR,
+            Self::Mkdir => Self::MKDIR,
+            Self::Rmdir => Self::RMDIR,
+            Self::Link => Self::LINK,
+            Self::Unlink => Self::UNLINK,
+            Self::Rename => Self::RENAME,
             Self::Readlink => Self::READLINK,
+            Self::Symlink => Self::SYMLINK,
+            Self::Chmod => Self::CHMOD,
+            Self::Chown => Self::CHOWN,
             Self::Umask => Self::UMASK,
             Self::ArchPrctl => Self::ARCH_PRCTL,
             Self::Gettid => Self::GETTID,
@@ -405,6 +444,7 @@ impl Syscall {
             Self::Linkat => Self::LINKAT,
             Self::Symlinkat => Self::SYMLINKAT,
             Self::Readlinkat => Self::READLINKAT,
+            Self::Utimensat => Self::UTIMENSAT,
             Self::Ppoll => Self::PPOLL,
             Self::SetRobustList => Self::SET_ROBUST_LIST,
             Self::Accept4 => Self::ACCEPT4,
@@ -427,6 +467,7 @@ impl Syscall {
             Self::Close => "close",
             Self::Stat => "stat",
             Self::Fstat => "fstat",
+            Self::Lstat => "lstat",
             Self::Poll => "poll",
             Self::Lseek => "lseek",
             Self::Mmap => "mmap",
@@ -484,7 +525,15 @@ impl Syscall {
             Self::Getdents => "getdents",
             Self::Getcwd => "getcwd",
             Self::Chdir => "chdir",
+            Self::Mkdir => "mkdir",
+            Self::Rmdir => "rmdir",
+            Self::Link => "link",
+            Self::Unlink => "unlink",
+            Self::Rename => "rename",
             Self::Readlink => "readlink",
+            Self::Symlink => "symlink",
+            Self::Chmod => "chmod",
+            Self::Chown => "chown",
             Self::Umask => "umask",
             Self::ArchPrctl => "arch_prctl",
             Self::Gettid => "gettid",
@@ -503,6 +552,7 @@ impl Syscall {
             Self::Linkat => "linkat",
             Self::Symlinkat => "symlinkat",
             Self::Readlinkat => "readlinkat",
+            Self::Utimensat => "utimensat",
             Self::Ppoll => "ppoll",
             Self::SetRobustList => "set_robust_list",
             Self::Accept4 => "accept4",

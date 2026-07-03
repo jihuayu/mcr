@@ -21,7 +21,7 @@ use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentP
 use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore};
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
-    SocketOptionName, SocketProtocol, SocketSpec, SocketType,
+    SocketOptionName, SocketSpec,
 };
 use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
@@ -44,7 +44,7 @@ use mcr_task::{
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
-    LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    FileTimes, LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -56,6 +56,8 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_UTIME_NOW: i64 = 0x3fffffff;
+const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
 const LINUX_GRND_NONBLOCK: u64 = 0x0001;
 const LINUX_GRND_RANDOM: u64 = 0x0002;
@@ -287,34 +289,12 @@ pub struct RuntimeDiagnostics {
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
-    memory_vmas: Vec<DiagnosticMemoryVma>,
-    fd_paths: Vec<DiagnosticFdPath>,
-    tasks: Vec<DiagnosticTask>,
     last_syscall: Option<DiagnosticSyscall>,
 }
 
 impl RuntimeDiagnostics {
     #[must_use]
     pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
-        Self::capture_with_memory(kernel, None, events)
-    }
-
-    #[must_use]
-    pub fn capture_with_memory(
-        kernel: &GuestKernel,
-        memory: Option<&GuestMemory>,
-        events: &[SyscallTraceEvent],
-    ) -> Self {
-        Self::capture_with_memory_and_fds(kernel, memory, None, events)
-    }
-
-    #[must_use]
-    pub fn capture_with_memory_and_fds(
-        kernel: &GuestKernel,
-        memory: Option<&GuestMemory>,
-        fds: Option<&mcr_vfs::FdTable>,
-        events: &[SyscallTraceEvent],
-    ) -> Self {
         let process = kernel
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process");
@@ -329,25 +309,6 @@ impl RuntimeDiagnostics {
                 .vmas()
                 .iter()
                 .map(DiagnosticVma::from_guest_vma)
-                .collect(),
-            memory_vmas: memory
-                .map(|memory| {
-                    memory
-                        .vmas()
-                        .map(DiagnosticMemoryVma::from_guest_vma)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            fd_paths: fds
-                .map(|fds| {
-                    fds.entries()
-                        .filter_map(DiagnosticFdPath::from_entry)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            tasks: kernel
-                .tasks()
-                .map(DiagnosticTask::from_guest_task)
                 .collect(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
         }
@@ -374,131 +335,8 @@ impl RuntimeDiagnostics {
     }
 
     #[must_use]
-    pub fn memory_vmas(&self) -> &[DiagnosticMemoryVma] {
-        &self.memory_vmas
-    }
-
-    #[must_use]
-    pub fn fd_paths(&self) -> &[DiagnosticFdPath] {
-        &self.fd_paths
-    }
-
-    #[must_use]
-    pub fn fd_path(&self, fd: i32) -> Option<&[u8]> {
-        self.fd_paths
-            .iter()
-            .find(|entry| entry.fd() == fd)
-            .map(DiagnosticFdPath::path)
-    }
-
-    #[must_use]
-    pub fn tasks(&self) -> &[DiagnosticTask] {
-        &self.tasks
-    }
-
-    #[must_use]
-    pub fn initial_task_tls(&self) -> Option<DiagnosticTls> {
-        self.tasks
-            .iter()
-            .find(|task| task.tid() == mcr_task::INITIAL_GUEST_TID)
-            .map(DiagnosticTask::tls)
-    }
-
-    #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiagnosticFdPath {
-    fd: i32,
-    path: Vec<u8>,
-}
-
-impl DiagnosticFdPath {
-    #[must_use]
-    pub fn from_entry((fd, entry): (i32, &mcr_vfs::FdEntry)) -> Option<Self> {
-        Some(Self {
-            fd,
-            path: entry.path()?.to_string().into_bytes(),
-        })
-    }
-
-    #[must_use]
-    pub const fn fd(&self) -> i32 {
-        self.fd
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &[u8] {
-        &self.path
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiagnosticTask {
-    tid: mcr_sys::GuestTid,
-    pid: mcr_sys::GuestPid,
-    state: mcr_task::TaskState,
-    tls: DiagnosticTls,
-}
-
-impl DiagnosticTask {
-    #[must_use]
-    pub fn from_guest_task(task: &mcr_task::GuestTask) -> Self {
-        Self {
-            tid: task.tid(),
-            pid: task.pid(),
-            state: task.state(),
-            tls: DiagnosticTls::from_guest_tls(task.tls()),
-        }
-    }
-
-    #[must_use]
-    pub const fn tid(&self) -> mcr_sys::GuestTid {
-        self.tid
-    }
-
-    #[must_use]
-    pub const fn pid(&self) -> mcr_sys::GuestPid {
-        self.pid
-    }
-
-    #[must_use]
-    pub const fn state(&self) -> mcr_task::TaskState {
-        self.state
-    }
-
-    #[must_use]
-    pub const fn tls(&self) -> DiagnosticTls {
-        self.tls
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiagnosticTls {
-    fs_base: u64,
-    gs_base: u64,
-}
-
-impl DiagnosticTls {
-    #[must_use]
-    pub const fn from_guest_tls(tls: mcr_task::TlsState) -> Self {
-        Self {
-            fs_base: tls.fs_base(),
-            gs_base: tls.gs_base(),
-        }
-    }
-
-    #[must_use]
-    pub const fn fs_base(self) -> u64 {
-        self.fs_base
-    }
-
-    #[must_use]
-    pub const fn gs_base(self) -> u64 {
-        self.gs_base
     }
 }
 
@@ -542,46 +380,6 @@ impl DiagnosticVma {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiagnosticMemoryVma {
-    start: u64,
-    end: u64,
-    permissions: DiagnosticPermissions,
-    kind: DiagnosticMemoryVmaKind,
-}
-
-impl DiagnosticMemoryVma {
-    #[must_use]
-    pub fn from_guest_vma(vma: &GuestVma) -> Self {
-        Self {
-            start: vma.start(),
-            end: vma.end(),
-            permissions: DiagnosticPermissions::from_memory(vma.protection()),
-            kind: DiagnosticMemoryVmaKind::from_guest_kind(vma.kind()),
-        }
-    }
-
-    #[must_use]
-    pub const fn start(&self) -> u64 {
-        self.start
-    }
-
-    #[must_use]
-    pub const fn end(&self) -> u64 {
-        self.end
-    }
-
-    #[must_use]
-    pub const fn permissions(&self) -> DiagnosticPermissions {
-        self.permissions
-    }
-
-    #[must_use]
-    pub const fn kind(&self) -> &DiagnosticMemoryVmaKind {
-        &self.kind
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiagnosticPermissions {
     read: bool,
@@ -606,11 +404,6 @@ impl DiagnosticPermissions {
             permissions.write(),
             permissions.execute(),
         )
-    }
-
-    #[must_use]
-    pub const fn from_memory(permissions: GuestMemoryProtection) -> Self {
-        Self::new(permissions.read, permissions.write, permissions.execute)
     }
 
     #[must_use]
@@ -670,39 +463,6 @@ impl DiagnosticVmaKind {
                 file_size: *file_size,
             },
             ElfGuestVmaKind::Stack => Self::Stack,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DiagnosticMemoryVmaKind {
-    Anonymous,
-    Heap,
-    FileBacked {
-        fd: i32,
-        path: Option<Vec<u8>>,
-        offset: i64,
-        shared: bool,
-    },
-}
-
-impl DiagnosticMemoryVmaKind {
-    #[must_use]
-    pub fn from_guest_kind(kind: &GuestVmaKind) -> Self {
-        match kind {
-            GuestVmaKind::Anonymous => Self::Anonymous,
-            GuestVmaKind::Heap => Self::Heap,
-            GuestVmaKind::FileBacked {
-                fd,
-                path,
-                offset,
-                shared,
-            } => Self::FileBacked {
-                fd: *fd,
-                path: path.clone(),
-                offset: *offset,
-                shared: *shared,
-            },
         }
     }
 }
@@ -808,12 +568,7 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
 
     #[must_use]
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        RuntimeDiagnostics::capture_with_memory_and_fds(
-            self.kernel(),
-            Some(self.memory()),
-            Some(self.vfs().fds()),
-            self.tracer().events(),
-        )
+        RuntimeDiagnostics::capture(self.kernel(), self.tracer().events())
     }
 
     #[must_use]
@@ -899,6 +654,7 @@ where
             mcr_sys::Syscall::Lseek => self.sys_lseek(request),
             mcr_sys::Syscall::Stat => self.sys_stat(request),
             mcr_sys::Syscall::Fstat => self.sys_fstat(request),
+            mcr_sys::Syscall::Lstat => self.sys_lstat(request),
             mcr_sys::Syscall::Newfstatat => self.sys_newfstatat(request),
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
@@ -912,12 +668,21 @@ where
             mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
             mcr_sys::Syscall::Fcntl => self.sys_fcntl(request),
             mcr_sys::Syscall::Ioctl => self.sys_ioctl(request),
+            mcr_sys::Syscall::Mkdir => self.sys_mkdir(request),
             mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
+            mcr_sys::Syscall::Rmdir => self.sys_rmdir(request),
+            mcr_sys::Syscall::Unlink => self.sys_unlink(request),
             mcr_sys::Syscall::Unlinkat => self.sys_unlinkat(request),
+            mcr_sys::Syscall::Rename => self.sys_rename(request),
             mcr_sys::Syscall::Renameat2 => self.sys_renameat2(request),
+            mcr_sys::Syscall::Symlink => self.sys_symlink(request),
             mcr_sys::Syscall::Symlinkat => self.sys_symlinkat(request),
+            mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Chmod => self.sys_chmod(request),
+            mcr_sys::Syscall::Chown => self.sys_chown(request),
+            mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
             mcr_sys::Syscall::Chdir => self.sys_chdir(request),
             mcr_sys::Syscall::Umask => self.sys_umask(request),
@@ -1114,7 +879,7 @@ where
         self.memory
             .read_bytes(args.buf, &mut buffer)
             .map_err(memory_errno)?;
-        let count = if args.sockaddr != 0 {
+        let count = if args.sockaddr != 0 || args.addrlen != 0 {
             let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
             let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
             self.sockets.send_to(socket_id, &buffer, address)
@@ -1138,20 +903,12 @@ where
         validate_socket_message_flags(args.flags, SocketOperation::Recv)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
-        let datagram = self.socket_uses_datagram_io(socket_id)?;
-        let count = if args.sockaddr != 0 || datagram {
+        let count = if args.sockaddr != 0 || args.addrlen != 0 {
             let (count, address) = self
                 .sockets
                 .recv_from(socket_id, &mut buffer)
                 .map_err(net_errno)?;
-            if args.sockaddr != 0 {
-                write_optional_socket_address(
-                    &mut self.memory,
-                    args.sockaddr,
-                    args.addrlen,
-                    address,
-                )?;
-            }
+            write_optional_socket_address(&mut self.memory, args.sockaddr, args.addrlen, address)?;
             count
         } else {
             self.sockets
@@ -1175,7 +932,7 @@ where
                 SocketOperation::SendMsg,
             )));
         }
-        let address = if message.msg_name != 0 {
+        let address = if message.msg_name != 0 || message.msg_namelen != 0 {
             Some(read_socket_address(
                 &self.memory,
                 message.msg_name,
@@ -1228,8 +985,7 @@ where
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
 
-        let datagram = self.socket_uses_datagram_io(socket_id)?;
-        let total = if message.msg_name != 0 || datagram {
+        let total = if message.msg_name != 0 || message.msg_namelen != 0 {
             let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
                 let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
                 total.checked_add(len).ok_or(LinuxErrno::EINVAL)
@@ -1388,12 +1144,6 @@ where
         let raw = self.vfs.socket_id_for_fd(fd).map_err(vfs_errno)?;
         SocketId::new(raw).ok_or(LinuxErrno::EBADF)
     }
-
-    fn socket_uses_datagram_io(&self, socket_id: SocketId) -> Result<bool, LinuxErrno> {
-        let socket = self.sockets.socket(socket_id).map_err(net_errno)?;
-        Ok(socket.socket_type() == SocketType::Datagram
-            && socket.effective_protocol() == SocketProtocol::Udp)
-    }
 }
 
 impl<M> RuntimeFileSystem<M>
@@ -1526,6 +1276,16 @@ where
         let attr = self
             .vfs
             .newfstatat(mcr_vfs::AT_FDCWD, &path, 0)
+            .map_err(vfs_errno)?;
+        self.write_stat(arg(request, 1), attr)?;
+        Ok(0)
+    }
+
+    fn sys_lstat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let attr = self
+            .vfs
+            .newfstatat(mcr_vfs::AT_FDCWD, &path, mcr_vfs::AT_SYMLINK_NOFOLLOW)
             .map_err(vfs_errno)?;
         self.write_stat(arg(request, 1), attr)?;
         Ok(0)
@@ -1671,6 +1431,14 @@ where
         Ok(0)
     }
 
+    fn sys_mkdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .mkdirat(mcr_vfs::AT_FDCWD, &path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_unlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 1))?;
         let flags = arg_u32(request, 2);
@@ -1679,6 +1447,31 @@ where
         }
         self.vfs
             .unlinkat(arg_i32(request, 0), &path, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rmdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, AT_REMOVEDIR)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_unlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, 0)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rename(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .renameat2(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
             .map_err(vfs_errno)?;
         Ok(0)
     }
@@ -1707,6 +1500,15 @@ where
         Ok(0)
     }
 
+    fn sys_symlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let target = self.read_path(arg(request, 0))?;
+        let linkpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .symlinkat(&target, mcr_vfs::AT_FDCWD, &linkpath)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_linkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let oldpath = self.read_path(arg(request, 1))?;
         let newpath = self.read_path(arg(request, 3))?;
@@ -1726,6 +1528,15 @@ where
         Ok(0)
     }
 
+    fn sys_link(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .linkat(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_ftruncate(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let length = arg(request, 1) as i64;
         if length < 0 {
@@ -1735,6 +1546,76 @@ where
             .ftruncate(arg_i32(request, 0), length as u64)
             .map_err(vfs_errno)?;
         Ok(0)
+    }
+
+    fn sys_chmod(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chmod(&path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_chown(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .chown(
+                &path,
+                optional_linux_id(arg_u32(request, 1)),
+                optional_linux_id(arg_u32(request, 2)),
+            )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_utimensat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let flags = arg_u32(request, 3);
+        if flags & !(mcr_vfs::AT_SYMLINK_NOFOLLOW | mcr_vfs::AT_EMPTY_PATH) != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let path = self.read_path(arg(request, 1))?;
+        let times = self.utimensat_times(arg_i32(request, 0), &path, arg(request, 2), flags)?;
+        self.vfs
+            .utimensat(arg_i32(request, 0), &path, times, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn utimensat_times(
+        &self,
+        dirfd: Fd,
+        path: &str,
+        times_ptr: u64,
+        flags: u32,
+    ) -> Result<FileTimes, LinuxErrno> {
+        let current = self
+            .vfs
+            .newfstatat(dirfd, path, flags)
+            .map_err(vfs_errno)
+            .ok();
+        let now = linux_timespec_from_system_time(std::time::SystemTime::now());
+        if times_ptr == 0 {
+            return Ok(FileTimes {
+                atime_sec: now.tv_sec,
+                atime_nsec: now.tv_nsec,
+                mtime_sec: now.tv_sec,
+                mtime_nsec: now.tv_nsec,
+            });
+        }
+
+        let atime = read_guest_timespec(&self.memory, times_ptr)?;
+        let mtime = read_guest_timespec(
+            &self.memory,
+            times_ptr.checked_add(16).ok_or(LinuxErrno::EFAULT)?,
+        )?;
+        let atime = resolve_utimensat_time(atime, now, current, true)?;
+        let mtime = resolve_utimensat_time(mtime, now, current, false)?;
+        Ok(FileTimes {
+            atime_sec: atime.tv_sec,
+            atime_nsec: atime.tv_nsec,
+            mtime_sec: mtime.tv_sec,
+            mtime_nsec: mtime.tv_nsec,
+        })
     }
 
     fn sys_getcwd(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1820,6 +1701,10 @@ fn arg_i32(request: &SyscallRequest, index: usize) -> Fd {
 
 fn arg_u32(request: &SyscallRequest, index: usize) -> u32 {
     arg(request, index) as u32
+}
+
+fn optional_linux_id(value: u32) -> Option<u32> {
+    (value != u32::MAX).then_some(value)
 }
 
 fn usize_arg(request: &SyscallRequest, index: usize) -> Result<usize, LinuxErrno> {
@@ -2519,6 +2404,7 @@ where
             .subsystems_mut()
             .resume_waiting_tasks()
             .map_err(|errno| GuestRunError::WaitResume { errno })?;
+        dispatcher.subsystems_mut().resume_fd_waiters();
         let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
         if runnable_tids.is_empty() {
             return Err(GuestRunError::NoRunnableTasks);
@@ -2672,6 +2558,11 @@ where
         .subsystems_mut()
         .select_memory_for_process(pid)
         .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?;
+    let native_fp = dispatcher
+        .subsystems()
+        .native_fp(tid)
+        .copied()
+        .unwrap_or_default();
     let fs_base = dispatcher
         .subsystems()
         .tasks
@@ -2690,11 +2581,20 @@ where
         if !vma.protection().execute {
             return Err(GuestExecutionError::Memory(GuestMemoryError::AccessDenied));
         }
-        let patches = patch_executable_syscalls(memory)?;
+        let patches = patch_executable_syscalls(memory, fs_base)?;
         let mut native_registers = host_registers_from_gpr(gpr);
+        native_registers.xmm = native_fp.xmm;
+        native_registers.mxcsr = native_fp.mxcsr;
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
         restore_executable_syscalls(memory, patches)?;
-        native_result.map_err(|error| native_execution_error(error, native_registers))?;
+        native_result.map_err(native_execution_error)?;
+        dispatcher.subsystems_mut().set_native_fp(
+            tid,
+            mcr_win::HostFloatingPointState {
+                xmm: native_registers.xmm,
+                mxcsr: native_registers.mxcsr,
+            },
+        );
 
         let mut registers = guest_registers_from_host(native_registers);
         let site = mcr_jit::SyscallSite {
@@ -2709,6 +2609,30 @@ where
                 Some(gpr_from_registers(child_registers));
         }
         let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+        if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+            && let Some((fd, write)) =
+                blocking_fd_wait(syscall_registers.rax, syscall_registers.rdi)
+        {
+            dispatcher
+                .subsystems_mut()
+                .tasks
+                .block_task_for_fd(tid, fd, write)
+                .map_err(|_| GuestExecutionError::MissingTask(tid))?;
+            let task = dispatcher
+                .subsystems_mut()
+                .tasks
+                .task_mut(tid)
+                .ok_or(GuestExecutionError::MissingTask(tid))?;
+            let blocked_regs = gpr_from_registers(registers);
+            task.set_regs(blocked_regs);
+            return Ok(GuestExecutionStep::new(
+                tid,
+                before_rip,
+                blocked_regs.rip(),
+                blocked_regs.rax(),
+                task.state(),
+            ));
+        }
         registers.apply_syscall_return(dispatch_result.encoded_rax, site.next_rip);
 
         let task = dispatcher
@@ -2745,7 +2669,11 @@ struct ExecutableSyscallPatch {
 
 fn patch_executable_syscalls(
     memory: &mut GuestMemory,
+    fs_base: u64,
 ) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = fs_base;
+
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
@@ -2757,8 +2685,11 @@ fn patch_executable_syscalls(
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        for (offset, window) in bytes.windows(2).enumerate() {
-            if window == [0x0f, 0x05] {
+        for offset in 0..bytes.len() {
+            if bytes
+                .get(offset..offset.saturating_add(2))
+                .is_some_and(|window| window == [0x0f, 0x05])
+            {
                 let address = start + offset as u64;
                 let old = memory.patch_code(address, &[0xcc, 0x90])?;
                 patches.push(ExecutableSyscallPatch {
@@ -2766,9 +2697,51 @@ fn patch_executable_syscalls(
                     bytes: old,
                 });
             }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(replacement) = fs_relative_patch(&bytes[offset..], fs_base) {
+                let address = start + offset as u64;
+                let _ = memory.patch_code(address, &replacement)?;
+            }
         }
     }
     Ok(patches)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
+    if fs_base == 0
+        || bytes.len() < 9
+        || bytes[0] != 0x64
+        || bytes[1] & 0xf8 != 0x48
+        || !matches!(bytes[2], 0x8b | 0x2b)
+        || bytes[3] & 0xc7 != 0x04
+        || bytes[4] != 0x25
+    {
+        return None;
+    }
+
+    let displacement = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    let absolute = if displacement >= 0 {
+        fs_base.checked_add(displacement as u64)?
+    } else {
+        fs_base.checked_sub(displacement.unsigned_abs() as u64)?
+    };
+    if absolute > i32::MAX as u64 {
+        return None;
+    }
+
+    let absolute = (absolute as u32).to_le_bytes();
+    Some([
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        absolute[0],
+        absolute[1],
+        absolute[2],
+        absolute[3],
+        0x90,
+    ])
 }
 
 fn restore_executable_syscalls(
@@ -2791,10 +2764,25 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
         || number == mcr_sys::Syscall::Clone.number().raw()
 }
 
-fn native_execution_error(
-    error: mcr_win::NativeExecutionError,
-    registers: mcr_win::HostCpuRegisters,
-) -> GuestExecutionError {
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
+    if syscall_number == mcr_sys::Syscall::Read.number().raw()
+        || syscall_number == mcr_sys::Syscall::Readv.number().raw()
+    {
+        Some((fd as Fd, false))
+    } else if syscall_number == mcr_sys::Syscall::Write.number().raw()
+        || syscall_number == mcr_sys::Syscall::Writev.number().raw()
+    {
+        Some((fd as Fd, true))
+    } else {
+        None
+    }
+}
+
+fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
     match error {
         mcr_win::NativeExecutionError::GuestFault {
             signal,
@@ -2804,7 +2792,6 @@ fn native_execution_error(
             signal,
             rip,
             address,
-            registers: guest_registers_from_host(registers),
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
         | mcr_win::NativeExecutionError::SignalHandler(_)
@@ -2813,7 +2800,6 @@ fn native_execution_error(
                 signal: 0,
                 rip: 0,
                 address: 0,
-                registers: GuestRegisters::default(),
             })
         }
     }
@@ -2897,6 +2883,8 @@ fn host_registers_from_gpr(value: GprState) -> mcr_win::HostCpuRegisters {
         r15: value.r15(),
         rip: value.rip(),
         rflags: value.rflags(),
+        xmm: mcr_win::HostXmmRegisters::default(),
+        mxcsr: mcr_win::DEFAULT_MXCSR,
     }
 }
 
@@ -2938,6 +2926,7 @@ pub struct RuntimeSubsystems {
     futexes: FutexRegistry,
     epolls: EpollRegistry,
     native_execution: bool,
+    native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
     pending_fork_child_regs: Option<GprState>,
 }
 
@@ -2969,6 +2958,7 @@ impl RuntimeSubsystems {
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
             native_execution: false,
+            native_fp: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
@@ -2997,12 +2987,21 @@ impl RuntimeSubsystems {
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
             native_execution: false,
+            native_fp: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
 
     pub const fn enable_native_execution(&mut self) {
         self.native_execution = true;
+    }
+
+    fn native_fp(&self, tid: mcr_sys::GuestTid) -> Option<&mcr_win::HostFloatingPointState> {
+        self.native_fp.get(&tid)
+    }
+
+    fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
+        self.native_fp.insert(tid, state);
     }
 
     fn default_vfs() -> VirtualFileSystem {
@@ -3276,13 +3275,6 @@ impl RuntimeSubsystems {
         if offset < 0 {
             return Err(LinuxErrno::EINVAL);
         }
-        let path = self
-            .files
-            .vfs()
-            .fds()
-            .get(fd)
-            .ok()
-            .and_then(|entry| entry.path().map(|path| path.to_string().into_bytes()));
         let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
         let mut bytes = vec![0; len];
         let count = self
@@ -3310,10 +3302,6 @@ impl RuntimeSubsystems {
             });
         write_result.map_err(|error| error.errno())?;
         restore_result.map_err(|error| error.errno())?;
-        self.files
-            .memory_mut()
-            .set_file_backed_path(mapped, path)
-            .map_err(|error| error.errno())?;
         Ok(())
     }
 
@@ -3463,6 +3451,33 @@ impl RuntimeSubsystems {
         self.close_unshared_process_sockets(pid)?;
         self.drop_process_memory(pid)?;
         self.drop_process_fds(pid)
+    }
+
+    fn fork_native_fp(&mut self, parent_tid: mcr_sys::GuestTid, child_pid: mcr_sys::GuestPid) {
+        let Some(state) = self.native_fp.get(&parent_tid).copied() else {
+            return;
+        };
+        let child_tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == child_pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for child_tid in child_tids {
+            self.native_fp.insert(child_tid, state);
+        }
+    }
+
+    fn drop_native_fp_for_process(&mut self, pid: mcr_sys::GuestPid) {
+        let tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for tid in tids {
+            self.native_fp.remove(&tid);
+        }
     }
 
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -3707,6 +3722,7 @@ impl RuntimeSubsystems {
                 }
             }
             mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup => {
+                self.drop_native_fp_for_process(pid);
                 if let Err(errno) = self.drop_process_resources(pid) {
                     return SyscallOutcome::errno(errno);
                 }
@@ -3731,9 +3747,25 @@ impl RuntimeSubsystems {
         let completed = self.tasks.resume_waiting_tasks();
         for wait in &completed {
             self.write_wait_status(*wait)?;
+            self.drop_native_fp_for_process(wait.waited().pid());
             self.drop_process_resources(wait.waited().pid())?;
         }
         Ok(completed)
+    }
+
+    fn resume_fd_waiters(&mut self) {
+        let selected_pid = self.selected_fds_pid;
+        let selected_fds = self.files.vfs().fds().clone();
+        let process_fds = self.process_fds.clone();
+        self.tasks.resume_fd_waiters(|pid, fd, write| {
+            let fds = if pid == selected_pid {
+                Some(&selected_fds)
+            } else {
+                process_fds.get(&pid)
+            };
+            fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
+                .unwrap_or(true)
+        });
     }
 
     fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
@@ -3802,6 +3834,7 @@ impl RuntimeSubsystems {
                 self.process_memory.insert(child_pid, memory);
                 self.process_fds
                     .insert(child_pid, self.files.vfs().fds().clone());
+                self.fork_native_fp(request.context.tid, child_pid);
                 outcome
             }
             Err(error) => {
@@ -3884,6 +3917,7 @@ impl RuntimeSubsystems {
             }
         }
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
+        self.native_fp.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
@@ -4291,6 +4325,33 @@ fn linux_timespec_from_duration(duration: Duration) -> Result<LinuxTimespec, Lin
     })
 }
 
+fn resolve_utimensat_time(
+    requested: LinuxTimespec,
+    now: LinuxTimespec,
+    current: Option<LinuxFileAttr>,
+    atime: bool,
+) -> Result<LinuxTimespec, LinuxErrno> {
+    match requested.tv_nsec {
+        LINUX_UTIME_NOW => Ok(now),
+        LINUX_UTIME_OMIT => {
+            let current = current.ok_or(LinuxErrno::ENOENT)?;
+            if atime {
+                Ok(LinuxTimespec {
+                    tv_sec: current.atime_sec,
+                    tv_nsec: current.atime_nsec,
+                })
+            } else {
+                Ok(LinuxTimespec {
+                    tv_sec: current.mtime_sec,
+                    tv_nsec: current.mtime_nsec,
+                })
+            }
+        }
+        0..=999_999_999 if requested.tv_sec >= 0 => Ok(requested),
+        _ => Err(LinuxErrno::EINVAL),
+    }
+}
+
 fn read_required_timespec_duration(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -4461,6 +4522,17 @@ fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
         revents |= LINUX_POLLHUP;
     }
     revents
+}
+
+fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno> {
+    let readiness = fds
+        .poll_readiness(&mcr_vfs::PathTree::new(), fd)
+        .map_err(vfs_errno)?;
+    Ok(if write {
+        readiness.writable || readiness.hang_up || readiness.error
+    } else {
+        readiness.readable || readiness.hang_up || readiness.error
+    })
 }
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
@@ -4810,12 +4882,8 @@ mod tests {
 
     #[test]
     fn runtime_file_backed_mmap_populates_private_mapping_from_vfs_fd() {
-        let mut runtime = Runtime::with_tracer_and_vfs(
-            test_program("/bin/app", 0x401000),
-            sample_vfs(),
-            RuntimeDiagnosticsTracer::new(),
-        )
-        .unwrap();
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
         runtime
             .memory_mut()
             .write(0x402000, b"/tmp/file\0")
@@ -4853,53 +4921,7 @@ mod tests {
         runtime.memory().read(0x7000_0000, &mut bytes).unwrap();
         assert_eq!(&bytes[..5], b"hello");
         assert_eq!(&bytes[5..], &[0, 0, 0]);
-        let diagnostics = runtime.diagnostics();
-        assert_eq!(diagnostics.fd_path(3), Some(b"/tmp/file".as_slice()));
-        assert!(diagnostics.memory_vmas().iter().any(|vma| {
-            vma.start() == 0x7000_0000
-                && matches!(
-                    vma.kind(),
-                    DiagnosticMemoryVmaKind::FileBacked {
-                        fd: 3,
-                        path: Some(path),
-                        offset: 0,
-                        shared: false
-                    } if path == b"/tmp/file"
-                )
-        }));
         assert_eq!(runtime.vfs().fds().get(3).unwrap().offset(), 2);
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(Syscall::Close, [3, 0, 0, 0, 0, 0]))
-                .result,
-            SyscallReturn::Success(0)
-        );
-        runtime
-            .memory_mut()
-            .write(0x402100, b"/tmp/other\0")
-            .unwrap();
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(
-                    Syscall::Openat,
-                    [AT_FDCWD as u64, 0x402100, u64::from(O_RDONLY), 0, 0, 0,]
-                ))
-                .result,
-            SyscallReturn::Success(3)
-        );
-        let diagnostics = runtime.diagnostics();
-        assert_eq!(diagnostics.fd_path(3), Some(b"/tmp/other".as_slice()));
-        assert!(diagnostics.memory_vmas().iter().any(|vma| {
-            matches!(
-                vma.kind(),
-                DiagnosticMemoryVmaKind::FileBacked {
-                    fd: 3,
-                    path: Some(path),
-                    offset: 0,
-                    shared: false
-                } if path == b"/tmp/file"
-            )
-        }));
         assert_eq!(
             runtime.memory_mut().write(0x7000_0000, b"x"),
             Err(GuestMemoryError::AccessDenied)
@@ -6416,57 +6438,6 @@ mod tests {
     }
 
     #[test]
-    fn datagram_recvfrom_and_recvmsg_allow_null_peer_address() {
-        let transport = runtime_socket_transport();
-        transport.push_incoming(b"dns!");
-        let mut runtime = RuntimeFileSystem::with_socket_transport(
-            sample_vfs(),
-            TestMemory::default(),
-            transport.handle(),
-        );
-
-        assert_eq!(
-            dispatch_network(
-                &mut runtime,
-                Syscall::Socket,
-                [
-                    u64::from(LINUX_AF_INET),
-                    u64::from(LINUX_SOCK_DGRAM),
-                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            SyscallReturn::Success(3)
-        );
-        assert_eq!(
-            dispatch_network(
-                &mut runtime,
-                Syscall::Recvfrom,
-                [3, 0x2100, 8, u64::from(LINUX_MSG_DONTWAIT), 0, 0],
-            ),
-            SyscallReturn::Success(4)
-        );
-        assert_eq!(runtime.memory().read(0x2100, 4), b"dns!");
-
-        transport.push_incoming(b"more");
-        runtime.memory_mut().write_iovec(0x3000, 0x3100, 4);
-        runtime.memory_mut().write_msghdr(0x4000, 0, 0, 0x3000, 1);
-        assert_eq!(
-            dispatch_network(
-                &mut runtime,
-                Syscall::Recvmsg,
-                [3, 0x4000, u64::from(LINUX_MSG_DONTWAIT), 0, 0, 0],
-            ),
-            SyscallReturn::Success(4)
-        );
-        assert_eq!(runtime.memory().read(0x3100, 4), b"more");
-        assert_eq!(u32_at(runtime.memory(), 0x4000 + 8), 0);
-        assert_eq!(u32_at(runtime.memory(), 0x4000 + 48), 0);
-    }
-
-    #[test]
     fn runtime_dispatch_routes_datagram_socket_io_through_transport() {
         let transport = runtime_socket_transport();
         transport.push_incoming(b"dns!");
@@ -6841,6 +6812,43 @@ mod tests {
             ),
             SyscallReturn::Success(0)
         );
+
+        runtime.memory_mut().write(0x2000, &10i64.to_le_bytes());
+        runtime.memory_mut().write(0x2008, &20i64.to_le_bytes());
+        runtime.memory_mut().write(0x2010, &30i64.to_le_bytes());
+        runtime.memory_mut().write(0x2018, &40i64.to_le_bytes());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Utimensat,
+                [AT_FDCWD as u64, 0x1200, 0x2000, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        let touched = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(touched.atime_sec, 10);
+        assert_eq!(touched.atime_nsec, 20);
+        assert_eq!(touched.mtime_sec, 30);
+        assert_eq!(touched.mtime_nsec, 40);
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chmod, [0x1200, 0o600, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Chown, [0x1200, 1000, 1001, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        let owned = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(owned.mode & 0o777, 0o600);
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 1001);
     }
 
     #[test]
@@ -7684,8 +7692,6 @@ mod tests {
         tree.create_dir("/tmp").unwrap();
         tree.create_file_with_content("/tmp/file", b"hello", 0o644)
             .unwrap();
-        tree.create_file_with_content("/tmp/other", b"other", 0o644)
-            .unwrap();
         tree.create_dir("/private").unwrap();
         tree.create_file_with_content("/private/secret", b"secret", 0o600)
             .unwrap();
@@ -7903,6 +7909,32 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 9 }
         );
+    }
+
+    #[test]
+    fn guest_registers_round_trip_preserves_argument_register_order() {
+        let registers = GuestRegisters {
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsi: 5,
+            rdi: 6,
+            rbp: 7,
+            rsp: 8,
+            r8: 9,
+            r9: 10,
+            r10: 11,
+            r11: 12,
+            r12: 13,
+            r13: 14,
+            r14: 15,
+            r15: 16,
+            rip: 17,
+            rflags: 18,
+        };
+
+        assert_eq!(registers_from_gpr(gpr_from_registers(registers)), registers);
     }
 
     #[test]
@@ -8925,15 +8957,6 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(
-                    Syscall::ArchPrctl,
-                    [ARCH_SET_FS, 0x7000_1234, 0, 0, 0, 0]
-                ))
-                .result,
-            SyscallReturn::Success(0)
-        );
         let result = runtime.dispatch_syscall(context(Syscall::Getpid, [0; 6]));
         assert_eq!(result.result, SyscallReturn::Success(1));
 
@@ -8946,16 +8969,6 @@ mod tests {
             &[b"/bin/app".to_vec(), b"--flag".to_vec()]
         );
         assert_eq!(diagnostics.envp(), &[b"A=B".to_vec()]);
-        assert_eq!(
-            diagnostics.initial_task_tls().unwrap().fs_base(),
-            0x7000_1234
-        );
-        assert_eq!(diagnostics.initial_task_tls().unwrap().gs_base(), 0);
-        assert_eq!(diagnostics.tasks().len(), 1);
-        assert_eq!(diagnostics.tasks()[0].tid(), INITIAL_GUEST_TID);
-        assert_eq!(diagnostics.tasks()[0].pid(), INITIAL_GUEST_PID);
-        assert_eq!(diagnostics.tasks()[0].state(), TaskState::Runnable);
-        assert_eq!(diagnostics.tasks()[0].tls().fs_base(), 0x7000_1234);
         assert!(diagnostics.vmas().iter().any(|vma| {
             vma.start() <= 0x401000
                 && 0x401000 < vma.end()
@@ -8976,50 +8989,6 @@ mod tests {
         assert_eq!(last.args(), [0; 6]);
         assert_eq!(last.result(), Some(SyscallReturn::Success(1)));
         assert_eq!(last.rip(), 0x401234);
-    }
-
-    #[test]
-    fn diagnostics_capture_all_task_tls_states() {
-        let mut runtime =
-            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
-
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(
-                    Syscall::ArchPrctl,
-                    [ARCH_SET_FS, 0x7000_1111, 0, 0, 0, 0]
-                ))
-                .result,
-            SyscallReturn::Success(0)
-        );
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(Syscall::Fork, [0; 6]))
-                .result,
-            SyscallReturn::Success(2)
-        );
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context_for(
-                    2,
-                    2,
-                    Syscall::ArchPrctl,
-                    [ARCH_SET_FS, 0x7000_2222, 0, 0, 0, 0]
-                ))
-                .result,
-            SyscallReturn::Success(0)
-        );
-
-        let diagnostics = runtime.diagnostics();
-        assert_eq!(diagnostics.tasks().len(), 2);
-        assert_eq!(diagnostics.tasks()[0].tid(), INITIAL_GUEST_TID);
-        assert_eq!(diagnostics.tasks()[0].pid(), INITIAL_GUEST_PID);
-        assert_eq!(diagnostics.tasks()[0].state(), TaskState::Runnable);
-        assert_eq!(diagnostics.tasks()[0].tls().fs_base(), 0x7000_1111);
-        assert_eq!(diagnostics.tasks()[1].tid(), 2);
-        assert_eq!(diagnostics.tasks()[1].pid(), 2);
-        assert_eq!(diagnostics.tasks()[1].state(), TaskState::Runnable);
-        assert_eq!(diagnostics.tasks()[1].tls().fs_base(), 0x7000_2222);
     }
 
     #[test]
