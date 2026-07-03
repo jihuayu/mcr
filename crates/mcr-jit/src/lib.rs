@@ -225,6 +225,10 @@ fn is_nonterminating_exception_instruction(instruction: &Instruction) -> bool {
             | Code::Cmpxchg_rm16_r16
             | Code::Cmpxchg_rm32_r32
             | Code::Cmpxchg_rm64_r64
+            | Code::Xchg_rm8_r8
+            | Code::Xchg_rm16_r16
+            | Code::Xchg_rm32_r32
+            | Code::Xchg_rm64_r64
     )
 }
 
@@ -1252,6 +1256,18 @@ where
         }
         Code::Cmpxchg_rm64_r64 => {
             execute_cmpxchg_u64(registers, flags, memory, &instruction)?;
+        }
+        Code::Xchg_rm8_r8 => {
+            execute_xchg_u8(registers, memory, &instruction)?;
+        }
+        Code::Xchg_rm16_r16 => {
+            execute_xchg_u16(registers, memory, &instruction)?;
+        }
+        Code::Xchg_rm32_r32 => {
+            execute_xchg_u32(registers, memory, &instruction)?;
+        }
+        Code::Xchg_rm64_r64 => {
+            execute_xchg_u64(registers, memory, &instruction)?;
         }
         Code::Bt_rm64_r64 | Code::Bt_rm64_imm8 if instruction.op0_kind() == OpKind::Register => {
             let lhs = read_reg64(registers, instruction.op0_register())?;
@@ -2326,6 +2342,62 @@ where
     } else {
         write_reg64(registers, Register::RAX, dest)
     }
+}
+
+fn execute_xchg_u8<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let dest = read_operand_u8(registers, memory, instruction, 0)?;
+    let source = read_reg8(registers, instruction.op1_register())?;
+    write_operand_u8(registers, memory, instruction, 0, source)?;
+    write_reg8(registers, instruction.op1_register(), dest)
+}
+
+fn execute_xchg_u16<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let dest = read_operand_u16(registers, memory, instruction, 0)?;
+    let source = read_reg16(registers, instruction.op1_register())?;
+    write_operand_u16(registers, memory, instruction, 0, source)?;
+    write_reg16(registers, instruction.op1_register(), dest)
+}
+
+fn execute_xchg_u32<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let dest = read_operand_u32(registers, memory, instruction, 0)?;
+    let source = read_reg32(registers, instruction.op1_register())?;
+    write_operand_u32(registers, memory, instruction, 0, source)?;
+    write_reg32(registers, instruction.op1_register(), dest)
+}
+
+fn execute_xchg_u64<M>(
+    registers: &mut GuestRegisters,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let dest = read_operand_u64(registers, memory, instruction, 0)?;
+    let source = read_reg64(registers, instruction.op1_register())?;
+    write_operand_u64(registers, memory, instruction, 0, source)?;
+    write_reg64(registers, instruction.op1_register(), dest)
 }
 
 fn execute_stos<M>(
@@ -4268,6 +4340,34 @@ mod tests {
         assert_eq!(failure_trap.registers().rax, Syscall::Getpid.number().raw());
         assert_eq!(u32::from_le_bytes(memory.read(0x715104)), 5);
         assert_eq!(failure_trap.site().rip, 0x46925d);
+    }
+
+    #[test]
+    fn execution_core_executes_xchg_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0xb8, 0xff, 0xff, 0xff, 0xff, // mov eax,-1
+                0x87, 0x42, 0x04, // xchg [rdx+4],eax
+                0x89, 0xc7, // mov edi,eax
+                0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+                0x0f, 0x05, // syscall
+            ],
+            0x469280,
+        );
+        let registers = GuestRegisters {
+            rdx: 0x715200,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x715204, &0x1234_5678_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute xchg before syscall");
+
+        assert_eq!(trap.registers().rdi, 0x1234_5678);
+        assert_eq!(u32::from_le_bytes(memory.read(0x715204)), u32::MAX);
+        assert_eq!(trap.site().rip, 0x46928f);
     }
 
     #[test]
