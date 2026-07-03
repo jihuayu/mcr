@@ -288,6 +288,7 @@ pub struct RuntimeDiagnostics {
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
     memory_vmas: Vec<DiagnosticMemoryVma>,
+    initial_task_tls: Option<DiagnosticTls>,
     last_syscall: Option<DiagnosticSyscall>,
 }
 
@@ -326,6 +327,9 @@ impl RuntimeDiagnostics {
                         .collect()
                 })
                 .unwrap_or_default(),
+            initial_task_tls: kernel
+                .task(mcr_task::INITIAL_GUEST_TID)
+                .map(|task| DiagnosticTls::from_guest_tls(task.tls())),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
         }
     }
@@ -356,8 +360,39 @@ impl RuntimeDiagnostics {
     }
 
     #[must_use]
+    pub const fn initial_task_tls(&self) -> Option<DiagnosticTls> {
+        self.initial_task_tls
+    }
+
+    #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticTls {
+    fs_base: u64,
+    gs_base: u64,
+}
+
+impl DiagnosticTls {
+    #[must_use]
+    pub const fn from_guest_tls(tls: mcr_task::TlsState) -> Self {
+        Self {
+            fs_base: tls.fs_base(),
+            gs_base: tls.gs_base(),
+        }
+    }
+
+    #[must_use]
+    pub const fn fs_base(self) -> u64 {
+        self.fs_base
+    }
+
+    #[must_use]
+    pub const fn gs_base(self) -> u64 {
+        self.gs_base
     }
 }
 
@@ -8704,6 +8739,15 @@ mod tests {
         ))
         .unwrap();
 
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::ArchPrctl,
+                    [ARCH_SET_FS, 0x7000_1234, 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
         let result = runtime.dispatch_syscall(context(Syscall::Getpid, [0; 6]));
         assert_eq!(result.result, SyscallReturn::Success(1));
 
@@ -8716,6 +8760,11 @@ mod tests {
             &[b"/bin/app".to_vec(), b"--flag".to_vec()]
         );
         assert_eq!(diagnostics.envp(), &[b"A=B".to_vec()]);
+        assert_eq!(
+            diagnostics.initial_task_tls().unwrap().fs_base(),
+            0x7000_1234
+        );
+        assert_eq!(diagnostics.initial_task_tls().unwrap().gs_base(), 0);
         assert!(diagnostics.vmas().iter().any(|vma| {
             vma.start() <= 0x401000
                 && 0x401000 < vma.end()

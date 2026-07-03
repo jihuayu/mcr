@@ -286,6 +286,14 @@ fn write_guest_run_diagnostics(
     } else {
         write!(formatter, "\nlast syscall: <none>")?;
     }
+    if let Some(tls) = diagnostics.initial_task_tls() {
+        write!(
+            formatter,
+            "\ninitial task TLS: fs_base=0x{:016x} gs_base=0x{:016x}",
+            tls.fs_base(),
+            tls.gs_base()
+        )?;
+    }
     if let Some(rip) = native_fault_rip(error) {
         write!(formatter, "\nfault rip: 0x{rip:016x}")?;
         if let Some(vma) = diagnostics
