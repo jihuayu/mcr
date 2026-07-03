@@ -1776,6 +1776,7 @@ mod tests {
     struct FakeHostSocketHandle {
         sent: Vec<u8>,
         incoming: Vec<u8>,
+        local: Option<SocketAddress>,
         connected: Option<SocketAddress>,
         connect_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
@@ -1802,6 +1803,13 @@ mod tests {
         fn with_connect_error(error: HostIoError) -> Self {
             Self {
                 connect_error: Some(error),
+                ..Self::default()
+            }
+        }
+
+        fn with_local_endpoint(local: SocketAddress) -> Self {
+            Self {
+                local: Some(local),
                 ..Self::default()
             }
         }
@@ -1848,10 +1856,12 @@ mod tests {
         }
 
         fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
-            Ok(SocketAddress::unspecified_for_domain(
-                self.connected
-                    .map_or(SocketDomain::Inet, SocketAddress::domain),
-            ))
+            Ok(self.bound.or(self.local).unwrap_or_else(|| {
+                SocketAddress::unspecified_for_domain(
+                    self.connected
+                        .map_or(SocketDomain::Inet, SocketAddress::domain),
+                )
+            }))
         }
 
         fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
@@ -2254,6 +2264,35 @@ mod tests {
             .expect("recv connected");
         assert_eq!(count, 4);
         assert_eq!(&buffer[..count], b"pong");
+    }
+
+    #[test]
+    fn connect_records_host_reported_local_endpoint() {
+        let mut table = GuestSocketTable::new();
+        let local = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_local_endpoint(local)),
+            )
+            .expect("socket with handle");
+
+        table.connect(stream, peer).expect("connect handle");
+
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected { local, peer }
+        );
+        assert_eq!(
+            table
+                .socket(stream)
+                .expect("socket")
+                .state()
+                .local_address(),
+            Some(local)
+        );
     }
 
     #[test]
