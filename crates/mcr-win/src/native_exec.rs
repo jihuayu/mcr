@@ -200,8 +200,18 @@ mod windows_x86_64 {
         push r13
         push r14
         push r15
-        sub rsp, 40
+        sub rsp, 200
         mov [rsp], rdx
+        movdqu xmmword ptr [rsp + 40], xmm6
+        movdqu xmmword ptr [rsp + 56], xmm7
+        movdqu xmmword ptr [rsp + 72], xmm8
+        movdqu xmmword ptr [rsp + 88], xmm9
+        movdqu xmmword ptr [rsp + 104], xmm10
+        movdqu xmmword ptr [rsp + 120], xmm11
+        movdqu xmmword ptr [rsp + 136], xmm12
+        movdqu xmmword ptr [rsp + 152], xmm13
+        movdqu xmmword ptr [rsp + 168], xmm14
+        movdqu xmmword ptr [rsp + 184], xmm15
         mov [rdx + 0], rsp
         lea rax, [rip + .Lmcr_native_trap_landing]
         mov [rdx + 8], rax
@@ -239,7 +249,17 @@ mod windows_x86_64 {
         mov rax, [r12 + 24]
         wrfsbase rax
         mov rsp, [r12 + 0]
-        add rsp, 40
+        movdqu xmm6, xmmword ptr [rsp + 40]
+        movdqu xmm7, xmmword ptr [rsp + 56]
+        movdqu xmm8, xmmword ptr [rsp + 72]
+        movdqu xmm9, xmmword ptr [rsp + 88]
+        movdqu xmm10, xmmword ptr [rsp + 104]
+        movdqu xmm11, xmmword ptr [rsp + 120]
+        movdqu xmm12, xmmword ptr [rsp + 136]
+        movdqu xmm13, xmmword ptr [rsp + 152]
+        movdqu xmm14, xmmword ptr [rsp + 168]
+        movdqu xmm15, xmmword ptr [rsp + 184]
+        add rsp, 200
         pop r15
         pop r14
         pop r13
