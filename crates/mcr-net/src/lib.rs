@@ -1141,7 +1141,10 @@ impl GuestSocketTable {
         }
 
         let entry = self.host_entry_mut(id, SocketOperation::Send)?;
-        entry.handle.send(buffer).map_err(SocketError::from_host)
+        entry
+            .handle
+            .send(buffer)
+            .map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn recv_connected(
@@ -1162,7 +1165,10 @@ impl GuestSocketTable {
         }
 
         let entry = self.host_entry_mut(id, SocketOperation::Recv)?;
-        entry.handle.recv(buffer).map_err(SocketError::from_host)
+        entry
+            .handle
+            .recv(buffer)
+            .map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn send_to(
@@ -1188,7 +1194,7 @@ impl GuestSocketTable {
         entry
             .handle
             .send_to(buffer, address)
-            .map_err(SocketError::from_host)
+            .map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn recv_from(
@@ -1212,7 +1218,7 @@ impl GuestSocketTable {
         entry
             .handle
             .recv_from(buffer)
-            .map_err(SocketError::from_host)
+            .map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn poll(
@@ -1315,6 +1321,13 @@ impl GuestSocketTable {
         let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
         let peer = entry.handle.peer_addr().map_err(SocketError::from_host)?;
         Ok((local, peer))
+    }
+
+    fn record_host_error(&mut self, id: SocketId, error: HostIoError) -> SocketError {
+        if let Ok(socket) = self.socket_mut(id) {
+            socket.last_error = Some(error.linux_errno());
+        }
+        SocketError::from_host(error)
     }
 
     fn finish_nonblocking_connect(&mut self, id: SocketId) -> Result<(), SocketError> {
@@ -2350,6 +2363,18 @@ mod tests {
                 .expect_err("host send failure")
                 .linux_errno(),
             LinuxErrno::BrokenPipe
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            LinuxErrno::BrokenPipe.code() as u32
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR is consumed"),
+            0
         );
     }
 
