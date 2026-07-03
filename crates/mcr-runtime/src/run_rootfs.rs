@@ -212,14 +212,28 @@ fn write_native_fault_details(
     };
     write!(
         formatter,
-        "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rsp=0x{:016x}",
+        "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rbp=0x{:016x} rsp=0x{:016x}",
         registers.rax,
         registers.rbx,
         registers.rcx,
         registers.rdx,
         registers.rsi,
         registers.rdi,
+        registers.rbp,
         registers.rsp
+    )?;
+    write!(
+        formatter,
+        "\nfault registers ext: r8=0x{:016x} r9=0x{:016x} r10=0x{:016x} r11=0x{:016x} r12=0x{:016x} r13=0x{:016x} r14=0x{:016x} r15=0x{:016x} rflags=0x{:016x}",
+        registers.r8,
+        registers.r9,
+        registers.r10,
+        registers.r11,
+        registers.r12,
+        registers.r13,
+        registers.r14,
+        registers.r15,
+        registers.rflags
     )?;
     if stack_words.is_empty() {
         return Ok(());
@@ -1128,6 +1142,7 @@ mod tests {
         assert!(rendered.contains("rax=0xffffffffffffffff"));
         assert!(rendered.contains("rdi=0x000000000009139b"));
         assert!(rendered.contains("rsp=0x00000001001ffb58"));
+        assert!(rendered.contains("fault registers ext:"));
         assert!(rendered.contains("fault stack words:"));
         assert!(
             rendered.contains("[0x00000001001ffb58]=0x00007000004d1234"),
