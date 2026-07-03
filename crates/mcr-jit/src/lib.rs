@@ -168,6 +168,12 @@ impl BlockDecoder {
                 });
             }
 
+            if instruction.flow_control() == FlowControl::Exception
+                && is_nonterminating_exception_instruction(&instruction)
+            {
+                continue;
+            }
+
             if let Some(flow) = decoded_flow_control(instruction.flow_control()) {
                 return Ok(DecodedBlock {
                     instructions,
@@ -210,6 +216,16 @@ fn decoded_flow_control(flow_control: FlowControl) -> Option<DecodedFlowControl>
         FlowControl::XbeginXabortXend => Some(DecodedFlowControl::XbeginXabortXend),
         FlowControl::Exception => Some(DecodedFlowControl::Exception),
     }
+}
+
+fn is_nonterminating_exception_instruction(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.code(),
+        Code::Cmpxchg_rm8_r8
+            | Code::Cmpxchg_rm16_r16
+            | Code::Cmpxchg_rm32_r32
+            | Code::Cmpxchg_rm64_r64
+    )
 }
 
 #[repr(C)]
@@ -1225,6 +1241,18 @@ where
         | Code::Setg_rm8 => {
             execute_setcc_u8(registers, flags, memory, &instruction)?;
         }
+        Code::Cmpxchg_rm8_r8 => {
+            execute_cmpxchg_u8(registers, flags, memory, &instruction)?;
+        }
+        Code::Cmpxchg_rm16_r16 => {
+            execute_cmpxchg_u16(registers, flags, memory, &instruction)?;
+        }
+        Code::Cmpxchg_rm32_r32 => {
+            execute_cmpxchg_u32(registers, flags, memory, &instruction)?;
+        }
+        Code::Cmpxchg_rm64_r64 => {
+            execute_cmpxchg_u64(registers, flags, memory, &instruction)?;
+        }
         Code::Bt_rm64_r64 | Code::Bt_rm64_imm8 if instruction.op0_kind() == OpKind::Register => {
             let lhs = read_reg64(registers, instruction.op0_register())?;
             let rhs = read_operand_or_immediate_u64(registers, memory, &instruction, 1)?;
@@ -2203,6 +2231,101 @@ where
 {
     let value = u8::from(condition_satisfied(instruction.code(), *flags)?);
     write_operand_u8(registers, memory, instruction, 0, value)
+}
+
+fn execute_cmpxchg_u8<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let accumulator = read_reg8(registers, Register::AL)?;
+    let dest = read_operand_u8(registers, memory, instruction, 0)?;
+    let source = read_reg8(registers, instruction.op1_register())?;
+    flags.set_sub_result(
+        u64::from(accumulator),
+        u64::from(dest),
+        u64::from(accumulator.wrapping_sub(dest)),
+        8,
+    );
+    if accumulator == dest {
+        write_operand_u8(registers, memory, instruction, 0, source)
+    } else {
+        write_reg8(registers, Register::AL, dest)
+    }
+}
+
+fn execute_cmpxchg_u16<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let accumulator = read_reg16(registers, Register::AX)?;
+    let dest = read_operand_u16(registers, memory, instruction, 0)?;
+    let source = read_reg16(registers, instruction.op1_register())?;
+    flags.set_sub_result(
+        u64::from(accumulator),
+        u64::from(dest),
+        u64::from(accumulator.wrapping_sub(dest)),
+        16,
+    );
+    if accumulator == dest {
+        write_operand_u16(registers, memory, instruction, 0, source)
+    } else {
+        write_reg16(registers, Register::AX, dest)
+    }
+}
+
+fn execute_cmpxchg_u32<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let accumulator = read_reg32(registers, Register::EAX)?;
+    let dest = read_operand_u32(registers, memory, instruction, 0)?;
+    let source = read_reg32(registers, instruction.op1_register())?;
+    flags.set_sub_result(
+        u64::from(accumulator),
+        u64::from(dest),
+        u64::from(accumulator.wrapping_sub(dest)),
+        32,
+    );
+    if accumulator == dest {
+        write_operand_u32(registers, memory, instruction, 0, source)
+    } else {
+        write_reg32(registers, Register::EAX, dest)
+    }
+}
+
+fn execute_cmpxchg_u64<M>(
+    registers: &mut GuestRegisters,
+    flags: &mut GuestFlags,
+    memory: &mut M,
+    instruction: &Instruction,
+) -> Result<(), ExecutionError>
+where
+    M: GuestMemoryOperandAccess,
+{
+    let accumulator = read_reg64(registers, Register::RAX)?;
+    let dest = read_operand_u64(registers, memory, instruction, 0)?;
+    let source = read_reg64(registers, instruction.op1_register())?;
+    flags.set_sub_result(accumulator, dest, accumulator.wrapping_sub(dest), 64);
+    if accumulator == dest {
+        write_operand_u64(registers, memory, instruction, 0, source)
+    } else {
+        write_reg64(registers, Register::RAX, dest)
+    }
 }
 
 fn execute_stos<M>(
@@ -4086,6 +4209,65 @@ mod tests {
         assert_eq!(trap.registers().rcx, 0xff01);
         assert_eq!(memory.read::<1>(0x714818), [0]);
         assert_eq!(trap.site().rip, 0x4691ec);
+    }
+
+    #[test]
+    fn execution_core_executes_locked_cmpxchg_memory_operands() {
+        let success_block = GuestBlock::new(
+            &[
+                0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax,0
+                0xba, 0x10, 0x00, 0x00, 0x00, // mov edx,0x10
+                0xf0, 0x0f, 0xb1, 0x57, 0x04, // lock cmpxchg [rdi+4],edx
+                0x75, 0x07, // jne failure
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+            ],
+            0x469200,
+        );
+        let registers = GuestRegisters {
+            rdi: 0x715000,
+            rip: success_block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x715004, &0_u32.to_le_bytes());
+
+        let success_trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(success_block, registers, &mut memory)
+            .expect("execute successful cmpxchg before syscall");
+
+        assert_eq!(success_trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(u32::from_le_bytes(memory.read(0x715004)), 0x10);
+        assert_eq!(success_trap.site().rip, 0x469216);
+
+        let failure_block = GuestBlock::new(
+            &[
+                0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+                0xba, 0x10, 0x00, 0x00, 0x00, // mov edx,0x10
+                0xf0, 0x0f, 0xb1, 0x57, 0x04, // lock cmpxchg [rdi+4],edx
+                0x75, 0x07, // jne success
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // skipped mov eax,60
+                0x0f, 0x05, // skipped syscall
+                0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax,39
+                0x0f, 0x05, // syscall
+            ],
+            0x469240,
+        );
+        let registers = GuestRegisters {
+            rdi: 0x715100,
+            rip: failure_block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x715104, &5_u32.to_le_bytes());
+
+        let failure_trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(failure_block, registers, &mut memory)
+            .expect("execute failed cmpxchg before syscall");
+
+        assert_eq!(failure_trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(u32::from_le_bytes(memory.read(0x715104)), 5);
+        assert_eq!(failure_trap.site().rip, 0x46925d);
     }
 
     #[test]
