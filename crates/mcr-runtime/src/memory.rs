@@ -692,13 +692,14 @@ impl GuestMemory {
         }
 
         let (allocation_id, allocation_offset) = self.ensure_host_allocation(start, length)?;
+        let offset =
+            usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let len = usize::try_from(length).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        self.zero_allocation_range(allocation_id, allocation_offset, len)?;
         let allocation = self
             .allocations
             .get(&allocation_id)
             .expect("new allocation was inserted");
-        let offset =
-            usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        let len = usize::try_from(length).map_err(|_| GuestMemoryError::RegionTooLarge)?;
         allocation
             .memory
             .protect_range(offset, len, protection.to_host())
@@ -714,6 +715,43 @@ impl GuestMemory {
                 allocation_offset,
             },
         );
+        Ok(())
+    }
+
+    fn zero_allocation_range(
+        &mut self,
+        allocation_id: u64,
+        allocation_offset: u64,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        let offset =
+            usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(GuestMemoryError::RegionTooLarge)?;
+        let ranges = self.allocation_protection_ranges(allocation_id)?;
+        {
+            let allocation = self
+                .allocations
+                .get(&allocation_id)
+                .expect("new mapping references live allocation");
+            allocation
+                .memory
+                .protect(MemoryProtection::ReadWrite)
+                .map_err(GuestMemoryError::Host)?;
+        }
+        {
+            let allocation = self
+                .allocations
+                .get_mut(&allocation_id)
+                .expect("new mapping references live allocation");
+            allocation.memory.as_mut_slice()[offset..end].fill(0);
+        }
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .expect("new mapping references live allocation");
+        apply_allocation_protections(&allocation.memory, &ranges)?;
         Ok(())
     }
 
@@ -1557,6 +1595,60 @@ mod tests {
             .read(addr + GUEST_PAGE_SIZE * 2, &mut bytes[1..])
             .unwrap();
         assert_eq!(bytes, [b'l', b'r']);
+    }
+
+    #[test]
+    fn anonymous_mmap_zero_fills_reused_unmapped_range() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE * 3,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+            ))
+            .unwrap();
+        let middle = addr + GUEST_PAGE_SIZE;
+        memory.write(addr, b"l").unwrap();
+        memory.write(middle, b"stale").unwrap();
+        memory.write(addr + GUEST_PAGE_SIZE * 2, b"r").unwrap();
+        memory
+            .mprotect(MprotectSyscallArgs {
+                addr,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ,
+            })
+            .unwrap();
+        memory
+            .munmap(MunmapSyscallArgs {
+                addr: middle,
+                length: GUEST_PAGE_SIZE,
+            })
+            .unwrap();
+
+        let remapped = memory
+            .mmap(anonymous(
+                middle,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_FIXED,
+            ))
+            .unwrap();
+
+        assert_eq!(remapped, middle);
+        let mut zeroes = [0xff; 5];
+        memory.read(middle, &mut zeroes).unwrap();
+        assert_eq!(zeroes, [0; 5]);
+        assert_eq!(
+            memory.write(addr, b"x"),
+            Err(GuestMemoryError::AccessDenied)
+        );
+        let mut preserved = [0, 0];
+        memory.read(addr, &mut preserved[..1]).unwrap();
+        memory
+            .read(addr + GUEST_PAGE_SIZE * 2, &mut preserved[1..])
+            .unwrap();
+        assert_eq!(preserved, [b'l', b'r']);
     }
 
     #[test]
