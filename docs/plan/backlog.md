@@ -11,6 +11,9 @@
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
 | Full overlay lower/upper layer implementation | Phase 3 | VFS must remain compatible with it, but export semantics belong to builder work. |
 | IOCP event backend | Later optimization | WSAPoll plus runtime readiness queue is simpler for Phase 2 correctness. |
+| General UDP socket semantics | Later compatibility | Phase 2 only needs UDP if it is the chosen implementation detail for DNS. |
+| Edge-triggered epoll and one-shot/exclusive watches | Later compatibility | Phase 2 readiness is level-triggered for CLI/network tool smoke tests. |
+| AF_UNIX compatibility | Later compatibility | TCP client behavior is the Phase 2 networking proof. |
 | Full `fork` without immediate exec | Later compatibility | Common shell and build paths can start with `fork+exec` fast path. |
 | Process-shared futex | Later compatibility | Current model intentionally keeps one host process per container. |
 | Strong sandboxing | Later product line | Current product trust model is trusted development workloads. |

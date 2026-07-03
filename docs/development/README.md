@@ -7,7 +7,7 @@ Development is split into two required runtime stages. Build work starts only af
 | Stage | Goal | Exit criteria |
 |---|---|---|
 | MVP | Run static Linux x86-64 ELF and BusyBox/Alpine commands from a rootfs. | BusyBox smoke suite passes with P0 syscall coverage and deterministic crash diagnostics. |
-| Phase 2 | Run shell commands, common `fork+exec`, networking, and minimal `/proc`/`/dev`. | Alpine shell, curl/git networking, and language runtime smoke tests pass. |
+| Phase 2 | Run shell commands, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc`/`/dev`. | Alpine shell, curl/git networking, and language runtime smoke tests pass under the documented ABI subset. |
 | Phase 3 | Build constrained Dockerfile images with native MCR builder and OCI/Docker output. | `mcr build` produces valid OCI layout and Docker tar for fixed Dockerfile fixtures. |
 | Phase 4 | Adapt stable build contracts to BuildKit worker/executor. | `buildctl` drives the supported Dockerfile subset through the MCR worker. |
 
@@ -24,7 +24,7 @@ crates/
   mcr-sys/       # syscall ABI table, dispatcher, errno
   mcr-vfs/       # VFS, fd table, procfs/devfs
   mcr-task/      # guest processes, tasks, futex, signals
-  mcr-net/       # sockets, DNS, poll/epoll
+  mcr-net/       # TCP sockets, bounded DNS, level-trigger poll/epoll
   mcr-win/       # Windows host adapters
   mcr-testkit/   # fixtures and smoke harness
   mcr-image/     # post-Phase 2 OCI content, image, registry, and exporter contracts
@@ -75,8 +75,9 @@ Required capabilities:
 - process-private futex `WAIT`/`WAKE`;
 - signals skeleton for install, mask, interrupt, and termination behavior;
 - `/proc/self` and `/dev` nodes listed in runtime design;
-- AF_INET/AF_INET6 TCP client sockets, DNS, selected server socket behavior;
-- `poll` and `epoll` compatibility over a shared readiness queue;
+- AF_INET/AF_INET6 TCP client sockets, bounded DNS, and selected loopback server socket behavior only when a smoke requires it;
+- level-trigger `poll` and `epoll` compatibility over a shared readiness queue;
+- per-task guest FS-base TLS through `ARCH_SET_FS` and `ARCH_GET_FS`;
 - smoke tests for shell, curl/git, and language runtimes.
 
 ## Validation Policy
@@ -165,7 +166,8 @@ MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored shell_smoke_contract
 ```
 
 The ignored network tests use the same `MCR_BIN` and materialized-rootfs gate,
-plus public network access. Run them explicitly with:
+plus public network access. They intentionally stay inside the Phase 2
+TCP-client and bounded-DNS subset. Run them explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored network_smoke_contract
@@ -238,6 +240,9 @@ The following are intentionally outside MVP and Phase 2:
 - Docker Engine API facade;
 - overlay lower/upper layer implementation beyond VFS design compatibility;
 - IOCP performance rewrite;
+- general UDP socket semantics outside the DNS path;
+- AF_UNIX compatibility;
+- edge-triggered epoll and one-shot/exclusive epoll watches;
 - full `fork` without exec;
 - process-shared futex;
 - pty/tty completeness;

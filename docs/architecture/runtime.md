@@ -249,7 +249,7 @@ Windows-specific APIs stay in `mcr-win`.
 | Memory | `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, exception handling hooks. |
 | File | `CreateFileW`, `ReadFile`, `WriteFile`, `SetFileInformationByHandle`, `ReplaceFileW`, symlink/hardlink helpers. |
 | Sync | `WaitOnAddress`, `WakeByAddressSingle`, `WakeByAddressAll`, waitable timers. |
-| Network | Winsock, `WSAPoll`, AF_UNIX, later IOCP. |
+| Network | Winsock, `std::net` where useful, `WSAPoll`, later IOCP. |
 | Process control | Host thread creation, Job Objects for cleanup and coarse resource handling. |
 
 Adapters return host-level errors to callers; Linux errno conversion happens above them in owning subsystems.
