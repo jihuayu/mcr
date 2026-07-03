@@ -584,6 +584,7 @@ impl SameIsaExecutionCore {
         let mut registers = registers;
         let mut current_rip = registers.rip;
         let mut flags = GuestFlags::from_registers(&registers);
+        let mut xmm0 = 0_u128;
         for _ in 0..MAX_CONTROL_FLOW_STEPS {
             let decoded = self.decode_block(block_from_rip(block, current_rip)?)?;
             let syscall_site = decoded.syscall_site();
@@ -601,6 +602,7 @@ impl SameIsaExecutionCore {
                     block,
                     &mut registers,
                     &mut flags,
+                    &mut xmm0,
                     memory,
                     instruction.rip,
                     instruction.len,
@@ -641,6 +643,7 @@ fn execute_simple_instruction<M>(
     block: GuestBlock<'_>,
     registers: &mut GuestRegisters,
     flags: &mut GuestFlags,
+    xmm0: &mut u128,
     memory: &mut M,
     rip: u64,
     len: usize,
@@ -1299,6 +1302,37 @@ where
             let result = 0_u8.wrapping_sub(lhs);
             write_operand_u8(registers, memory, &instruction, 0, result)?;
             flags.set_sub_result(0, u64::from(lhs), u64::from(result), 8);
+        }
+        Code::Movq_xmm_rm64
+            if instruction.op0_register() == Register::XMM0
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            *xmm0 = u128::from(read_reg64(registers, instruction.op1_register())?);
+        }
+        Code::Movq_xmm_rm64
+            if instruction.op0_register() == Register::XMM0
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let value = read_memory_u64(memory, rip, effective_address(registers, &instruction)?)?;
+            *xmm0 = u128::from(value);
+        }
+        Code::Punpcklqdq_xmm_xmmm128
+            if instruction.op0_register() == Register::XMM0
+                && instruction.op1_register() == Register::XMM0 =>
+        {
+            let low = *xmm0 & u128::from(u64::MAX);
+            *xmm0 = low | (low << 64);
+        }
+        Code::Movups_xmmm128_xmm
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_register() == Register::XMM0 =>
+        {
+            write_memory_bytes(
+                memory,
+                rip,
+                effective_address(registers, &instruction)?,
+                &xmm0.to_le_bytes(),
+            )?;
         }
         Code::Cmp_rm64_r64 | Code::Cmp_r64_rm64
             if instruction.op0_kind() == OpKind::Register
@@ -3460,6 +3494,38 @@ mod tests {
         assert_eq!(trap.registers().r12, u64::MAX - 7);
         assert_eq!(u32::from_le_bytes(memory.read(0x713c08)), u32::MAX - 2);
         assert_eq!(trap.site().rip, 0x469176);
+    }
+
+    #[test]
+    fn execution_core_tracks_xmm0_for_tls_pair_store() {
+        let block = GuestBlock::new(
+            &[
+                0x66, 0x48, 0x0f, 0x6e, 0xc3, // movq xmm0,rbx
+                0x66, 0x0f, 0x6c, 0xc0, // punpcklqdq xmm0,xmm0
+                0x0f, 0x11, 0x43, 0x10, // movups xmmword ptr [rbx+0x10],xmm0
+                0x0f, 0x05, // syscall
+            ],
+            0x469178,
+        );
+        let registers = GuestRegisters {
+            rbx: 0x714000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x714010, &[0; 16]);
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("track xmm0 through musl TLS pair store");
+
+        assert_eq!(
+            memory.read::<16>(0x714010),
+            [
+                0x00, 0x40, 0x71, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x71, 0x00, 0x00,
+                0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(trap.site().rip, 0x469185);
     }
 
     #[test]
