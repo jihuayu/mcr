@@ -1,7 +1,25 @@
 use std::fmt;
 
+pub const DEFAULT_MXCSR: u32 = 0x1f80;
+pub type HostXmmRegisters = [[u8; 16]; 16];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostFloatingPointState {
+    pub xmm: HostXmmRegisters,
+    pub mxcsr: u32,
+}
+
+impl Default for HostFloatingPointState {
+    fn default() -> Self {
+        Self {
+            xmm: HostXmmRegisters::default(),
+            mxcsr: DEFAULT_MXCSR,
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostCpuRegisters {
     pub rax: u64,
     pub rbx: u64,
@@ -21,6 +39,35 @@ pub struct HostCpuRegisters {
     pub r15: u64,
     pub rip: u64,
     pub rflags: u64,
+    pub xmm: HostXmmRegisters,
+    pub mxcsr: u32,
+}
+
+impl Default for HostCpuRegisters {
+    fn default() -> Self {
+        Self {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            rsp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            rflags: 0x202,
+            xmm: HostFloatingPointState::default().xmm,
+            mxcsr: DEFAULT_MXCSR,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +136,7 @@ mod windows_x86_64 {
         landing_rip: u64,
         registers: *mut HostCpuRegisters,
         host_fs: u64,
+        host_rflags: u64,
         fault_code: u32,
         fault_address: u64,
     }
@@ -200,18 +248,25 @@ mod windows_x86_64 {
         push r13
         push r14
         push r15
-        sub rsp, 200
+        sub rsp, 296
         mov [rsp], rdx
-        movdqu xmmword ptr [rsp + 40], xmm6
-        movdqu xmmword ptr [rsp + 56], xmm7
-        movdqu xmmword ptr [rsp + 72], xmm8
-        movdqu xmmword ptr [rsp + 88], xmm9
-        movdqu xmmword ptr [rsp + 104], xmm10
-        movdqu xmmword ptr [rsp + 120], xmm11
-        movdqu xmmword ptr [rsp + 136], xmm12
-        movdqu xmmword ptr [rsp + 152], xmm13
-        movdqu xmmword ptr [rsp + 168], xmm14
-        movdqu xmmword ptr [rsp + 184], xmm15
+        stmxcsr dword ptr [rsp + 16]
+        movdqu xmmword ptr [rsp + 40], xmm0
+        movdqu xmmword ptr [rsp + 56], xmm1
+        movdqu xmmword ptr [rsp + 72], xmm2
+        movdqu xmmword ptr [rsp + 88], xmm3
+        movdqu xmmword ptr [rsp + 104], xmm4
+        movdqu xmmword ptr [rsp + 120], xmm5
+        movdqu xmmword ptr [rsp + 136], xmm6
+        movdqu xmmword ptr [rsp + 152], xmm7
+        movdqu xmmword ptr [rsp + 168], xmm8
+        movdqu xmmword ptr [rsp + 184], xmm9
+        movdqu xmmword ptr [rsp + 200], xmm10
+        movdqu xmmword ptr [rsp + 216], xmm11
+        movdqu xmmword ptr [rsp + 232], xmm12
+        movdqu xmmword ptr [rsp + 248], xmm13
+        movdqu xmmword ptr [rsp + 264], xmm14
+        movdqu xmmword ptr [rsp + 280], xmm15
         mov [rdx + 0], rsp
         lea rax, [rip + .Lmcr_native_trap_landing]
         mov [rdx + 8], rax
@@ -220,9 +275,42 @@ mod windows_x86_64 {
         mov r12, rdx
         mov r13, r8
 
+        pushfq
+        pop rax
+        mov [r12 + 32], rax
         rdfsbase rax
         mov [r12 + 24], rax
         wrfsbase r13
+
+        ldmxcsr dword ptr [r15 + 400]
+        movdqu xmm0, xmmword ptr [r15 + 144]
+        movdqu xmm1, xmmword ptr [r15 + 160]
+        movdqu xmm2, xmmword ptr [r15 + 176]
+        movdqu xmm3, xmmword ptr [r15 + 192]
+        movdqu xmm4, xmmword ptr [r15 + 208]
+        movdqu xmm5, xmmword ptr [r15 + 224]
+        movdqu xmm6, xmmword ptr [r15 + 240]
+        movdqu xmm7, xmmword ptr [r15 + 256]
+        movdqu xmm8, xmmword ptr [r15 + 272]
+        movdqu xmm9, xmmword ptr [r15 + 288]
+        movdqu xmm10, xmmword ptr [r15 + 304]
+        movdqu xmm11, xmmword ptr [r15 + 320]
+        movdqu xmm12, xmmword ptr [r15 + 336]
+        movdqu xmm13, xmmword ptr [r15 + 352]
+        movdqu xmm14, xmmword ptr [r15 + 368]
+        movdqu xmm15, xmmword ptr [r15 + 384]
+
+        mov rax, [r15 + 136]
+        and rax, 0x0000000000000ed5
+        or rax, 0x202
+        push rax
+        popfq
+
+        mov rax, [r15 + 56]
+        sub rax, 8
+        mov rsp, rax
+        mov rax, [r15 + 128]
+        mov [rsp], rax
 
         mov rax, [r15 + 0]
         mov rbx, [r15 + 8]
@@ -234,32 +322,54 @@ mod windows_x86_64 {
         mov r8, [r15 + 64]
         mov r9, [r15 + 72]
         mov r10, [r15 + 80]
+        mov r11, [r15 + 88]
         mov r12, [r15 + 96]
         mov r13, [r15 + 104]
         mov r14, [r15 + 112]
-        mov rsp, [r15 + 56]
-        push qword ptr [r15 + 136]
-        popfq
-        mov r11, [r15 + 128]
         mov r15, [r15 + 120]
-        jmp r11
+        ret
 
     .Lmcr_native_trap_landing:
         mov r12, [rsp]
+        mov r11, [r12 + 16]
+        stmxcsr dword ptr [r11 + 400]
+        movdqu xmmword ptr [r11 + 144], xmm0
+        movdqu xmmword ptr [r11 + 160], xmm1
+        movdqu xmmword ptr [r11 + 176], xmm2
+        movdqu xmmword ptr [r11 + 192], xmm3
+        movdqu xmmword ptr [r11 + 208], xmm4
+        movdqu xmmword ptr [r11 + 224], xmm5
+        movdqu xmmword ptr [r11 + 240], xmm6
+        movdqu xmmword ptr [r11 + 256], xmm7
+        movdqu xmmword ptr [r11 + 272], xmm8
+        movdqu xmmword ptr [r11 + 288], xmm9
+        movdqu xmmword ptr [r11 + 304], xmm10
+        movdqu xmmword ptr [r11 + 320], xmm11
+        movdqu xmmword ptr [r11 + 336], xmm12
+        movdqu xmmword ptr [r11 + 352], xmm13
+        movdqu xmmword ptr [r11 + 368], xmm14
+        movdqu xmmword ptr [r11 + 384], xmm15
         mov rax, [r12 + 24]
         wrfsbase rax
         mov rsp, [r12 + 0]
-        movdqu xmm6, xmmword ptr [rsp + 40]
-        movdqu xmm7, xmmword ptr [rsp + 56]
-        movdqu xmm8, xmmword ptr [rsp + 72]
-        movdqu xmm9, xmmword ptr [rsp + 88]
-        movdqu xmm10, xmmword ptr [rsp + 104]
-        movdqu xmm11, xmmword ptr [rsp + 120]
-        movdqu xmm12, xmmword ptr [rsp + 136]
-        movdqu xmm13, xmmword ptr [rsp + 152]
-        movdqu xmm14, xmmword ptr [rsp + 168]
-        movdqu xmm15, xmmword ptr [rsp + 184]
-        add rsp, 200
+        ldmxcsr dword ptr [rsp + 16]
+        movdqu xmm0, xmmword ptr [rsp + 40]
+        movdqu xmm1, xmmword ptr [rsp + 56]
+        movdqu xmm2, xmmword ptr [rsp + 72]
+        movdqu xmm3, xmmword ptr [rsp + 88]
+        movdqu xmm4, xmmword ptr [rsp + 104]
+        movdqu xmm5, xmmword ptr [rsp + 120]
+        movdqu xmm6, xmmword ptr [rsp + 136]
+        movdqu xmm7, xmmword ptr [rsp + 152]
+        movdqu xmm8, xmmword ptr [rsp + 168]
+        movdqu xmm9, xmmword ptr [rsp + 184]
+        movdqu xmm10, xmmword ptr [rsp + 200]
+        movdqu xmm11, xmmword ptr [rsp + 216]
+        movdqu xmm12, xmmword ptr [rsp + 232]
+        movdqu xmm13, xmmword ptr [rsp + 248]
+        movdqu xmm14, xmmword ptr [rsp + 264]
+        movdqu xmm15, xmmword ptr [rsp + 280]
+        lea rsp, [rsp + 296]
         pop r15
         pop r14
         pop r13
@@ -290,6 +400,7 @@ mod windows_x86_64 {
             landing_rip: 0,
             registers,
             host_fs: 0,
+            host_rflags: 0x202,
             fault_code: 0,
             fault_address: 0,
         };
@@ -374,6 +485,15 @@ mod windows_x86_64 {
         registers.r15 = context.r15;
         registers.rip = context.rip;
         registers.rflags = u64::from(context.eflags);
+        registers.mxcsr = context.mx_csr;
+        for (target, source) in registers
+            .xmm
+            .iter_mut()
+            .zip(context.xmm_save.xmm_registers.iter())
+        {
+            target[..8].copy_from_slice(&source.low.to_le_bytes());
+            target[8..].copy_from_slice(&source.high.to_le_bytes());
+        }
 
         if record.exception_code == EXCEPTION_BREAKPOINT {
             registers.rip = registers.rip.saturating_sub(1);
@@ -396,6 +516,7 @@ mod windows_x86_64 {
 
         context.rip = state.landing_rip;
         context.rsp = state.landing_rsp;
+        context.eflags = state.host_rflags as u32;
         EXCEPTION_CONTINUE_EXECUTION
     }
 
@@ -424,6 +545,7 @@ mod linux_x86_64 {
         landing_rip: u64,
         registers: *mut HostCpuRegisters,
         host_fs: u64,
+        host_rflags: u64,
         signal: i32,
         fault_address: u64,
     }
@@ -443,16 +565,52 @@ mod linux_x86_64 {
         push r14
         push r15
         push rsi
+        sub rsp, 16
+        mov [rsp], rsi
+        stmxcsr dword ptr [rsp + 8]
         mov [rsi + 0], rsp
         lea rax, [rip + .Lmcr_native_trap_landing]
         mov [rsi + 8], rax
 
         mov r15, rdi
         mov r12, rdx
+        pushfq
+        pop rax
+        mov [rsi + 32], rax
         mov eax, 158
         mov edi, 0x1002
         mov rsi, r12
         syscall
+
+        ldmxcsr dword ptr [r15 + 400]
+        movdqu xmm0, xmmword ptr [r15 + 144]
+        movdqu xmm1, xmmword ptr [r15 + 160]
+        movdqu xmm2, xmmword ptr [r15 + 176]
+        movdqu xmm3, xmmword ptr [r15 + 192]
+        movdqu xmm4, xmmword ptr [r15 + 208]
+        movdqu xmm5, xmmword ptr [r15 + 224]
+        movdqu xmm6, xmmword ptr [r15 + 240]
+        movdqu xmm7, xmmword ptr [r15 + 256]
+        movdqu xmm8, xmmword ptr [r15 + 272]
+        movdqu xmm9, xmmword ptr [r15 + 288]
+        movdqu xmm10, xmmword ptr [r15 + 304]
+        movdqu xmm11, xmmword ptr [r15 + 320]
+        movdqu xmm12, xmmword ptr [r15 + 336]
+        movdqu xmm13, xmmword ptr [r15 + 352]
+        movdqu xmm14, xmmword ptr [r15 + 368]
+        movdqu xmm15, xmmword ptr [r15 + 384]
+
+        mov rax, [r15 + 136]
+        and rax, 0x0000000000000ed5
+        or rax, 0x202
+        push rax
+        popfq
+
+        mov rax, [r15 + 56]
+        sub rax, 8
+        mov rsp, rax
+        mov rax, [r15 + 128]
+        mov [rsp], rax
 
         mov rax, [r15 + 0]
         mov rbx, [r15 + 8]
@@ -464,23 +622,40 @@ mod linux_x86_64 {
         mov r8, [r15 + 64]
         mov r9, [r15 + 72]
         mov r10, [r15 + 80]
+        mov r11, [r15 + 88]
         mov r12, [r15 + 96]
         mov r13, [r15 + 104]
         mov r14, [r15 + 112]
-        mov rsp, [r15 + 56]
-        push qword ptr [r15 + 136]
-        popfq
-        mov r11, [r15 + 128]
         mov r15, [r15 + 120]
-        jmp r11
+        ret
 
     .Lmcr_native_trap_landing:
         mov r12, [rsp]
+        mov r11, [r12 + 16]
+        stmxcsr dword ptr [r11 + 400]
+        movdqu xmmword ptr [r11 + 144], xmm0
+        movdqu xmmword ptr [r11 + 160], xmm1
+        movdqu xmmword ptr [r11 + 176], xmm2
+        movdqu xmmword ptr [r11 + 192], xmm3
+        movdqu xmmword ptr [r11 + 208], xmm4
+        movdqu xmmword ptr [r11 + 224], xmm5
+        movdqu xmmword ptr [r11 + 240], xmm6
+        movdqu xmmword ptr [r11 + 256], xmm7
+        movdqu xmmword ptr [r11 + 272], xmm8
+        movdqu xmmword ptr [r11 + 288], xmm9
+        movdqu xmmword ptr [r11 + 304], xmm10
+        movdqu xmmword ptr [r11 + 320], xmm11
+        movdqu xmmword ptr [r11 + 336], xmm12
+        movdqu xmmword ptr [r11 + 352], xmm13
+        movdqu xmmword ptr [r11 + 368], xmm14
+        movdqu xmmword ptr [r11 + 384], xmm15
         mov rdx, [r12 + 24]
         mov eax, 158
         mov edi, 0x1002
         mov rsi, rdx
         syscall
+        ldmxcsr dword ptr [rsp + 8]
+        lea rsp, [rsp + 16]
         pop rsi
         pop r15
         pop r14
@@ -517,6 +692,7 @@ mod linux_x86_64 {
             landing_rip: 0,
             registers,
             host_fs,
+            host_rflags: 0x202,
             signal: 0,
             fault_address: 0,
         };
@@ -627,6 +803,19 @@ mod linux_x86_64 {
             registers.r15 = gregs[libc::REG_R15 as usize] as u64;
             registers.rip = gregs[libc::REG_RIP as usize] as u64;
             registers.rflags = gregs[libc::REG_EFL as usize] as u64;
+            if !context.uc_mcontext.fpregs.is_null() {
+                registers.mxcsr = (*context.uc_mcontext.fpregs).mxcsr;
+                for (target, source) in registers
+                    .xmm
+                    .iter_mut()
+                    .zip((*context.uc_mcontext.fpregs)._xmm)
+                {
+                    target.copy_from_slice(std::slice::from_raw_parts(
+                        source.element.as_ptr().cast::<u8>(),
+                        16,
+                    ));
+                }
+            }
 
             if signal == libc::SIGTRAP {
                 registers.rip = registers.rip.saturating_sub(1);
@@ -642,6 +831,7 @@ mod linux_x86_64 {
 
             gregs[libc::REG_RIP as usize] = state.landing_rip as libc::greg_t;
             gregs[libc::REG_RSP as usize] = state.landing_rsp as libc::greg_t;
+            gregs[libc::REG_EFL as usize] = state.host_rflags as libc::greg_t;
         }
     }
 }

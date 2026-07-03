@@ -1463,20 +1463,6 @@ impl PipeNode {
         self.inner.state.lock().expect("pipe mutex poisoned")
     }
 
-    fn wait_readable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
-        self.inner
-            .readable
-            .wait(state)
-            .expect("pipe mutex poisoned while waiting for readable state")
-    }
-
-    fn wait_writable<'a>(&self, state: MutexGuard<'a, PipeState>) -> MutexGuard<'a, PipeState> {
-        self.inner
-            .writable
-            .wait(state)
-            .expect("pipe mutex poisoned while waiting for writable state")
-    }
-
     fn notify_readable(&self) {
         self.inner.readable.notify_all();
     }
@@ -3671,10 +3657,7 @@ fn pipe_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
     let pipe = pipe_node(entry.file())?;
     let mut state = pipe.state();
     while state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
-        if entry.flags().nonblock() {
-            return Err(VfsError::WouldBlock);
-        }
-        state = pipe.wait_readable(state);
+        return Err(VfsError::WouldBlock);
     }
     let count = state.read(buffer);
     if count > 0 {
@@ -3690,10 +3673,7 @@ fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
         return Err(VfsError::BrokenPipe);
     }
     while state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
-        if entry.flags().nonblock() {
-            return Err(VfsError::WouldBlock);
-        }
-        state = pipe.wait_writable(state);
+        return Err(VfsError::WouldBlock);
     }
     let count = state.write(buffer)?;
     if count > 0 {

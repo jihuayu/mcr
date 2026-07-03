@@ -23,7 +23,10 @@ pub use files::{
     create_symlink_file, delete_file, rename_file, replace_file,
 };
 pub use memory::{HostMemory, MemoryProtection};
-pub use native_exec::{HostCpuRegisters, NativeExecutionError, execute_x86_64_until_trap};
+pub use native_exec::{
+    DEFAULT_MXCSR, HostCpuRegisters, HostFloatingPointState, HostXmmRegisters,
+    NativeExecutionError, execute_x86_64_until_trap,
+};
 pub use network::{
     AddressFamily, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
     NetworkStack, SocketEvents, SocketKind, SocketPoll, SocketProtocol,

@@ -2404,6 +2404,7 @@ where
             .subsystems_mut()
             .resume_waiting_tasks()
             .map_err(|errno| GuestRunError::WaitResume { errno })?;
+        dispatcher.subsystems_mut().resume_fd_waiters();
         let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
         if runnable_tids.is_empty() {
             return Err(GuestRunError::NoRunnableTasks);
@@ -2557,6 +2558,11 @@ where
         .subsystems_mut()
         .select_memory_for_process(pid)
         .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?;
+    let native_fp = dispatcher
+        .subsystems()
+        .native_fp(tid)
+        .copied()
+        .unwrap_or_default();
     let fs_base = dispatcher
         .subsystems()
         .tasks
@@ -2575,11 +2581,20 @@ where
         if !vma.protection().execute {
             return Err(GuestExecutionError::Memory(GuestMemoryError::AccessDenied));
         }
-        let patches = patch_executable_syscalls(memory)?;
+        let patches = patch_executable_syscalls(memory, fs_base)?;
         let mut native_registers = host_registers_from_gpr(gpr);
+        native_registers.xmm = native_fp.xmm;
+        native_registers.mxcsr = native_fp.mxcsr;
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
         restore_executable_syscalls(memory, patches)?;
         native_result.map_err(native_execution_error)?;
+        dispatcher.subsystems_mut().set_native_fp(
+            tid,
+            mcr_win::HostFloatingPointState {
+                xmm: native_registers.xmm,
+                mxcsr: native_registers.mxcsr,
+            },
+        );
 
         let mut registers = guest_registers_from_host(native_registers);
         let site = mcr_jit::SyscallSite {
@@ -2594,6 +2609,30 @@ where
                 Some(gpr_from_registers(child_registers));
         }
         let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+        if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+            && let Some((fd, write)) =
+                blocking_fd_wait(syscall_registers.rax, syscall_registers.rdi)
+        {
+            dispatcher
+                .subsystems_mut()
+                .tasks
+                .block_task_for_fd(tid, fd, write)
+                .map_err(|_| GuestExecutionError::MissingTask(tid))?;
+            let task = dispatcher
+                .subsystems_mut()
+                .tasks
+                .task_mut(tid)
+                .ok_or(GuestExecutionError::MissingTask(tid))?;
+            let blocked_regs = gpr_from_registers(registers);
+            task.set_regs(blocked_regs);
+            return Ok(GuestExecutionStep::new(
+                tid,
+                before_rip,
+                blocked_regs.rip(),
+                blocked_regs.rax(),
+                task.state(),
+            ));
+        }
         registers.apply_syscall_return(dispatch_result.encoded_rax, site.next_rip);
 
         let task = dispatcher
@@ -2630,7 +2669,11 @@ struct ExecutableSyscallPatch {
 
 fn patch_executable_syscalls(
     memory: &mut GuestMemory,
+    fs_base: u64,
 ) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = fs_base;
+
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
@@ -2642,8 +2685,11 @@ fn patch_executable_syscalls(
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        for (offset, window) in bytes.windows(2).enumerate() {
-            if window == [0x0f, 0x05] {
+        for offset in 0..bytes.len() {
+            if bytes
+                .get(offset..offset.saturating_add(2))
+                .is_some_and(|window| window == [0x0f, 0x05])
+            {
                 let address = start + offset as u64;
                 let old = memory.patch_code(address, &[0xcc, 0x90])?;
                 patches.push(ExecutableSyscallPatch {
@@ -2651,9 +2697,51 @@ fn patch_executable_syscalls(
                     bytes: old,
                 });
             }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(replacement) = fs_relative_patch(&bytes[offset..], fs_base) {
+                let address = start + offset as u64;
+                let _ = memory.patch_code(address, &replacement)?;
+            }
         }
     }
     Ok(patches)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
+    if fs_base == 0
+        || bytes.len() < 9
+        || bytes[0] != 0x64
+        || bytes[1] & 0xf8 != 0x48
+        || !matches!(bytes[2], 0x8b | 0x2b)
+        || bytes[3] & 0xc7 != 0x04
+        || bytes[4] != 0x25
+    {
+        return None;
+    }
+
+    let displacement = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    let absolute = if displacement >= 0 {
+        fs_base.checked_add(displacement as u64)?
+    } else {
+        fs_base.checked_sub(displacement.unsigned_abs() as u64)?
+    };
+    if absolute > i32::MAX as u64 {
+        return None;
+    }
+
+    let absolute = (absolute as u32).to_le_bytes();
+    Some([
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        absolute[0],
+        absolute[1],
+        absolute[2],
+        absolute[3],
+        0x90,
+    ])
 }
 
 fn restore_executable_syscalls(
@@ -2674,6 +2762,24 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
     number == mcr_sys::Syscall::Fork.number().raw()
         || number == mcr_sys::Syscall::Vfork.number().raw()
         || number == mcr_sys::Syscall::Clone.number().raw()
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn blocking_fd_wait(syscall_number: u64, fd: u64) -> Option<(Fd, bool)> {
+    if syscall_number == mcr_sys::Syscall::Read.number().raw()
+        || syscall_number == mcr_sys::Syscall::Readv.number().raw()
+    {
+        Some((fd as Fd, false))
+    } else if syscall_number == mcr_sys::Syscall::Write.number().raw()
+        || syscall_number == mcr_sys::Syscall::Writev.number().raw()
+    {
+        Some((fd as Fd, true))
+    } else {
+        None
+    }
 }
 
 fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
@@ -2777,6 +2883,8 @@ fn host_registers_from_gpr(value: GprState) -> mcr_win::HostCpuRegisters {
         r15: value.r15(),
         rip: value.rip(),
         rflags: value.rflags(),
+        xmm: mcr_win::HostXmmRegisters::default(),
+        mxcsr: mcr_win::DEFAULT_MXCSR,
     }
 }
 
@@ -2818,6 +2926,7 @@ pub struct RuntimeSubsystems {
     futexes: FutexRegistry,
     epolls: EpollRegistry,
     native_execution: bool,
+    native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
     pending_fork_child_regs: Option<GprState>,
 }
 
@@ -2849,6 +2958,7 @@ impl RuntimeSubsystems {
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
             native_execution: false,
+            native_fp: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
@@ -2877,12 +2987,21 @@ impl RuntimeSubsystems {
             futexes: FutexRegistry::default(),
             epolls: EpollRegistry::default(),
             native_execution: false,
+            native_fp: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
     }
 
     pub const fn enable_native_execution(&mut self) {
         self.native_execution = true;
+    }
+
+    fn native_fp(&self, tid: mcr_sys::GuestTid) -> Option<&mcr_win::HostFloatingPointState> {
+        self.native_fp.get(&tid)
+    }
+
+    fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
+        self.native_fp.insert(tid, state);
     }
 
     fn default_vfs() -> VirtualFileSystem {
@@ -3334,6 +3453,33 @@ impl RuntimeSubsystems {
         self.drop_process_fds(pid)
     }
 
+    fn fork_native_fp(&mut self, parent_tid: mcr_sys::GuestTid, child_pid: mcr_sys::GuestPid) {
+        let Some(state) = self.native_fp.get(&parent_tid).copied() else {
+            return;
+        };
+        let child_tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == child_pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for child_tid in child_tids {
+            self.native_fp.insert(child_tid, state);
+        }
+    }
+
+    fn drop_native_fp_for_process(&mut self, pid: mcr_sys::GuestPid) {
+        let tids = self
+            .tasks
+            .tasks()
+            .filter(|task| task.pid() == pid)
+            .map(mcr_task::GuestTask::tid)
+            .collect::<Vec<_>>();
+        for tid in tids {
+            self.native_fp.remove(&tid);
+        }
+    }
+
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         let Some((socket_ids, epoll_ids)) = self.fd_table_for_process(pid).map(|fds| {
             (
@@ -3576,6 +3722,7 @@ impl RuntimeSubsystems {
                 }
             }
             mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup => {
+                self.drop_native_fp_for_process(pid);
                 if let Err(errno) = self.drop_process_resources(pid) {
                     return SyscallOutcome::errno(errno);
                 }
@@ -3600,9 +3747,25 @@ impl RuntimeSubsystems {
         let completed = self.tasks.resume_waiting_tasks();
         for wait in &completed {
             self.write_wait_status(*wait)?;
+            self.drop_native_fp_for_process(wait.waited().pid());
             self.drop_process_resources(wait.waited().pid())?;
         }
         Ok(completed)
+    }
+
+    fn resume_fd_waiters(&mut self) {
+        let selected_pid = self.selected_fds_pid;
+        let selected_fds = self.files.vfs().fds().clone();
+        let process_fds = self.process_fds.clone();
+        self.tasks.resume_fd_waiters(|pid, fd, write| {
+            let fds = if pid == selected_pid {
+                Some(&selected_fds)
+            } else {
+                process_fds.get(&pid)
+            };
+            fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
+                .unwrap_or(true)
+        });
     }
 
     fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
@@ -3671,6 +3834,7 @@ impl RuntimeSubsystems {
                 self.process_memory.insert(child_pid, memory);
                 self.process_fds
                     .insert(child_pid, self.files.vfs().fds().clone());
+                self.fork_native_fp(request.context.tid, child_pid);
                 outcome
             }
             Err(error) => {
@@ -3753,6 +3917,7 @@ impl RuntimeSubsystems {
             }
         }
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
+        self.native_fp.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)
@@ -4357,6 +4522,17 @@ fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
         revents |= LINUX_POLLHUP;
     }
     revents
+}
+
+fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno> {
+    let readiness = fds
+        .poll_readiness(&mcr_vfs::PathTree::new(), fd)
+        .map_err(vfs_errno)?;
+    Ok(if write {
+        readiness.writable || readiness.hang_up || readiness.error
+    } else {
+        readiness.readable || readiness.hang_up || readiness.error
+    })
 }
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
