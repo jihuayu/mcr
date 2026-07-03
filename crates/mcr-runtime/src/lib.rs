@@ -21,7 +21,7 @@ use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentP
 use mcr_jit::{ExecutionError, GuestBlock, GuestRegisters, SameIsaExecutionCore};
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
-    SocketOptionName, SocketSpec,
+    SocketOptionName, SocketProtocol, SocketSpec, SocketType,
 };
 use mcr_sys::{
     Accept4SyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, EventSyscalls,
@@ -867,7 +867,7 @@ where
         self.memory
             .read_bytes(args.buf, &mut buffer)
             .map_err(memory_errno)?;
-        let count = if args.sockaddr != 0 || args.addrlen != 0 {
+        let count = if args.sockaddr != 0 {
             let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
             let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
             self.sockets.send_to(socket_id, &buffer, address)
@@ -891,12 +891,20 @@ where
         validate_socket_message_flags(args.flags, SocketOperation::Recv)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
         let mut buffer = vec![0; len];
-        let count = if args.sockaddr != 0 || args.addrlen != 0 {
+        let datagram = self.socket_uses_datagram_io(socket_id)?;
+        let count = if args.sockaddr != 0 || datagram {
             let (count, address) = self
                 .sockets
                 .recv_from(socket_id, &mut buffer)
                 .map_err(net_errno)?;
-            write_optional_socket_address(&mut self.memory, args.sockaddr, args.addrlen, address)?;
+            if args.sockaddr != 0 {
+                write_optional_socket_address(
+                    &mut self.memory,
+                    args.sockaddr,
+                    args.addrlen,
+                    address,
+                )?;
+            }
             count
         } else {
             self.sockets
@@ -920,7 +928,7 @@ where
                 SocketOperation::SendMsg,
             )));
         }
-        let address = if message.msg_name != 0 || message.msg_namelen != 0 {
+        let address = if message.msg_name != 0 {
             Some(read_socket_address(
                 &self.memory,
                 message.msg_name,
@@ -973,7 +981,8 @@ where
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
 
-        let total = if message.msg_name != 0 || message.msg_namelen != 0 {
+        let datagram = self.socket_uses_datagram_io(socket_id)?;
+        let total = if message.msg_name != 0 || datagram {
             let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
                 let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
                 total.checked_add(len).ok_or(LinuxErrno::EINVAL)
@@ -1131,6 +1140,12 @@ where
     fn socket_id_for_fd(&self, fd: Fd) -> Result<SocketId, LinuxErrno> {
         let raw = self.vfs.socket_id_for_fd(fd).map_err(vfs_errno)?;
         SocketId::new(raw).ok_or(LinuxErrno::EBADF)
+    }
+
+    fn socket_uses_datagram_io(&self, socket_id: SocketId) -> Result<bool, LinuxErrno> {
+        let socket = self.sockets.socket(socket_id).map_err(net_errno)?;
+        Ok(socket.socket_type() == SocketType::Datagram
+            && socket.effective_protocol() == SocketProtocol::Udp)
     }
 }
 
@@ -6085,6 +6100,57 @@ mod tests {
             runtime.memory().read(0x2200, SOCKADDR_IN_LEN),
             ipv4_sockaddr(53)
         );
+    }
+
+    #[test]
+    fn datagram_recvfrom_and_recvmsg_allow_null_peer_address() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"dns!");
+        let mut runtime = RuntimeFileSystem::with_socket_transport(
+            sample_vfs(),
+            TestMemory::default(),
+            transport.handle(),
+        );
+
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_INET),
+                    u64::from(LINUX_SOCK_DGRAM),
+                    u64::from(mcr_sys::LINUX_IPPROTO_UDP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Recvfrom,
+                [3, 0x2100, 8, u64::from(LINUX_MSG_DONTWAIT), 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 4), b"dns!");
+
+        transport.push_incoming(b"more");
+        runtime.memory_mut().write_iovec(0x3000, 0x3100, 4);
+        runtime.memory_mut().write_msghdr(0x4000, 0, 0, 0x3000, 1);
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Recvmsg,
+                [3, 0x4000, u64::from(LINUX_MSG_DONTWAIT), 0, 0, 0],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(runtime.memory().read(0x3100, 4), b"more");
+        assert_eq!(u32_at(runtime.memory(), 0x4000 + 8), 0);
+        assert_eq!(u32_at(runtime.memory(), 0x4000 + 48), 0);
     }
 
     #[test]
