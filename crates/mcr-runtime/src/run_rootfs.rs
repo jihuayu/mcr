@@ -236,13 +236,16 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         transport,
     )?;
 
-    match runtime.run_guest_until_exit() {
+    match runtime.run_guest_until_exit_with_crash_diagnostics() {
         Ok(status) => Ok(RunRootfsOutput::new(
             status,
             runtime.vfs().stdout_snapshot(),
             runtime.vfs().stderr_snapshot(),
         )),
-        Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
+        Err(error)
+            if config.mvp_emulator()
+                && error.source_error().linux_errno() == LinuxErrno::ENOEXEC =>
+        {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
         Err(error) => Err(RunRootfsError::GuestRun(error)),
@@ -1042,7 +1045,9 @@ mod tests {
         .expect_err("synthetic busybox should not fall back to the MVP emulator by default");
 
         match &error {
-            RunRootfsError::GuestRun(error) => assert_eq!(error.linux_errno(), LinuxErrno::ENOEXEC),
+            RunRootfsError::GuestRun(error) => {
+                assert_eq!(error.source_error().linux_errno(), LinuxErrno::ENOEXEC);
+            }
             other => panic!("expected detailed guest runtime error, got {other:?}"),
         }
         assert!(
@@ -1050,6 +1055,47 @@ mod tests {
                 .to_string()
                 .contains("guest block did not terminate at syscall"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn run_rootfs_guest_error_display_includes_runtime_context() {
+        let rootfs = TestRootfs::new("guest-error-diagnostics");
+        rootfs.write_guest_syscall_then_invalid_elf("/bin/app");
+
+        let error = run_rootfs(RunRootfsConfig::new(rootfs.path(), b"/bin/app".to_vec()))
+            .expect_err("invalid guest block should include runtime diagnostics");
+        let display = error.to_string();
+
+        match &error {
+            RunRootfsError::GuestRun(error) => {
+                assert_eq!(error.source_error().linux_errno(), LinuxErrno::ENOEXEC);
+                assert!(matches!(
+                    error.source_error(),
+                    crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
+                        mcr_jit::ExecutionError::MissingSyscall { .. }
+                    ))
+                ));
+            }
+            other => panic!("expected guest run error with diagnostics, got {other:?}"),
+        }
+        assert!(
+            display.contains("guest block did not terminate at syscall"),
+            "{display}"
+        );
+        assert!(
+            display.contains("current task: pid=1 tid=1 rip=0x0000000000401007"),
+            "{display}"
+        );
+        assert!(
+            display.contains("entrypoint: 0x0000000000401000"),
+            "{display}"
+        );
+        assert!(display.contains("last syscall: getpid"), "{display}");
+        assert!(display.contains("nearby VMAs:"), "{display}");
+        assert!(
+            display.contains("0x0000000000401000-0x0000000000402000"),
+            "{display}"
         );
     }
 
@@ -1139,6 +1185,27 @@ mod tests {
                 .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x403000, 0x100, 0x100))
                 .data_at(0x1000, code)
                 .data_at(0x2000, stdout.to_vec())
+                .build();
+            self.write_file(guest_path, &elf);
+        }
+
+        fn write_guest_syscall_then_invalid_elf(&self, guest_path: &str) {
+            let mut code = Vec::new();
+            push_mov_r32_imm32(&mut code, 0, Syscall::Getpid.number().raw() as u32);
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code.extend_from_slice(&[0xc3]); // ret
+
+            let elf = Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    0x1000,
+                    0x1000,
+                ))
+                .program_header(Elf64ProgramHeader::load(PF_R, 0, 0x402000, 0x100, 0x100))
+                .data_at(0x1000, code)
                 .build();
             self.write_file(guest_path, &elf);
         }

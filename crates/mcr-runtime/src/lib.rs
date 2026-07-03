@@ -286,6 +286,7 @@ pub struct RuntimeDiagnostics {
     executable_path: Vec<u8>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
+    entrypoint: u64,
     vmas: Vec<DiagnosticVma>,
     last_syscall: Option<DiagnosticSyscall>,
 }
@@ -293,15 +294,36 @@ pub struct RuntimeDiagnostics {
 impl RuntimeDiagnostics {
     #[must_use]
     pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
-        let process = kernel
-            .process(mcr_task::INITIAL_GUEST_PID)
-            .expect("runtime always starts with an initial process");
+        Self::capture_process(kernel, events, mcr_task::INITIAL_GUEST_PID)
+    }
+
+    #[must_use]
+    pub fn capture_for_task(
+        kernel: &GuestKernel,
+        events: &[SyscallTraceEvent],
+        tid: mcr_sys::GuestTid,
+    ) -> Self {
+        let Some(task) = kernel.task(tid) else {
+            return Self::capture(kernel, events);
+        };
+        Self::capture_process(kernel, events, task.pid())
+    }
+
+    fn capture_process(
+        kernel: &GuestKernel,
+        events: &[SyscallTraceEvent],
+        pid: mcr_sys::GuestPid,
+    ) -> Self {
+        let Some(process) = kernel.process(pid) else {
+            return Self::default();
+        };
         let image = process.image();
 
         Self {
             executable_path: image.executable().path().to_vec(),
             argv: image.argv().to_vec(),
             envp: image.envp().to_vec(),
+            entrypoint: image.memory().entrypoint(),
             vmas: image
                 .memory()
                 .vmas()
@@ -328,6 +350,11 @@ impl RuntimeDiagnostics {
     }
 
     #[must_use]
+    pub const fn entrypoint(&self) -> u64 {
+        self.entrypoint
+    }
+
+    #[must_use]
     pub fn vmas(&self) -> &[DiagnosticVma] {
         &self.vmas
     }
@@ -335,6 +362,17 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
+    }
+}
+
+impl fmt::Display for RuntimeDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "executable `{}`, entrypoint 0x{:016x}",
+            diagnostic_bytes_lossy(&self.executable_path),
+            self.entrypoint
+        )
     }
 }
 
@@ -375,6 +413,21 @@ impl DiagnosticVma {
     #[must_use]
     pub const fn kind(&self) -> &DiagnosticVmaKind {
         &self.kind
+    }
+
+    #[must_use]
+    pub const fn contains(&self, address: u64) -> bool {
+        self.start <= address && address < self.end
+    }
+}
+
+impl fmt::Display for DiagnosticVma {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "0x{:016x}-0x{:016x} {} {}",
+            self.start, self.end, self.permissions, self.kind
+        )
     }
 }
 
@@ -420,6 +473,14 @@ impl DiagnosticPermissions {
     }
 }
 
+impl fmt::Display for DiagnosticPermissions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(if self.read { "r" } else { "-" })?;
+        formatter.write_str(if self.write { "w" } else { "-" })?;
+        formatter.write_str(if self.execute { "x" } else { "-" })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiagnosticVmaKind {
     ElfLoad {
@@ -461,6 +522,32 @@ impl DiagnosticVmaKind {
                 file_size: *file_size,
             },
             ElfGuestVmaKind::Stack => Self::Stack,
+        }
+    }
+}
+
+impl fmt::Display for DiagnosticVmaKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ElfLoad {
+                program_header_index,
+                file_offset,
+                file_size,
+            } => write!(
+                formatter,
+                "elf phdr #{program_header_index} file 0x{file_offset:x}+0x{file_size:x}"
+            ),
+            Self::InterpreterLoad {
+                path,
+                program_header_index,
+                file_offset,
+                file_size,
+            } => write!(
+                formatter,
+                "interpreter `{}` phdr #{program_header_index} file 0x{file_offset:x}+0x{file_size:x}",
+                diagnostic_bytes_lossy(path)
+            ),
+            Self::Stack => formatter.write_str("stack"),
         }
     }
 }
@@ -522,6 +609,178 @@ impl DiagnosticSyscall {
     }
 }
 
+impl fmt::Display for DiagnosticSyscall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}({}) args=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+            self.name,
+            self.number,
+            self.args[0],
+            self.args[1],
+            self.args[2],
+            self.args[3],
+            self.args[4],
+            self.args[5]
+        )?;
+        if let Some(result) = self.result {
+            write!(formatter, " -> {result:?}")?;
+        }
+        write!(formatter, " at rip=0x{:016x}", self.rip)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticTask {
+    pid: mcr_sys::GuestPid,
+    tid: mcr_sys::GuestTid,
+    rip: u64,
+    rsp: u64,
+    rax: u64,
+    state: TaskState,
+}
+
+impl DiagnosticTask {
+    #[must_use]
+    pub fn from_guest_task(task: &mcr_task::GuestTask) -> Self {
+        let regs = task.regs();
+        Self {
+            pid: task.pid(),
+            tid: task.tid(),
+            rip: regs.rip(),
+            rsp: regs.rsp(),
+            rax: regs.rax(),
+            state: task.state(),
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> mcr_sys::GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn tid(&self) -> mcr_sys::GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    #[must_use]
+    pub const fn rsp(&self) -> u64 {
+        self.rsp
+    }
+
+    #[must_use]
+    pub const fn rax(&self) -> u64 {
+        self.rax
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> TaskState {
+        self.state
+    }
+}
+
+impl fmt::Display for DiagnosticTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "pid={} tid={} rip=0x{:016x} rsp=0x{:016x} rax=0x{:016x} state={:?}",
+            self.pid, self.tid, self.rip, self.rsp, self.rax, self.state
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeCrashDiagnostics {
+    current_task: Option<DiagnosticTask>,
+    diagnostics: RuntimeDiagnostics,
+}
+
+impl RuntimeCrashDiagnostics {
+    #[must_use]
+    pub fn capture(
+        kernel: &GuestKernel,
+        events: &[SyscallTraceEvent],
+        current_tid: Option<mcr_sys::GuestTid>,
+    ) -> Self {
+        Self {
+            current_task: current_tid
+                .and_then(|tid| kernel.task(tid))
+                .map(DiagnosticTask::from_guest_task),
+            diagnostics: current_tid.map_or_else(
+                || RuntimeDiagnostics::capture(kernel, events),
+                |tid| RuntimeDiagnostics::capture_for_task(kernel, events, tid),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn current_task(&self) -> Option<&DiagnosticTask> {
+        self.current_task.as_ref()
+    }
+
+    #[must_use]
+    pub const fn runtime(&self) -> &RuntimeDiagnostics {
+        &self.diagnostics
+    }
+
+    #[must_use]
+    pub fn nearby_vmas(&self, rip: u64, limit: usize) -> Vec<&DiagnosticVma> {
+        let mut vmas = self.diagnostics.vmas().iter().collect::<Vec<_>>();
+        vmas.sort_by_key(|vma| (vma_distance_to(rip, vma), vma.start()));
+        vmas.truncate(limit);
+        vmas.sort_by_key(|vma| vma.start());
+        vmas
+    }
+}
+
+impl fmt::Display for RuntimeCrashDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "runtime context:")?;
+        if let Some(task) = self.current_task() {
+            writeln!(formatter, "  current task: {task}")?;
+        } else {
+            writeln!(formatter, "  current task: unavailable")?;
+        }
+        writeln!(
+            formatter,
+            "  entrypoint: 0x{:016x}",
+            self.runtime().entrypoint()
+        )?;
+        match self.runtime().last_syscall() {
+            Some(syscall) => writeln!(formatter, "  last syscall: {syscall}")?,
+            None => writeln!(formatter, "  last syscall: none recorded")?,
+        }
+        if let Some(task) = self.current_task() {
+            writeln!(formatter, "  nearby VMAs:")?;
+            for vma in self.nearby_vmas(task.rip(), 4) {
+                let marker = if vma.contains(task.rip()) { "*" } else { " " };
+                writeln!(formatter, "    {marker} {vma}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn vma_distance_to(rip: u64, vma: &DiagnosticVma) -> u64 {
+    if rip < vma.start() {
+        vma.start() - rip
+    } else if rip >= vma.end() {
+        rip.saturating_sub(vma.end()).saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn diagnostic_bytes_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrashReport {
     reason: String,
@@ -576,6 +835,18 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
         registers: GuestRegisters,
     ) -> CrashReport {
         CrashReport::new(reason, registers, self.diagnostics())
+    }
+
+    #[must_use]
+    pub fn crash_diagnostics(
+        &self,
+        current_tid: Option<mcr_sys::GuestTid>,
+    ) -> RuntimeCrashDiagnostics {
+        RuntimeCrashDiagnostics::capture(self.kernel(), self.tracer().events(), current_tid)
+    }
+
+    pub fn run_guest_until_exit_with_crash_diagnostics(&mut self) -> Result<i32, GuestRunError> {
+        run_guest_until_exit_with_crash_diagnostics(&mut self.dispatcher)
     }
 }
 
@@ -2141,6 +2412,10 @@ pub enum GuestRunError {
         errno: LinuxErrno,
     },
     GuestExecution(GuestExecutionError),
+    RuntimeContext {
+        source: Box<GuestRunError>,
+        diagnostics: Box<RuntimeCrashDiagnostics>,
+    },
 }
 
 impl GuestRunError {
@@ -2153,6 +2428,24 @@ impl GuestRunError {
             | Self::NoRunnableTasks => LinuxErrno::ESRCH,
             Self::WaitResume { errno } => *errno,
             Self::GuestExecution(error) => error.linux_errno(),
+            Self::RuntimeContext { source, .. } => source.linux_errno(),
+        }
+    }
+
+    #[must_use]
+    pub fn source_error(&self) -> &GuestRunError {
+        let mut error = self;
+        while let Self::RuntimeContext { source, .. } = error {
+            error = source;
+        }
+        error
+    }
+
+    #[must_use]
+    pub fn runtime_context(&self) -> Option<&RuntimeCrashDiagnostics> {
+        match self {
+            Self::RuntimeContext { diagnostics, .. } => Some(diagnostics.as_ref()),
+            _ => None,
         }
     }
 }
@@ -2173,11 +2466,25 @@ impl fmt::Display for GuestRunError {
                 write!(formatter, "failed to resume waiting guest task: {errno}")
             }
             Self::GuestExecution(error) => error.fmt(formatter),
+            Self::RuntimeContext {
+                source,
+                diagnostics,
+            } => {
+                writeln!(formatter, "{source}")?;
+                write!(formatter, "{diagnostics}")
+            }
         }
     }
 }
 
-impl std::error::Error for GuestRunError {}
+impl std::error::Error for GuestRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RuntimeContext { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl GuestExecutionError {
     #[must_use]
@@ -2232,6 +2539,67 @@ where
                 break;
             }
         }
+    }
+}
+
+fn run_guest_until_exit_with_crash_diagnostics(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, RuntimeDiagnosticsTracer>,
+) -> Result<i32, GuestRunError> {
+    loop {
+        if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)
+            .map_err(|error| guest_run_crash(dispatcher, None, error))?
+        {
+            return Ok(status);
+        }
+        dispatcher
+            .subsystems_mut()
+            .resume_waiting_tasks()
+            .map_err(|errno| GuestRunError::WaitResume { errno })
+            .map_err(|error| guest_run_crash(dispatcher, None, error))?;
+        let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
+        if runnable_tids.is_empty() {
+            return Err(guest_run_crash(
+                dispatcher,
+                None,
+                GuestRunError::NoRunnableTasks,
+            ));
+        }
+        for tid in runnable_tids {
+            if !matches!(
+                dispatcher
+                    .subsystems()
+                    .tasks
+                    .task(tid)
+                    .map(mcr_task::GuestTask::state),
+                Some(TaskState::Runnable)
+            ) {
+                continue;
+            }
+            dispatch_guest_task_with_dispatcher(dispatcher, tid)
+                .map_err(GuestRunError::from)
+                .map_err(|error| guest_run_crash(dispatcher, Some(tid), error))?;
+            if initial_process_exit_status(&dispatcher.subsystems().tasks)
+                .map_err(|error| guest_run_crash(dispatcher, Some(tid), error))?
+                .is_some()
+            {
+                break;
+            }
+        }
+    }
+}
+
+fn guest_run_crash(
+    dispatcher: &SyscallDispatcher<RuntimeSubsystems, RuntimeDiagnosticsTracer>,
+    current_tid: Option<mcr_sys::GuestTid>,
+    error: GuestRunError,
+) -> GuestRunError {
+    GuestRunError::RuntimeContext {
+        source: Box::new(error),
+        diagnostics: Box::new(RuntimeCrashDiagnostics::capture(
+            &dispatcher.subsystems().tasks,
+            dispatcher.tracer().events(),
+            current_tid,
+        )),
     }
 }
 
@@ -7418,6 +7786,66 @@ mod tests {
                 ExecutionError::MissingSyscall { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn guest_run_crash_display_preserves_source_and_runtime_context() {
+        let mut runtime = RuntimeWithTracer::with_diagnostics(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x0f, 0x05, // syscall
+                0xc3, // ret
+            ],
+        ))
+        .unwrap();
+        let rsp = runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .regs()
+            .rsp();
+        runtime
+            .kernel_mut()
+            .task_mut(INITIAL_GUEST_TID)
+            .unwrap()
+            .set_regs(GprState::with_syscall_registers(
+                0x401000,
+                rsp,
+                Syscall::Getpid.number().raw(),
+                [0; 6],
+            ));
+
+        let error = runtime
+            .run_guest_until_exit_with_crash_diagnostics()
+            .expect_err("guest run should stop on a block without syscall");
+        let display = error.to_string();
+
+        assert!(matches!(
+            error.source_error(),
+            GuestRunError::GuestExecution(GuestExecutionError::Execution(
+                ExecutionError::MissingSyscall { .. }
+            ))
+        ));
+        let diagnostics = error.runtime_context().unwrap();
+        assert_eq!(diagnostics.current_task().unwrap().rip(), 0x401002);
+        assert_eq!(
+            diagnostics.runtime().last_syscall().unwrap().name(),
+            "getpid"
+        );
+        assert!(
+            display.contains("guest block did not terminate at syscall"),
+            "{display}"
+        );
+        assert!(
+            display.contains("current task: pid=1 tid=1 rip=0x0000000000401002"),
+            "{display}"
+        );
+        assert!(
+            display.contains("entrypoint: 0x0000000000401000"),
+            "{display}"
+        );
+        assert!(display.contains("last syscall: getpid"), "{display}");
     }
 
     #[test]
