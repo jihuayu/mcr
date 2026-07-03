@@ -979,12 +979,56 @@ where
             write_reg64(registers, instruction.op0_register(), result)?;
             flags.set_sub_result(lhs, rhs, result, 64);
         }
+        Code::Sub_rm64_r64
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u64(memory, rip, address)?;
+            let rhs = read_reg64(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_sub(rhs);
+            write_memory_u64(memory, rip, address, result)?;
+            flags.set_sub_result(lhs, rhs, result, 64);
+        }
+        Code::Sub_r64_rm64
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_reg64(registers, instruction.op0_register())?;
+            let rhs = read_memory_u64(memory, rip, address)?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg64(registers, instruction.op0_register(), result)?;
+            flags.set_sub_result(lhs, rhs, result, 64);
+        }
         Code::Sub_rm32_r32 | Code::Sub_r32_rm32
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
         {
             let lhs = read_reg32(registers, instruction.op0_register())?;
             let rhs = read_reg32(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_sub(rhs);
+            write_reg32(registers, instruction.op0_register(), result)?;
+            flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
+        }
+        Code::Sub_rm32_r32
+            if instruction.op0_kind() == OpKind::Memory
+                && instruction.op1_kind() == OpKind::Register =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_memory_u32(memory, rip, address)?;
+            let rhs = read_reg32(registers, instruction.op1_register())?;
+            let result = lhs.wrapping_sub(rhs);
+            write_memory_u32(memory, rip, address, result)?;
+            flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
+        }
+        Code::Sub_r32_rm32
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let address = effective_address(registers, &instruction)?;
+            let lhs = read_reg32(registers, instruction.op0_register())?;
+            let rhs = read_memory_u32(memory, rip, address)?;
             let result = lhs.wrapping_sub(rhs);
             write_reg32(registers, instruction.op0_register(), result)?;
             flags.set_sub_result(u64::from(lhs), u64::from(rhs), u64::from(result), 32);
@@ -3332,6 +3376,39 @@ mod tests {
         assert_eq!(trap.registers().rdi, 12);
         assert_eq!(trap.registers().rcx, 12);
         assert_eq!(trap.site().rip, 0x469147);
+    }
+
+    #[test]
+    fn execution_core_subtracts_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x2b, 0x46, 0x04, // sub eax,dword ptr [rsi+4]
+                0x48, 0x2b, 0x4e, 0x08, // sub rcx,qword ptr [rsi+8]
+                0x29, 0x56, 0x10, // sub dword ptr [rsi+0x10],edx
+                0x0f, 0x05, // syscall
+            ],
+            0x469160,
+        );
+        let registers = GuestRegisters {
+            rax: 12,
+            rcx: 20,
+            rdx: 3,
+            rsi: 0x713800,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(0x713804, &5_u32.to_le_bytes());
+        memory.write(0x713808, &6_u64.to_le_bytes());
+        memory.write(0x713810, &9_u32.to_le_bytes());
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute sub memory operands before syscall");
+
+        assert_eq!(trap.registers().rax, 7);
+        assert_eq!(trap.registers().rcx, 14);
+        assert_eq!(u32::from_le_bytes(memory.read(0x713810)), 6);
+        assert_eq!(trap.site().rip, 0x46916a);
     }
 
     #[test]
