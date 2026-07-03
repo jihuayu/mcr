@@ -943,6 +943,20 @@ impl GuestSocketTable {
         Ok(())
     }
 
+    pub fn local_address(&mut self, id: SocketId) -> Result<Option<SocketAddress>, SocketError> {
+        if matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+            let _ = self.finish_nonblocking_connect(id);
+        }
+        Ok(self.socket(id)?.state().local_address())
+    }
+
+    pub fn peer_address(&mut self, id: SocketId) -> Result<Option<SocketAddress>, SocketError> {
+        if matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+            let _ = self.finish_nonblocking_connect(id);
+        }
+        Ok(self.socket(id)?.state().peer_address())
+    }
+
     pub fn bind(&mut self, id: SocketId, address: SocketAddress) -> Result<(), SocketError> {
         let socket = self.socket(id)?;
         validate_address_domain(socket.domain, address)?;
@@ -2594,6 +2608,49 @@ mod tests {
                 .get_option(stream, SocketOptionName::SocketError)
                 .expect("SO_ERROR"),
             0
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected {
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer,
+            }
+        );
+    }
+
+    #[test]
+    fn nonblocking_connect_completes_before_local_address_query() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_connect_error(HostIoError::new(
+                    LinuxErrno::OperationWouldBlock,
+                    "connect would block",
+                ))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("connect should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(
+            table.local_address(stream).expect("local address"),
+            Some(SocketAddress::inet([0, 0, 0, 0], 0))
         );
         assert_eq!(
             table.socket(stream).expect("socket").state(),

@@ -1162,10 +1162,13 @@ where
     fn sys_getsockaddr(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let args = SockaddrSyscallArgs::new(arg_i32(request, 0), arg(request, 1), 0);
         let socket_id = self.socket_id_for_fd(args.fd)?;
-        let socket = self.sockets.socket(socket_id).map_err(net_errno)?;
         let address = match request.syscall {
-            mcr_sys::Syscall::Getsockname => socket.state().local_address(),
-            mcr_sys::Syscall::Getpeername => socket.state().peer_address(),
+            mcr_sys::Syscall::Getsockname => {
+                self.sockets.local_address(socket_id).map_err(net_errno)?
+            }
+            mcr_sys::Syscall::Getpeername => {
+                self.sockets.peer_address(socket_id).map_err(net_errno)?
+            }
             _ => unreachable!(),
         }
         .ok_or(LinuxErrno::ENOTCONN)?;
@@ -7203,6 +7206,69 @@ mod tests {
     }
 
     #[test]
+    fn runtime_getsockname_completes_nonblocking_connect() {
+        let transport = runtime_socket_transport();
+        transport.set_connect_would_block_once();
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402300, &(SOCKADDR_IN_LEN as u32).to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINPROGRESS)
+        );
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Getsockname,
+                    [3, 0x402200, 0x402300, 0, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let mut address = [0; SOCKADDR_IN_LEN];
+        runtime.memory().read(0x402200, &mut address).unwrap();
+        assert_eq!(address, ipv4_sockaddr_for([0, 0, 0, 0], 0)[..]);
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402300),
+            SOCKADDR_IN_LEN as u32
+        );
+    }
+
+    #[test]
     fn ppoll_reads_timespec_and_rejects_signal_masks() {
         let mut runtime =
             Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
@@ -9644,10 +9710,14 @@ mod tests {
     }
 
     fn ipv4_sockaddr(port: u16) -> Vec<u8> {
+        ipv4_sockaddr_for([127, 0, 0, 1], port)
+    }
+
+    fn ipv4_sockaddr_for(address: [u8; 4], port: u16) -> Vec<u8> {
         let mut bytes = vec![0; SOCKADDR_IN_LEN];
         bytes[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_le_bytes());
         bytes[2..4].copy_from_slice(&port.to_be_bytes());
-        bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        bytes[4..8].copy_from_slice(&address);
         bytes
     }
 
