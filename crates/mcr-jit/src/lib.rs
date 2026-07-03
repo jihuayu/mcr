@@ -879,6 +879,14 @@ where
             let value = effective_address(registers, &instruction)?;
             write_reg64(registers, instruction.op0_register(), value)?;
         }
+        Code::Lea_r32_m if instruction.op1_kind() == OpKind::Memory => {
+            let value = effective_address(registers, &instruction)? as u32;
+            write_reg32(registers, instruction.op0_register(), value)?;
+        }
+        Code::Lea_r16_m if instruction.op1_kind() == OpKind::Memory => {
+            let value = effective_address(registers, &instruction)? as u16;
+            write_reg16(registers, instruction.op0_register(), value)?;
+        }
         Code::Add_rm64_r64 | Code::Add_r64_rm64
             if instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Register =>
@@ -3075,6 +3083,34 @@ mod tests {
         );
         assert_eq!(registers.rax, 7);
         assert_eq!(registers.rip, 0x460037);
+    }
+
+    #[test]
+    fn execution_core_resolves_32_bit_lea_addresses() {
+        let block = GuestBlock::new(
+            &[
+                0x44, 0x8d, 0x34, 0x02, // lea r14d,[rdx+rax]
+                0x66, 0x8d, 0x34, 0x02, // lea si,[rdx+rax]
+                0x0f, 0x05, // syscall
+            ],
+            0x460040,
+        );
+        let registers = GuestRegisters {
+            rax: 0xffff_ffff_0000_0003,
+            rdx: 0x1_0000_0004,
+            r14: 0xffff_ffff_ffff_ffff,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::default();
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute 32-bit lea before syscall");
+
+        assert_eq!(trap.registers().r14, 7);
+        assert_eq!(trap.registers().rsi, 7);
+        assert_eq!(trap.site().rip, 0x460048);
     }
 
     #[test]
