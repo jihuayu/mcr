@@ -41,6 +41,7 @@ pub enum Syscall {
     Close,
     Stat,
     Fstat,
+    Lstat,
     Poll,
     Lseek,
     Mmap,
@@ -98,7 +99,13 @@ pub enum Syscall {
     Getdents,
     Getcwd,
     Chdir,
+    Mkdir,
+    Rmdir,
+    Link,
+    Unlink,
+    Rename,
     Readlink,
+    Symlink,
     Umask,
     ArchPrctl,
     Gettid,
@@ -136,6 +143,7 @@ impl Syscall {
     pub const CLOSE: SyscallNumber = SyscallNumber::new(3);
     pub const STAT: SyscallNumber = SyscallNumber::new(4);
     pub const FSTAT: SyscallNumber = SyscallNumber::new(5);
+    pub const LSTAT: SyscallNumber = SyscallNumber::new(6);
     pub const POLL: SyscallNumber = SyscallNumber::new(7);
     pub const LSEEK: SyscallNumber = SyscallNumber::new(8);
     pub const MMAP: SyscallNumber = SyscallNumber::new(9);
@@ -193,7 +201,13 @@ impl Syscall {
     pub const GETDENTS: SyscallNumber = SyscallNumber::new(78);
     pub const GETCWD: SyscallNumber = SyscallNumber::new(79);
     pub const CHDIR: SyscallNumber = SyscallNumber::new(80);
+    pub const MKDIR: SyscallNumber = SyscallNumber::new(83);
+    pub const RMDIR: SyscallNumber = SyscallNumber::new(84);
+    pub const RENAME: SyscallNumber = SyscallNumber::new(82);
     pub const READLINK: SyscallNumber = SyscallNumber::new(89);
+    pub const SYMLINK: SyscallNumber = SyscallNumber::new(88);
+    pub const LINK: SyscallNumber = SyscallNumber::new(86);
+    pub const UNLINK: SyscallNumber = SyscallNumber::new(87);
     pub const UMASK: SyscallNumber = SyscallNumber::new(95);
     pub const ARCH_PRCTL: SyscallNumber = SyscallNumber::new(158);
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
@@ -231,6 +245,7 @@ impl Syscall {
             3 => Self::Close,
             4 => Self::Stat,
             5 => Self::Fstat,
+            6 => Self::Lstat,
             7 => Self::Poll,
             8 => Self::Lseek,
             9 => Self::Mmap,
@@ -276,6 +291,12 @@ impl Syscall {
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
+            82 => Self::Rename,
+            83 => Self::Mkdir,
+            84 => Self::Rmdir,
+            86 => Self::Link,
+            87 => Self::Unlink,
+            88 => Self::Symlink,
             89 => Self::Readlink,
             95 => Self::Umask,
             102 => Self::Getuid,
@@ -329,6 +350,7 @@ impl Syscall {
             Self::Close => Self::CLOSE,
             Self::Stat => Self::STAT,
             Self::Fstat => Self::FSTAT,
+            Self::Lstat => Self::LSTAT,
             Self::Poll => Self::POLL,
             Self::Lseek => Self::LSEEK,
             Self::Mmap => Self::MMAP,
@@ -386,7 +408,13 @@ impl Syscall {
             Self::Getdents => Self::GETDENTS,
             Self::Getcwd => Self::GETCWD,
             Self::Chdir => Self::CHDIR,
+            Self::Mkdir => Self::MKDIR,
+            Self::Rmdir => Self::RMDIR,
+            Self::Link => Self::LINK,
+            Self::Unlink => Self::UNLINK,
+            Self::Rename => Self::RENAME,
             Self::Readlink => Self::READLINK,
+            Self::Symlink => Self::SYMLINK,
             Self::Umask => Self::UMASK,
             Self::ArchPrctl => Self::ARCH_PRCTL,
             Self::Gettid => Self::GETTID,
@@ -427,6 +455,7 @@ impl Syscall {
             Self::Close => "close",
             Self::Stat => "stat",
             Self::Fstat => "fstat",
+            Self::Lstat => "lstat",
             Self::Poll => "poll",
             Self::Lseek => "lseek",
             Self::Mmap => "mmap",
@@ -484,7 +513,13 @@ impl Syscall {
             Self::Getdents => "getdents",
             Self::Getcwd => "getcwd",
             Self::Chdir => "chdir",
+            Self::Mkdir => "mkdir",
+            Self::Rmdir => "rmdir",
+            Self::Link => "link",
+            Self::Unlink => "unlink",
+            Self::Rename => "rename",
             Self::Readlink => "readlink",
+            Self::Symlink => "symlink",
             Self::Umask => "umask",
             Self::ArchPrctl => "arch_prctl",
             Self::Gettid => "gettid",

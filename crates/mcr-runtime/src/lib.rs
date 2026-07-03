@@ -652,6 +652,7 @@ where
             mcr_sys::Syscall::Lseek => self.sys_lseek(request),
             mcr_sys::Syscall::Stat => self.sys_stat(request),
             mcr_sys::Syscall::Fstat => self.sys_fstat(request),
+            mcr_sys::Syscall::Lstat => self.sys_lstat(request),
             mcr_sys::Syscall::Newfstatat => self.sys_newfstatat(request),
             mcr_sys::Syscall::Statx => self.sys_statx(request),
             mcr_sys::Syscall::Access => self.sys_access(request),
@@ -665,10 +666,16 @@ where
             mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
             mcr_sys::Syscall::Fcntl => self.sys_fcntl(request),
             mcr_sys::Syscall::Ioctl => self.sys_ioctl(request),
+            mcr_sys::Syscall::Mkdir => self.sys_mkdir(request),
             mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
+            mcr_sys::Syscall::Rmdir => self.sys_rmdir(request),
+            mcr_sys::Syscall::Unlink => self.sys_unlink(request),
             mcr_sys::Syscall::Unlinkat => self.sys_unlinkat(request),
+            mcr_sys::Syscall::Rename => self.sys_rename(request),
             mcr_sys::Syscall::Renameat2 => self.sys_renameat2(request),
+            mcr_sys::Syscall::Symlink => self.sys_symlink(request),
             mcr_sys::Syscall::Symlinkat => self.sys_symlinkat(request),
+            mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
@@ -1269,6 +1276,16 @@ where
         Ok(0)
     }
 
+    fn sys_lstat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        let attr = self
+            .vfs
+            .newfstatat(mcr_vfs::AT_FDCWD, &path, mcr_vfs::AT_SYMLINK_NOFOLLOW)
+            .map_err(vfs_errno)?;
+        self.write_stat(arg(request, 1), attr)?;
+        Ok(0)
+    }
+
     fn sys_newfstatat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 1))?;
         let attr = self
@@ -1409,6 +1426,14 @@ where
         Ok(0)
     }
 
+    fn sys_mkdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .mkdirat(mcr_vfs::AT_FDCWD, &path, arg_u32(request, 1))
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_unlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 1))?;
         let flags = arg_u32(request, 2);
@@ -1417,6 +1442,31 @@ where
         }
         self.vfs
             .unlinkat(arg_i32(request, 0), &path, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rmdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, AT_REMOVEDIR)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_unlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let path = self.read_path(arg(request, 0))?;
+        self.vfs
+            .unlinkat(mcr_vfs::AT_FDCWD, &path, 0)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_rename(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .renameat2(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
             .map_err(vfs_errno)?;
         Ok(0)
     }
@@ -1445,6 +1495,15 @@ where
         Ok(0)
     }
 
+    fn sys_symlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let target = self.read_path(arg(request, 0))?;
+        let linkpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .symlinkat(&target, mcr_vfs::AT_FDCWD, &linkpath)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
     fn sys_linkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let oldpath = self.read_path(arg(request, 1))?;
         let newpath = self.read_path(arg(request, 3))?;
@@ -1460,6 +1519,15 @@ where
                 &newpath,
                 flags,
             )
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_link(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let oldpath = self.read_path(arg(request, 0))?;
+        let newpath = self.read_path(arg(request, 1))?;
+        self.vfs
+            .linkat(mcr_vfs::AT_FDCWD, &oldpath, mcr_vfs::AT_FDCWD, &newpath, 0)
             .map_err(vfs_errno)?;
         Ok(0)
     }
