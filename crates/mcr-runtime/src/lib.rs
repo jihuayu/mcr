@@ -7932,6 +7932,10 @@ mod tests {
             Ok(())
         }
 
+        fn take_error(&mut self) -> Result<Option<mcr_net::HostIoError>, mcr_net::HostIoError> {
+            Ok(None)
+        }
+
         fn local_addr(&self) -> Result<SocketAddress, mcr_net::HostIoError> {
             let state = self.state.borrow();
             Ok(state.bound.unwrap_or_else(|| {

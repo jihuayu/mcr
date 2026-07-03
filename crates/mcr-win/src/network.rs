@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::error::{HostError, HostOperation, HostResult};
+use crate::error::{HostError, HostErrorCode, HostOperation, HostResult};
 
 /// Host address family for socket creation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -262,6 +262,11 @@ impl HostSocket {
         get_socket_option_platform(self, name)
     }
 
+    /// Reads and clears the pending socket error when the host exposes one.
+    pub fn take_error(&self) -> HostResult<Option<HostError>> {
+        take_error_platform(self)
+    }
+
     /// Shuts down one or both directions of this socket.
     pub fn shutdown(&self, how: HostShutdown) -> HostResult<()> {
         shutdown_platform(self, how)
@@ -374,6 +379,11 @@ fn get_socket_option_platform(
     _socket: &HostSocket,
     _name: HostSocketOptionName,
 ) -> HostResult<HostSocketOptionValue> {
+    Err(HostError::unsupported(HostOperation::GetSocketOption))
+}
+
+#[cfg(not(windows))]
+fn take_error_platform(_socket: &HostSocket) -> HostResult<Option<HostError>> {
     Err(HostError::unsupported(HostOperation::GetSocketOption))
 }
 
@@ -644,6 +654,19 @@ fn get_socket_option_platform(
         ));
     }
     socket_option_from_winsock(name, raw)
+}
+
+#[cfg(windows)]
+fn take_error_platform(socket: &HostSocket) -> HostResult<Option<HostError>> {
+    match socket.get_option(HostSocketOptionName::SocketError)? {
+        HostSocketOptionValue::Int(0) => Ok(None),
+        HostSocketOptionValue::Int(code) => Ok(Some(HostError::with_code(
+            HostOperation::ConnectSocket,
+            crate::error::winsock_kind(code),
+            HostErrorCode::Winsock(code),
+        ))),
+        _ => Err(HostError::invalid_input(HostOperation::GetSocketOption)),
+    }
 }
 
 #[cfg(windows)]

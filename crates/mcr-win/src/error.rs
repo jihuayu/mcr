@@ -265,7 +265,12 @@ pub(crate) fn winsock_kind(code: i32) -> HostErrorKind {
         winsock_codes::WSAEINVAL | winsock_codes::WSAENOTSOCK => HostErrorKind::InvalidInput,
         winsock_codes::WSAEINTR => HostErrorKind::Interrupted,
         winsock_codes::WSAETIMEDOUT => HostErrorKind::TimedOut,
-        winsock_codes::WSAEWOULDBLOCK => HostErrorKind::WouldBlock,
+        winsock_codes::WSAEWOULDBLOCK
+        | winsock_codes::WSAEINPROGRESS
+        | winsock_codes::WSAEALREADY => HostErrorKind::WouldBlock,
+        winsock_codes::WSAECONNREFUSED
+        | winsock_codes::WSAENETUNREACH
+        | winsock_codes::WSAEHOSTUNREACH => HostErrorKind::Unavailable,
         winsock_codes::WSAECONNRESET | winsock_codes::WSAESHUTDOWN => HostErrorKind::BrokenPipe,
         _ => HostErrorKind::Other,
     }
@@ -319,19 +324,22 @@ mod winsock_codes {
     pub const WSAEMFILE: i32 = 10024;
     pub const WSAEWOULDBLOCK: i32 = 10035;
     pub const WSAEINPROGRESS: i32 = 10036;
+    pub const WSAEALREADY: i32 = 10037;
     pub const WSAENOTSOCK: i32 = 10038;
     pub const WSAESHUTDOWN: i32 = 10058;
     pub const WSAETIMEDOUT: i32 = 10060;
+    pub const WSAECONNREFUSED: i32 = 10061;
     pub const WSAECONNRESET: i32 = 10054;
     pub const WSAEADDRINUSE: i32 = 10048;
     pub const WSAEAFNOSUPPORT: i32 = 10047;
+    pub const WSAENETUNREACH: i32 = 10051;
+    pub const WSAEHOSTUNREACH: i32 = 10065;
     pub const WSAEPROTONOSUPPORT: i32 = 10043;
     pub const WSAESOCKTNOSUPPORT: i32 = 10044;
 
     const _: () = {
         let _ = WSAEFAULT;
         let _ = WSAEMFILE;
-        let _ = WSAEINPROGRESS;
     };
 }
 

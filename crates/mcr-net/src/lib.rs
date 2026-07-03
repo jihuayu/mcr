@@ -484,6 +484,7 @@ pub trait HostSocketHandle: fmt::Debug {
     fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError>;
+    fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError>;
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
@@ -564,6 +565,13 @@ impl HostSocketHandle for WinHostSocketHandle {
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
         self.socket
             .connect(SocketAddr::from(address))
+            .map_err(HostIoError::from)
+    }
+
+    fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
+        self.socket
+            .take_error()
+            .map(|error| error.map(HostIoError::from))
             .map_err(HostIoError::from)
     }
 
@@ -1313,11 +1321,17 @@ impl GuestSocketTable {
         let SocketState::Connecting(address) = self.socket(id)?.state else {
             return Ok(());
         };
-        let (local, peer) = if let Some(entry) = self.host_handles.get(&id) {
-            (
-                entry.handle.local_addr().map_err(SocketError::from_host)?,
-                entry.handle.peer_addr().map_err(SocketError::from_host)?,
-            )
+        let (local, peer) = if let Some(entry) = self.host_handles.get_mut(&id) {
+            if let Some(error) = entry.handle.take_error().map_err(SocketError::from_host)? {
+                let errno = error.linux_errno();
+                let socket = self.socket_mut(id)?;
+                socket.state = SocketState::Created;
+                socket.last_error = Some(errno);
+                return Err(SocketError::from_host(error));
+            }
+            let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
+            let peer = entry.handle.peer_addr().map_err(SocketError::from_host)?;
+            (local, peer)
         } else {
             (
                 SocketAddress::unspecified_for_domain(address.domain()),
@@ -1781,6 +1795,7 @@ mod tests {
         local: Option<SocketAddress>,
         connected: Option<SocketAddress>,
         connect_error: Option<HostIoError>,
+        socket_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
         accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
         bound: Option<SocketAddress>,
@@ -1805,6 +1820,17 @@ mod tests {
         fn with_connect_error(error: HostIoError) -> Self {
             Self {
                 connect_error: Some(error),
+                ..Self::default()
+            }
+        }
+
+        fn with_pending_connect_error(error: HostIoError) -> Self {
+            Self {
+                connect_error: Some(HostIoError::new(
+                    LinuxErrno::OperationWouldBlock,
+                    "connect would block",
+                )),
+                socket_error: Some(error),
                 ..Self::default()
             }
         }
@@ -1855,6 +1881,10 @@ mod tests {
             }
             self.connected = Some(address);
             Ok(())
+        }
+
+        fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
+            Ok(self.socket_error.take())
         }
 
         fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
@@ -2386,6 +2416,60 @@ mod tests {
             table
                 .get_option(stream, SocketOptionName::SocketError)
                 .expect("SO_ERROR"),
+            0
+        );
+    }
+
+    #[test]
+    fn nonblocking_connect_failure_is_reported_after_writable_poll() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_pending_connect_error(
+                    HostIoError::new(LinuxErrno::ConnectionRefused, "connection refused"),
+                )),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 9);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("connect should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(
+            table
+                .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+                .expect_err("poll should surface connect failure")
+                .linux_errno(),
+            LinuxErrno::ConnectionRefused
+        );
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Created
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            LinuxErrno::ConnectionRefused.code() as u32
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR is consumed"),
             0
         );
     }
