@@ -486,12 +486,20 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(error) => error.fmt(f),
-            Self::MissingSyscall { terminator } => {
-                write!(
-                    f,
-                    "guest block did not terminate at syscall: {terminator:?}"
-                )
-            }
+            Self::MissingSyscall {
+                terminator:
+                    BlockTerminator::ControlFlow {
+                        rip,
+                        flow: DecodedFlowControl::Exception,
+                    },
+            } => write!(
+                f,
+                "guest block terminated with x86 exception before syscall at guest rip 0x{rip:016x} (UD2 or another exception terminator)"
+            ),
+            Self::MissingSyscall { terminator } => write!(
+                f,
+                "guest block did not terminate at syscall: {terminator:?}"
+            ),
             Self::MemoryOperand {
                 rip,
                 address,
@@ -3250,6 +3258,33 @@ mod tests {
             ExecutionError::MissingSyscall {
                 terminator: BlockTerminator::EndOfBytes
             }
+        );
+    }
+
+    #[test]
+    fn execution_error_display_reports_ud2_exception_terminator_rip() {
+        let block = GuestBlock::new(&[0x0f, 0x0b], 0x402100);
+        let registers = GuestRegisters {
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+
+        let error = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap(block, registers)
+            .expect_err("ud2 exception terminator should not be treated as syscall");
+
+        assert_eq!(
+            error,
+            ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::ControlFlow {
+                    rip: 0x402100,
+                    flow: DecodedFlowControl::Exception,
+                }
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "guest block terminated with x86 exception before syscall at guest rip 0x0000000000402100 (UD2 or another exception terminator)"
         );
     }
 }
