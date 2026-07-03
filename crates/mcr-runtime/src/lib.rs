@@ -44,7 +44,7 @@ use mcr_task::{
 };
 use mcr_vfs::{
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, DirectoryEntry, Fd, FdReadiness, FdTable, FileKind, FileRef,
-    LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    FileTimes, LinuxFileAttr, OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -56,6 +56,8 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_UTIME_NOW: i64 = 0x3fffffff;
+const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
 const LINUX_GRND_NONBLOCK: u64 = 0x0001;
 const LINUX_GRND_RANDOM: u64 = 0x0002;
@@ -678,6 +680,7 @@ where
             mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
             mcr_sys::Syscall::Chdir => self.sys_chdir(request),
             mcr_sys::Syscall::Umask => self.sys_umask(request),
@@ -1541,6 +1544,56 @@ where
             .ftruncate(arg_i32(request, 0), length as u64)
             .map_err(vfs_errno)?;
         Ok(0)
+    }
+
+    fn sys_utimensat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let flags = arg_u32(request, 3);
+        if flags & !(mcr_vfs::AT_SYMLINK_NOFOLLOW | mcr_vfs::AT_EMPTY_PATH) != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        let path = self.read_path(arg(request, 1))?;
+        let times = self.utimensat_times(arg_i32(request, 0), &path, arg(request, 2), flags)?;
+        self.vfs
+            .utimensat(arg_i32(request, 0), &path, times, flags)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn utimensat_times(
+        &self,
+        dirfd: Fd,
+        path: &str,
+        times_ptr: u64,
+        flags: u32,
+    ) -> Result<FileTimes, LinuxErrno> {
+        let current = self
+            .vfs
+            .newfstatat(dirfd, path, flags)
+            .map_err(vfs_errno)
+            .ok();
+        let now = linux_timespec_from_system_time(std::time::SystemTime::now());
+        if times_ptr == 0 {
+            return Ok(FileTimes {
+                atime_sec: now.tv_sec,
+                atime_nsec: now.tv_nsec,
+                mtime_sec: now.tv_sec,
+                mtime_nsec: now.tv_nsec,
+            });
+        }
+
+        let atime = read_guest_timespec(&self.memory, times_ptr)?;
+        let mtime = read_guest_timespec(
+            &self.memory,
+            times_ptr.checked_add(16).ok_or(LinuxErrno::EFAULT)?,
+        )?;
+        let atime = resolve_utimensat_time(atime, now, current, true)?;
+        let mtime = resolve_utimensat_time(mtime, now, current, false)?;
+        Ok(FileTimes {
+            atime_sec: atime.tv_sec,
+            atime_nsec: atime.tv_nsec,
+            mtime_sec: mtime.tv_sec,
+            mtime_nsec: mtime.tv_nsec,
+        })
     }
 
     fn sys_getcwd(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -4081,6 +4134,33 @@ fn linux_timespec_from_duration(duration: Duration) -> Result<LinuxTimespec, Lin
     })
 }
 
+fn resolve_utimensat_time(
+    requested: LinuxTimespec,
+    now: LinuxTimespec,
+    current: Option<LinuxFileAttr>,
+    atime: bool,
+) -> Result<LinuxTimespec, LinuxErrno> {
+    match requested.tv_nsec {
+        LINUX_UTIME_NOW => Ok(now),
+        LINUX_UTIME_OMIT => {
+            let current = current.ok_or(LinuxErrno::ENOENT)?;
+            if atime {
+                Ok(LinuxTimespec {
+                    tv_sec: current.atime_sec,
+                    tv_nsec: current.atime_nsec,
+                })
+            } else {
+                Ok(LinuxTimespec {
+                    tv_sec: current.mtime_sec,
+                    tv_nsec: current.mtime_nsec,
+                })
+            }
+        }
+        0..=999_999_999 if requested.tv_sec >= 0 => Ok(requested),
+        _ => Err(LinuxErrno::EINVAL),
+    }
+}
+
 fn read_required_timespec_duration(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -6530,6 +6610,27 @@ mod tests {
             ),
             SyscallReturn::Success(0)
         );
+
+        runtime.memory_mut().write(0x2000, &10i64.to_le_bytes());
+        runtime.memory_mut().write(0x2008, &20i64.to_le_bytes());
+        runtime.memory_mut().write(0x2010, &30i64.to_le_bytes());
+        runtime.memory_mut().write(0x2018, &40i64.to_le_bytes());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Utimensat,
+                [AT_FDCWD as u64, 0x1200, 0x2000, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        let touched = runtime
+            .vfs()
+            .newfstatat(AT_FDCWD, "/tmp/pkg/file", 0)
+            .unwrap();
+        assert_eq!(touched.atime_sec, 10);
+        assert_eq!(touched.atime_nsec, 20);
+        assert_eq!(touched.mtime_sec, 30);
+        assert_eq!(touched.mtime_nsec, 40);
     }
 
     #[test]

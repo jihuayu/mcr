@@ -170,6 +170,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Linkat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Symlinkat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Readlinkat, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Utimensat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Ppoll, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::SetRobustList, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Accept4, SyscallSubsystem::Network),
@@ -545,6 +546,12 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("newpath_ptr", arg(1)),
         ],
         Syscall::Unlink => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Utimensat => vec![
+            signed_field("dirfd", arg(0)),
+            hex_field("path_ptr", arg(1)),
+            hex_field("times", arg(2)),
+            hex_field("flags", arg(3)),
+        ],
         Syscall::Mkdirat | Syscall::Unlinkat => vec![
             signed_field("dirfd", arg(0)),
             hex_field("path_ptr", arg(1)),

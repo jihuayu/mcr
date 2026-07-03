@@ -124,6 +124,7 @@ pub enum Syscall {
     Linkat,
     Symlinkat,
     Readlinkat,
+    Utimensat,
     Ppoll,
     SetRobustList,
     EpollCreate1,
@@ -226,6 +227,7 @@ impl Syscall {
     pub const LINKAT: SyscallNumber = SyscallNumber::new(265);
     pub const SYMLINKAT: SyscallNumber = SyscallNumber::new(266);
     pub const READLINKAT: SyscallNumber = SyscallNumber::new(267);
+    pub const UTIMENSAT: SyscallNumber = SyscallNumber::new(280);
     pub const PPOLL: SyscallNumber = SyscallNumber::new(271);
     pub const SET_ROBUST_LIST: SyscallNumber = SyscallNumber::new(273);
     pub const EPOLL_CREATE1: SyscallNumber = SyscallNumber::new(291);
@@ -330,6 +332,7 @@ impl Syscall {
             267 => Self::Readlinkat,
             271 => Self::Ppoll,
             273 => Self::SetRobustList,
+            280 => Self::Utimensat,
             288 => Self::Accept4,
             291 => Self::EpollCreate1,
             292 => Self::Dup3,
@@ -433,6 +436,7 @@ impl Syscall {
             Self::Linkat => Self::LINKAT,
             Self::Symlinkat => Self::SYMLINKAT,
             Self::Readlinkat => Self::READLINKAT,
+            Self::Utimensat => Self::UTIMENSAT,
             Self::Ppoll => Self::PPOLL,
             Self::SetRobustList => Self::SET_ROBUST_LIST,
             Self::Accept4 => Self::ACCEPT4,
@@ -538,6 +542,7 @@ impl Syscall {
             Self::Linkat => "linkat",
             Self::Symlinkat => "symlinkat",
             Self::Readlinkat => "readlinkat",
+            Self::Utimensat => "utimensat",
             Self::Ppoll => "ppoll",
             Self::SetRobustList => "set_robust_list",
             Self::Accept4 => "accept4",
