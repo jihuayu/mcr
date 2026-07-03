@@ -36,7 +36,7 @@ Runtime manager
 | Syscall dispatcher | Syscall table, Linux ABI structs, errno mapping, argument validation, dispatch tracing. | File, process, network, and sync behavior to owned subsystems. |
 | VFS | Linux path semantics, rootfs jail, virtual inode model, fd table, metadata sidecar, procfs/devfs nodes. | Host file operations to Windows file adapter. |
 | Process and sync | Guest PID/TID, task lifecycle, `fork+exec` fast path, `wait4`, signals skeleton, process-private futex. | Host threads and wait primitives to Windows sync adapter. |
-| Network and eventing | Guest socket ABI for the Phase 2 TCP/DNS subset, socket readiness, level-trigger `poll`/`epoll` compatibility. | Winsock, `std::net` where useful, WSAPoll, and later IOCP to Windows net adapter. |
+| Network and eventing | Linux/POSIX socket syscall ABI compatibility, guest socket fd objects, socket readiness, and level-trigger `poll`/`epoll` compatibility. | Winsock, `std::net` only where it preserves ABI semantics, WSAPoll, and later IOCP to Windows net adapter. |
 | Windows adapters | Narrow wrappers over Win32/NT capabilities. | Nothing upward; adapters expose host capability, not Linux policy. |
 
 ## Module Map
@@ -112,7 +112,7 @@ The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-i
 | Guest memory map | `mcr-elf` initially, then runtime memory manager | VMAs are Linux concepts mapped onto host memory allocations. |
 | Guest FS base | `mcr-task` and execution core | `arch_prctl` updates per-task guest TLS state; host Rust TLS is not guest truth. |
 | Syscall ABI table | `mcr-sys` | Syscall numbers, argument decoding, and errno conversion live here. |
-| Socket readiness | `mcr-net` | Exposes the documented level-trigger readiness subset over host Winsock/readiness helpers. |
+| Socket readiness | `mcr-net` | Exposes the documented level-trigger readiness subset over host Winsock/readiness helpers; IOCP is a later performance backend, not the guest-visible model. |
 | Host handles | `mcr-win` adapters | Handles must not leak into Linux-facing types. |
 | OCI blobs and descriptors | `mcr-image` | Content-addressed blobs are keyed by digest and never by mutable tags. |
 | Build snapshot roots | `mcr-snapshot` | Build layers are derived from explicit lower/upper state, not host directory diffs alone. |
@@ -124,7 +124,7 @@ The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-i
 - Every syscall returns a Linux ABI result, including Linux errno values.
 - Windows adapters stay below subsystem policy; they do not decide guest path, pid, signal, or fd semantics.
 - Through Phase 2, process-private futex relies on the one-host-process-per-container model.
-- Through Phase 2, networking is a TCP-client-first compatibility layer. UDP exists only when needed for the documented DNS path unless a task explicitly expands it.
+- The networking architecture targets Linux/POSIX socket syscall ABI compatibility, not a source-level Winsock wrapper. Phase 2 still gates on the smaller TCP/DNS subset unless a task explicitly expands it.
 - Through Phase 2, `poll` and `epoll` are level-trigger only; unsupported flags must fail intentionally instead of being accepted silently.
 - Unsupported syscalls must be tracked and tested as unsupported behavior, not silently ignored.
 - Build steps must call the same runtime executor as user-visible `run-rootfs` workloads.

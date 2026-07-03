@@ -213,6 +213,47 @@ Phase 2 requires:
 
 MCR uses host networking and virtualizes the guest socket ABI.
 
+The long-term networking boundary is Linux/POSIX socket syscall ABI
+compatibility on top of Windows user-mode networking. It is not a thin
+`winsock2.h` portability wrapper. Guest code sees Linux-style
+`socket`/`accept4`/`connect`/`sendmsg`/`poll`/`epoll`/`close`/`read`/`write`
+semantics, while Windows `SOCKET` values remain hidden behind MCR-owned guest fd
+objects.
+
+```text
+guest syscall ABI
+        |
+        v
+syscall decoding and guest struct conversion
+        |
+        v
+Linux fd table and open object table
+        |
+        +--> socket object -> Winsock adapter
+        +--> epoll object  -> readiness backend
+        +--> pipe/eventfd/timerfd objects as they land
+        |
+        v
+Windows backends: Winsock + WSAPoll/select MVP, later IOCP
+```
+
+Required design rules:
+
+- guest fd allocation stays in the shared MCR fd namespace; never return a
+  Windows `SOCKET` or host handle as a guest fd;
+- `FD_CLOEXEC` is fd-entry state, while `O_NONBLOCK` belongs to the shared open
+  socket object so `dup` aliases observe the same nonblocking mode;
+- syscall handlers must copy guest socket structs and iovecs into host structs,
+  validate lengths and flags, call the host adapter, then copy translated
+  results back to guest memory;
+- errno mapping is owned above Winsock, and `WSAGetLastError` values must never
+  leak into guest-visible results;
+- close, poll, epoll, and fd reuse paths need object lifetime and generation
+  checks so a reused integer fd cannot satisfy an old readiness watch;
+- the semantic-first backend uses nonblocking Winsock sockets plus runtime wait
+  loops and `WSAPoll`/select-style readiness. IOCP, `AcceptEx`, and `ConnectEx`
+  are deferred performance backends behind the same socket/readiness contracts.
+
 Phase 2 networking includes:
 
 - AF_INET and AF_INET6 `SOCK_STREAM` TCP client sockets;
@@ -228,6 +269,12 @@ Phase 2 networking includes:
 Rust `std::net` and Windows networking APIs are valid host backends, but Linux-visible fd allocation, socket flags, sockaddr layout, errno mapping, nonblocking behavior, and close-on-exec state remain owned by MCR.
 
 `poll` and `epoll` expose a level-trigger Linux readiness subset over Windows host mechanisms.
+
+Deferred or partial areas include AF_UNIX fidelity, `SCM_RIGHTS`, raw sockets,
+advanced multicast options, `SO_REUSEPORT`, `recvmmsg`/`sendmmsg`, fork-time
+socket inheritance, cross-process fd passing, and IOCP-backed high-concurrency
+readiness. Unsupported pieces must fail intentionally with Linux-compatible
+errors rather than silently accepting flags or options.
 
 Phase 2 eventing includes:
 
