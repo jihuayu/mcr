@@ -542,7 +542,7 @@ impl DiagnosticVma {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticMemoryVma {
     start: u64,
     end: u64,
@@ -577,8 +577,8 @@ impl DiagnosticMemoryVma {
     }
 
     #[must_use]
-    pub const fn kind(&self) -> DiagnosticMemoryVmaKind {
-        self.kind
+    pub const fn kind(&self) -> &DiagnosticMemoryVmaKind {
+        &self.kind
     }
 }
 
@@ -674,21 +674,32 @@ impl DiagnosticVmaKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiagnosticMemoryVmaKind {
     Anonymous,
     Heap,
-    FileBacked { fd: i32, offset: i64, shared: bool },
+    FileBacked {
+        fd: i32,
+        path: Option<Vec<u8>>,
+        offset: i64,
+        shared: bool,
+    },
 }
 
 impl DiagnosticMemoryVmaKind {
     #[must_use]
-    pub const fn from_guest_kind(kind: &GuestVmaKind) -> Self {
+    pub fn from_guest_kind(kind: &GuestVmaKind) -> Self {
         match kind {
             GuestVmaKind::Anonymous => Self::Anonymous,
             GuestVmaKind::Heap => Self::Heap,
-            GuestVmaKind::FileBacked { fd, offset, shared } => Self::FileBacked {
+            GuestVmaKind::FileBacked {
+                fd,
+                path,
+                offset,
+                shared,
+            } => Self::FileBacked {
                 fd: *fd,
+                path: path.clone(),
                 offset: *offset,
                 shared: *shared,
             },
@@ -3260,6 +3271,13 @@ impl RuntimeSubsystems {
         if offset < 0 {
             return Err(LinuxErrno::EINVAL);
         }
+        let path = self
+            .files
+            .vfs()
+            .fds()
+            .get(fd)
+            .ok()
+            .and_then(|entry| entry.path().map(|path| path.to_string().into_bytes()));
         let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
         let mut bytes = vec![0; len];
         let count = self
@@ -3287,6 +3305,10 @@ impl RuntimeSubsystems {
             });
         write_result.map_err(|error| error.errno())?;
         restore_result.map_err(|error| error.errno())?;
+        self.files
+            .memory_mut()
+            .set_file_backed_path(mapped, path)
+            .map_err(|error| error.errno())?;
         Ok(())
     }
 
@@ -4834,12 +4856,45 @@ mod tests {
                     vma.kind(),
                     DiagnosticMemoryVmaKind::FileBacked {
                         fd: 3,
+                        path: Some(path),
                         offset: 0,
                         shared: false
-                    }
+                    } if path == b"/tmp/file"
                 )
         }));
         assert_eq!(runtime.vfs().fds().get(3).unwrap().offset(), 2);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Close, [3, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/tmp/other\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402100, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        let diagnostics = runtime.diagnostics();
+        assert_eq!(diagnostics.fd_path(3), Some(b"/tmp/other".as_slice()));
+        assert!(diagnostics.memory_vmas().iter().any(|vma| {
+            matches!(
+                vma.kind(),
+                DiagnosticMemoryVmaKind::FileBacked {
+                    fd: 3,
+                    path: Some(path),
+                    offset: 0,
+                    shared: false
+                } if path == b"/tmp/file"
+            )
+        }));
         assert_eq!(
             runtime.memory_mut().write(0x7000_0000, b"x"),
             Err(GuestMemoryError::AccessDenied)
@@ -7623,6 +7678,8 @@ mod tests {
         let mut tree = PathTree::new();
         tree.create_dir("/tmp").unwrap();
         tree.create_file_with_content("/tmp/file", b"hello", 0o644)
+            .unwrap();
+        tree.create_file_with_content("/tmp/other", b"other", 0o644)
             .unwrap();
         tree.create_dir("/private").unwrap();
         tree.create_file_with_content("/private/secret", b"secret", 0o600)

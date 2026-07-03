@@ -391,15 +391,21 @@ fn format_diagnostic_vma_kind(kind: &crate::DiagnosticVmaKind) -> String {
 }
 
 fn format_diagnostic_memory_vma_kind(
-    kind: crate::DiagnosticMemoryVmaKind,
+    kind: &crate::DiagnosticMemoryVmaKind,
     diagnostics: &RuntimeDiagnostics,
 ) -> String {
     match kind {
         crate::DiagnosticMemoryVmaKind::Anonymous => "anonymous".to_owned(),
         crate::DiagnosticMemoryVmaKind::Heap => "heap".to_owned(),
-        crate::DiagnosticMemoryVmaKind::FileBacked { fd, offset, shared } => {
-            let path = diagnostics
-                .fd_path(fd)
+        crate::DiagnosticMemoryVmaKind::FileBacked {
+            fd,
+            path,
+            offset,
+            shared,
+        } => {
+            let path = path
+                .as_deref()
+                .or_else(|| diagnostics.fd_path(*fd))
                 .map(bytes_lossy)
                 .unwrap_or_else(|| "<unknown>".to_owned());
             format!("file_backed(fd={fd}, path={path}, offset=0x{offset:x}, shared={shared})")
