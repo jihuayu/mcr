@@ -2694,7 +2694,7 @@ where
         let mut native_registers = host_registers_from_gpr(gpr);
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
         restore_executable_syscalls(memory, patches)?;
-        native_result.map_err(native_execution_error)?;
+        native_result.map_err(|error| native_execution_error(error, native_registers))?;
 
         let mut registers = guest_registers_from_host(native_registers);
         let site = mcr_jit::SyscallSite {
@@ -2791,7 +2791,10 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
         || number == mcr_sys::Syscall::Clone.number().raw()
 }
 
-fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutionError {
+fn native_execution_error(
+    error: mcr_win::NativeExecutionError,
+    registers: mcr_win::HostCpuRegisters,
+) -> GuestExecutionError {
     match error {
         mcr_win::NativeExecutionError::GuestFault {
             signal,
@@ -2801,6 +2804,7 @@ fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutio
             signal,
             rip,
             address,
+            registers: guest_registers_from_host(registers),
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
         | mcr_win::NativeExecutionError::SignalHandler(_)
@@ -2809,6 +2813,7 @@ fn native_execution_error(error: mcr_win::NativeExecutionError) -> GuestExecutio
                 signal: 0,
                 rip: 0,
                 address: 0,
+                registers: GuestRegisters::default(),
             })
         }
     }

@@ -484,6 +484,7 @@ pub enum ExecutionError {
         signal: i32,
         rip: u64,
         address: u64,
+        registers: GuestRegisters,
     },
 }
 
@@ -518,6 +519,7 @@ impl fmt::Display for ExecutionError {
                 signal,
                 rip,
                 address,
+                registers: _,
             } => write!(
                 f,
                 "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}"

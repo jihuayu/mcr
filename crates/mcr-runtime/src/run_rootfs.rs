@@ -338,6 +338,19 @@ fn write_guest_run_diagnostics(
             write!(formatter, " in vma=<unmapped>")?;
         }
     }
+    if let Some(registers) = native_fault_registers(error) {
+        write!(
+            formatter,
+            "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rsp=0x{:016x}",
+            registers.rax,
+            registers.rbx,
+            registers.rcx,
+            registers.rdx,
+            registers.rsi,
+            registers.rdi,
+            registers.rsp
+        )?;
+    }
     Ok(())
 }
 
@@ -354,6 +367,15 @@ fn native_fault_rip(error: &crate::GuestRunError) -> Option<u64> {
         crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
             ExecutionError::NativeFault { rip, .. },
         )) => Some(*rip),
+        _ => None,
+    }
+}
+
+fn native_fault_registers(error: &crate::GuestRunError) -> Option<mcr_jit::GuestRegisters> {
+    match error {
+        crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
+            ExecutionError::NativeFault { registers, .. },
+        )) => Some(*registers),
         _ => None,
     }
 }
@@ -1237,6 +1259,11 @@ mod tests {
                 signal: -1073741819,
                 rip: 0x401010,
                 address: 0,
+                registers: mcr_jit::GuestRegisters {
+                    rdi: 0x9139b,
+                    rsp: 0x7000_2000,
+                    ..mcr_jit::GuestRegisters::default()
+                },
             },
         ));
         let error = RunRootfsError::GuestRunDiagnostics { error, diagnostics };
@@ -1248,6 +1275,8 @@ mod tests {
             rendered.contains("task TLS: tid=1 pid=1 state=runnable fs_base=0x0000000000000000")
         );
         assert!(rendered.contains("fault rip: 0x0000000000401010"));
+        assert!(rendered.contains("fault registers:"));
+        assert!(rendered.contains("rdi=0x000000000009139b"));
         assert!(rendered.contains("vma=[0x0000000000401000..0x0000000000402000)"));
         assert!(rendered.contains("kind=anonymous"));
     }
