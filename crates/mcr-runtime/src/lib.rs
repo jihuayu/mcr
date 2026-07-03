@@ -287,12 +287,22 @@ pub struct RuntimeDiagnostics {
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
+    memory_vmas: Vec<DiagnosticMemoryVma>,
     last_syscall: Option<DiagnosticSyscall>,
 }
 
 impl RuntimeDiagnostics {
     #[must_use]
     pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
+        Self::capture_with_memory(kernel, None, events)
+    }
+
+    #[must_use]
+    pub fn capture_with_memory(
+        kernel: &GuestKernel,
+        memory: Option<&GuestMemory>,
+        events: &[SyscallTraceEvent],
+    ) -> Self {
         let process = kernel
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process");
@@ -308,6 +318,14 @@ impl RuntimeDiagnostics {
                 .iter()
                 .map(DiagnosticVma::from_guest_vma)
                 .collect(),
+            memory_vmas: memory
+                .map(|memory| {
+                    memory
+                        .vmas()
+                        .map(DiagnosticMemoryVma::from_guest_vma)
+                        .collect()
+                })
+                .unwrap_or_default(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
         }
     }
@@ -330,6 +348,11 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub fn vmas(&self) -> &[DiagnosticVma] {
         &self.vmas
+    }
+
+    #[must_use]
+    pub fn memory_vmas(&self) -> &[DiagnosticMemoryVma] {
+        &self.memory_vmas
     }
 
     #[must_use]
@@ -379,6 +402,46 @@ impl DiagnosticVma {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticMemoryVma {
+    start: u64,
+    end: u64,
+    permissions: DiagnosticPermissions,
+    kind: DiagnosticMemoryVmaKind,
+}
+
+impl DiagnosticMemoryVma {
+    #[must_use]
+    pub fn from_guest_vma(vma: &GuestVma) -> Self {
+        Self {
+            start: vma.start(),
+            end: vma.end(),
+            permissions: DiagnosticPermissions::from_memory(vma.protection()),
+            kind: DiagnosticMemoryVmaKind::from_guest_kind(vma.kind()),
+        }
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn permissions(&self) -> DiagnosticPermissions {
+        self.permissions
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DiagnosticMemoryVmaKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiagnosticPermissions {
     read: bool,
     write: bool,
@@ -402,6 +465,11 @@ impl DiagnosticPermissions {
             permissions.write(),
             permissions.execute(),
         )
+    }
+
+    #[must_use]
+    pub const fn from_memory(permissions: GuestMemoryProtection) -> Self {
+        Self::new(permissions.read, permissions.write, permissions.execute)
     }
 
     #[must_use]
@@ -461,6 +529,28 @@ impl DiagnosticVmaKind {
                 file_size: *file_size,
             },
             ElfGuestVmaKind::Stack => Self::Stack,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticMemoryVmaKind {
+    Anonymous,
+    Heap,
+    FileBacked { fd: i32, offset: i64, shared: bool },
+}
+
+impl DiagnosticMemoryVmaKind {
+    #[must_use]
+    pub const fn from_guest_kind(kind: &GuestVmaKind) -> Self {
+        match kind {
+            GuestVmaKind::Anonymous => Self::Anonymous,
+            GuestVmaKind::Heap => Self::Heap,
+            GuestVmaKind::FileBacked { fd, offset, shared } => Self::FileBacked {
+                fd: *fd,
+                offset: *offset,
+                shared: *shared,
+            },
         }
     }
 }
@@ -566,7 +656,11 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
 
     #[must_use]
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        RuntimeDiagnostics::capture(self.kernel(), self.tracer().events())
+        RuntimeDiagnostics::capture_with_memory(
+            self.kernel(),
+            Some(self.memory()),
+            self.tracer().events(),
+        )
     }
 
     #[must_use]
