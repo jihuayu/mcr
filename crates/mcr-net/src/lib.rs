@@ -1354,12 +1354,20 @@ impl GuestSocketTable {
         id: SocketId,
         address: SocketAddress,
     ) -> Result<(SocketAddress, SocketAddress), SocketError> {
+        let is_udp_datagram = {
+            let socket = self.socket(id)?;
+            socket.socket_type == SocketType::Datagram
+                && socket.effective_protocol() == SocketProtocol::Udp
+        };
         let entry = self.ensure_host_entry_mut(id, SocketOperation::Connect)?;
         entry
             .handle
             .connect(address)
             .map_err(SocketError::from_host)?;
         let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
+        if is_udp_datagram {
+            return Ok((local, address));
+        }
         let peer = entry.handle.peer_addr().map_err(SocketError::from_host)?;
         Ok((local, peer))
     }
@@ -1882,6 +1890,7 @@ mod tests {
         incoming: Vec<u8>,
         local: Option<SocketAddress>,
         connected: Option<SocketAddress>,
+        fail_peer_addr: bool,
         connect_error: Option<HostIoError>,
         socket_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
@@ -1927,6 +1936,13 @@ mod tests {
         fn with_local_endpoint(local: SocketAddress) -> Self {
             Self {
                 local: Some(local),
+                ..Self::default()
+            }
+        }
+
+        fn with_udp_peer_addr_unsupported() -> Self {
+            Self {
+                fail_peer_addr: true,
                 ..Self::default()
             }
         }
@@ -1991,6 +2007,12 @@ mod tests {
         }
 
         fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
+            if self.fail_peer_addr {
+                return Err(HostIoError::new(
+                    LinuxErrno::ConnectionReset,
+                    "UDP peer address query failed",
+                ));
+            }
             self.connected.ok_or_else(|| {
                 HostIoError::new(LinuxErrno::NotConnected, "socket is not connected")
             })
@@ -2422,6 +2444,33 @@ mod tests {
             .expect("recv connected");
         assert_eq!(count, 4);
         assert_eq!(&buffer[..count], b"dns!");
+    }
+
+    #[test]
+    fn connected_udp_socket_does_not_require_host_peer_addr_query() {
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket_with_handle(
+                SocketSpec::new(
+                    SocketDomain::Inet,
+                    SocketType::Datagram,
+                    SocketProtocol::Udp,
+                )
+                .expect("udp spec"),
+                Box::new(FakeHostSocketHandle::with_udp_peer_addr_unsupported()),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([1, 1, 1, 1], 53);
+
+        table.connect(datagram, peer).expect("connect UDP handle");
+
+        assert_eq!(
+            table.socket(datagram).expect("socket").state(),
+            SocketState::Connected {
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer,
+            }
+        );
     }
 
     #[test]
