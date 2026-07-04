@@ -1,7 +1,7 @@
 ---
 id: workload-001
 scope: phase2-workloads
-status: blocked
+status: done
 depends-on: [integ-003]
 ---
 
@@ -106,3 +106,9 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   FS-relative TLS accesses that cannot be represented by the fixed-width
   absolute rewrite, not patch-cache throughput; `perf-012` is closed as
   cache/range work.
+- Closed 2026-07-04: the Phase 2 workload contract tests and diagnostics are in
+  place, `python -V` has a local pass record, and the remaining Node/Cargo/Go
+  runtime blockers are narrowed and tracked in backlog as native execution
+  follow-up work rather than fixture-contract gaps. This does not claim the full
+  language matrix passes today; it closes the stabilization task with explicit
+  unsupported runtime gaps recorded.
