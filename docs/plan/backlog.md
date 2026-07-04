@@ -41,10 +41,9 @@ materialization, materializes only new candidates when FS base is unchanged, and
 batches fixed-width patch writes by host allocation. Native fault diagnostics
 now render instruction bytes, a decoded instruction summary, FS base, registers,
 and stack words. Package-rootfs reruns no longer show Node/Cargo blocked in
-patch-cache scan/apply; they fail in same-ISA execution on high-address guest
-FS-base TLS loads that cannot be encoded by the current fixed-width absolute
-rewrite. Track that as a workload/native-execution fallback boundary, not a
-perf-012 cache blocker.
+patch-cache scan/apply. The high-address FS/TLS fallback has since landed in
+the runtime and JIT, so current package-rootfs follow-up is workload-native
+execution stability after that fallback, not perf-012 cache throughput.
 
 `MCR_HOSTSTEP_TRACE=1` remains the opt-in host-side timing path for rootfs
 loading, program loading, native entry/return, native patch scanning, and
@@ -53,9 +52,9 @@ host/native window instead of returning a guest step-limit diagnostic.
 
 | Command | Current result | Required follow-up |
 |---|---|---|
-| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Host-backed package-rootfs loading cleared the eager materialization blocker and the latest recorded rerun entered native guest execution, but it still exceeded a 30s process timeout in a native/host-side window after repeated patch-cache work for `fs_base=0x700a6b28`. | Rerun with host-step and native-fault diagnostics after the perf-012 close to classify whether Go shares the high-address FS/TLS fallback boundary or has a different native-window blocker. |
-| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | No longer times out applying `45171` zero-base FS-relative patches. It now fails with a native null-address fault on the original `mov rax, fs:[0x28]` at RIP `0x700000751bd6` with FS base `0x700000277c90`; that high guest FS address cannot be represented by the current fixed-width absolute rewrite. | Define and implement the native execution or JIT fallback boundary for unrepresentable high-address FS-relative TLS loads. |
-| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | No longer times out rescanning/reapplying Rust executable-range patches. It now fails with a native null-address fault on the original `mov rax, fs:[0]` at RIP `0x7006680a` with FS base `0x700010ba1140`; that high guest FS address cannot be represented by the current fixed-width absolute rewrite. | Define and implement the native execution or JIT fallback boundary for unrepresentable high-address FS-relative TLS loads. |
+| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | After the FS/TLS fallback checkpoint, the latest bounded local rerun still exceeded a 90s process timeout without output. | Rerun with host-step and native-fault diagnostics to classify the current native-window blocker now that high-address FS/TLS fallback is no longer the known missing boundary. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | The FS/TLS fallback removes the previous native null-address fault; local reruns include successful `v24.17.0` output around 11-12s, but a repeated normal run also failed with `guest block did not terminate at syscall: Invalid { rip: 1879212813 }`. | Stabilize the remaining native/JIT block execution path and add repeatable workload smoke evidence before claiming Node is fully green. |
+| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | The FS/TLS fallback now handles the prior `mov rax, fs:[0]` native fault and advances execution to `guest block terminated with x86 exception before syscall at guest rip 0x000000007006681e`. | Classify the new x86 exception terminator and decide whether it is an unsupported instruction, signal/exception semantic gap, or workload-specific runtime blocker. |
 
 ## Resolved Build Direction
 

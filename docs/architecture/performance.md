@@ -105,7 +105,8 @@ The first VFS cache checkpoint keeps this boundary narrow: `mcr-vfs` maintains
 an inode-and-generation keyed metadata cache plus a small regular-file read
 cache. Any successful VFS mutation that can affect attributes, links, paths, or
 file contents advances the generation and drops cached entries. Directory
-iteration batching remains a later `perf-002` step.
+listing cache entries are also keyed by inode and generation, store immutable
+listing snapshots, and hand shared entries back to callers on cache hits.
 
 ### File Mapping
 
@@ -333,6 +334,14 @@ diagnostics are part of the performance boundary because they distinguish
 patch-cache throughput regressions from same-ISA execution correctness blockers,
 such as FS-relative TLS instructions whose guest FS base cannot be encoded by
 the current fixed-width absolute rewrite.
+
+When Windows native execution faults on an original FS-relative instruction that
+could not be rewritten into the fixed-width absolute form, the runtime now uses
+a narrow interpreted fallback. It preserves native floating-point state, seeds
+the same-ISA execution core with the guest FS base, executes the current block
+until the next syscall through the JIT memory operand path, and then resumes the
+normal syscall return flow. This keeps high-address TLS loads correct without
+turning unsupported native execution faults into a broad interpreter escape.
 
 ## Measurement Gates
 

@@ -55,3 +55,8 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   DNS, loopback, and guest workload command-shape coverage. The guest workload
   baseline skips execution without `MCR_BIN`, and the GitHub workflow trigger
   remains an external CI operation rather than a local repo change.
+- 2026-07-04 public-network rerun with
+  `MCR_BIN=target\debug\mcr.exe MCR_PERF_PUBLIC_NETWORK=1 cargo test -p mcr-testkit --test perf_baseline perf_baseline_guest_smoke_workloads -- --ignored --nocapture`
+  passed. Current local baseline: shell startup `355.664ms`, guest small-file
+  loop `9737.243ms`, directory metadata walk `30309.548ms`, `curl
+  https://example.com` `1947.129ms`, and `git ls-remote` `114131.414ms`.

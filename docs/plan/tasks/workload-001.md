@@ -112,3 +112,13 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   follow-up work rather than fixture-contract gaps. This does not claim the full
   language matrix passes today; it closes the stabilization task with explicit
   unsupported runtime gaps recorded.
+- 2026-07-04 follow-up after the high-address FS/TLS fallback: `python -V`
+  still passes locally (`Python 3.14.5`, about `1641ms`). `node -v` can now
+  print `v24.17.0` in about `11-12s`, including a host-step traced pass, but a
+  repeated normal rerun also failed with `guest block did not terminate at
+  syscall: Invalid { rip: 1879212813 }`. `cargo --version` now gets past the
+  prior FS-relative native fault and reaches `guest block terminated with x86
+  exception before syscall at guest rip 0x000000007006681e`. `go version` still
+  exceeded a 90s local process timeout. The current open work is native/JIT
+  execution stability for the language matrix, not the perf-012 patch-cache or
+  FS/TLS fallback boundary.

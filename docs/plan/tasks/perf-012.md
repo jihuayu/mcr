@@ -76,3 +76,11 @@ cargo test -p mcr-testkit perf_native_execution -- --ignored --nocapture
   loads cannot be represented by the current fixed-width absolute rewrite, so
   `workload-001` and the backlog track the native execution or JIT fallback
   boundary for those accesses.
+- 2026-07-04 follow-up: the high-address FS/TLS fallback boundary has now
+  landed. `GuestRegisters` carries `fs_base`, the same-ISA JIT effective-address
+  path applies the FS segment base for memory operands, and Windows native
+  faults on original FS-relative instructions fall back to interpreted block
+  execution until the next syscall. Focused `mcr-jit` and `mcr-runtime` tests
+  cover FS-relative syscall dispatch and the unrewritten high-address fallback
+  detection. Remaining package-rootfs failures are tracked as workload-native
+  execution blockers rather than perf-012 cache/range work.
