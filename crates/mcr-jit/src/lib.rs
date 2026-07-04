@@ -191,6 +191,22 @@ impl Default for BlockDecoder {
     }
 }
 
+#[must_use]
+pub fn syscall_instruction_sites(bytes: &[u8], rip: u64) -> Vec<SyscallSite> {
+    let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
+    let mut sites = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if !instruction.is_invalid() && instruction.mnemonic() == Mnemonic::Syscall {
+            sites.push(SyscallSite {
+                rip: instruction.ip(),
+                next_rip: instruction.ip() + instruction.len() as u64,
+            });
+        }
+    }
+    sites
+}
+
 fn decoded_mnemonic(instruction: &Instruction) -> DecodedMnemonic {
     if instruction.mnemonic() == Mnemonic::Syscall {
         DecodedMnemonic::Syscall
@@ -2027,7 +2043,7 @@ mod tests {
     use super::{
         BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError,
         GuestBlock, GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters,
-        SameIsaExecutionCore, TrampolineCore,
+        SameIsaExecutionCore, SyscallSite, TrampolineCore, syscall_instruction_sites,
     };
     use std::collections::BTreeMap;
 
@@ -2125,6 +2141,25 @@ mod tests {
                 rip: 0x400007,
                 next_rip: 0x400009,
             })
+        );
+    }
+
+    #[test]
+    fn syscall_site_scan_ignores_immediate_bytes() {
+        let sites = syscall_instruction_sites(
+            &[
+                0xc7, 0x04, 0x24, 0x00, 0x0f, 0x05, 0x00, // mov dword ptr [rsp],0x50f00
+                0x0f, 0x05, // syscall
+            ],
+            0x401000,
+        );
+
+        assert_eq!(
+            sites,
+            [SyscallSite {
+                rip: 0x401007,
+                next_rip: 0x401009
+            }]
         );
     }
 

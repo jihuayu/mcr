@@ -24,7 +24,7 @@
 
 | Command | Current result | Required follow-up |
 |---|---|---|
-| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault at guest RIP `0x8931db`; Go now fails with `runtime: failed to create new OS thread (have 2 already; errno=22)` / `fatal error: newosproc`. | Diagnose the Linux thread clone shape Go uses for `newosproc` before `workload-001` can be marked done. |
+| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault, and instruction-aware syscall patching cleared the Go `newosproc` clone failure caused by rewriting the `0x50f00` clone-flags immediate. The command now starts without that fatal error but did not complete within a bounded local Windows run. | Add a bounded timeout diagnostic and identify whether Go is blocked in guest wait/futex, scheduling, or native execution. |
 | `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Did not complete within several minutes on local Windows x86-64 with a package-backed Alpine Node rootfs. | Add a bounded timeout diagnostic and identify whether startup is blocked in guest wait/futex, epoll/readiness, or native execution. |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Did not complete within several minutes on local Windows x86-64 with a package-backed Alpine Cargo rootfs. | Add a bounded timeout diagnostic and identify whether startup is blocked in guest wait/futex, filesystem metadata, or native execution. |
 

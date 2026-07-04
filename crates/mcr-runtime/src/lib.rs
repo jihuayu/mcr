@@ -3133,14 +3133,8 @@ fn find_executable_syscall_patches(
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        for offset in 0..bytes.len() {
-            if bytes
-                .get(offset..offset.saturating_add(2))
-                .is_some_and(|window| window == [0x0f, 0x05])
-            {
-                let address = start + offset as u64;
-                patches.push(ExecutableSyscallPatch { address });
-            }
+        for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
+            patches.push(ExecutableSyscallPatch { address: site.rip });
         }
     }
     Ok(patches)
@@ -12225,6 +12219,25 @@ mod tests {
                 .iter()
                 .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
         );
+    }
+
+    #[test]
+    fn native_patch_cache_does_not_rewrite_syscall_bytes_inside_immediate() {
+        let code = [
+            0xc7, 0x04, 0x24, 0x00, 0x0f, 0x05, 0x00, // mov dword ptr [rsp],0x50f00
+            0x0f, 0x05, // syscall
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(INITIAL_GUEST_PID, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 7), code[..7]);
+        assert_eq!(guest_bytes(runtime.memory(), 0x401007, 2), [0xcc, 0x90]);
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

@@ -50,8 +50,9 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   guest shell commands and skip unless `MCR_BIN` plus the matching materialized
   rootfs are available.
 - Local package-backed rootfs validation on Windows passed `python -V`
-  (`Python 3.14.5`) but did not clear the matrix: `sigaltstack` support moved
-  `go version` from a native execution fault to a Go `newosproc` thread-creation
-  failure, while `node -v` and `cargo --version` did not complete within
-  several minutes and were stopped. These are runtime execution blockers, not
-  fixture-contract gaps.
+  (`Python 3.14.5`) but did not clear the matrix: `sigaltstack` support and
+  instruction-aware syscall patching moved `go version` past the native
+  execution fault and Go `newosproc` clone failure, but it still did not
+  complete within a bounded local run. `node -v` and `cargo --version` also did
+  not complete within several minutes and were stopped. These are runtime
+  execution blockers, not fixture-contract gaps.
