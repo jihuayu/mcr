@@ -81,3 +81,8 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   file instead of copying every file before guest execution. This moves the Go
   rootfs bulk copy out of the pre-guest critical path; `go version` still needs
   a package-rootfs rerun to identify the next runtime blocker after guest entry.
+- 2026-07-04 rerun: with `MCR_HOSTSTEP_TRACE=1`, `go version` now registers the
+  rootfs in `1249ms` and enters native guest execution. The remaining 30s
+  timeout is repeated native patch-cache work after guest entry, including
+  repeated scans of the two executable ranges and reapplying roughly `1616`
+  FS-relative patches for `fs_base=0x700a6b28`.
