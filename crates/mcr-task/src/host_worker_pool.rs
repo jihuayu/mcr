@@ -1,4 +1,8 @@
+use std::collections::VecDeque;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 pub const HOST_WORKER_POOL_MAX_WORKERS: usize = 64;
 pub const HOST_WORKER_POOL_MAX_QUEUED_JOBS: usize = 4096;
@@ -250,6 +254,9 @@ pub enum HostWorkerPoolSubmitError {
         max_workers: usize,
         max_queued_jobs: usize,
     },
+    Shutdown {
+        role: HostWorkerPoolRole,
+    },
 }
 
 impl fmt::Display for HostWorkerPoolSubmitError {
@@ -265,6 +272,7 @@ impl fmt::Display for HostWorkerPoolSubmitError {
                 formatter,
                 "{role} worker pool is full: active {active_workers}/{max_workers}, queued {queued_jobs}/{max_queued_jobs}"
             ),
+            Self::Shutdown { role } => write!(formatter, "{role} worker pool is shut down"),
         }
     }
 }
@@ -290,6 +298,178 @@ impl fmt::Display for HostWorkerPoolCompletionError {
 }
 
 impl std::error::Error for HostWorkerPoolCompletionError {}
+
+type HostWorkerJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Bounded host worker pool that can execute runtime and I/O completion jobs.
+#[derive(Debug)]
+pub struct HostWorkerPoolExecutor {
+    config: HostWorkerPoolConfig,
+    state: Arc<HostWorkerPoolExecutorState>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl HostWorkerPoolExecutor {
+    pub fn new(config: HostWorkerPoolConfig) -> std::io::Result<Self> {
+        let state = Arc::new(HostWorkerPoolExecutorState {
+            inner: Mutex::new(HostWorkerPoolExecutorInner {
+                queue: VecDeque::with_capacity(config.queue_capacity()),
+                active_workers: 0,
+                submitted_jobs: 0,
+                completed_jobs: 0,
+                rejected_jobs: 0,
+                shutdown: false,
+            }),
+            available: Condvar::new(),
+        });
+        let mut workers = Vec::with_capacity(config.max_workers());
+        for index in 0..config.max_workers() {
+            let worker_state = state.clone();
+            let worker = thread::Builder::new()
+                .name(format!("mcr-{}-{index}", config.role()))
+                .spawn(move || host_worker_loop(worker_state))?;
+            workers.push(worker);
+        }
+
+        Ok(Self {
+            config,
+            state,
+            workers,
+        })
+    }
+
+    pub fn submit(
+        &self,
+        job: impl FnOnce() + Send + 'static,
+    ) -> Result<HostWorkerPoolSubmission, HostWorkerPoolSubmitError> {
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .expect("host worker pool mutex poisoned");
+        if inner.shutdown {
+            inner.rejected_jobs += 1;
+            return Err(HostWorkerPoolSubmitError::Shutdown {
+                role: self.config.role(),
+            });
+        }
+        if inner.queue.len() >= self.config.queue_capacity() {
+            inner.rejected_jobs += 1;
+            return Err(HostWorkerPoolSubmitError::QueueFull {
+                role: self.config.role(),
+                active_workers: inner.active_workers,
+                queued_jobs: inner.queue.len(),
+                max_workers: self.config.max_workers(),
+                max_queued_jobs: self.config.queue_capacity(),
+            });
+        }
+
+        inner.queue.push_back(Box::new(job));
+        inner.submitted_jobs += 1;
+        drop(inner);
+        self.state.available.notify_one();
+        Ok(HostWorkerPoolSubmission::Queued)
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> HostWorkerPoolDiagnostics {
+        let inner = self
+            .state
+            .inner
+            .lock()
+            .expect("host worker pool mutex poisoned");
+        HostWorkerPoolDiagnostics {
+            role: self.config.role(),
+            max_workers: self.config.max_workers(),
+            max_queued_jobs: self.config.queue_capacity(),
+            active_workers: inner.active_workers,
+            queued_jobs: inner.queue.len(),
+            submitted_jobs: inner.submitted_jobs,
+            completed_jobs: inner.completed_jobs,
+            rejected_jobs: inner.rejected_jobs,
+        }
+    }
+
+    pub fn shutdown(mut self) {
+        self.shutdown_workers();
+    }
+
+    fn shutdown_workers(&mut self) {
+        {
+            let mut inner = self
+                .state
+                .inner
+                .lock()
+                .expect("host worker pool mutex poisoned");
+            inner.shutdown = true;
+        }
+        self.state.available.notify_all();
+        while let Some(worker) = self.workers.pop() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for HostWorkerPoolExecutor {
+    fn drop(&mut self) {
+        self.shutdown_workers();
+    }
+}
+
+#[derive(Debug)]
+struct HostWorkerPoolExecutorState {
+    inner: Mutex<HostWorkerPoolExecutorInner>,
+    available: Condvar,
+}
+
+struct HostWorkerPoolExecutorInner {
+    queue: VecDeque<HostWorkerJob>,
+    active_workers: usize,
+    submitted_jobs: usize,
+    completed_jobs: usize,
+    rejected_jobs: usize,
+    shutdown: bool,
+}
+
+impl fmt::Debug for HostWorkerPoolExecutorInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostWorkerPoolExecutorInner")
+            .field("queued_jobs", &self.queue.len())
+            .field("active_workers", &self.active_workers)
+            .field("submitted_jobs", &self.submitted_jobs)
+            .field("completed_jobs", &self.completed_jobs)
+            .field("rejected_jobs", &self.rejected_jobs)
+            .field("shutdown", &self.shutdown)
+            .finish()
+    }
+}
+
+fn host_worker_loop(state: Arc<HostWorkerPoolExecutorState>) {
+    loop {
+        let job = {
+            let mut inner = state.inner.lock().expect("host worker pool mutex poisoned");
+            loop {
+                if let Some(job) = inner.queue.pop_front() {
+                    inner.active_workers += 1;
+                    break job;
+                }
+                if inner.shutdown {
+                    return;
+                }
+                inner = state
+                    .available
+                    .wait(inner)
+                    .expect("host worker pool mutex poisoned");
+            }
+        };
+
+        let _ = catch_unwind(AssertUnwindSafe(job));
+        let mut inner = state.inner.lock().expect("host worker pool mutex poisoned");
+        inner.active_workers -= 1;
+        inner.completed_jobs += 1;
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostWorkerPoolBoundary {
@@ -456,6 +636,8 @@ impl Default for HostWorkerPools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn default_pool_limits_are_bounded_and_observable() {
@@ -596,5 +778,118 @@ mod tests {
                 role: HostWorkerPoolRole::GuestTaskExecution,
             })
         );
+    }
+
+    #[test]
+    fn executor_runs_jobs_and_reports_active_queued_and_completed_counts() {
+        let config =
+            HostWorkerPoolConfig::with_queue_capacity(HostWorkerPoolRole::IoCompletion, 2, 4)
+                .unwrap();
+        let executor = HostWorkerPoolExecutor::new(config).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        for id in 0..2 {
+            let release = release.clone();
+            let started_tx = started_tx.clone();
+            let done_tx = done_tx.clone();
+            assert_eq!(
+                executor.submit(move || {
+                    started_tx.send(id).unwrap();
+                    let (lock, cvar) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                    done_tx.send(id).unwrap();
+                }),
+                Ok(HostWorkerPoolSubmission::Queued)
+            );
+        }
+
+        let _ = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _ = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let diagnostics = executor.diagnostics();
+        assert_eq!(diagnostics.active_workers(), 2);
+        assert_eq!(diagnostics.queued_jobs(), 0);
+        assert_eq!(diagnostics.submitted_jobs(), 2);
+
+        let done_tx_queued = done_tx.clone();
+        assert_eq!(
+            executor.submit(move || {
+                done_tx_queued.send(2).unwrap();
+            }),
+            Ok(HostWorkerPoolSubmission::Queued)
+        );
+        assert_eq!(executor.diagnostics().queued_jobs(), 1);
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        let mut completed = [
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        completed.sort_unstable();
+        assert_eq!(completed, [0, 1, 2]);
+
+        let diagnostics = executor.diagnostics();
+        assert_eq!(diagnostics.active_workers(), 0);
+        assert_eq!(diagnostics.queued_jobs(), 0);
+        assert_eq!(diagnostics.completed_jobs(), 3);
+        executor.shutdown();
+    }
+
+    #[test]
+    fn executor_rejects_full_queue_without_losing_diagnostics() {
+        let config =
+            HostWorkerPoolConfig::with_queue_capacity(HostWorkerPoolRole::GuestTaskExecution, 1, 1)
+                .unwrap();
+        let executor = HostWorkerPoolExecutor::new(config).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let release_running = release.clone();
+        executor
+            .submit(move || {
+                started_tx.send(()).unwrap();
+                let (lock, cvar) = &*release_running;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        executor.submit(|| {}).unwrap();
+        assert_eq!(
+            executor.submit(|| {}),
+            Err(HostWorkerPoolSubmitError::QueueFull {
+                role: HostWorkerPoolRole::GuestTaskExecution,
+                active_workers: 1,
+                queued_jobs: 1,
+                max_workers: 1,
+                max_queued_jobs: 1,
+            })
+        );
+
+        let diagnostics = executor.diagnostics();
+        assert_eq!(diagnostics.active_workers(), 1);
+        assert_eq!(diagnostics.queued_jobs(), 1);
+        assert_eq!(diagnostics.submitted_jobs(), 2);
+        assert_eq!(diagnostics.rejected_jobs(), 1);
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        executor.shutdown();
     }
 }

@@ -45,3 +45,12 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 - Cancellation and shutdown must drain queued and active work deterministically.
 - Guest process/thread IDs remain MCR state; host worker identity must not leak
   into guest-visible APIs.
+
+## Checkpoints
+
+- Added a real bounded `HostWorkerPoolExecutor` next to the existing diagnostic
+  boundary. It starts a fixed worker set per role, accepts `Send + 'static`
+  jobs through a capacity-limited queue, reports active/queued/submitted/
+  completed/rejected counts through `HostWorkerPoolDiagnostics`, catches job
+  panics so counters are drained, and joins workers on explicit shutdown or
+  drop.
