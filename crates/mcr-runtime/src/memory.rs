@@ -470,6 +470,51 @@ impl GuestMemory {
         self.write_guest(address, bytes)
     }
 
+    pub fn intrinsic_memset(
+        &mut self,
+        address: u64,
+        value: u8,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        checked_raw_range(address, len as u64)?;
+        self.write_guest(address, &vec![value; len])
+    }
+
+    pub fn intrinsic_memmove(
+        &mut self,
+        destination: u64,
+        source: u64,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        let mut bytes = vec![0; len];
+        self.copy_guest(source, &mut bytes, AccessKind::Read)?;
+        self.write_guest(destination, &bytes)
+    }
+
+    pub fn intrinsic_memchr(
+        &self,
+        address: u64,
+        needle: u8,
+        len: usize,
+    ) -> Result<Option<u64>, GuestMemoryError> {
+        let mut bytes = vec![0; len];
+        self.copy_guest(address, &mut bytes, AccessKind::Read)?;
+        Ok(bytes
+            .iter()
+            .position(|byte| *byte == needle)
+            .map(|index| address + index as u64))
+    }
+
+    pub fn intrinsic_strlen(
+        &self,
+        address: u64,
+        max_len: usize,
+    ) -> Result<Option<usize>, GuestMemoryError> {
+        let mut bytes = vec![0; max_len];
+        self.copy_guest(address, &mut bytes, AccessKind::Read)?;
+        Ok(bytes.iter().position(|byte| *byte == 0))
+    }
+
     pub fn patch_code(&mut self, address: u64, bytes: &[u8]) -> Result<Vec<u8>, GuestMemoryError> {
         let end = checked_raw_range(address, bytes.len() as u64)?;
         let vma = self
@@ -1595,6 +1640,42 @@ mod tests {
         assert_eq!(fixed, addr);
         memory.write(addr, b"b").unwrap();
         assert_eq!(memory.vmas().count(), 2);
+    }
+
+    #[test]
+    fn intrinsic_memory_primitives_preserve_guest_access_rules_and_overlap() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+            ))
+            .unwrap();
+
+        memory.intrinsic_memset(addr, b'a', 8).unwrap();
+        assert_eq!(memory.intrinsic_memchr(addr, b'a', 8).unwrap(), Some(addr));
+        assert_eq!(memory.intrinsic_memchr(addr, b'z', 8).unwrap(), None);
+
+        memory.write(addr, b"abcdef\0tail").unwrap();
+        memory.intrinsic_memmove(addr + 2, addr, 6).unwrap();
+        let mut moved = [0; 8];
+        memory.read(addr, &mut moved).unwrap();
+        assert_eq!(&moved, b"ababcdef");
+        assert_eq!(memory.intrinsic_strlen(addr, 12).unwrap(), Some(11));
+
+        memory
+            .mprotect(MprotectSyscallArgs {
+                addr,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ,
+            })
+            .unwrap();
+        assert_eq!(
+            memory.intrinsic_memset(addr, 0, 1),
+            Err(GuestMemoryError::AccessDenied)
+        );
     }
 
     #[test]

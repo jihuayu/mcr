@@ -44,3 +44,11 @@ cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
   as native/JIT execution.
 - Overlap semantics must match the specific target routine, especially
   `memcpy` versus `memmove`-like behavior.
+
+## Checkpoints
+
+- Added runtime-owned guest-memory intrinsic primitives for `memset`,
+  overlap-safe `memmove`, `memchr`, and bounded `strlen`. They reuse the normal
+  guest memory access checks, so unmapped ranges and read/write permissions keep
+  returning the same Linux-facing memory errors. Native symbol/patch dispatch is
+  still the remaining replacement step.
