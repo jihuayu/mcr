@@ -5608,6 +5608,7 @@ impl EventSyscalls for RuntimeSubsystems {
         }
         match request.syscall {
             mcr_sys::Syscall::Poll => self.dispatch_poll(request),
+            mcr_sys::Syscall::Select => self.dispatch_select(request),
             mcr_sys::Syscall::Ppoll => self.dispatch_ppoll(request),
             mcr_sys::Syscall::Eventfd2 => self.dispatch_eventfd2(request),
             mcr_sys::Syscall::EpollCreate1 => self.dispatch_epoll_create1(request),
@@ -7237,6 +7238,37 @@ impl RuntimeSubsystems {
         outcome
     }
 
+    fn dispatch_select(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let nfds = match select_nfds(arg(request, 0)) {
+            Ok(nfds) => nfds,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match read_select_timeout(self.files.memory(), arg(request, 4)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let outcome = outcome(self.select_fds(
+            nfds,
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+            timeout,
+        ));
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+        }
+        outcome
+    }
+
     fn poll_fds(
         &mut self,
         fds_addr: u64,
@@ -7261,6 +7293,81 @@ impl RuntimeSubsystems {
             }
         }
         Ok(ready)
+    }
+
+    fn select_fds(
+        &mut self,
+        nfds: usize,
+        readfds_addr: u64,
+        writefds_addr: u64,
+        exceptfds_addr: u64,
+        timeout: Option<Duration>,
+    ) -> Result<u64, LinuxErrno> {
+        let interests = read_select_interests(
+            self.files.memory(),
+            nfds,
+            readfds_addr,
+            writefds_addr,
+            exceptfds_addr,
+        )?;
+        let mut ready = self.select_ready_fds(&interests, Some(Duration::ZERO))?;
+        if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {
+            ready = self.select_ready_fds(&interests, timeout)?;
+        }
+
+        write_select_fd_set(self.files.memory_mut(), readfds_addr, nfds, &ready.read)?;
+        write_select_fd_set(self.files.memory_mut(), writefds_addr, nfds, &ready.write)?;
+        write_select_fd_set(
+            self.files.memory_mut(),
+            exceptfds_addr,
+            nfds,
+            &ready.exceptional,
+        )?;
+        Ok(ready.count() as u64)
+    }
+
+    fn select_ready_fds(
+        &mut self,
+        interests: &[SelectInterest],
+        timeout: Option<Duration>,
+    ) -> Result<SelectReadyFds, LinuxErrno> {
+        let mut ready = SelectReadyFds::default();
+        let wait_index = self.select_wait_interest_index(interests, timeout);
+        for (index, interest) in interests.iter().enumerate() {
+            let wait_timeout = if wait_index == Some(index) {
+                timeout
+            } else {
+                Some(Duration::ZERO)
+            };
+            let revents = self.poll_fd_revents(interest.fd, interest.events, wait_timeout)?;
+            if revents & LINUX_POLLNVAL != 0 {
+                return Err(LinuxErrno::EBADF);
+            }
+            if interest.read && select_revents_readable(revents) {
+                ready.read.push(interest.fd);
+            }
+            if interest.write && select_revents_writable(revents) {
+                ready.write.push(interest.fd);
+            }
+            if interest.exceptional && revents & LINUX_POLLPRI != 0 {
+                ready.exceptional.push(interest.fd);
+            }
+        }
+        Ok(ready)
+    }
+
+    fn select_wait_interest_index(
+        &self,
+        interests: &[SelectInterest],
+        timeout: Option<Duration>,
+    ) -> Option<usize> {
+        if matches!(timeout, Some(duration) if duration.is_zero()) {
+            return None;
+        }
+        interests
+            .iter()
+            .position(|interest| self.files.vfs().socket_id_for_fd(interest.fd).is_ok())
+            .or_else(|| (!interests.is_empty()).then_some(0))
     }
 
     fn poll_fd_revents(
@@ -7550,6 +7657,41 @@ impl RuntimeSubsystems {
 
 const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
+const SELECT_FD_BITS: usize = 64;
+const MAX_SELECT_FDS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectInterest {
+    fd: Fd,
+    events: i16,
+    read: bool,
+    write: bool,
+    exceptional: bool,
+}
+
+#[derive(Default)]
+struct SelectReadyFds {
+    read: Vec<Fd>,
+    write: Vec<Fd>,
+    exceptional: Vec<Fd>,
+}
+
+impl SelectReadyFds {
+    fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.write.is_empty() && self.exceptional.is_empty()
+    }
+
+    fn count(&self) -> usize {
+        let mut fds =
+            Vec::with_capacity(self.read.len() + self.write.len() + self.exceptional.len());
+        fds.extend_from_slice(&self.read);
+        fds.extend_from_slice(&self.write);
+        fds.extend_from_slice(&self.exceptional);
+        fds.sort_unstable();
+        fds.dedup();
+        fds.len()
+    }
+}
 
 const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
     LINUX_EPOLLIN | LINUX_EPOLLPRI | LINUX_EPOLLOUT | LINUX_EPOLLERR | LINUX_EPOLLHUP;
@@ -7950,6 +8092,128 @@ fn write_pollfd_revents(
         .map_err(memory_errno)
 }
 
+fn select_nfds(raw: u64) -> Result<usize, LinuxErrno> {
+    let signed = raw as i64;
+    if signed < 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let nfds = usize::try_from(signed).map_err(|_| LinuxErrno::EINVAL)?;
+    if nfds > MAX_SELECT_FDS {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(nfds)
+}
+
+fn read_select_timeout(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<Option<Duration>, LinuxErrno> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let tv_sec = read_guest_i64(memory, addr)?;
+    let tv_usec = read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?;
+    if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(Some(Duration::new(
+        tv_sec as u64,
+        u32::try_from(tv_usec * 1_000).map_err(|_| LinuxErrno::EINVAL)?,
+    )))
+}
+
+fn read_select_interests(
+    memory: &impl GuestMemoryAccess,
+    nfds: usize,
+    readfds_addr: u64,
+    writefds_addr: u64,
+    exceptfds_addr: u64,
+) -> Result<Vec<SelectInterest>, LinuxErrno> {
+    let mut interests = Vec::new();
+    for fd in 0..nfds {
+        let read = select_fd_set_contains(memory, readfds_addr, fd)?;
+        let write = select_fd_set_contains(memory, writefds_addr, fd)?;
+        let exceptional = select_fd_set_contains(memory, exceptfds_addr, fd)?;
+        if !read && !write && !exceptional {
+            continue;
+        }
+        let mut events = 0;
+        if read {
+            events |= LINUX_POLLIN | LINUX_POLLRDNORM;
+        }
+        if write {
+            events |= LINUX_POLLOUT | LINUX_POLLWRNORM;
+        }
+        if exceptional {
+            events |= LINUX_POLLPRI;
+        }
+        interests.push(SelectInterest {
+            fd: i32::try_from(fd).map_err(|_| LinuxErrno::EINVAL)?,
+            events,
+            read,
+            write,
+            exceptional,
+        });
+    }
+    Ok(interests)
+}
+
+fn select_fd_set_contains(
+    memory: &impl GuestMemoryAccess,
+    set_addr: u64,
+    fd: usize,
+) -> Result<bool, LinuxErrno> {
+    if set_addr == 0 {
+        return Ok(false);
+    }
+    let word_addr = select_fd_word_addr(set_addr, fd)?;
+    let word = read_guest_u64(memory, word_addr)?;
+    Ok(word & select_fd_bit(fd) != 0)
+}
+
+fn write_select_fd_set(
+    memory: &mut impl GuestMemoryAccess,
+    set_addr: u64,
+    nfds: usize,
+    fds: &[Fd],
+) -> Result<(), LinuxErrno> {
+    if set_addr == 0 {
+        return Ok(());
+    }
+    write_zeroed(memory, set_addr, select_fd_set_len(nfds)?)?;
+    for fd in fds {
+        if *fd < 0 {
+            continue;
+        }
+        let fd = usize::try_from(*fd).map_err(|_| LinuxErrno::EINVAL)?;
+        if fd >= nfds {
+            continue;
+        }
+        let word_addr = select_fd_word_addr(set_addr, fd)?;
+        let word = read_guest_u64(memory, word_addr)? | select_fd_bit(fd);
+        memory
+            .write_bytes(word_addr, &word.to_le_bytes())
+            .map_err(memory_errno)?;
+    }
+    Ok(())
+}
+
+fn select_fd_set_len(nfds: usize) -> Result<usize, LinuxErrno> {
+    nfds.checked_add(SELECT_FD_BITS - 1)
+        .map(|bits| bits / SELECT_FD_BITS * 8)
+        .ok_or(LinuxErrno::EINVAL)
+}
+
+fn select_fd_word_addr(set_addr: u64, fd: usize) -> Result<u64, LinuxErrno> {
+    set_addr
+        .checked_add(((fd / SELECT_FD_BITS) * 8) as u64)
+        .ok_or(LinuxErrno::EFAULT)
+}
+
+fn select_fd_bit(fd: usize) -> u64 {
+    1u64 << (fd % SELECT_FD_BITS)
+}
+
 fn read_epoll_event(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -8075,6 +8339,14 @@ fn poll_revents_from_socket_events(readiness: SocketEvents, events: i16) -> i16 
         revents |= LINUX_POLLNVAL;
     }
     revents
+}
+
+fn select_revents_readable(revents: i16) -> bool {
+    revents & (LINUX_POLL_READ_NORMAL | LINUX_POLLERR | LINUX_POLLHUP) != 0
+}
+
+fn select_revents_writable(revents: i16) -> bool {
+    revents & (LINUX_POLL_WRITE_NORMAL | LINUX_POLLERR | LINUX_POLLHUP) != 0
 }
 
 fn fork_child_pid(decoded: &[TraceField]) -> Option<mcr_sys::GuestPid> {
@@ -9923,6 +10195,95 @@ mod tests {
             pollfd_revents(runtime.memory(), 0x402100),
             LINUX_POLLRDNORM | LINUX_POLLOUT | LINUX_POLLWRNORM
         );
+    }
+
+    #[test]
+    fn select_reports_regular_file_readiness_and_clears_unready_sets() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        write_select_fdset(runtime.memory_mut(), 0x402100, 4, &[3]);
+        write_select_fdset(runtime.memory_mut(), 0x402180, 4, &[3]);
+        write_timeval(runtime.memory_mut(), 0x402200, 0, 0);
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Select,
+            [4, 0x402100, 0x402180, 0, 0x402200, 0],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Success(1));
+        assert!(select_fdset_contains(runtime.memory(), 0x402100, 3));
+        assert!(!select_fdset_contains(runtime.memory(), 0x402180, 3));
+    }
+
+    #[test]
+    fn select_reports_socket_readiness_and_bad_fds() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        write_select_fdset(runtime.memory_mut(), 0x402100, 4, &[3]);
+        write_select_fdset(runtime.memory_mut(), 0x402180, 4, &[3]);
+        write_timeval(runtime.memory_mut(), 0x402200, 0, 0);
+        let ready = runtime.dispatch_syscall(context(
+            Syscall::Select,
+            [4, 0x402100, 0x402180, 0, 0x402200, 0],
+        ));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert!(select_fdset_contains(runtime.memory(), 0x402100, 3));
+        assert!(select_fdset_contains(runtime.memory(), 0x402180, 3));
+
+        write_select_fdset(runtime.memory_mut(), 0x402300, 100, &[99]);
+        write_timeval(runtime.memory_mut(), 0x402380, 0, 0);
+        let bad_fd =
+            runtime.dispatch_syscall(context(Syscall::Select, [100, 0x402300, 0, 0, 0x402380, 0]));
+        assert_eq!(bad_fd.result, SyscallReturn::Errno(LinuxErrno::EBADF));
     }
 
     #[test]
@@ -12869,6 +13230,19 @@ mod tests {
         let mut bytes = [0; 2];
         memory.read(addr + 6, &mut bytes).unwrap();
         i16::from_le_bytes(bytes)
+    }
+
+    fn write_select_fdset(memory: &mut GuestMemory, addr: u64, nfds: usize, fds: &[Fd]) {
+        write_select_fd_set(memory, addr, nfds, fds).unwrap();
+    }
+
+    fn select_fdset_contains(memory: &GuestMemory, addr: u64, fd: usize) -> bool {
+        select_fd_set_contains(memory, addr, fd).unwrap()
+    }
+
+    fn write_timeval(memory: &mut GuestMemory, addr: u64, sec: i64, usec: i64) {
+        memory.write(addr, &sec.to_le_bytes()).unwrap();
+        memory.write(addr + 8, &usec.to_le_bytes()).unwrap();
     }
 
     fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {

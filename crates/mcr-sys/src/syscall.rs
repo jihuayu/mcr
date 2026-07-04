@@ -59,6 +59,7 @@ pub enum Syscall {
     Writev,
     Access,
     Pipe,
+    Select,
     SchedYield,
     Madvise,
     Gettimeofday,
@@ -190,6 +191,7 @@ impl Syscall {
     pub const WRITEV: SyscallNumber = SyscallNumber::new(20);
     pub const ACCESS: SyscallNumber = SyscallNumber::new(21);
     pub const PIPE: SyscallNumber = SyscallNumber::new(22);
+    pub const SELECT: SyscallNumber = SyscallNumber::new(23);
     pub const SCHED_YIELD: SyscallNumber = SyscallNumber::new(24);
     pub const MADVISE: SyscallNumber = SyscallNumber::new(28);
     pub const GETTIMEOFDAY: SyscallNumber = SyscallNumber::new(96);
@@ -319,6 +321,7 @@ impl Syscall {
             20 => Self::Writev,
             21 => Self::Access,
             22 => Self::Pipe,
+            23 => Self::Select,
             24 => Self::SchedYield,
             28 => Self::Madvise,
             32 => Self::Dup,
@@ -455,6 +458,7 @@ impl Syscall {
             Self::Writev => Self::WRITEV,
             Self::Access => Self::ACCESS,
             Self::Pipe => Self::PIPE,
+            Self::Select => Self::SELECT,
             Self::SchedYield => Self::SCHED_YIELD,
             Self::Madvise => Self::MADVISE,
             Self::Gettimeofday => Self::GETTIMEOFDAY,
@@ -589,6 +593,7 @@ impl Syscall {
             Self::Writev => "writev",
             Self::Access => "access",
             Self::Pipe => "pipe",
+            Self::Select => "select",
             Self::SchedYield => "sched_yield",
             Self::Madvise => "madvise",
             Self::Gettimeofday => "gettimeofday",
@@ -731,6 +736,7 @@ mod tests {
             (Syscall::PREAD64, Syscall::Pread64, "pread64"),
             (Syscall::FSYNC, Syscall::Fsync, "fsync"),
             (Syscall::FDATASYNC, Syscall::Fdatasync, "fdatasync"),
+            (Syscall::SELECT, Syscall::Select, "select"),
             (Syscall::SCHED_YIELD, Syscall::SchedYield, "sched_yield"),
             (Syscall::MADVISE, Syscall::Madvise, "madvise"),
             (Syscall::GETTIMEOFDAY, Syscall::Gettimeofday, "gettimeofday"),
