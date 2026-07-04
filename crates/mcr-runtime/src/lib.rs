@@ -15939,42 +15939,38 @@ mod tests {
 
     #[test]
     fn runtime_unimplemented_fake_syscalls_return_enosys_and_trace_args() {
-        for (syscall, args, decoded_field) in [(
-            Syscall::Rseq,
-            [0x402000, 32, 0, 0x53053053, 0, 0],
-            ("rseq", "0x402000"),
-        )] {
-            let mut runtime = Runtime::with_tracer(
-                test_program("/bin/app", 0x401000),
-                InMemorySyscallTracer::new(),
-            )
-            .unwrap();
+        let syscall = Syscall::Rseq;
+        let args = [0x402000, 32, 0, 0x53053053, 0, 0];
+        let decoded_field = ("rseq", "0x402000");
+        let mut runtime = Runtime::with_tracer(
+            test_program("/bin/app", 0x401000),
+            InMemorySyscallTracer::new(),
+        )
+        .unwrap();
 
-            let result = runtime.dispatch_syscall(context(syscall, args));
+        let result = runtime.dispatch_syscall(context(syscall, args));
 
-            assert_eq!(
-                result.result,
-                SyscallReturn::Errno(LinuxErrno::ENOSYS),
-                "{syscall}"
-            );
-            match runtime.tracer().events() {
-                [
-                    SyscallTraceEvent::Enter(enter),
-                    SyscallTraceEvent::Exit(exit),
-                ] => {
-                    assert_eq!(enter.syscall, syscall);
-                    assert_eq!(exit.syscall, syscall);
-                    assert_eq!(exit.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
-                    assert!(
-                        exit.decoded
-                            .iter()
-                            .any(|field| field.name == decoded_field.0
-                                && field.value == decoded_field.1),
-                        "{syscall} should preserve decoded argument {decoded_field:?}"
-                    );
-                }
-                other => panic!("expected enter and exit trace for {syscall}, got {other:?}"),
+        assert_eq!(
+            result.result,
+            SyscallReturn::Errno(LinuxErrno::ENOSYS),
+            "{syscall}"
+        );
+        match runtime.tracer().events() {
+            [
+                SyscallTraceEvent::Enter(enter),
+                SyscallTraceEvent::Exit(exit),
+            ] => {
+                assert_eq!(enter.syscall, syscall);
+                assert_eq!(exit.syscall, syscall);
+                assert_eq!(exit.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+                assert!(
+                    exit.decoded.iter().any(
+                        |field| field.name == decoded_field.0 && field.value == decoded_field.1
+                    ),
+                    "{syscall} should preserve decoded argument {decoded_field:?}"
+                );
             }
+            other => panic!("expected enter and exit trace for {syscall}, got {other:?}"),
         }
     }
 
