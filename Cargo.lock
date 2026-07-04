@@ -141,6 +141,7 @@ dependencies = [
  "mcr-elf",
  "mcr-jit",
  "mcr-net",
+ "mcr-snapshot",
  "mcr-sys",
  "mcr-task",
  "mcr-testkit",

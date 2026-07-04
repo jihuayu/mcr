@@ -1,7 +1,7 @@
 ---
 id: buildrun-001
 scope: phase3-build-executor
-status: pending
+status: in-progress
 depends-on: [workload-001, snapshot-001]
 ---
 
@@ -37,3 +37,10 @@ cargo test -p mcr-testkit
 - Host shell execution is forbidden.
 - Preserve exit code, stdout/stderr routing, trace ID, cwd, env, argv, and cancellation behavior.
 - Shell form defaults to `/bin/sh -c` unless the image config later supplies a different shell.
+- 2026-07-04 checkpoint: `mcr-runtime` now exposes `BuildRunSpec`,
+  `BuildRunCommand`, and `BuildRunResult` as the build executor boundary. Shell
+  form maps to guest `/bin/sh -c`, exec form preserves argv, env is passed
+  deterministically into `run-rootfs`, and results preserve status,
+  stdout/stderr, snapshot ID, and trace ID. Snapshot-rootfs mounting, working
+  directory application, cancellation, and end-to-end `RUN` mutation remain
+  follow-up work.

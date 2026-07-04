@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 
+mod build_run;
 pub mod memory;
 pub mod run_rootfs;
 
@@ -13,6 +14,9 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+pub use build_run::{
+    BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
+};
 pub use memory::{
     DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
     GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
