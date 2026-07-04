@@ -813,43 +813,30 @@ impl GuestMemory {
             return Ok(());
         }
 
+        let old_mapped_end = self.heap_mapped_end();
         let new_size = mapped_end
             .checked_sub(self.brk_base)
             .ok_or(GuestMemoryError::InvalidAddress)?;
-        let len = usize::try_from(new_size).map_err(|_| GuestMemoryError::RegionTooLarge)?;
         let protection = GuestMemoryProtection::new(true, true, false);
-        let mut new_memory = allocate_guest_host_memory_at(
+        let (allocation_id, allocation_offset) = self.ensure_host_allocation(
             self.brk_base,
-            len,
-            protection.to_host(),
-            self.host_address_mode,
+            mapped_end
+                .checked_sub(self.brk_base)
+                .ok_or(GuestMemoryError::InvalidAddress)?,
         )?;
-
-        if let Some(heap) = self.heap_vma().cloned() {
-            let copy_len = heap.len().min(new_size);
-            let old_allocation = self
-                .allocations
-                .get(&heap.allocation_id)
-                .expect("heap VMA references live allocation");
-            let copy_len =
-                usize::try_from(copy_len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-            new_memory.as_mut_slice()[..copy_len]
-                .copy_from_slice(&old_allocation.memory.as_slice()[..copy_len]);
+        let zero_start = old_mapped_end.max(self.brk_base);
+        if zero_start < mapped_end {
+            let zero_offset = allocation_offset
+                .checked_add(
+                    zero_start
+                        .checked_sub(self.brk_base)
+                        .ok_or(GuestMemoryError::InvalidAddress)?,
+                )
+                .ok_or(GuestMemoryError::RegionTooLarge)?;
+            let zero_len = usize::try_from(mapped_end - zero_start)
+                .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+            self.zero_allocation_range(allocation_id, zero_offset, zero_len)?;
         }
-
-        self.remove_heap_vmas();
-        let allocation_id = self.next_allocation_id;
-        self.next_allocation_id = self
-            .next_allocation_id
-            .checked_add(1)
-            .ok_or(GuestMemoryError::OutOfMemory)?;
-        self.allocations.insert(
-            allocation_id,
-            GuestAllocation {
-                guest_start: self.brk_base,
-                memory: new_memory,
-            },
-        );
         self.vmas.insert(
             self.brk_base,
             GuestVma {
@@ -858,9 +845,20 @@ impl GuestMemory {
                 protection,
                 kind: GuestVmaKind::Heap,
                 allocation_id,
-                allocation_offset: 0,
+                allocation_offset,
             },
         );
+        let offset =
+            usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let len = usize::try_from(new_size).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .expect("heap VMA references live allocation");
+        allocation
+            .memory
+            .protect_range(offset, len, protection.to_host())
+            .map_err(GuestMemoryError::Host)?;
         Ok(())
     }
 
@@ -1799,6 +1797,31 @@ mod tests {
 
         assert_eq!(outcome.current, BRK_BASE);
         assert_eq!(outcome.error, Some(GuestMemoryError::OutOfMemory));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn brk_growth_reuses_fixed_allocation_tail_after_native_clone() {
+        let brk_base = 0x0100_1000;
+        let mut memory = GuestMemory::with_layout(brk_base, MMAP_BASE, ADDRESS_END).unwrap();
+        memory
+            .insert_loaded_mapping(
+                0x0100_0000,
+                GUEST_PAGE_SIZE,
+                GuestMemoryProtection::new(true, false, true),
+                &[0x7f; GUEST_PAGE_SIZE as usize],
+            )
+            .unwrap();
+        let mut memory = memory.try_clone_runtime_at_guest_addresses().unwrap();
+
+        let outcome = memory.set_brk(brk_base + GUEST_PAGE_SIZE);
+
+        assert_eq!(outcome.current, brk_base + GUEST_PAGE_SIZE);
+        assert_eq!(outcome.error, None);
+        memory.write(brk_base, b"heap").unwrap();
+        let mut loaded = [0];
+        memory.read(0x0100_0000, &mut loaded).unwrap();
+        assert_eq!(loaded, [0x7f]);
     }
 
     #[test]
