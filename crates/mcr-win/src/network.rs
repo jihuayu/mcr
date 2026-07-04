@@ -1,5 +1,7 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::net::SocketAddr;
+#[cfg(windows)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{HostError, HostErrorCode, HostOperation, HostResult};
@@ -283,12 +285,30 @@ impl Drop for NetworkStack {
 #[derive(Debug)]
 pub struct HostSocket {
     #[cfg(windows)]
-    raw: crate::windows::Socket,
+    inner: Arc<HostSocketInner>,
     #[cfg(not(windows))]
     _private: (),
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct HostSocketInner {
+    raw: crate::windows::Socket,
+}
+
 impl HostSocket {
+    #[cfg(windows)]
+    fn from_raw(raw: crate::windows::Socket) -> Self {
+        Self {
+            inner: Arc::new(HostSocketInner { raw }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn raw(&self) -> crate::windows::Socket {
+        self.inner.raw
+    }
+
     /// Connects this socket to a remote address.
     pub fn connect(&self, address: SocketAddr) -> HostResult<()> {
         connect_platform(self, address)
@@ -408,7 +428,7 @@ impl HostSocket {
 }
 
 #[cfg(windows)]
-impl Drop for HostSocket {
+impl Drop for HostSocketInner {
     fn drop(&mut self) {
         // SAFETY: `raw` is an owned SOCKET created by `socket`.
         unsafe {
@@ -604,7 +624,7 @@ fn open_socket_with_iocp_platform(
     // SAFETY: `socket` owns a valid overlapped Winsock SOCKET and keeps it alive
     // for at least as long as any operations submitted through this adapter.
     unsafe {
-        port.associate_raw_handle(socket.raw, completion_key)?;
+        port.associate_raw_handle(socket.raw(), completion_key)?;
     }
     Ok(socket)
 }
@@ -641,7 +661,7 @@ fn open_socket_raw_platform(
     if raw == crate::windows::INVALID_SOCKET {
         return Err(crate::error::last_winsock_error(HostOperation::OpenSocket));
     }
-    Ok(HostSocket { raw })
+    Ok(HostSocket::from_raw(raw))
 }
 
 #[cfg(windows)]
@@ -656,7 +676,7 @@ fn poll_platform(entries: &mut [SocketPoll<'_>], timeout: Option<Duration>) -> H
     let mut poll_fds = entries
         .iter()
         .map(|entry| WsaPollFd {
-            fd: entry.socket.raw,
+            fd: entry.socket.raw(),
             events: entry.interest.to_winsock(),
             revents: 0,
         })
@@ -680,7 +700,7 @@ fn poll_platform(entries: &mut [SocketPoll<'_>], timeout: Option<Duration>) -> H
 fn connect_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> {
     let storage = SocketAddressStorage::from_socket_addr(address);
     // SAFETY: `storage` points to a valid sockaddr for the supplied address.
-    let status = unsafe { connect(socket.raw, storage.as_sockaddr(), storage.len()) };
+    let status = unsafe { connect(socket.raw(), storage.as_sockaddr(), storage.len()) };
     if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(
             HostOperation::ConnectSocket,
@@ -693,7 +713,7 @@ fn connect_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> 
 fn bind_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> {
     let storage = SocketAddressStorage::from_socket_addr(address);
     // SAFETY: `storage` points to a valid sockaddr for the supplied address.
-    let status = unsafe { bind(socket.raw, storage.as_sockaddr(), storage.len()) };
+    let status = unsafe { bind(socket.raw(), storage.as_sockaddr(), storage.len()) };
     if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(HostOperation::BindSocket));
     }
@@ -703,7 +723,7 @@ fn bind_platform(socket: &HostSocket, address: SocketAddr) -> HostResult<()> {
 #[cfg(windows)]
 fn listen_platform(socket: &HostSocket, backlog: i32) -> HostResult<()> {
     // SAFETY: Arguments are plain Winsock values.
-    let status = unsafe { listen(socket.raw, backlog) };
+    let status = unsafe { listen(socket.raw(), backlog) };
     if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(
             HostOperation::ListenSocket,
@@ -717,14 +737,14 @@ fn accept_platform(socket: &HostSocket) -> HostResult<(HostSocket, SocketAddr)> 
     let mut storage = SockaddrStorage::default();
     let mut len = size_of_i32::<SockaddrStorage>()?;
     // SAFETY: `storage` and `len` point to writable sockaddr storage.
-    let accepted = unsafe { accept(socket.raw, storage.as_mut_sockaddr(), &mut len) };
+    let accepted = unsafe { accept(socket.raw(), storage.as_mut_sockaddr(), &mut len) };
     if accepted == crate::windows::INVALID_SOCKET {
         return Err(crate::error::last_winsock_error(
             HostOperation::AcceptSocket,
         ));
     }
     Ok((
-        HostSocket { raw: accepted },
+        HostSocket::from_raw(accepted),
         socket_addr_from_storage(&storage)?,
     ))
 }
@@ -734,7 +754,7 @@ fn send_platform(socket: &HostSocket, buffer: &[u8]) -> HostResult<usize> {
     let len = i32::try_from(buffer.len())
         .map_err(|_| HostError::invalid_input(HostOperation::SendSocket))?;
     // SAFETY: `buffer` points to `len` readable bytes for the duration of the call.
-    let sent = unsafe { send(socket.raw, buffer.as_ptr().cast(), len, 0) };
+    let sent = unsafe { send(socket.raw(), buffer.as_ptr().cast(), len, 0) };
     if sent == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(HostOperation::SendSocket));
     }
@@ -752,7 +772,7 @@ fn send_vectored_platform(socket: &HostSocket, buffers: &[IoSlice<'_>]) -> HostR
     // SAFETY: Each `WSABUF` points to readable slice storage for this synchronous call.
     let status = unsafe {
         WSASend(
-            socket.raw,
+            socket.raw(),
             wsa_buffers.as_mut_ptr(),
             wsa_buffer_count(wsa_buffers.len(), HostOperation::SendSocket)?,
             &mut sent,
@@ -775,7 +795,7 @@ fn send_to_platform(socket: &HostSocket, buffer: &[u8], address: SocketAddr) -> 
     // SAFETY: `buffer` points to `len` readable bytes and `storage` is a valid sockaddr.
     let sent = unsafe {
         sendto(
-            socket.raw,
+            socket.raw(),
             buffer.as_ptr().cast(),
             len,
             0,
@@ -805,7 +825,7 @@ fn send_to_vectored_platform(
     // SAFETY: `WSABUF` entries and `storage` remain valid for this synchronous call.
     let status = unsafe {
         WSASendTo(
-            socket.raw,
+            socket.raw(),
             wsa_buffers.as_mut_ptr(),
             wsa_buffer_count(wsa_buffers.len(), HostOperation::SendSocket)?,
             &mut sent,
@@ -827,7 +847,7 @@ fn recv_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<usize> {
     let len = i32::try_from(buffer.len())
         .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
     // SAFETY: `buffer` points to `len` writable bytes for the duration of the call.
-    let received = unsafe { recv(socket.raw, buffer.as_mut_ptr().cast(), len, 0) };
+    let received = unsafe { recv(socket.raw(), buffer.as_mut_ptr().cast(), len, 0) };
     if received == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
     }
@@ -849,7 +869,7 @@ fn recv_vectored_platform(
     // SAFETY: Each `WSABUF` points to writable slice storage for this synchronous call.
     let status = unsafe {
         WSARecv(
-            socket.raw,
+            socket.raw(),
             wsa_buffers.as_mut_ptr(),
             wsa_buffer_count(wsa_buffers.len(), HostOperation::RecvSocket)?,
             &mut received,
@@ -873,7 +893,7 @@ fn recv_from_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<(usi
     // SAFETY: `buffer`, `storage`, and `address_len` point to writable storage.
     let received = unsafe {
         recvfrom(
-            socket.raw,
+            socket.raw(),
             buffer.as_mut_ptr().cast(),
             len,
             0,
@@ -904,7 +924,7 @@ fn recv_from_vectored_platform(
     // SAFETY: `WSABUF`, `storage`, and length pointers remain valid for this synchronous call.
     let status = unsafe {
         WSARecvFrom(
-            socket.raw,
+            socket.raw(),
             wsa_buffers.as_mut_ptr(),
             wsa_buffer_count(wsa_buffers.len(), HostOperation::RecvSocket)?,
             &mut received,
@@ -960,7 +980,7 @@ fn wsa_buffer_count(count: usize, operation: HostOperation) -> HostResult<u32> {
 fn set_nonblocking_platform(socket: &HostSocket, nonblocking: bool) -> HostResult<()> {
     let mut mode = u32::from(nonblocking);
     // SAFETY: `mode` points to writable u_long storage as required by ioctlsocket.
-    let status = unsafe { ioctlsocket(socket.raw, FIONBIO, &mut mode) };
+    let status = unsafe { ioctlsocket(socket.raw(), FIONBIO, &mut mode) };
     if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(
             HostOperation::SetSocketNonblocking,
@@ -979,7 +999,7 @@ fn set_socket_option_platform(
     // SAFETY: `raw` points to an initialized i32 option value.
     let status = unsafe {
         setsockopt(
-            socket.raw,
+            socket.raw(),
             level,
             option,
             std::ptr::from_ref(&raw).cast(),
@@ -1005,7 +1025,7 @@ fn get_socket_option_platform(
     // SAFETY: `raw` and `len` point to writable option storage.
     let status = unsafe {
         getsockopt(
-            socket.raw,
+            socket.raw(),
             level,
             option,
             std::ptr::from_mut(&mut raw).cast(),
@@ -1036,7 +1056,7 @@ fn take_error_platform(socket: &HostSocket) -> HostResult<Option<HostError>> {
 #[cfg(windows)]
 fn shutdown_platform(socket: &HostSocket, how: HostShutdown) -> HostResult<()> {
     // SAFETY: Arguments are plain Winsock values.
-    let status = unsafe { shutdown(socket.raw, how.to_winsock()) };
+    let status = unsafe { shutdown(socket.raw(), how.to_winsock()) };
     if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(
             HostOperation::ShutdownSocket,
@@ -1052,11 +1072,11 @@ fn socket_addr_platform(socket: &HostSocket, kind: SocketAddressKind) -> HostRes
     let status = match kind {
         SocketAddressKind::Local => {
             // SAFETY: `storage` and `len` point to writable sockaddr storage.
-            unsafe { getsockname(socket.raw, storage.as_mut_sockaddr(), &mut len) }
+            unsafe { getsockname(socket.raw(), storage.as_mut_sockaddr(), &mut len) }
         }
         SocketAddressKind::Peer => {
             // SAFETY: `storage` and `len` point to writable sockaddr storage.
-            unsafe { getpeername(socket.raw, storage.as_mut_sockaddr(), &mut len) }
+            unsafe { getpeername(socket.raw(), storage.as_mut_sockaddr(), &mut len) }
         }
     };
     if status == crate::windows::SOCKET_ERROR {
