@@ -1,7 +1,7 @@
 ---
 id: snapshot-001
 scope: phase3-snapshot
-status: in-progress
+status: done
 depends-on: [workload-001]
 ---
 
@@ -39,3 +39,5 @@ cargo test -p mcr-snapshot
   layer references, writable upper root records, Linux metadata sidecar records,
   and deterministic path-ordered snapshot views. Diff export remains separate in
   `snapshot-002`.
+- 2026-07-04: verified complete for the model/API boundary; deterministic layer
+  diff export is tracked separately under `snapshot-002`.

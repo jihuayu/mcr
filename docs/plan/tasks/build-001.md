@@ -1,7 +1,7 @@
 ---
 id: build-001
 scope: phase3-build
-status: in-progress
+status: done
 depends-on: [workload-001]
 ---
 
@@ -43,3 +43,5 @@ cargo test -p mcr-cli
   parser for the supported subset plus `mcr build [--file <Dockerfile>]
   <context>` CLI parsing. The CLI parses and reports instruction count only; it
   does not pull images, mutate snapshots, or execute build steps.
+- 2026-07-04: verified complete for the parser and CLI plan boundary. Build
+  context application and execution remain tracked by later build tasks.

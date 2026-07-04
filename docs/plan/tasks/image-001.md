@@ -1,7 +1,7 @@
 ---
 id: image-001
 scope: phase3-image
-status: in-progress
+status: done
 depends-on: [workload-001]
 ---
 
@@ -40,3 +40,6 @@ cargo test -p mcr-image
   SHA-256 descriptor digest parsing/normalization, and a local content-addressed
   blob store that writes and reads under `blobs/sha256/<digest>` with size and
   digest verification.
+- 2026-07-04: verified complete for the OCI descriptor and local content-store
+  foundation. Registry pull and image export remain tracked under later image
+  tasks.
