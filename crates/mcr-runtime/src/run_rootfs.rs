@@ -844,15 +844,13 @@ impl From<crate::RuntimeError> for RunRootfsError {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
     use mcr_vfs::{AT_FDCWD, O_RDONLY};
 
     use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
-
-    static RUN_ROOTFS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn run_rootfs_executes_busybox_echo_smoke() {
@@ -1164,7 +1162,7 @@ mod tests {
 
     impl TestRootfs {
         fn new(name: &str) -> Self {
-            let guard = RUN_ROOTFS_TEST_LOCK.lock().unwrap();
+            let guard = crate::test_support::native_execution_test_guard();
             let path = std::env::temp_dir().join(format!(
                 "mcr-runtime-run-rootfs-{name}-{}-{:?}",
                 std::process::id(),

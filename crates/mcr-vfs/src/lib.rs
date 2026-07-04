@@ -3939,7 +3939,7 @@ fn unregister_fd_endpoint(file: &FileRef) {
 fn pipe_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
     let pipe = pipe_node(entry.file())?;
     let mut state = pipe.state();
-    while state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
+    if state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
         return Err(VfsError::WouldBlock);
     }
     let count = state.read(buffer);
@@ -3955,7 +3955,7 @@ fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
     if state.readers == 0 {
         return Err(VfsError::BrokenPipe);
     }
-    while state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
+    if state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
         return Err(VfsError::WouldBlock);
     }
     let count = state.write(buffer)?;

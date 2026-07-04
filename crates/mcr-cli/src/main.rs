@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};

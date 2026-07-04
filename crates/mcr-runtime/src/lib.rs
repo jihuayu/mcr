@@ -1,3 +1,6 @@
+#![allow(clippy::result_large_err)]
+//! Runtime errors preserve native fault diagnostics and guest register snapshots.
+
 pub mod memory;
 pub mod run_rootfs;
 
@@ -97,6 +100,19 @@ const LINUX_STATFS_SIZE: usize = 120;
 const LINUX_EXT_SUPER_MAGIC: u64 = 0xef53;
 const LINUX_TMPFS_MAGIC: u64 = 0x0102_1994;
 const LINUX_STATFS_BLOCK_SIZE: u64 = 4096;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static NATIVE_EXECUTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn native_execution_test_guard() -> MutexGuard<'static, ()> {
+        NATIVE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinuxOpenHow {
@@ -3026,13 +3042,13 @@ where
         } else {
             task.regs()
         };
-        return Ok(GuestExecutionStep::new(
+        Ok(GuestExecutionStep::new(
             tid,
             before_rip,
             final_regs.rip(),
             final_regs.rax(),
             task.state(),
-        ));
+        ))
     }
 }
 
@@ -5445,8 +5461,7 @@ fn read_elf64_program_headers(
     let ph_offset = le_u64(&elf_header[32..40]);
     let ph_entry_size = usize::from(le_u16(&elf_header[54..56]));
     let ph_count = usize::from(le_u16(&elf_header[56..58]));
-    if ph_entry_size < ELF_PROGRAM_HEADER_MIN_LEN
-        || ph_entry_size > MAX_ELF_PROGRAM_HEADER_LEN
+    if !(ELF_PROGRAM_HEADER_MIN_LEN..=MAX_ELF_PROGRAM_HEADER_LEN).contains(&ph_entry_size)
         || ph_count > MAX_ELF_PROGRAM_HEADERS
     {
         return None;
@@ -11241,6 +11256,7 @@ mod tests {
 
     #[test]
     fn native_fork_keeps_parent_and_child_memory_isolated() {
+        let _guard = crate::test_support::native_execution_test_guard();
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
             0x401000,
@@ -11285,6 +11301,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_execution_uses_patchable_low_mmap_base() {
+        let _guard = crate::test_support::native_execution_test_guard();
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime.enable_native_execution();
 
