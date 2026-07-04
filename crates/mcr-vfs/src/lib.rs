@@ -3288,6 +3288,46 @@ impl VirtualFileSystem {
         self.fds.read(&self.tree, &self.proc_self, fd, buffer)
     }
 
+    pub fn can_regular_readv_fast_path(&self, fd: Fd) -> VfsResult<bool> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        Ok(matches!(
+            entry.file().kind(),
+            FileKind::Regular | FileKind::Symlink
+        ))
+    }
+
+    pub fn readv_regular(&mut self, fd: Fd, buffers: &mut [Vec<u8>]) -> VfsResult<Option<usize>> {
+        let entry = self.fds.get_mut(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular | FileKind::Symlink) {
+            return Ok(None);
+        }
+
+        let node = self
+            .tree
+            .lookup_inode(entry.inode_id())
+            .ok_or(VfsError::NoEntry)?;
+        if node.attr().is_directory() {
+            return Err(VfsError::IsDirectory);
+        }
+        let total_len = vectored_len(buffers.iter().map(Vec::len))?;
+        if total_len == 0 {
+            return Ok(Some(0));
+        }
+
+        let mut staging = vec![0; total_len];
+        let mut description = entry.description();
+        let count = read_regular_node_at(node, &self.proc_self, description.offset, &mut staging)?;
+        scatter_vectored(&staging[..count], buffers);
+        description.offset += count as u64;
+        Ok(Some(count))
+    }
+
     pub fn pread(&self, fd: Fd, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
         if let Some(count) = self.cached_small_read_at(fd, offset, buffer)? {
             return Ok(count);
@@ -3369,6 +3409,54 @@ impl VirtualFileSystem {
             }
             Err(error) => Err(vfs_error_from_host(error)),
         }
+    }
+
+    pub fn can_regular_writev_fast_path(&self, fd: Fd) -> VfsResult<bool> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_write() {
+            return Err(VfsError::BadFd);
+        }
+        Ok(matches!(entry.file().kind(), FileKind::Regular))
+    }
+
+    pub fn writev_regular(&mut self, fd: Fd, buffers: &[Vec<u8>]) -> VfsResult<Option<usize>> {
+        let count = {
+            let entry = self.fds.get_mut(fd)?;
+            if !entry.flags().can_write() {
+                return Err(VfsError::BadFd);
+            }
+            if !matches!(entry.file().kind(), FileKind::Regular) {
+                return Ok(None);
+            }
+
+            let inode_id = entry.inode_id();
+            let node = self
+                .tree
+                .lookup_inode_mut(inode_id)
+                .ok_or(VfsError::NoEntry)?;
+            let total_len = vectored_len(buffers.iter().map(Vec::len))?;
+            if total_len == 0 {
+                return Ok(Some(0));
+            }
+
+            let mut staging = Vec::with_capacity(total_len);
+            for buffer in buffers {
+                staging.extend_from_slice(buffer);
+            }
+            let mut description = entry.description();
+            let offset = if description.flags.append() {
+                node.attr().size
+            } else {
+                description.offset
+            };
+            let count = node.write_at(offset, &staging)?;
+            description.offset = offset + count as u64;
+            count
+        };
+        if count > 0 {
+            self.invalidate_vfs_caches();
+        }
+        Ok(Some(count))
     }
 
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
@@ -4354,6 +4442,25 @@ fn read_memory_at(data: &[u8], offset: u64, buffer: &mut [u8]) -> VfsResult<usiz
     let count = available.len().min(buffer.len());
     buffer[..count].copy_from_slice(&available[..count]);
     Ok(count)
+}
+
+fn vectored_len(lengths: impl IntoIterator<Item = usize>) -> VfsResult<usize> {
+    lengths
+        .into_iter()
+        .try_fold(0usize, |total, len| total.checked_add(len))
+        .ok_or(VfsError::InvalidPath)
+}
+
+fn scatter_vectored(source: &[u8], buffers: &mut [Vec<u8>]) {
+    let mut copied = 0usize;
+    for buffer in buffers {
+        if copied >= source.len() {
+            break;
+        }
+        let count = buffer.len().min(source.len() - copied);
+        buffer[..count].copy_from_slice(&source[copied..copied + count]);
+        copied += count;
+    }
 }
 
 fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
@@ -5441,6 +5548,30 @@ mod tests {
         assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 5);
         assert_eq!(&buffer, b"HELLO");
         assert_eq!(vfs.cache_snapshot().small_read_entries, 1);
+    }
+
+    #[test]
+    fn regular_file_readv_writev_fast_path_moves_multiple_buffers_once() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+
+        assert!(vfs.can_regular_writev_fast_path(fd).unwrap());
+        let write_buffers = vec![b"ab".to_vec(), b"cd".to_vec(), Vec::new(), b"ef".to_vec()];
+        assert_eq!(vfs.writev_regular(fd, &write_buffers).unwrap(), Some(6));
+        assert_eq!(vfs.fds().get(fd).unwrap().offset(), 6);
+        assert_eq!(vfs.cache_snapshot().small_read_entries, 0);
+
+        vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
+        assert!(vfs.can_regular_readv_fast_path(fd).unwrap());
+        let mut read_buffers = vec![vec![0; 1], vec![0; 3], vec![0; 2]];
+        assert_eq!(vfs.readv_regular(fd, &mut read_buffers).unwrap(), Some(6));
+        assert_eq!(
+            read_buffers,
+            vec![b"a".to_vec(), b"bcd".to_vec(), b"ef".to_vec()]
+        );
+        assert_eq!(vfs.fds().get(fd).unwrap().offset(), 6);
     }
 
     #[test]

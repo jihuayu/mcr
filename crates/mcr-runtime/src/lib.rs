@@ -1724,6 +1724,20 @@ where
         if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
             return self.recv_connected_into_iovecs(socket_id, &iov);
         }
+        if self
+            .vfs
+            .can_regular_readv_fast_path(fd)
+            .map_err(vfs_errno)?
+        {
+            let mut buffers = iovec_output_buffers(&iov)?;
+            let count = self
+                .vfs
+                .readv_regular(fd, &mut buffers)
+                .map_err(vfs_errno)?
+                .expect("regular readv fast path was preflighted");
+            self.write_iovec_buffers(&iov, &buffers, count)?;
+            return Ok(count as u64);
+        }
 
         let mut total = 0u64;
         for item in iov {
@@ -1751,6 +1765,19 @@ where
                 .sockets
                 .send_connected_vectored(socket_id, &slices)
                 .map_err(net_errno)?;
+            return Ok(count as u64);
+        }
+        if self
+            .vfs
+            .can_regular_writev_fast_path(fd)
+            .map_err(vfs_errno)?
+        {
+            let buffers = self.read_iovec_buffers(&iov)?;
+            let count = self
+                .vfs
+                .writev_regular(fd, &buffers)
+                .map_err(vfs_errno)?
+                .expect("regular writev fast path was preflighted");
             return Ok(count as u64);
         }
 

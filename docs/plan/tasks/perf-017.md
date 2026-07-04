@@ -47,3 +47,11 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
   records unless their lifetime and pinning semantics are explicit.
 - Unsupported or poorly aligned I/O must fall back without changing Linux errno
   behavior.
+
+## Checkpoints
+
+- Added a VFS/runtime regular-file `readv`/`writev` fast path that preflights
+  regular descriptors, stages a single contiguous regular-file transfer, scatters
+  or gathers guest iovec buffers, and updates the file offset once. Unsupported
+  fd kinds still use the existing per-iovec fallback, and no borrowed guest
+  buffers are exposed to host completion records.
