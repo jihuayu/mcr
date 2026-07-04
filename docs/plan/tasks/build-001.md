@@ -1,7 +1,7 @@
 ---
 id: build-001
 scope: phase3-build
-status: pending
+status: in-progress
 depends-on: [workload-001]
 ---
 
@@ -39,3 +39,7 @@ cargo test -p mcr-cli
 - Supported instructions are `FROM`, `ARG`, `ENV`, `WORKDIR`, `COPY`, local `ADD`, `RUN`, `CMD`, and `ENTRYPOINT`.
 - Unsupported instructions must fail with a typed error naming the instruction and subset boundary.
 - This task must not pull images, mutate snapshots, or run commands.
+- Initial checkpoint: added the `mcr-build` crate with a typed Dockerfile plan
+  parser for the supported subset plus `mcr build [--file <Dockerfile>]
+  <context>` CLI parsing. The CLI parses and reports instruction count only; it
+  does not pull images, mutate snapshots, or execute build steps.

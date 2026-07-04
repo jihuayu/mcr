@@ -3,8 +3,10 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process;
 
+use mcr_build::parse_dockerfile;
 use mcr_runtime::{RunRootfsConfig, run_rootfs};
 
 fn main() {
@@ -26,12 +28,24 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<i32, CliError> {
             io::stderr().write_all(output.stderr())?;
             Ok(output.status())
         }
+        Command::Build(config) => {
+            let dockerfile = std::fs::read_to_string(config.dockerfile())?;
+            let plan = parse_dockerfile(&dockerfile)?;
+            writeln!(
+                io::stdout(),
+                "parsed Dockerfile at {}: {} instruction(s)",
+                config.dockerfile().display(),
+                plan.instructions().len()
+            )?;
+            Ok(0)
+        }
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum Command {
     RunRootfs(RunRootfsConfig),
+    Build(BuildCliConfig),
 }
 
 fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
@@ -39,12 +53,19 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, Cl
     let Some(command) = args.next() else {
         return Err(CliError::Usage);
     };
-    if command != "run-rootfs" {
-        return Err(CliError::UnknownCommand(
-            command.to_string_lossy().into_owned(),
-        ));
+    if command == "run-rootfs" {
+        return parse_run_rootfs(args);
+    }
+    if command == "build" {
+        return parse_build(args);
     }
 
+    Err(CliError::UnknownCommand(
+        command.to_string_lossy().into_owned(),
+    ))
+}
+
+fn parse_run_rootfs(mut args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
     let mut mvp_emulator = false;
     let mut guest_step_limit = None;
     let mut rootfs = args.next().ok_or(CliError::Usage)?;
@@ -74,6 +95,44 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, Cl
     Ok(Command::RunRootfs(config))
 }
 
+fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut dockerfile = None;
+    let mut context = None;
+    while let Some(arg) = args.next() {
+        if arg == "--file" || arg == "-f" {
+            dockerfile = Some(PathBuf::from(args.next().ok_or(CliError::Usage)?));
+            continue;
+        }
+        if context.is_some() {
+            return Err(CliError::Usage);
+        }
+        context = Some(PathBuf::from(arg));
+    }
+    let context = context.ok_or(CliError::Usage)?;
+    let dockerfile = dockerfile.unwrap_or_else(|| context.join("Dockerfile"));
+    Ok(Command::Build(BuildCliConfig {
+        context,
+        dockerfile,
+    }))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct BuildCliConfig {
+    context: PathBuf,
+    dockerfile: PathBuf,
+}
+
+impl BuildCliConfig {
+    #[cfg(test)]
+    fn context(&self) -> &std::path::Path {
+        &self.context
+    }
+
+    fn dockerfile(&self) -> &std::path::Path {
+        &self.dockerfile
+    }
+}
+
 fn os_bytes(value: &OsString) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
@@ -90,6 +149,7 @@ enum CliError {
     Usage,
     UnknownCommand(String),
     InvalidGuestStepLimit(String),
+    Build(mcr_build::DockerfileParseError),
     Runtime(mcr_runtime::RunRootfsError),
     Io(io::Error),
 }
@@ -99,12 +159,13 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: mcr run-rootfs [--mvp-emulator] [--guest-step-limit <steps>] <rootfs> <program> [args...]"
+                "usage: mcr run-rootfs [--mvp-emulator] [--guest-step-limit <steps>] <rootfs> <program> [args...]\n       mcr build [--file <Dockerfile>] <context>"
             ),
             Self::UnknownCommand(command) => write!(formatter, "unknown command `{command}`"),
             Self::InvalidGuestStepLimit(value) => {
                 write!(formatter, "invalid guest step limit `{value}`")
             }
+            Self::Build(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
         }
@@ -114,10 +175,17 @@ impl fmt::Display for CliError {
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Build(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Usage | Self::UnknownCommand(_) | Self::InvalidGuestStepLimit(_) => None,
         }
+    }
+}
+
+impl From<mcr_build::DockerfileParseError> for CliError {
+    fn from(value: mcr_build::DockerfileParseError) -> Self {
+        Self::Build(value)
     }
 }
 
@@ -155,7 +223,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::RunRootfs(config) = command;
+        let Command::RunRootfs(config) = command else {
+            panic!("expected run-rootfs command");
+        };
         assert_eq!(config.rootfs(), std::path::Path::new("rootfs"));
         assert_eq!(config.program(), b"/bin/busybox");
         assert!(!config.mvp_emulator());
@@ -181,7 +251,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::RunRootfs(config) = command;
+        let Command::RunRootfs(config) = command else {
+            panic!("expected run-rootfs command");
+        };
         assert!(config.mvp_emulator());
         assert_eq!(config.rootfs(), std::path::Path::new("rootfs"));
         assert_eq!(config.program(), b"/bin/sh");
@@ -198,9 +270,42 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::RunRootfs(config) = command;
+        let Command::RunRootfs(config) = command else {
+            panic!("expected run-rootfs command");
+        };
         assert_eq!(config.guest_step_limit(), Some(1234));
         assert_eq!(config.rootfs(), std::path::Path::new("rootfs"));
         assert_eq!(config.program(), b"/bin/sh");
+    }
+
+    #[test]
+    fn parses_build_command_with_default_dockerfile() {
+        let command = parse_command([OsString::from("build"), OsString::from("context")]).unwrap();
+
+        let Command::Build(config) = command else {
+            panic!("expected build command");
+        };
+        assert_eq!(config.context(), std::path::Path::new("context"));
+        assert_eq!(
+            config.dockerfile(),
+            std::path::Path::new("context/Dockerfile")
+        );
+    }
+
+    #[test]
+    fn parses_build_command_with_file_flag() {
+        let command = parse_command([
+            OsString::from("build"),
+            OsString::from("--file"),
+            OsString::from("Dockerfile.dev"),
+            OsString::from("."),
+        ])
+        .unwrap();
+
+        let Command::Build(config) = command else {
+            panic!("expected build command");
+        };
+        assert_eq!(config.context(), std::path::Path::new("."));
+        assert_eq!(config.dockerfile(), std::path::Path::new("Dockerfile.dev"));
     }
 }

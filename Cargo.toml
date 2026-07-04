@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/mcr-build",
     "crates/mcr-cli",
     "crates/mcr-elf",
     "crates/mcr-image",
@@ -22,6 +23,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 getrandom = "0.4.3"
+mcr-build = { path = "crates/mcr-build" }
 mcr-cli = { path = "crates/mcr-cli" }
 mcr-elf = { path = "crates/mcr-elf" }
 mcr-image = { path = "crates/mcr-image" }
