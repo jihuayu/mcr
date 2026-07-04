@@ -3098,13 +3098,33 @@ struct NativePatchMetadata {
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
+#[derive(Clone, Debug)]
+struct NativePatchMetadataEntry {
+    base: u64,
+    metadata: NativePatchMetadata,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug)]
+struct NativeImagePatchRanges {
+    base: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 type NativeImagePatchKeyMap = BTreeMap<mcr_sys::GuestPid, NativeImagePatchKey>;
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-type NativeImagePatchRangeMap = BTreeMap<mcr_sys::GuestPid, Vec<(u64, u64)>>;
+type NativeImagePatchRangeMap = BTreeMap<mcr_sys::GuestPid, NativeImagePatchRanges>;
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -3197,7 +3217,7 @@ const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-const NATIVE_PATCH_CACHE_VERSION: u32 = 1;
+const NATIVE_PATCH_CACHE_VERSION: u32 = 2;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -3237,19 +3257,21 @@ fn native_patch_cache_dir() -> Option<PathBuf> {
 ))]
 fn native_image_patch_key_and_ranges(
     image: &mcr_elf::GuestMemoryImage,
-) -> Option<(NativeImagePatchKey, Vec<(u64, u64)>)> {
+) -> Option<(NativeImagePatchKey, NativeImagePatchRanges)> {
     let mut hash = FNV64_OFFSET;
     let mut executable_len = 0u64;
     let mut ranges = Vec::new();
-    for vma in image
+    let executable_vmas = image
         .vmas()
         .iter()
         .filter(|vma| vma.permissions().execute())
-    {
+        .collect::<Vec<_>>();
+    let base = executable_vmas.first()?.start();
+    for vma in executable_vmas {
         let len = vma.end().checked_sub(vma.start())?;
         let bytes = image.read(vma.start(), usize::try_from(len).ok()?)?;
-        hash_u64(&mut hash, vma.start());
-        hash_u64(&mut hash, vma.end());
+        hash_u64(&mut hash, vma.start().checked_sub(base)?);
+        hash_u64(&mut hash, vma.end().checked_sub(base)?);
         hash_u8(&mut hash, u8::from(vma.permissions().read()));
         hash_u8(&mut hash, u8::from(vma.permissions().write()));
         hash_u8(&mut hash, u8::from(vma.permissions().execute()));
@@ -3265,8 +3287,39 @@ fn native_image_patch_key_and_ranges(
             hash,
             executable_len,
         },
-        ranges,
+        NativeImagePatchRanges { base, ranges },
     ))
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn native_executable_range_patch_key(
+    memory: &GuestMemory,
+    start: u64,
+    end: u64,
+    protection: GuestMemoryProtection,
+) -> Result<NativeImagePatchKey, GuestExecutionError> {
+    let len = end
+        .checked_sub(start)
+        .ok_or(GuestExecutionError::Memory(GuestMemoryError::InvalidLength))?;
+    let len_usize = usize::try_from(len)
+        .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+    let mut bytes = vec![0; len_usize];
+    memory.read(start, &mut bytes)?;
+
+    let mut hash = FNV64_OFFSET;
+    hash_u64(&mut hash, 0);
+    hash_u64(&mut hash, len);
+    hash_u8(&mut hash, u8::from(protection.read));
+    hash_u8(&mut hash, u8::from(protection.write));
+    hash_u8(&mut hash, u8::from(protection.execute));
+    hash_bytes(&mut hash, &bytes);
+    Ok(NativeImagePatchKey {
+        hash,
+        executable_len: len,
+    })
 }
 
 #[cfg(any(
@@ -3302,11 +3355,12 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 ))]
 fn load_persistent_native_patch_metadata(
     key: &NativeImagePatchKey,
+    base: u64,
 ) -> io::Result<Option<NativePatchMetadata>> {
     let Some(dir) = native_patch_cache_dir() else {
         return Ok(None);
     };
-    load_persistent_native_patch_metadata_from_dir(key, &dir)
+    load_persistent_native_patch_metadata_from_dir(key, base, &dir)
 }
 
 #[cfg(any(
@@ -3316,11 +3370,12 @@ fn load_persistent_native_patch_metadata(
 fn store_persistent_native_patch_metadata(
     key: &NativeImagePatchKey,
     metadata: &NativePatchMetadata,
+    base: u64,
 ) -> io::Result<()> {
     let Some(dir) = native_patch_cache_dir() else {
         return Ok(());
     };
-    store_persistent_native_patch_metadata_in_dir(key, metadata, &dir)
+    store_persistent_native_patch_metadata_in_dir(key, metadata, base, &dir)
 }
 
 #[cfg(any(
@@ -3329,6 +3384,7 @@ fn store_persistent_native_patch_metadata(
 ))]
 fn load_persistent_native_patch_metadata_from_dir(
     key: &NativeImagePatchKey,
+    base: u64,
     dir: &Path,
 ) -> io::Result<Option<NativePatchMetadata>> {
     let path = dir.join(key.file_name());
@@ -3337,7 +3393,7 @@ fn load_persistent_native_patch_metadata_from_dir(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    decode_native_patch_metadata(key, &bytes).map(Some)
+    decode_native_patch_metadata(key, &bytes, base).map(Some)
 }
 
 #[cfg(any(
@@ -3347,12 +3403,16 @@ fn load_persistent_native_patch_metadata_from_dir(
 fn store_persistent_native_patch_metadata_in_dir(
     key: &NativeImagePatchKey,
     metadata: &NativePatchMetadata,
+    base: u64,
     dir: &Path,
 ) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = dir.join(key.file_name());
     let temp_path = dir.join(format!("{}.{}.tmp", key.file_name(), std::process::id()));
-    fs::write(&temp_path, encode_native_patch_metadata(key, metadata))?;
+    fs::write(
+        &temp_path,
+        encode_native_patch_metadata(key, metadata, base)?,
+    )?;
     match fs::rename(&temp_path, &path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -3373,7 +3433,8 @@ fn store_persistent_native_patch_metadata_in_dir(
 fn encode_native_patch_metadata(
     key: &NativeImagePatchKey,
     metadata: &NativePatchMetadata,
-) -> Vec<u8> {
+    base: u64,
+) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(NATIVE_PATCH_CACHE_MAGIC);
     push_cache_u32(&mut bytes, NATIVE_PATCH_CACHE_VERSION);
@@ -3381,18 +3442,18 @@ fn encode_native_patch_metadata(
     push_cache_u64(&mut bytes, key.executable_len);
     push_cache_u32(&mut bytes, metadata.scanned_ranges.len() as u32);
     for (start, end) in &metadata.scanned_ranges {
-        push_cache_u64(&mut bytes, *start);
-        push_cache_u64(&mut bytes, *end);
+        push_cache_u64(&mut bytes, cache_relative_offset(*start, base)?);
+        push_cache_u64(&mut bytes, cache_relative_offset(*end, base)?);
     }
     push_cache_u32(&mut bytes, metadata.syscall_patches.len() as u32);
     for patch in &metadata.syscall_patches {
-        push_cache_u64(&mut bytes, patch.address);
+        push_cache_u64(&mut bytes, cache_relative_offset(patch.address, base)?);
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
         push_cache_u32(&mut bytes, metadata.fs_relative_patches.len() as u32);
         for (address, patch) in &metadata.fs_relative_patches {
-            push_cache_u64(&mut bytes, *address);
+            push_cache_u64(&mut bytes, cache_relative_offset(*address, base)?);
             bytes.extend_from_slice(&patch.original);
         }
     }
@@ -3400,7 +3461,7 @@ fn encode_native_patch_metadata(
     {
         push_cache_u32(&mut bytes, 0);
     }
-    bytes
+    Ok(bytes)
 }
 
 #[cfg(any(
@@ -3410,6 +3471,7 @@ fn encode_native_patch_metadata(
 fn decode_native_patch_metadata(
     key: &NativeImagePatchKey,
     bytes: &[u8],
+    base: u64,
 ) -> io::Result<NativePatchMetadata> {
     let mut reader = NativePatchMetadataReader::new(bytes);
     reader.expect_magic(NATIVE_PATCH_CACHE_MAGIC)?;
@@ -3432,18 +3494,19 @@ fn decode_native_patch_metadata(
     }
     let mut metadata = NativePatchMetadata::default();
     for _ in 0..reader.read_u32()? {
-        metadata
-            .scanned_ranges
-            .push((reader.read_u64()?, reader.read_u64()?));
+        metadata.scanned_ranges.push((
+            cache_absolute_address(reader.read_u64()?, base)?,
+            cache_absolute_address(reader.read_u64()?, base)?,
+        ));
     }
     for _ in 0..reader.read_u32()? {
         metadata.syscall_patches.push(ExecutableSyscallPatch {
-            address: reader.read_u64()?,
+            address: cache_absolute_address(reader.read_u64()?, base)?,
         });
     }
     let fs_count = reader.read_u32()?;
     for _ in 0..fs_count {
-        let address = reader.read_u64()?;
+        let address = cache_absolute_address(reader.read_u64()?, base)?;
         let original = reader.read_array::<9>()?;
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
@@ -3458,6 +3521,32 @@ fn decode_native_patch_metadata(
     }
     reader.expect_eof()?;
     Ok(metadata)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn cache_relative_offset(address: u64, base: u64) -> io::Result<u64> {
+    address.checked_sub(base).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native patch metadata address precedes cache base",
+        )
+    })
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn cache_absolute_address(offset: u64, base: u64) -> io::Result<u64> {
+    base.checked_add(offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native patch metadata address overflows cache base",
+        )
+    })
 }
 
 #[cfg(any(
@@ -3633,6 +3722,49 @@ fn metadata_for_ranges(
             })
             .collect(),
     }
+}
+
+fn rebase_native_patch_metadata(
+    metadata: &NativePatchMetadata,
+    source_base: u64,
+    target_base: u64,
+) -> Option<NativePatchMetadata> {
+    Some(NativePatchMetadata {
+        scanned_ranges: metadata
+            .scanned_ranges
+            .iter()
+            .map(|(start, end)| {
+                Some((
+                    rebase_native_patch_address(*start, source_base, target_base)?,
+                    rebase_native_patch_address(*end, source_base, target_base)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?,
+        syscall_patches: metadata
+            .syscall_patches
+            .iter()
+            .map(|patch| {
+                Some(ExecutableSyscallPatch {
+                    address: rebase_native_patch_address(patch.address, source_base, target_base)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: metadata
+            .fs_relative_patches
+            .iter()
+            .map(|(address, patch)| {
+                Some((
+                    rebase_native_patch_address(*address, source_base, target_base)?,
+                    *patch,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?,
+    })
+}
+
+fn rebase_native_patch_address(address: u64, source_base: u64, target_base: u64) -> Option<u64> {
+    target_base.checked_add(address.checked_sub(source_base)?)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -3943,7 +4075,7 @@ pub struct RuntimeSubsystems {
     native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
     native_image_patch_keys: NativeImagePatchKeyMap,
     native_image_patch_ranges: NativeImagePatchRangeMap,
-    native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadata>,
+    native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
     pending_fork_child_regs: Option<GprState>,
 }
 
@@ -4061,6 +4193,29 @@ impl RuntimeSubsystems {
         self.native_fp.insert(tid, state);
     }
 
+    fn cached_native_patch_metadata(
+        &mut self,
+        key: &NativeImagePatchKey,
+        base: u64,
+    ) -> Option<NativePatchMetadata> {
+        if let Some(entry) = self.native_image_patch_metadata.get(key)
+            && let Some(metadata) = rebase_native_patch_metadata(&entry.metadata, entry.base, base)
+        {
+            return Some(metadata);
+        }
+        let metadata = load_persistent_native_patch_metadata(key, base)
+            .ok()
+            .flatten()?;
+        self.native_image_patch_metadata.insert(
+            key.clone(),
+            NativePatchMetadataEntry {
+                base,
+                metadata: metadata.clone(),
+            },
+        );
+        Some(metadata)
+    }
+
     fn ensure_native_patch_cache(
         &mut self,
         pid: mcr_sys::GuestPid,
@@ -4071,19 +4226,10 @@ impl RuntimeSubsystems {
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
             cache.image_metadata_checked = true;
             if let Some(key) = self.native_image_patch_keys.get(&pid).cloned() {
-                let metadata = self
-                    .native_image_patch_metadata
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| {
-                        load_persistent_native_patch_metadata(&key)
-                            .ok()
-                            .flatten()
-                            .inspect(|metadata| {
-                                self.native_image_patch_metadata
-                                    .insert(key.clone(), metadata.clone());
-                            })
-                    });
+                let image_ranges = self.native_image_patch_ranges.get(&pid).cloned();
+                let metadata = image_ranges
+                    .as_ref()
+                    .and_then(|ranges| self.cached_native_patch_metadata(&key, ranges.base));
                 if let Some(metadata) = metadata {
                     {
                         let memory = self
@@ -4092,11 +4238,41 @@ impl RuntimeSubsystems {
                         apply_native_patch_metadata(memory, fs_base, &metadata)?;
                     }
                     cache.merge_metadata(&metadata);
-                } else if let Some(ranges) = self.native_image_patch_ranges.get(&pid).cloned() {
-                    store_image_metadata = Some((key, ranges));
+                } else if let Some(ranges) = image_ranges {
+                    store_image_metadata = Some((key, ranges.base, ranges.ranges));
                 }
             }
         }
+
+        let executable_ranges = self
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
+            .vmas()
+            .filter(|vma| vma.protection().execute)
+            .filter(|vma| !range_is_covered(vma.start(), vma.end(), &cache.scanned_ranges))
+            .map(|vma| (vma.start(), vma.end(), vma.protection()))
+            .collect::<Vec<_>>();
+        let mut store_range_metadata = Vec::new();
+        for (start, end, protection) in executable_ranges {
+            let key = {
+                let memory = self
+                    .memory_for_process(pid)
+                    .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+                native_executable_range_patch_key(memory, start, end, protection)?
+            };
+            if let Some(metadata) = self.cached_native_patch_metadata(&key, start) {
+                {
+                    let memory = self
+                        .memory_for_process_mut(pid)
+                        .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+                    apply_native_patch_metadata(memory, fs_base, &metadata)?;
+                }
+                cache.merge_metadata(&metadata);
+            } else {
+                store_range_metadata.push((key, start, (start, end)));
+            }
+        }
+
         let scanned_ranges = cache.scanned_ranges.clone();
         let scanned_metadata;
         {
@@ -4117,12 +4293,30 @@ impl RuntimeSubsystems {
                 cache.merge_metadata(&scanned_metadata);
             }
         }
-        if let Some((key, ranges)) = store_image_metadata {
+        if let Some((key, base, ranges)) = store_image_metadata {
             let image_metadata = metadata_for_ranges(&scanned_metadata, &ranges);
             if !image_metadata.scanned_ranges.is_empty() {
-                self.native_image_patch_metadata
-                    .insert(key.clone(), image_metadata.clone());
-                let _ = store_persistent_native_patch_metadata(&key, &image_metadata);
+                self.native_image_patch_metadata.insert(
+                    key.clone(),
+                    NativePatchMetadataEntry {
+                        base,
+                        metadata: image_metadata.clone(),
+                    },
+                );
+                let _ = store_persistent_native_patch_metadata(&key, &image_metadata, base);
+            }
+        }
+        for (key, base, range) in store_range_metadata {
+            let range_metadata = metadata_for_ranges(&scanned_metadata, &[range]);
+            if !range_metadata.scanned_ranges.is_empty() {
+                self.native_image_patch_metadata.insert(
+                    key.clone(),
+                    NativePatchMetadataEntry {
+                        base,
+                        metadata: range_metadata.clone(),
+                    },
+                );
+                let _ = store_persistent_native_patch_metadata(&key, &range_metadata, base);
             }
         }
         let scanned_now = self
@@ -12619,15 +12813,26 @@ mod tests {
             )]),
         };
 
-        store_persistent_native_patch_metadata_in_dir(&key, &metadata, &dir).unwrap();
-        let loaded = load_persistent_native_patch_metadata_from_dir(&key, &dir)
+        store_persistent_native_patch_metadata_in_dir(&key, &metadata, 0x400000, &dir).unwrap();
+        let loaded = load_persistent_native_patch_metadata_from_dir(&key, 0x600000, &dir)
             .unwrap()
             .expect("metadata should load");
 
-        assert_eq!(loaded.scanned_ranges, metadata.scanned_ranges);
-        assert_eq!(loaded.syscall_patches, metadata.syscall_patches);
+        assert_eq!(loaded.scanned_ranges, vec![(0x601000, 0x602000)]);
+        assert_eq!(
+            loaded.syscall_patches,
+            vec![ExecutableSyscallPatch { address: 0x601123 }]
+        );
         #[cfg(all(windows, target_arch = "x86_64"))]
-        assert_eq!(loaded.fs_relative_patches, metadata.fs_relative_patches);
+        assert_eq!(
+            loaded.fs_relative_patches,
+            BTreeMap::from([(
+                0x601200,
+                FsRelativePatch {
+                    original: [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0],
+                },
+            )])
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -12657,13 +12862,57 @@ mod tests {
             .native_image_patch_metadata
             .insert(
                 key,
-                NativePatchMetadata {
-                    scanned_ranges: ranges,
-                    syscall_patches: vec![ExecutableSyscallPatch { address: 0x401000 }],
-                    #[cfg(all(windows, target_arch = "x86_64"))]
-                    fs_relative_patches: BTreeMap::new(),
+                NativePatchMetadataEntry {
+                    base: ranges.base,
+                    metadata: NativePatchMetadata {
+                        scanned_ranges: ranges.ranges,
+                        syscall_patches: vec![ExecutableSyscallPatch { address: 0x401000 }],
+                        #[cfg(all(windows, target_arch = "x86_64"))]
+                        fs_relative_patches: BTreeMap::new(),
+                    },
                 },
             );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+    }
+
+    #[test]
+    fn native_patch_cache_applies_executable_range_metadata_at_current_base() {
+        let code = [0x0f, 0x05, 0x90];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+        let (start, end, protection) = runtime
+            .memory()
+            .vmas()
+            .find(|vma| vma.protection().execute)
+            .map(|vma| (vma.start(), vma.end(), vma.protection()))
+            .expect("test image should have executable VMA");
+        let key =
+            native_executable_range_patch_key(runtime.memory(), start, end, protection).unwrap();
+        {
+            let subsystems = runtime.dispatcher.subsystems_mut();
+            subsystems.native_image_patch_keys.remove(&pid);
+            subsystems.native_image_patch_ranges.remove(&pid);
+            subsystems.native_image_patch_metadata.insert(
+                key,
+                NativePatchMetadataEntry {
+                    base: 0x500000,
+                    metadata: NativePatchMetadata {
+                        scanned_ranges: vec![(0x500000, 0x500000 + (end - start))],
+                        syscall_patches: vec![ExecutableSyscallPatch { address: 0x500000 }],
+                        #[cfg(all(windows, target_arch = "x86_64"))]
+                        fs_relative_patches: BTreeMap::new(),
+                    },
+                },
+            );
+        }
 
         runtime
             .dispatcher
