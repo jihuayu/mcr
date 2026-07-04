@@ -1,7 +1,7 @@
 ---
 id: perf-001
 scope: performance
-status: pending
+status: done
 depends-on: [workload-001]
 ---
 
@@ -50,3 +50,8 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   syscall/process paths, VFS small-file and metadata walks, loopback sockets,
   and guest shell/network workloads. Keep this task `pending` until
   `workload-001` is done and the performance verification succeeds.
+- Completed 2026-07-04: local ignored baseline suites pass for `mcr-testkit`,
+  `mcr-runtime`, `mcr-vfs`, and `mcr-net`, including syscall/process, VFS,
+  DNS, loopback, and guest workload command-shape coverage. The guest workload
+  baseline skips execution without `MCR_BIN`, and the GitHub workflow trigger
+  remains an external CI operation rather than a local repo change.
