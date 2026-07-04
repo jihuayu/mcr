@@ -105,3 +105,7 @@ cargo test -p mcr-testkit --test perf_baseline perf_baseline_guest_smoke_workloa
   `167.507ms`, guest small-file loop `1430.149ms`, directory metadata walk
   `3800.368ms`, `curl https://example.com` `485.074ms`, and `git ls-remote`
   `1872.576ms`.
+- 2026-07-04 follow-up: sticky scheduling is now the default runtime policy,
+  because the release public-network gate regressed to the scheduler latency
+  cliff when the environment variable was omitted. Set `MCR_SCHED_STICKY=0`
+  only for differential fairness/debug comparisons.

@@ -3288,7 +3288,7 @@ where
     T: SyscallTracer,
 {
     dispatcher.subsystems_mut().perf_begin_run();
-    let sticky_scheduler = std::env::var_os(STICKY_SCHED_ENV).is_some();
+    let sticky_scheduler = sticky_scheduler_enabled();
     let result = (|| -> Result<i32, GuestRunError> {
         let mut guest_steps = 0u64;
         let mut last_dispatched_tid = None;
@@ -3351,6 +3351,17 @@ where
     })();
     dispatcher.subsystems_mut().perf_finish_run();
     result
+}
+
+fn sticky_scheduler_enabled() -> bool {
+    let Some(value) = std::env::var_os(STICKY_SCHED_ENV) else {
+        return true;
+    };
+    let value = value.to_string_lossy();
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 
 fn initial_process_exit_status(kernel: &GuestKernel) -> Result<Option<i32>, GuestRunError> {
