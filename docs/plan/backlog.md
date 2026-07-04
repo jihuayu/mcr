@@ -20,6 +20,14 @@
 | Strong sandboxing | Later product line | Current product trust model is trusted development workloads. |
 | Cross-architecture guest execution | Later product line | Same-ISA x86-64 is required to keep MVP feasible. |
 
+## Phase 2 Workload Blockers
+
+| Command | Current result | Required follow-up |
+|---|---|---|
+| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Native execution faulted on local Windows x86-64 with access violation at guest RIP `0x8931db` while running the package-backed Alpine Go rootfs. | Diagnose the native execution path around the faulting Go startup block before `workload-001` can be marked done. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Did not complete within several minutes on local Windows x86-64 with a package-backed Alpine Node rootfs. | Add a bounded timeout diagnostic and identify whether startup is blocked in guest wait/futex, epoll/readiness, or native execution. |
+| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Did not complete within several minutes on local Windows x86-64 with a package-backed Alpine Cargo rootfs. | Add a bounded timeout diagnostic and identify whether startup is blocked in guest wait/futex, filesystem metadata, or native execution. |
+
 ## Resolved Build Direction
 
 - Phase 3 is the native MCR builder plus OCI/Docker image output.
