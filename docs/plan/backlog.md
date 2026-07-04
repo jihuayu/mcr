@@ -22,6 +22,12 @@
 
 ## Phase 2 Workload Blockers
 
+2026-07-04 perf-012 reduced native executable patch startup work by avoiding
+decoder passes for candidate-free ranges and deriving syscall and FS/TLS patch
+plans from one range read. The language workload blocker remains open until a
+bounded package-rootfs run captures the next wait/futex, readiness, scheduling,
+or native execution stall.
+
 | Command | Current result | Required follow-up |
 |---|---|---|
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault, and instruction-aware syscall patching cleared the Go `newosproc` clone failure caused by rewriting the `0x50f00` clone-flags immediate. The command now starts without that fatal error but did not complete within a bounded local Windows run. | Add a bounded timeout diagnostic and identify whether Go is blocked in guest wait/futex, scheduling, or native execution. |

@@ -232,6 +232,13 @@ The syscall layer should avoid repeated dynamic allocation and table lookups on
 hot paths, but the syscall table remains the source of truth for number, name,
 argument, trace, and unsupported behavior.
 
+Native same-ISA syscall patching keeps a per-process record of executable ranges
+already scanned. New ranges are read once to derive both syscall trap patches and
+Windows FS-relative TLS patch candidates. The syscall scanner first checks for
+the `0f 05` byte pair and skips the decoder entirely for candidate-free ranges;
+when candidates exist, decoding stops after the last candidate so large package
+binary tails are not walked after the final possible `syscall`.
+
 ## Measurement Gates
 
 Each performance task must add or update an observable benchmark or smoke gate.

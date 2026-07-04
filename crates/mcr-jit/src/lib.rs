@@ -193,6 +193,10 @@ impl Default for BlockDecoder {
 
 #[must_use]
 pub fn syscall_instruction_sites(bytes: &[u8], rip: u64) -> Vec<SyscallSite> {
+    let Some(last_candidate) = last_syscall_byte_pair(bytes) else {
+        return Vec::new();
+    };
+
     let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
     let mut sites = Vec::new();
     while decoder.can_decode() {
@@ -203,8 +207,17 @@ pub fn syscall_instruction_sites(bytes: &[u8], rip: u64) -> Vec<SyscallSite> {
                 next_rip: instruction.ip() + instruction.len() as u64,
             });
         }
+        if decoder.position() > last_candidate {
+            break;
+        }
     }
     sites
+}
+
+fn last_syscall_byte_pair(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(2)
+        .rposition(|window| matches!(window, [0x0f, 0x05]))
 }
 
 fn decoded_mnemonic(instruction: &Instruction) -> DecodedMnemonic {
@@ -2161,6 +2174,13 @@ mod tests {
                 next_rip: 0x401009
             }]
         );
+    }
+
+    #[test]
+    fn syscall_site_scan_skips_candidate_free_ranges() {
+        let sites = syscall_instruction_sites(&[0x90; 1024], 0x401000);
+
+        assert!(sites.is_empty());
     }
 
     #[test]

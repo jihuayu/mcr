@@ -3078,6 +3078,17 @@ struct ExecutableSyscallPatch {
     address: u64,
 }
 
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug, Default)]
+struct ExecutableNativePatches {
+    syscall_patches: Vec<ExecutableSyscallPatch>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fs_relative_patches: Vec<(u64, FsRelativePatch)>,
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 struct FsRelativePatch {
@@ -3117,63 +3128,49 @@ impl NativePatchCache {
     }
 }
 
-fn find_executable_syscall_patches(
+fn find_executable_native_patches(
     memory: &mut GuestMemory,
     skipped_ranges: &[(u64, u64)],
-) -> Result<Vec<ExecutableSyscallPatch>, GuestExecutionError> {
+    previous_fs_base: u64,
+) -> Result<ExecutableNativePatches, GuestExecutionError> {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = previous_fs_base;
+
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
         .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
         .map(|vma| (vma.start(), vma.end()))
         .collect::<Vec<_>>();
-    let mut patches = Vec::new();
+    let mut patches = ExecutableNativePatches::default();
     for (start, end) in executable_ranges {
         let len = usize::try_from(end - start)
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
         for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
-            patches.push(ExecutableSyscallPatch { address: site.rip });
+            patches
+                .syscall_patches
+                .push(ExecutableSyscallPatch { address: site.rip });
         }
-    }
-    Ok(patches)
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
-fn find_executable_fs_relative_patches(
-    memory: &mut GuestMemory,
-    skipped_ranges: &[(u64, u64)],
-    previous_fs_base: u64,
-) -> Result<Vec<(u64, FsRelativePatch)>, GuestExecutionError> {
-    let executable_ranges = memory
-        .vmas()
-        .filter(|vma| vma.protection().execute)
-        .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
-        .map(|vma| (vma.start(), vma.end()))
-        .collect::<Vec<_>>();
-    let mut patches = Vec::new();
-    for (start, end) in executable_ranges {
-        let len = usize::try_from(end - start)
-            .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
-        let mut bytes = vec![0; len];
-        memory.read(start, &mut bytes)?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
         for offset in 0..bytes.len() {
             if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
                 fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
             }) {
-                patches.push((start + offset as u64, FsRelativePatch { original }));
+                patches
+                    .fs_relative_patches
+                    .push((start + offset as u64, FsRelativePatch { original }));
             }
         }
     }
     Ok(patches)
 }
 
-fn patch_executable_syscalls(
+fn apply_executable_syscall_patches(
     memory: &mut GuestMemory,
-    skipped_ranges: &[(u64, u64)],
+    patches: &[ExecutableSyscallPatch],
 ) -> Result<(), GuestExecutionError> {
-    let patches = find_executable_syscall_patches(memory, skipped_ranges)?;
     for patch in patches {
         memory.patch_code(patch.address, &[0xcc, 0x90])?;
     }
@@ -3585,13 +3582,12 @@ impl RuntimeSubsystems {
             let memory = self
                 .memory_for_process_mut(pid)
                 .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-            patch_executable_syscalls(memory, &scanned_ranges)?;
+            let patches = find_executable_native_patches(memory, &scanned_ranges, cache.fs_base)?;
+            apply_executable_syscall_patches(memory, &patches.syscall_patches)?;
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
                 let mut added_fs_patch = false;
-                for (address, patch) in
-                    find_executable_fs_relative_patches(memory, &scanned_ranges, cache.fs_base)?
-                {
+                for (address, patch) in patches.fs_relative_patches {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
                         cache.fs_relative_patches.entry(address)
                     {
