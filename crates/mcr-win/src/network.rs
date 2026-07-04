@@ -126,6 +126,28 @@ impl SocketCompletionKind {
     }
 }
 
+/// Winsock extension fast paths that can feed the socket readiness seam.
+///
+/// The host adapter owns extension-function lookup, overlapped operation
+/// lifetime, context update, and cancellation. Higher layers only observe the
+/// corresponding completion class and keep Linux socket state unchanged.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SocketFastPathKind {
+    AcceptEx,
+    ConnectEx,
+}
+
+impl SocketFastPathKind {
+    /// Completion kind emitted when this fast path has progressed enough to
+    /// wake guest readiness waiters.
+    pub const fn completion_kind(self) -> SocketCompletionKind {
+        match self {
+            Self::AcceptEx => SocketCompletionKind::Accept,
+            Self::ConnectEx => SocketCompletionKind::Connect,
+        }
+    }
+}
+
 impl SocketEvents {
     /// Read readiness interest.
     pub const fn read() -> Self {
@@ -1269,6 +1291,18 @@ mod tests {
         let error = SocketCompletionKind::Error.readiness();
         assert!(error.error);
         assert!(!error.hang_up);
+    }
+
+    #[test]
+    fn socket_fast_path_kinds_map_to_completion_classes() {
+        assert_eq!(
+            super::SocketFastPathKind::AcceptEx.completion_kind(),
+            SocketCompletionKind::Accept
+        );
+        assert_eq!(
+            super::SocketFastPathKind::ConnectEx.completion_kind(),
+            SocketCompletionKind::Connect
+        );
     }
 
     #[cfg(windows)]

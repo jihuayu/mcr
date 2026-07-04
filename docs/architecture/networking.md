@@ -195,6 +195,16 @@ Winsock backend still falls back to `WSAPoll` when no completion-backed
 readiness is cached, so IOCP remains an implementation backend rather than a new
 guest-visible wait model.
 
+`AcceptEx` and `ConnectEx` are optional host fast paths behind that same seam.
+The socket adapter may report unsupported and leave the plain `accept` or
+`connect` path unchanged, or it may submit an extension operation that later
+emits an `Accept` or `Connect` completion for the active readiness token. A
+completed `AcceptEx` result must have applied `SO_UPDATE_ACCEPT_CONTEXT` before
+returning an accepted host handle to `mcr-net`. A completed `ConnectEx` result
+must have applied `SO_UPDATE_CONNECT_CONTEXT` before `SO_ERROR`, local address,
+or peer address queries are used to complete the Linux nonblocking connect state
+machine.
+
 ## MCR-Owned DNS Resolution
 
 Guest-created UDP/TCP sockets keep their normal ownership even when the payload

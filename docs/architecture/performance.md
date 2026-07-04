@@ -154,6 +154,14 @@ The nonblocking `connect` state machine still reports guest success through the
 Linux socket state and `SO_ERROR` equivalent, even if IOCP completion is the
 host notification source.
 
+The first checkpoint adds the adapter boundary without binding to the real
+Windows extension functions. Host socket handles can return unsupported and keep
+the plain fallback paths, or submit pending `AcceptEx`/`ConnectEx` work that
+feeds the existing readiness-token cache with accept/connect completions. The
+actual Winsock function lookup, overlapped buffer ownership, IOCP registration,
+context update calls, cancellation, and A/B measurement remain separate backend
+work.
+
 ### Registered I/O
 
 Registered I/O (RIO) is a later optional backend for small-message workloads.

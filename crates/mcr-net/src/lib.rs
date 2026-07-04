@@ -126,6 +126,30 @@ impl HostSocketCompletion {
     }
 }
 
+#[derive(Debug)]
+pub enum SocketAcceptFastPath {
+    Unsupported,
+    Pending,
+    Accepted {
+        handle: Box<dyn HostSocketHandle>,
+        peer: SocketAddress,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketConnectFastPath {
+    Unsupported,
+    Pending,
+    Connected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketConnectFastPathCompletion {
+    Inactive,
+    Pending,
+    Completed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketDomain {
     Inet,
@@ -538,9 +562,43 @@ pub trait HostSocketTransport {
 pub trait HostSocketHandle: fmt::Debug {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
+    /// Attempts to submit or finish an adapter-owned `AcceptEx` operation.
+    ///
+    /// `Pending` means the adapter owns the in-flight operation and must later
+    /// return an `Accept` completion for the supplied readiness token. `Accepted`
+    /// means any host `SO_UPDATE_ACCEPT_CONTEXT` work has already completed and
+    /// guest-visible address and option queries may observe the accepted socket.
+    /// `Unsupported` keeps the plain `accept` fallback path unchanged.
+    fn accept_fast_path(
+        &mut self,
+        _token: SocketReadinessToken,
+        _spec: SocketSpec,
+    ) -> Result<SocketAcceptFastPath, HostIoError> {
+        Ok(SocketAcceptFastPath::Unsupported)
+    }
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError>;
+    /// Attempts to submit an adapter-owned `ConnectEx` operation.
+    ///
+    /// `Pending` means the Linux socket remains `Connecting` until a matching
+    /// `Connect` completion is drained through the readiness token and
+    /// `complete_connect_fast_path` reports completion. `Unsupported` keeps the
+    /// plain `connect` fallback path unchanged.
+    fn connect_fast_path(
+        &mut self,
+        _token: SocketReadinessToken,
+        _address: SocketAddress,
+    ) -> Result<SocketConnectFastPath, HostIoError> {
+        Ok(SocketConnectFastPath::Unsupported)
+    }
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError>;
+    /// Advances `ConnectEx` completion state before `SO_ERROR`, local address,
+    /// or peer address queries are used to complete the Linux state machine.
+    fn complete_connect_fast_path(
+        &mut self,
+    ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
+        Ok(SocketConnectFastPathCompletion::Inactive)
+    }
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError>;
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
@@ -1342,14 +1400,33 @@ impl GuestSocketTable {
             .state
             .local_address()
             .unwrap_or_else(|| SocketAddress::unspecified_for_domain(spec.domain));
+        let fast_path = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Accept)?;
+            let token = entry.readiness_token;
+            entry
+                .handle
+                .accept_fast_path(token, spec)
+                .map_err(SocketError::from_host)?
+        };
+        match fast_path {
+            SocketAcceptFastPath::Accepted { handle, peer } => {
+                return self.register_accepted_socket(spec, handle, local, peer);
+            }
+            SocketAcceptFastPath::Pending => {
+                return Err(SocketError::would_block(
+                    SocketOperation::Accept,
+                    "AcceptEx operation is pending",
+                ));
+            }
+            SocketAcceptFastPath::Unsupported => {}
+        }
+
         let (handle, peer) = self
             .ensure_host_entry_mut(id, SocketOperation::Accept)?
             .handle
             .accept()
             .map_err(SocketError::from_host)?;
-        let accepted = self.create_socket_with_handle(spec, handle)?;
-        self.socket_mut(accepted)?.state = SocketState::Connected { local, peer };
-        Ok((accepted, peer))
+        self.register_accepted_socket(spec, handle, local, peer)
     }
 
     pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
@@ -1701,10 +1778,23 @@ impl GuestSocketTable {
                 && socket.effective_protocol() == SocketProtocol::Udp
         };
         let entry = self.ensure_host_entry_mut(id, SocketOperation::Connect)?;
-        entry
+        match entry
             .handle
-            .connect(address)
-            .map_err(SocketError::from_host)?;
+            .connect_fast_path(entry.readiness_token, address)
+            .map_err(SocketError::from_host)?
+        {
+            SocketConnectFastPath::Connected => {}
+            SocketConnectFastPath::Pending => {
+                return Err(SocketError::would_block(
+                    SocketOperation::Connect,
+                    "ConnectEx operation is pending",
+                ));
+            }
+            SocketConnectFastPath::Unsupported => entry
+                .handle
+                .connect(address)
+                .map_err(SocketError::from_host)?,
+        }
         let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
         if is_udp_datagram {
             return Ok((local, address));
@@ -1725,6 +1815,14 @@ impl GuestSocketTable {
             return Ok(());
         };
         let (local, peer) = if let Some(entry) = self.host_handles.get_mut(&id) {
+            if entry
+                .handle
+                .complete_connect_fast_path()
+                .map_err(SocketError::from_host)?
+                == SocketConnectFastPathCompletion::Pending
+            {
+                return Ok(());
+            }
             if let Some(error) = entry.handle.take_error().map_err(SocketError::from_host)? {
                 let errno = error.linux_errno();
                 let socket = self.socket_mut(id)?;
@@ -1745,6 +1843,18 @@ impl GuestSocketTable {
         socket.state = SocketState::Connected { local, peer };
         socket.last_error = None;
         Ok(())
+    }
+
+    fn register_accepted_socket(
+        &mut self,
+        spec: SocketSpec,
+        handle: Box<dyn HostSocketHandle>,
+        local: SocketAddress,
+        peer: SocketAddress,
+    ) -> Result<(SocketId, SocketAddress), SocketError> {
+        let accepted = self.create_socket_with_handle(spec, handle)?;
+        self.socket_mut(accepted)?.state = SocketState::Connected { local, peer };
+        Ok((accepted, peer))
     }
 
     fn socket_spec(&self, id: SocketId) -> Result<SocketSpec, SocketError> {
@@ -2245,6 +2355,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
+    use mcr_win::SocketFastPathKind;
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -2260,10 +2372,27 @@ mod tests {
         readiness_completions: Vec<ReadinessCompletionFixture>,
         fallback_readiness: Option<SocketEvents>,
         poll_calls: Option<Rc<Cell<usize>>>,
+        accept_calls: Option<Rc<Cell<usize>>>,
+        connect_calls: Option<Rc<Cell<usize>>>,
+        fast_path_accept: Option<FastPathAcceptFixture>,
+        fast_path_connect: Option<FastPathConnectFixture>,
         accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
         nonblocking: bool,
+    }
+
+    #[derive(Debug)]
+    struct FastPathAcceptFixture {
+        accepted: Option<(Box<FakeHostSocketHandle>, SocketAddress)>,
+        submitted: bool,
+        ready: bool,
+    }
+
+    #[derive(Debug)]
+    struct FastPathConnectFixture {
+        submitted: bool,
+        ready: bool,
     }
 
     impl FakeHostSocketHandle {
@@ -2316,6 +2445,53 @@ mod tests {
         fn with_accepted(peer: SocketAddress, incoming: &[u8]) -> Self {
             Self {
                 accepted: vec![(Self::with_incoming(incoming), peer)],
+                ..Self::default()
+            }
+        }
+
+        fn with_counted_accepted(
+            peer: SocketAddress,
+            incoming: &[u8],
+            accept_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                accept_calls: Some(accept_calls),
+                ..Self::with_accepted(peer, incoming)
+            }
+        }
+
+        fn with_acceptex(
+            peer: SocketAddress,
+            incoming: &[u8],
+            accept_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                accept_calls: Some(accept_calls),
+                fast_path_accept: Some(FastPathAcceptFixture {
+                    accepted: Some((Box::new(Self::with_incoming(incoming)), peer)),
+                    submitted: false,
+                    ready: false,
+                }),
+                ..Self::default()
+            }
+        }
+
+        fn with_counted_connect(local: SocketAddress, connect_calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                local: Some(local),
+                connect_calls: Some(connect_calls),
+                ..Self::default()
+            }
+        }
+
+        fn with_connectex(local: SocketAddress, connect_calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                local: Some(local),
+                connect_calls: Some(connect_calls),
+                fast_path_connect: Some(FastPathConnectFixture {
+                    submitted: false,
+                    ready: false,
+                }),
                 ..Self::default()
             }
         }
@@ -2579,7 +2755,31 @@ mod tests {
             Ok(())
         }
 
+        fn accept_fast_path(
+            &mut self,
+            _token: SocketReadinessToken,
+            _spec: SocketSpec,
+        ) -> Result<SocketAcceptFastPath, HostIoError> {
+            let Some(fast_path) = self.fast_path_accept.as_mut() else {
+                return Ok(SocketAcceptFastPath::Unsupported);
+            };
+            if fast_path.ready {
+                let Some((handle, peer)) = fast_path.accepted.take() else {
+                    return Err(HostIoError::new(
+                        LinuxErrno::OperationWouldBlock,
+                        "AcceptEx fixture has no accepted socket",
+                    ));
+                };
+                return Ok(SocketAcceptFastPath::Accepted { handle, peer });
+            }
+            fast_path.submitted = true;
+            Ok(SocketAcceptFastPath::Pending)
+        }
+
         fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+            if let Some(calls) = &self.accept_calls {
+                calls.set(calls.get() + 1);
+            }
             if self.accepted.is_empty() {
                 return Err(HostIoError::new(
                     LinuxErrno::OperationWouldBlock,
@@ -2595,7 +2795,23 @@ mod tests {
             Ok(())
         }
 
+        fn connect_fast_path(
+            &mut self,
+            _token: SocketReadinessToken,
+            address: SocketAddress,
+        ) -> Result<SocketConnectFastPath, HostIoError> {
+            let Some(fast_path) = self.fast_path_connect.as_mut() else {
+                return Ok(SocketConnectFastPath::Unsupported);
+            };
+            fast_path.submitted = true;
+            self.connected = Some(address);
+            Ok(SocketConnectFastPath::Pending)
+        }
+
         fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
+            if let Some(calls) = &self.connect_calls {
+                calls.set(calls.get() + 1);
+            }
             if let Some(error) = self.connect_error.take() {
                 if error.linux_errno() == LinuxErrno::OperationWouldBlock {
                     self.connected = Some(address);
@@ -2604,6 +2820,22 @@ mod tests {
             }
             self.connected = Some(address);
             Ok(())
+        }
+
+        fn complete_connect_fast_path(
+            &mut self,
+        ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
+            let Some(fast_path) = self.fast_path_connect.as_ref() else {
+                return Ok(SocketConnectFastPathCompletion::Inactive);
+            };
+            if !fast_path.submitted {
+                return Ok(SocketConnectFastPathCompletion::Inactive);
+            }
+            if fast_path.ready {
+                Ok(SocketConnectFastPathCompletion::Completed)
+            } else {
+                Ok(SocketConnectFastPathCompletion::Pending)
+            }
         }
 
         fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
@@ -2684,7 +2916,7 @@ mod tests {
             &mut self,
             token: SocketReadinessToken,
         ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
-            let completions = self
+            let mut completions = self
                 .readiness_completions
                 .drain(..)
                 .map(|completion| match completion {
@@ -2699,7 +2931,27 @@ mod tests {
                         kind,
                     ),
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let Some(fast_path) = self.fast_path_accept.as_mut()
+                && fast_path.submitted
+                && !fast_path.ready
+            {
+                fast_path.ready = true;
+                completions.push(HostSocketCompletion::new(
+                    token,
+                    SocketFastPathKind::AcceptEx.completion_kind(),
+                ));
+            }
+            if let Some(fast_path) = self.fast_path_connect.as_mut()
+                && fast_path.submitted
+                && !fast_path.ready
+            {
+                fast_path.ready = true;
+                completions.push(HostSocketCompletion::new(
+                    token,
+                    SocketFastPathKind::ConnectEx.completion_kind(),
+                ));
+            }
             Ok(completions)
         }
 
@@ -3340,6 +3592,162 @@ mod tests {
         assert!(readiness.writable);
         assert!(!readiness.readable);
         assert_eq!(poll_calls.get(), 1);
+    }
+
+    #[test]
+    fn acceptex_unsupported_uses_plain_accept_fallback() {
+        let accept_calls = Rc::new(Cell::new(0));
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let listener_handle = FakeHostSocketHandle::with_counted_accepted(
+            peer,
+            b"fallback",
+            Rc::clone(&accept_calls),
+        );
+        let mut table = GuestSocketTable::with_transport(NoopHostSocketTransport);
+        let listener = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(listener_handle),
+            )
+            .expect("listener");
+        let local = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(listener, local).expect("bind");
+        table.listen(listener, 1).expect("listen");
+        let (accepted, accepted_peer) = table.accept(listener).expect("plain accept fallback");
+
+        assert_eq!(accepted_peer, peer);
+        assert_eq!(accept_calls.get(), 1);
+        assert_eq!(
+            table.socket(accepted).expect("accepted").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn acceptex_pending_completion_feeds_readiness_then_accepts_without_plain_fallback() {
+        let accept_calls = Rc::new(Cell::new(0));
+        let poll_calls = Rc::new(Cell::new(0));
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut listener_handle =
+            FakeHostSocketHandle::with_acceptex(peer, b"accepted", Rc::clone(&accept_calls));
+        listener_handle.poll_calls = Some(Rc::clone(&poll_calls));
+        let mut table = GuestSocketTable::with_transport(NoopHostSocketTransport);
+        let listener = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(listener_handle),
+            )
+            .expect("listener");
+        let local = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(listener, local).expect("bind");
+        table.listen(listener, 1).expect("listen");
+        assert_eq!(
+            table
+                .accept(listener)
+                .expect_err("AcceptEx submit should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationWouldBlock
+        );
+        assert_eq!(accept_calls.get(), 0);
+
+        let readiness = table
+            .poll(listener, SocketEvents::read(), Some(Duration::ZERO))
+            .expect("AcceptEx readiness");
+        assert!(readiness.readable);
+        assert_eq!(poll_calls.get(), 0);
+
+        let (accepted, accepted_peer) = table.accept(listener).expect("completed AcceptEx");
+        assert_eq!(accepted_peer, peer);
+        assert_eq!(accept_calls.get(), 0);
+        assert_eq!(
+            table.socket(accepted).expect("accepted").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn connectex_unsupported_uses_plain_connect_fallback() {
+        let connect_calls = Rc::new(Cell::new(0));
+        let local = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_counted_connect(
+                    local,
+                    Rc::clone(&connect_calls),
+                )),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.connect(stream, peer).expect("plain connect fallback");
+
+        assert_eq!(connect_calls.get(), 1);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn connectex_pending_completion_preserves_nonblocking_state_and_so_error() {
+        let connect_calls = Rc::new(Cell::new(0));
+        let poll_calls = Rc::new(Cell::new(0));
+        let local = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut handle = FakeHostSocketHandle::with_connectex(local, Rc::clone(&connect_calls));
+        handle.poll_calls = Some(Rc::clone(&poll_calls));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("ConnectEx submit should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connecting(peer)
+        );
+
+        let readiness = table
+            .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+            .expect("ConnectEx readiness");
+        assert!(readiness.writable);
+        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected { local, peer }
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            0
+        );
     }
 
     #[test]

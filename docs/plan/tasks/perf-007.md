@@ -1,7 +1,7 @@
 ---
 id: perf-007
 scope: network-performance
-status: pending
+status: in-progress
 depends-on: [perf-006]
 ---
 
@@ -40,3 +40,15 @@ cargo test -p mcr-testkit perf_connect -- --ignored --nocapture
 - Successful `ConnectEx` completions must apply `SO_UPDATE_CONNECT_CONTEXT` and
   still drive the Linux nonblocking connect state machine.
 - Keep plain accept/connect fallback paths for unsupported sockets.
+
+## Checkpoints
+
+- 2026-07-04: Added the fast-path adapter contract over the existing
+  readiness-token seam without replacing the plain Winsock fallback. `mcr-win`
+  now names `AcceptEx`/`ConnectEx` fast-path kinds and their completion classes.
+  `mcr-net` host handles can report unsupported, pending, or completed
+  accept/connect fast paths; pending operations feed `Accept`/`Connect`
+  completions into the readiness cache while Linux accept/connect state and
+  `SO_ERROR` completion semantics stay in `mcr-net`. Real Windows extension
+  function lookup, overlapped ownership, context update calls, cancellation, and
+  performance smoke remain follow-up work.

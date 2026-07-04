@@ -30,7 +30,8 @@ pub use native_exec::{
 };
 pub use network::{
     AddressFamily, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
-    NetworkStack, SocketCompletionKind, SocketEvents, SocketKind, SocketPoll, SocketProtocol,
+    NetworkStack, SocketCompletionKind, SocketEvents, SocketFastPathKind, SocketKind, SocketPoll,
+    SocketProtocol,
 };
 pub use overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
