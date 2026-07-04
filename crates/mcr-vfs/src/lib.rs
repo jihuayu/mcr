@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -398,6 +400,30 @@ impl PathTree {
                 kind: PathNodeKind::File,
                 metadata: MetadataSidecar::new(attr),
                 data,
+                deferred_host_path: None,
+            },
+        )?;
+        Ok(inode_id)
+    }
+
+    pub fn create_file_with_host_content(
+        &mut self,
+        path: impl AsRef<str>,
+        host_path: impl Into<PathBuf>,
+        size: u64,
+        mode: u32,
+    ) -> VfsResult<InodeId> {
+        let path = parse_absolute_path(path.as_ref())?;
+        self.ensure_parent_dir(&path)?;
+        let inode_id = self.allocate_inode_id();
+        self.insert_path_node(
+            path,
+            PathNode {
+                inode_id,
+                kind: PathNodeKind::File,
+                metadata: MetadataSidecar::new(LinuxFileAttr::regular(inode_id, mode, size)),
+                data: Vec::new(),
+                deferred_host_path: Some(host_path.into()),
             },
         )?;
         Ok(inode_id)
@@ -581,6 +607,7 @@ impl PathTree {
                 kind,
                 metadata: MetadataSidecar::new(attr),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )?;
         Ok(inode_id)
@@ -640,6 +667,7 @@ impl PathTree {
                 kind: PathNodeKind::Device(kind),
                 metadata: MetadataSidecar::new(LinuxFileAttr::character_device(inode_id, 0o666)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -670,6 +698,7 @@ impl PathTree {
                         kind: PathNodeKind::Proc(kind),
                         metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
                         data: Vec::new(),
+                        deferred_host_path: None,
                     },
                 );
                 return Ok(());
@@ -686,6 +715,7 @@ impl PathTree {
                 kind: PathNodeKind::Proc(kind),
                 metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -752,6 +782,7 @@ pub struct PathNode {
     kind: PathNodeKind,
     metadata: MetadataSidecar,
     data: Vec<u8>,
+    deferred_host_path: Option<PathBuf>,
 }
 
 impl PathNode {
@@ -761,6 +792,7 @@ impl PathNode {
             kind: PathNodeKind::Directory,
             metadata: MetadataSidecar::new(LinuxFileAttr::directory(inode_id)),
             data: Vec::new(),
+            deferred_host_path: None,
         }
     }
 
@@ -788,6 +820,10 @@ impl PathNode {
         &self.data
     }
 
+    fn deferred_host_path(&self) -> Option<&Path> {
+        self.deferred_host_path.as_deref()
+    }
+
     pub fn set_mode(&mut self, mode: u32) {
         self.metadata.set_mode(mode);
     }
@@ -800,6 +836,7 @@ impl PathNode {
         if !matches!(self.kind, PathNodeKind::File) {
             return Err(VfsError::InvalidPath);
         }
+        self.materialize_deferred_content()?;
         let length = usize::try_from(length).map_err(|_| VfsError::NoSpace)?;
         self.data.resize(length, 0);
         self.metadata.set_size(length as u64);
@@ -810,6 +847,7 @@ impl PathNode {
         if !matches!(self.kind, PathNodeKind::File) {
             return Err(VfsError::InvalidPath);
         }
+        self.materialize_deferred_content()?;
 
         let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
         let end = offset
@@ -821,6 +859,16 @@ impl PathNode {
         self.data[offset..end].copy_from_slice(data);
         self.metadata.set_size(self.data.len() as u64);
         Ok(data.len())
+    }
+
+    fn materialize_deferred_content(&mut self) -> VfsResult<()> {
+        let Some(path) = self.deferred_host_path.clone() else {
+            return Ok(());
+        };
+        let data = fs::read(&path).map_err(|_| VfsError::NoEntry)?;
+        self.data = data;
+        self.deferred_host_path = None;
+        Ok(())
     }
 
     fn increment_link_count(&mut self) -> VfsResult<()> {
@@ -2538,23 +2586,7 @@ impl FdTable {
                     return Err(VfsError::IsDirectory);
                 }
                 let mut description = entry.description();
-                let offset =
-                    usize::try_from(description.offset).map_err(|_| VfsError::InvalidPath)?;
-                let proc_data;
-                let data = match node.kind() {
-                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
-                        proc_data = proc_self.cmdline_bytes();
-                        &proc_data
-                    }
-                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
-                        proc_data = proc_self.environ_bytes();
-                        &proc_data
-                    }
-                    _ => node.data(),
-                };
-                let available = data.get(offset..).unwrap_or(&[]);
-                let count = available.len().min(buffer.len());
-                buffer[..count].copy_from_slice(&available[..count]);
+                let count = read_regular_node_at(node, proc_self, description.offset, buffer)?;
                 description.offset += count as u64;
                 Ok(count)
             }
@@ -2601,23 +2633,7 @@ impl FdTable {
                 if node.attr().is_directory() {
                     return Err(VfsError::IsDirectory);
                 }
-                let proc_data;
-                let data = match node.kind() {
-                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
-                        proc_data = proc_self.cmdline_bytes();
-                        &proc_data
-                    }
-                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
-                        proc_data = proc_self.environ_bytes();
-                        &proc_data
-                    }
-                    _ => node.data(),
-                };
-                let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
-                let available = data.get(offset..).unwrap_or(&[]);
-                let count = available.len().min(buffer.len());
-                buffer[..count].copy_from_slice(&available[..count]);
-                Ok(count)
+                read_regular_node_at(node, proc_self, offset, buffer)
             }
             FileKind::Dev(DevNodeKind::Null) => Ok(0),
             FileKind::Dev(DevNodeKind::Zero) => {
@@ -3197,6 +3213,7 @@ impl VirtualFileSystem {
         if flags.directory() && !node.attr().is_directory() {
             return Err(VfsError::NotDirectory);
         }
+        let is_regular_file = matches!(node.kind(), PathNodeKind::File);
         if node.attr().is_symlink() && flags.nofollow() {
             return Err(VfsError::Loop);
         }
@@ -3213,12 +3230,18 @@ impl VirtualFileSystem {
         if !created {
             node.attr().check_access(access_mode)?;
         }
-        if flags.truncate() && flags.can_write() && matches!(node.kind(), PathNodeKind::File) {
+        if flags.truncate() && flags.can_write() && is_regular_file {
             self.tree
                 .lookup_path_mut(&path)
                 .ok_or(VfsError::NoEntry)?
                 .truncate()?;
             truncated = true;
+        }
+        if flags.can_read() && is_regular_file {
+            self.tree
+                .lookup_path_mut(&path)
+                .ok_or(VfsError::NoEntry)?
+                .materialize_deferred_content()?;
         }
 
         let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
@@ -3616,6 +3639,7 @@ impl VirtualFileSystem {
                     mode & !self.umask,
                 )),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )?;
         self.invalidate_vfs_caches();
@@ -3672,6 +3696,7 @@ impl VirtualFileSystem {
                     target.len() as u64,
                 )),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )?;
         self.invalidate_vfs_caches();
@@ -3853,6 +3878,9 @@ impl VirtualFileSystem {
         if !matches!(node.kind(), PathNodeKind::File) {
             return Ok(None);
         }
+        if node.deferred_host_path().is_some() {
+            return Ok(None);
+        }
         if node.data().len() > SMALL_READ_CACHE_LIMIT {
             return Ok(None);
         }
@@ -3910,6 +3938,7 @@ impl VirtualFileSystem {
                 kind: PathNodeKind::File,
                 metadata: MetadataSidecar::new(LinuxFileAttr::regular(inode_id, mode, 0)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -4246,6 +4275,45 @@ fn proc_self_fd_link_inode(fd: Fd) -> VfsResult<InodeId> {
     FIRST_PROC_SELF_FD_LINK_INODE_ID
         .checked_add(fd)
         .ok_or(VfsError::BadFd)
+}
+
+fn read_regular_node_at(
+    node: &PathNode,
+    proc_self: &ProcSelfData,
+    offset: u64,
+    buffer: &mut [u8],
+) -> VfsResult<usize> {
+    let proc_data;
+    let data = match node.kind() {
+        PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
+            proc_data = proc_self.cmdline_bytes();
+            return read_memory_at(&proc_data, offset, buffer);
+        }
+        PathNodeKind::Proc(ProcNodeKind::Environ) => {
+            proc_data = proc_self.environ_bytes();
+            return read_memory_at(&proc_data, offset, buffer);
+        }
+        _ => node.data(),
+    };
+    if let Some(path) = node.deferred_host_path() {
+        return read_host_file_at(path, offset, buffer);
+    }
+    read_memory_at(data, offset, buffer)
+}
+
+fn read_memory_at(data: &[u8], offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+    let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
+    let available = data.get(offset..).unwrap_or(&[]);
+    let count = available.len().min(buffer.len());
+    buffer[..count].copy_from_slice(&available[..count]);
+    Ok(count)
+}
+
+fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+    let mut file = fs::File::open(path).map_err(|_| VfsError::NoEntry)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|_| VfsError::InvalidPath)?;
+    file.read(buffer).map_err(|_| VfsError::InvalidPath)
 }
 
 fn inode_backend_for_path_node(node: &PathNode, host_path: PathBuf) -> InodeBackend {

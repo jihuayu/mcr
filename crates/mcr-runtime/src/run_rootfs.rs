@@ -794,28 +794,15 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
             let host_path = rootfs.join(&entry.relative);
             if entry.len >= LARGE_FILE_TRACE_BYTES {
                 crate::host_step_trace(format_args!(
-                    "load-rootfs large-file-read start path={} bytes={}",
+                    "load-rootfs large-file-deferred path={} bytes={}",
                     guest_path, entry.len
                 ));
             }
-            let file_start = Instant::now();
-            let content = fs::read(&host_path).map_err(|source| RunRootfsError::Io {
-                path: host_path,
-                source,
-            })?;
-            bytes = bytes.saturating_add(content.len() as u64);
-            if entry.len >= LARGE_FILE_TRACE_BYTES {
-                crate::host_step_trace(format_args!(
-                    "load-rootfs large-file-read done path={} bytes={} elapsed_ms={}",
-                    guest_path,
-                    content.len(),
-                    crate::host_step_elapsed_ms(file_start)
-                ));
-            }
-            tree.create_file_with_content(&guest_path, content, 0o755)?;
+            bytes = bytes.saturating_add(entry.len);
+            tree.create_file_with_host_content(&guest_path, host_path, entry.len, 0o755)?;
             if crate::host_step_trace_enabled() && files % 256 == 0 {
                 crate::host_step_trace(format_args!(
-                    "load-rootfs progress files={} dirs={} symlinks={} bytes={} elapsed_ms={}",
+                    "load-rootfs register-progress files={} dirs={} symlinks={} deferred_bytes={} elapsed_ms={}",
                     files,
                     directories,
                     symlinks,
@@ -826,7 +813,7 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
         }
     }
     crate::host_step_trace(format_args!(
-        "load-rootfs materialized files={} dirs={} symlinks={} bytes={} elapsed_ms={}",
+        "load-rootfs registered files={} dirs={} symlinks={} deferred_bytes={} elapsed_ms={}",
         files,
         directories,
         symlinks,
@@ -954,9 +941,9 @@ mod tests {
 
     use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
-    use mcr_vfs::{AT_FDCWD, O_RDONLY};
+    use mcr_vfs::{AT_FDCWD, O_RDONLY, OpenFlags};
 
-    use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
+    use super::{RunRootfsConfig, RunRootfsError, load_rootfs, run_rootfs};
 
     static RUN_ROOTFS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1001,6 +988,25 @@ mod tests {
         .unwrap();
         assert_eq!(cat.status(), 0);
         assert_eq!(cat.stdout(), b"NAME=Alpine\n");
+    }
+
+    #[test]
+    fn load_rootfs_defers_regular_file_content_until_open() {
+        let rootfs = TestRootfs::new("lazy-open");
+        rootfs.write_file("/payload.txt", b"first");
+
+        let mut vfs = load_rootfs(rootfs.path()).unwrap();
+        fs::write(rootfs.host_path("/payload.txt"), b"late!").unwrap();
+        let fd = vfs
+            .openat(AT_FDCWD, "/payload.txt", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        fs::write(rootfs.host_path("/payload.txt"), b"after").unwrap();
+
+        let mut buffer = [0; 8];
+        let count = vfs.read(fd, &mut buffer).unwrap();
+        vfs.close(fd).unwrap();
+
+        assert_eq!(&buffer[..count], b"late!");
     }
 
     #[test]

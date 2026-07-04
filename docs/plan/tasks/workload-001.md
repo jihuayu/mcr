@@ -76,3 +76,8 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   out inside a large FS-relative patch apply (`45171` patches with `fs_base=0`);
   `cargo --version` reaches native execution and times out during repeated
   native patch scan/apply work for Rust-sized executable ranges.
+- 2026-07-04 checkpoint: `run-rootfs` now registers regular package-rootfs
+  files as host-backed VFS entries and reads file bytes when the guest opens a
+  file instead of copying every file before guest execution. This moves the Go
+  rootfs bulk copy out of the pre-guest critical path; `go version` still needs
+  a package-rootfs rerun to identify the next runtime blocker after guest entry.

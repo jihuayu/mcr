@@ -120,6 +120,15 @@ exposes host paths or handles, writes cached bytes into each guest VMA with the
 requested permissions restored afterward, and bypasses reuse for initially
 writable private mappings until a real copy-on-write page backend exists.
 
+### Rootfs Startup
+
+`run-rootfs` must not copy every regular file in a package rootfs before the
+initial guest executable can run. Rootfs loading should register directory,
+symlink, metadata, and host-backed regular-file nodes first, then materialize
+regular-file bytes only when a readable fd is opened. The initial checkpoint
+keeps writes isolated by materializing a deferred file into the in-memory VFS
+before truncation or write paths mutate it.
+
 ## Network Optimization
 
 ### IOCP Backend
