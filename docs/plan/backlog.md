@@ -7,6 +7,7 @@
 | Dockerfile builder | Phase 3 | Runtime must first support shell, process, network, and filesystem behavior used by `RUN`. |
 | OCI/Docker image output | Phase 3 | Requires reliable snapshot diff and overlay semantics, which build on VFS after Phase 2. |
 | Registry pull/push | Phase 3 | Not needed to prove runtime execution; rootfs fixtures are enough for MVP and Phase 2. |
+| Registry transport/auth/gzip gate | Phase 3 | `image-002` closed only the pull/unpack contract boundary. Reopen for real OCI registry HTTP transport, auth/token handling, remote manifest/blob fetch, gzip layer decompression, and local-registry integration proof before claiming remote image pull support. |
 | Build RUN snapshot mutation and cancellation gate | build-003 | `buildrun-001` closed only the `mcr-runtime` executor API boundary. Follow-up must mount snapshot rootfs views, route `RUN` writes into snapshot mutation and layer diffing, and wire build cancellation before claiming end-to-end Dockerfile `RUN` mutation. |
 | BuildKit worker/executor | Phase 4 | Needs a stable runtime executor contract, snapshot diff boundary, and native builder proof first. |
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
