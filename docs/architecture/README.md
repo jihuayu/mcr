@@ -128,6 +128,9 @@ The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-i
 - Detailed networking rules live in [Network ABI design](networking.md), including
   the guest fd/object model, Winsock lifecycle, syscall mappings, readiness
   strategy, socket options, close semantics, and deferred IOCP backend.
+- Performance goals and backend optimization boundaries live in
+  [Performance optimization design](performance.md). Performance work must keep
+  guest-visible syscall, fd, task, VFS, and socket contracts stable.
 - Through Phase 2, `poll` and `epoll` are level-trigger only; unsupported flags must fail intentionally instead of being accepted silently.
 - Unsupported syscalls must be tracked and tested as unsupported behavior, not silently ignored.
 - Build steps must call the same runtime executor as user-visible `run-rootfs` workloads.

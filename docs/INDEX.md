@@ -10,6 +10,7 @@ MCR is a Rust runtime project for running selected Linux x86-64 development work
 | [Architecture overview](architecture/README.md) | Runtime boundary, subsystem ownership, module map, and cross-module flows. |
 | [Runtime design](architecture/runtime.md) | ELF execution, syscall dispatch, guest task model, VFS, `/proc`, networking, futex, and Windows host adapters. |
 | [Network ABI design](architecture/networking.md) | Linux/POSIX socket syscall ABI compatibility over Windows networking, including fd ownership, readiness, sockopts, and deferred IOCP. |
+| [Performance optimization design](architecture/performance.md) | Post-correctness performance goals for I/O, networking, process creation, syscall dispatch, and JIT execution. |
 | [Build, OCI, and BuildKit design](architecture/build.md) | Post-Phase 2 Dockerfile build, OCI image, snapshot, registry, and BuildKit worker boundaries. |
 
 ## Delivery
