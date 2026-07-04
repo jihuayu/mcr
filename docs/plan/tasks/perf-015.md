@@ -1,7 +1,7 @@
 ---
 id: perf-015
 scope: product-performance
-status: ready
+status: done
 depends-on: [perf-001, perf-010, perf-013, integ-003]
 ---
 
@@ -67,3 +67,41 @@ cargo test -p mcr-testkit --test perf_baseline perf_baseline_guest_smoke_workloa
 - Unsafe shortcuts must stay narrow and opt-in. Sharing fork/vfork memory until
   exec is a candidate experiment; globally sharing guest virtual address space
   across execed processes is not an accepted design.
+
+## Checkpoints
+
+- Added `MCR_TRACE_PERF_SUMMARY=1`, which reports wall time, guest syscall
+  count, scheduler enter/sleep/no-runnable counts, same-pid and cross-pid
+  switches, remap count and latency distribution, clone/exec counts,
+  clone-to-exec time, pipe I/O counts, fd wakeups, poll/select/wait/futex
+  counts, and fork-like syscall shape.
+- Added `MCR_SCHED_STICKY=1`, so the scheduler keeps running the current guest
+  task while it remains runnable and only rotates when the task blocks, exits,
+  yields, or another explicit wait boundary requires a handoff.
+- Added narrow spawn-path fixes needed by the measured workload: clone3
+  fork-like exec support, vfork child-stack handling, opt-in
+  `MCR_UNSAFE_SHARE_UNTIL_EXEC=1`, and guest futex wait scheduling.
+- Verified 2026-07-04 on current `main` with:
+
+```powershell
+cargo fmt --check
+cargo test -p mcr-sys maps_linux_x86_64_syscall_numbers
+cargo test -p mcr-task -- --test-threads=1
+cargo test -p mcr-runtime -- --test-threads=1
+cargo build --release -p mcr-cli
+$env:MCR_TRACE_PERF_SUMMARY='1'
+$env:MCR_SCHED_STICKY='1'
+target\release\mcr.exe run-rootfs tests\fixtures\rootfs\alpine-rootfs /bin/sh -c "GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null"
+$env:MCR_BIN='target\release\mcr.exe'
+$env:MCR_PERF_PUBLIC_NETWORK='1'
+cargo test -p mcr-testkit --test perf_baseline perf_baseline_guest_smoke_workloads -- --ignored --nocapture
+```
+
+- Direct release `git ls-remote` returned exit `0`; host-observed wall time was
+  `3341.323ms`. The runtime summary reported `2173ms`, `9568` guest syscalls,
+  `0` scheduler sleeps, `30` PID switches, `29` remaps, `276470us` total remap
+  time, `6567` pipe reads, `184` pipe writes, and `19` fd wakeups.
+- Release public-network baseline with `MCR_SCHED_STICKY=1`: shell startup
+  `167.507ms`, guest small-file loop `1430.149ms`, directory metadata walk
+  `3800.368ms`, `curl https://example.com` `485.074ms`, and `git ls-remote`
+  `1872.576ms`.

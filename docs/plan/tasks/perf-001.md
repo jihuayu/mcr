@@ -64,3 +64,8 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   threaten product viability. `perf-015` reopens shell/network metadata
   performance as a front-loaded gate instead of leaving threshold storage and
   trend dashboards as the only follow-up.
+- 2026-07-04 release rerun after `perf-015`, with `MCR_BIN=target\release\mcr.exe`,
+  `MCR_PERF_PUBLIC_NETWORK=1`, and `MCR_SCHED_STICKY=1`: shell startup
+  `167.507ms`, guest small-file loop `1430.149ms`, directory metadata walk
+  `3800.368ms`, `curl https://example.com` `485.074ms`, and `git ls-remote`
+  `1872.576ms`.

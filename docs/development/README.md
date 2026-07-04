@@ -89,17 +89,17 @@ Required capabilities:
 ### Performance Viability Gate
 
 Performance work is allowed to move ahead of broader compatibility when a
-measured path threatens product value. Current `main` has a public-network
-baseline where `curl https://example.com` is about `1947ms`, while
-`git ls-remote https://github.com/octocat/Hello-World.git HEAD` is about
-`114131ms`. That gap is too large to treat as a late backend optimization.
+measured path threatens product value. The pre-gate public-network baseline had
+`curl https://example.com` at about `1947ms` and `git ls-remote
+https://github.com/octocat/Hello-World.git HEAD` at about `114131ms`, which was
+too large to treat as a late backend optimization.
 
-The immediate performance gate is `perf-015`. It must classify where wall time
-goes with an opt-in summary trace, reduce pathological scheduler/remap or IPC
-handoff costs, and rerun the public-network baseline before later workload or
-build milestones claim progress. If the gate cannot get `git ls-remote` near
-host-order latency, the project direction must be reconsidered before investing
-in wider compatibility.
+`perf-015` closed the first viability gate by adding opt-in summary tracing and
+sticky scheduling for the shell/network metadata path. The 2026-07-04 release
+rerun with `MCR_SCHED_STICKY=1` measured `curl https://example.com` at
+`485.074ms` and `git ls-remote` at `1872.576ms`; the direct
+`MCR_TRACE_PERF_SUMMARY=1` run reported zero scheduler sleeps and showed remap
+plus pipe IPC as the remaining visible costs.
 
 ## Validation Policy
 

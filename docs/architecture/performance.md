@@ -65,14 +65,15 @@ highest-risk overhead:
 - shallow clone and package-manager metadata paths;
 - native execution patch/cache behavior for language runtime startup.
 
-The current `main` baseline proves why this gate exists: `curl
-https://example.com` is about `1947ms`, while `git ls-remote
-https://github.com/octocat/Hello-World.git HEAD` is about `114131ms`. That
-shape points to runtime handoff overhead rather than network throughput alone.
-`perf-015` owns the first product-value proof: add an opt-in performance summary
-trace, classify scheduler sleep versus memory remap versus clone/exec versus
-pipe handoff, then optimize the dominant path before the wider workload matrix
-or build plane advances.
+The initial public-network baseline proved why this gate exists: `curl
+https://example.com` was about `1947ms`, while `git ls-remote
+https://github.com/octocat/Hello-World.git HEAD` was about `114131ms`. That
+shape pointed to runtime handoff overhead rather than network throughput alone.
+`perf-015` closed the first product-value proof with opt-in summary tracing and
+sticky scheduling. The 2026-07-04 release rerun with `MCR_SCHED_STICKY=1`
+measured `curl https://example.com` at `485.074ms` and `git ls-remote` at
+`1872.576ms`; the direct trace reported zero scheduler sleeps, with remap and
+pipe IPC still visible for later backend work.
 
 ## File And I/O Optimization
 
@@ -413,10 +414,10 @@ The first baseline suites are intentionally split by subsystem boundary:
   filters provide task-specific host-only reports for active perf checkpoints.
 
 These suites started as baselines, not performance assertions. For
-product-critical paths, that is no longer enough. `perf-015` promotes selected
-shell/network metadata measurements into a viability gate: the benchmark must
-still report raw wall time and operation counts, but the task may block
-milestone progress when the runtime remains orders of magnitude slower than the
-host for small payloads. Long-term threshold storage and trend dashboards can
-remain later work; the immediate gate is local, repeatable, and tied to
-specific commands.
+product-critical paths, that is no longer enough. `perf-015` promoted selected
+shell/network metadata measurements into a viability gate: the benchmark still
+reports raw wall time and operation counts, but the task may block milestone
+progress when the runtime remains orders of magnitude slower than the host for
+small payloads. Long-term threshold storage and trend dashboards can remain
+later work; the immediate gate is local, repeatable, and tied to specific
+commands.

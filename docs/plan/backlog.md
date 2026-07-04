@@ -1,11 +1,10 @@
 # Backlog
 
 Targeted shell/network metadata performance is no longer a later backlog item.
-`perf-015` is the active front-loaded gate for classifying and reducing the
-current `git ls-remote` latency cliff before Phase 2 broadens the workload
-matrix or Phase 3 build work starts. Broad IOCP, overlapped file/pipe, worker
-pool routing, and memory-manager backend rewrites remain deferred unless
-`perf-015` measurements prove one of them is the dominant blocker.
+`perf-015` closed the first front-loaded gate by reducing the `git ls-remote`
+latency cliff with opt-in summary tracing and sticky scheduling. Broad IOCP,
+overlapped file/pipe, worker-pool routing, and memory-manager backend rewrites
+remain separate performance gates unless a task explicitly promotes them.
 
 ## Deferred Or Later Than Phase 2
 
