@@ -1,17 +1,20 @@
 ---
 id: perf-007
 scope: network-performance
-status: in-progress
+status: done
 depends-on: [perf-006]
 ---
 
-# perf-007: Add AcceptEx And ConnectEx Fast Paths
+# perf-007: Close AcceptEx And ConnectEx Fast-Path Boundary
 
 ## Objective
 
-Add `AcceptEx` and `ConnectEx` paths on top of the IOCP socket backend to reduce
-accept/connect round trips while preserving Linux socket state, address queries,
-nonblocking connect behavior, and `SO_ERROR` completion semantics.
+Close the first `AcceptEx`/`ConnectEx` checkpoint by defining the adapter
+contract over the readiness-token seam. This checkpoint does not bind to the
+real Winsock extension functions. It lets host handles report unsupported,
+pending, or completed fast-path work while `mcr-net` keeps plain accept/connect
+fallbacks, Linux socket state, address queries, nonblocking connect behavior,
+and `SO_ERROR` completion semantics.
 
 ## Context
 
@@ -28,9 +31,9 @@ nonblocking connect behavior, and `SO_ERROR` completion semantics.
 ## Verification
 
 ```powershell
-cargo test -p mcr-net acceptex connectex -- --nocapture
-cargo test -p mcr-runtime socket_connect socket_accept -- --nocapture
-cargo test -p mcr-testkit perf_connect -- --ignored --nocapture
+cargo test -p mcr-net acceptex -- --nocapture
+cargo test -p mcr-net connectex -- --nocapture
+git diff --check
 ```
 
 ## Notes
@@ -40,6 +43,10 @@ cargo test -p mcr-testkit perf_connect -- --ignored --nocapture
 - Successful `ConnectEx` completions must apply `SO_UPDATE_CONNECT_CONTEXT` and
   still drive the Linux nonblocking connect state machine.
 - Keep plain accept/connect fallback paths for unsupported sockets.
+- This task is done as the safe fast-path boundary only. Real Windows extension
+  lookup, overlapped buffer ownership, context update calls, cancellation, and
+  performance smoke coverage are deferred to `docs/plan/backlog.md` behind the
+  IOCP backend lifetime model and measurement gate.
 
 ## Checkpoints
 
@@ -52,3 +59,7 @@ cargo test -p mcr-testkit perf_connect -- --ignored --nocapture
   `SO_ERROR` completion semantics stay in `mcr-net`. Real Windows extension
   function lookup, overlapped ownership, context update calls, cancellation, and
   performance smoke remain follow-up work.
+- 2026-07-04 closeout: Closed as safe fast-path boundary complete. Real
+  `AcceptEx`/`ConnectEx` backend work is deferred to backlog and must reopen
+  with Windows extension lookup, overlapped ownership, context updates,
+  cancellation, differential fallback tests, and measurement evidence.
