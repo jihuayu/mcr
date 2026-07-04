@@ -59,3 +59,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   function pointer, keep the `OVERLAPPED` state alive, complete from a matching
   IOCP packet, and apply `SO_UPDATE_CONNECT_CONTEXT`. Wiring this into
   `mcr-net::HostSocketHandle::connect_fast_path` remains in this task.
+- Wired `ConnectEx` into the Windows `mcr-net` host transport. New sockets are
+  opened with a per-socket IOCP when available, nonblocking TCP connect submits
+  `ConnectEx`, readiness draining consumes the matching IOCP packet, and the
+  existing Linux `Connecting` -> `Connected` state machine completes through the
+  `Connect` readiness class. Plain connect remains the fallback.

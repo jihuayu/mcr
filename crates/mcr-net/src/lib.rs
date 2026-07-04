@@ -7,9 +7,10 @@ use std::{
 };
 
 use mcr_win::{
-    AddressFamily, HostError, HostErrorKind, HostRioCapability, HostShutdown, HostSocket,
-    HostSocketOptionName, HostSocketOptionValue, NetworkStack, SocketCompletionKind, SocketEvents,
-    SocketKind, SocketProtocol as HostSocketProtocol,
+    AddressFamily, HostConnectExSubmission, HostError, HostErrorKind, HostIoCompletionPort,
+    HostRioCapability, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
+    NetworkStack, PendingHostConnectEx, SocketCompletionKind, SocketEvents, SocketKind,
+    SocketProtocol as HostSocketProtocol,
 };
 
 mod dns_cache;
@@ -716,26 +717,51 @@ impl HostSocketTransport for WinHostSocketTransport {
         spec: SocketSpec,
         options: SocketOptions,
     ) -> Result<Box<dyn HostSocketHandle>, HostIoError> {
-        let socket = self
-            .stack
-            .open_socket(
-                address_family_from_socket_domain(spec.domain),
-                socket_kind_from_socket_type(spec.socket_type),
-                host_protocol_from_socket_protocol(spec.effective_protocol()),
-            )
-            .map_err(HostIoError::from)?;
+        let family = address_family_from_socket_domain(spec.domain);
+        let kind = socket_kind_from_socket_type(spec.socket_type);
+        let protocol = host_protocol_from_socket_protocol(spec.effective_protocol());
+        let (socket, completion_port) = match HostIoCompletionPort::new() {
+            Ok(port) => {
+                let socket = self
+                    .stack
+                    .open_socket_with_iocp(family, kind, protocol, &port, WIN_IOCP_COMPLETION_KEY)
+                    .map_err(HostIoError::from)?;
+                (socket, Some(port))
+            }
+            Err(_) => {
+                let socket = self
+                    .stack
+                    .open_socket(family, kind, protocol)
+                    .map_err(HostIoError::from)?;
+                (socket, None)
+            }
+        };
         apply_socket_options(&socket, spec, options)?;
         if spec.flags.nonblocking {
             socket.set_nonblocking(true).map_err(HostIoError::from)?;
         }
-        Ok(Box::new(WinHostSocketHandle { socket }))
+        Ok(Box::new(WinHostSocketHandle {
+            socket,
+            spec,
+            completion_port,
+            pending_connect: None,
+            connect_completed: false,
+            connect_error: None,
+        }))
     }
 }
 
 #[derive(Debug)]
 struct WinHostSocketHandle {
     socket: HostSocket,
+    spec: SocketSpec,
+    completion_port: Option<HostIoCompletionPort>,
+    pending_connect: Option<PendingHostConnectEx>,
+    connect_completed: bool,
+    connect_error: Option<HostIoError>,
 }
+
+const WIN_IOCP_COMPLETION_KEY: usize = 1;
 
 impl HostSocketHandle for WinHostSocketHandle {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
@@ -757,7 +783,17 @@ impl HostSocketHandle for WinHostSocketHandle {
 
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
         let (socket, peer) = self.socket.accept().map_err(HostIoError::from)?;
-        Ok((Box::new(Self { socket }), SocketAddress::from(peer)))
+        Ok((
+            Box::new(Self {
+                socket,
+                spec: self.spec,
+                completion_port: None,
+                pending_connect: None,
+                connect_completed: false,
+                connect_error: None,
+            }),
+            SocketAddress::from(peer),
+        ))
     }
 
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError> {
@@ -766,10 +802,54 @@ impl HostSocketHandle for WinHostSocketHandle {
             .map_err(HostIoError::from)
     }
 
+    fn connect_fast_path(
+        &mut self,
+        _token: SocketReadinessToken,
+        address: SocketAddress,
+    ) -> Result<SocketConnectFastPath, HostIoError> {
+        if self.pending_connect.is_some()
+            || self.completion_port.is_none()
+            || self.spec.socket_type != SocketType::Stream
+            || self.spec.effective_protocol() != SocketProtocol::Tcp
+        {
+            return Ok(SocketConnectFastPath::Unsupported);
+        }
+        if self.socket.local_addr().is_err() {
+            self.socket
+                .bind(SocketAddr::from(SocketAddress::unspecified_for_domain(
+                    address.domain(),
+                )))
+                .map_err(HostIoError::from)?;
+        }
+        match self.socket.submit_connect_ex(SocketAddr::from(address)) {
+            HostConnectExSubmission::Pending(pending) => {
+                self.pending_connect = Some(pending);
+                Ok(SocketConnectFastPath::Pending)
+            }
+            HostConnectExSubmission::Failed(error) => Err(HostIoError::from(error)),
+        }
+    }
+
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
         self.socket
             .connect(SocketAddr::from(address))
             .map_err(HostIoError::from)
+    }
+
+    fn complete_connect_fast_path(
+        &mut self,
+    ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
+        if self.connect_completed {
+            self.connect_completed = false;
+            return Ok(SocketConnectFastPathCompletion::Completed);
+        }
+        if self.connect_error.is_some() {
+            return Ok(SocketConnectFastPathCompletion::Completed);
+        }
+        if self.pending_connect.is_some() {
+            return Ok(SocketConnectFastPathCompletion::Pending);
+        }
+        Ok(SocketConnectFastPathCompletion::Inactive)
     }
 
     fn rio_capability(&mut self) -> Result<HostRioCapability, HostIoError> {
@@ -777,6 +857,9 @@ impl HostSocketHandle for WinHostSocketHandle {
     }
 
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
+        if self.connect_error.is_some() {
+            return Ok(self.connect_error.take());
+        }
         self.socket
             .take_error()
             .map(|error| error.map(HostIoError::from))
@@ -858,6 +941,45 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket
             .poll(interest, timeout)
             .map_err(HostIoError::from)
+    }
+
+    fn drain_readiness_completions(
+        &mut self,
+        token: SocketReadinessToken,
+    ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
+        let mut completions = Vec::new();
+        let Some(port) = self.completion_port.as_ref() else {
+            return Ok(completions);
+        };
+        while let Some(packet) = port.get(Some(Duration::ZERO)).map_err(HostIoError::from)? {
+            if let Some(pending) = self.pending_connect.take() {
+                if pending.matches_completion(packet) {
+                    match pending.complete_from_packet(packet) {
+                        Ok(()) => {
+                            self.connect_completed = true;
+                            completions.push(HostSocketCompletion::new(
+                                token,
+                                SocketCompletionKind::Connect,
+                            ));
+                        }
+                        Err(error) => {
+                            self.connect_error = Some(HostIoError::from(error));
+                            completions.push(HostSocketCompletion::new(
+                                token,
+                                SocketCompletionKind::Connect,
+                            ));
+                            completions.push(HostSocketCompletion::new(
+                                token,
+                                SocketCompletionKind::Error,
+                            ));
+                        }
+                    }
+                } else {
+                    self.pending_connect = Some(pending);
+                }
+            }
+        }
+        Ok(completions)
     }
 
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError> {
@@ -4229,6 +4351,76 @@ mod tests {
         assert!(!capability.is_supported());
         assert_eq!(capability.error_code(), None);
         assert_eq!(capability.function_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_host_transport_connectex_completes_nonblocking_connect() {
+        let stack = NetworkStack::start().expect("network stack");
+        let listener = stack
+            .open_socket(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                HostSocketProtocol::Tcp,
+            )
+            .expect("listener socket");
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let server_addr = SocketAddress::from(listener.local_addr().unwrap());
+
+        let mut table = GuestSocketTable::with_transport(
+            WinHostSocketTransport::new().expect("host transport"),
+        );
+        let client = table
+            .create_socket_from_spec(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+            )
+            .expect("client socket");
+
+        assert_eq!(
+            table
+                .connect(client, server_addr)
+                .expect_err("ConnectEx should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        for _ in 0..10 {
+            let _ = table.poll(
+                client,
+                SocketEvents::write(),
+                Some(Duration::from_millis(50)),
+            );
+            if matches!(
+                table.socket(client).expect("client state").state(),
+                SocketState::Connected { .. }
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            table.socket(client).expect("client state").state(),
+            SocketState::Connected { .. }
+        ));
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(
+            table.peer_address(client).expect("peer address"),
+            Some(SocketAddress::from(server.local_addr().unwrap()))
+        );
     }
 
     #[cfg(windows)]
