@@ -10,9 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mcr_net::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
 #[cfg(windows)]
 use mcr_net::{
-    GuestSocketTable, SocketAddress, SocketDomain, SocketProtocol, SocketSpec, SocketType,
-    WinHostSocketTransport,
+    GuestSocketTable, LinuxErrno, SocketAddress, SocketDomain, SocketProtocol, SocketSpec,
+    SocketType, WinHostSocketTransport,
 };
+#[cfg(windows)]
+use mcr_win::SocketEvents;
 
 #[cfg(windows)]
 #[test]
@@ -232,7 +234,22 @@ fn serve_loopback_clients(
     connections: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..connections {
-        let (accepted, _) = table.accept(listener)?;
+        let (accepted, _) = loop {
+            match table.accept(listener) {
+                Ok(accepted) => break accepted,
+                Err(error) if error.linux_errno() == LinuxErrno::OperationWouldBlock => {
+                    let readiness = table.poll(
+                        listener,
+                        SocketEvents::read(),
+                        Some(Duration::from_millis(100)),
+                    )?;
+                    if !(readiness.readable || readiness.hang_up || readiness.error) {
+                        continue;
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let mut byte = [0];
         assert_eq!(table.recv_connected(accepted, &mut byte)?, 1);
         assert_eq!(table.send_connected(accepted, &byte)?, 1);
