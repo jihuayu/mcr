@@ -66,6 +66,7 @@ use mcr_win::SocketEvents;
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
+const PERF_SUMMARY_TRACE_ENV: &str = "MCR_TRACE_PERF_SUMMARY";
 
 pub(crate) fn host_step_trace_enabled() -> bool {
     std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
@@ -3144,47 +3145,56 @@ fn run_guest_until_exit_loop<T>(
 where
     T: SyscallTracer,
 {
-    let mut guest_steps = 0u64;
-    loop {
-        if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
-            return Ok(status);
-        }
-        dispatcher
-            .subsystems_mut()
-            .resume_waiting_tasks()
-            .map_err(|errno| GuestRunError::WaitResume { errno })?;
-        dispatcher.subsystems_mut().resume_fd_waiters();
-        let mut runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
-        dispatcher
-            .subsystems()
-            .prioritize_pending_fork_exec_tids(&mut runnable_tids);
-        if runnable_tids.is_empty() {
-            return Err(GuestRunError::NoRunnableTasks);
-        }
-        for tid in runnable_tids {
-            if !matches!(
-                dispatcher
+    dispatcher.subsystems_mut().perf_begin_run();
+    let result = (|| -> Result<i32, GuestRunError> {
+        let mut guest_steps = 0u64;
+        loop {
+            if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
+                return Ok(status);
+            }
+            dispatcher.subsystems_mut().perf_record_scheduler_enter();
+            dispatcher
+                .subsystems_mut()
+                .resume_waiting_tasks()
+                .map_err(|errno| GuestRunError::WaitResume { errno })?;
+            dispatcher.subsystems_mut().resume_fd_waiters();
+            let mut runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
+            dispatcher
+                .subsystems()
+                .prioritize_pending_fork_exec_tids(&mut runnable_tids);
+            if runnable_tids.is_empty() {
+                dispatcher.subsystems_mut().perf_record_no_runnable();
+                return Err(GuestRunError::NoRunnableTasks);
+            }
+            for tid in runnable_tids {
+                let Some((pid, state)) = dispatcher
                     .subsystems()
                     .tasks
                     .task(tid)
-                    .map(mcr_task::GuestTask::state),
-                Some(TaskState::Runnable)
-            ) {
-                continue;
-            }
-            if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
-                return Err(GuestRunError::StepLimitExceeded {
-                    steps: guest_steps,
-                    diagnostic: capture_diagnostic(dispatcher),
-                });
-            }
-            dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
-            guest_steps = guest_steps.saturating_add(1);
-            if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
-                break;
+                    .map(|task| (task.pid(), task.state()))
+                else {
+                    continue;
+                };
+                if !matches!(state, TaskState::Runnable) {
+                    continue;
+                }
+                if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
+                    return Err(GuestRunError::StepLimitExceeded {
+                        steps: guest_steps,
+                        diagnostic: capture_diagnostic(dispatcher),
+                    });
+                }
+                dispatcher.subsystems_mut().perf_record_dispatch(tid, pid);
+                dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+                guest_steps = guest_steps.saturating_add(1);
+                if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
+                    break;
+                }
             }
         }
-    }
+    })();
+    dispatcher.subsystems_mut().perf_finish_run();
+    result
 }
 
 fn initial_process_exit_status(kernel: &GuestKernel) -> Result<Option<i32>, GuestRunError> {
@@ -3452,6 +3462,9 @@ where
         trap.registers().syscall_registers(),
     ));
     let syscall_registers = trap.registers().syscall_registers();
+    dispatcher
+        .subsystems_mut()
+        .perf_record_syscall(syscall_registers.syscall());
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
@@ -3527,6 +3540,9 @@ where
     };
 
     let syscall_registers = trap.registers().syscall_registers();
+    dispatcher
+        .subsystems_mut()
+        .perf_record_syscall(syscall_registers.syscall());
     let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
@@ -3690,6 +3706,9 @@ where
             next_rip: registers.rip + 2,
         };
         let syscall_registers = registers.syscall_registers();
+        dispatcher
+            .subsystems_mut()
+            .perf_record_syscall(syscall_registers.syscall());
         if is_fork_like_syscall_number(syscall_registers.rax) {
             let mut child_registers = registers;
             child_registers.apply_syscall_return(0, site.next_rip);
@@ -5004,6 +5023,266 @@ struct FileBackedMappingCacheSnapshot {
     misses: usize,
 }
 
+#[derive(Debug, Default)]
+struct RuntimePerfSummary {
+    enabled: bool,
+    run_started_at: Option<Instant>,
+    guest_syscall_count: u64,
+    scheduler_enter_count: u64,
+    scheduler_no_runnable_count: u64,
+    scheduler_runnable_but_switched_count: u64,
+    scheduler_sleep_count: u64,
+    scheduler_sleep_total_us: u128,
+    last_dispatched: Option<(mcr_sys::GuestTid, mcr_sys::GuestPid)>,
+    pid_switch_count: u64,
+    same_pid_switch_count: u64,
+    cross_pid_switch_count: u64,
+    remap_samples_us: Vec<u128>,
+    clone_count: u64,
+    vfork_clone_count: u64,
+    fork_clone_count: u64,
+    execve_count: u64,
+    clone_to_exec_samples_us: Vec<u128>,
+    pipe_read_count: u64,
+    pipe_read_empty_count: u64,
+    pipe_write_count: u64,
+    pipe_wakeup_count: u64,
+    fd_wakeup_count: u64,
+    poll_count: u64,
+    select_count: u64,
+    wait4_count: u64,
+    futex_count: u64,
+}
+
+impl RuntimePerfSummary {
+    fn begin_run(&mut self) {
+        self.enabled = std::env::var_os(PERF_SUMMARY_TRACE_ENV).is_some();
+        if !self.enabled {
+            return;
+        }
+        *self = Self {
+            enabled: true,
+            run_started_at: Some(Instant::now()),
+            ..Self::default()
+        };
+    }
+
+    fn record_scheduler_enter(&mut self) {
+        if self.enabled {
+            self.scheduler_enter_count = self.scheduler_enter_count.saturating_add(1);
+        }
+    }
+
+    fn record_no_runnable(&mut self) {
+        if self.enabled {
+            self.scheduler_no_runnable_count = self.scheduler_no_runnable_count.saturating_add(1);
+        }
+    }
+
+    fn record_dispatch(
+        &mut self,
+        tid: mcr_sys::GuestTid,
+        pid: mcr_sys::GuestPid,
+        previous_still_runnable: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        if let Some((last_tid, last_pid)) = self.last_dispatched
+            && last_tid != tid
+        {
+            if previous_still_runnable {
+                self.scheduler_runnable_but_switched_count =
+                    self.scheduler_runnable_but_switched_count.saturating_add(1);
+            }
+            if last_pid == pid {
+                self.same_pid_switch_count = self.same_pid_switch_count.saturating_add(1);
+            } else {
+                self.pid_switch_count = self.pid_switch_count.saturating_add(1);
+                self.cross_pid_switch_count = self.cross_pid_switch_count.saturating_add(1);
+            }
+        }
+        self.last_dispatched = Some((tid, pid));
+    }
+
+    fn record_syscall(&mut self, syscall: mcr_sys::Syscall) {
+        if !self.enabled {
+            return;
+        }
+        self.guest_syscall_count = self.guest_syscall_count.saturating_add(1);
+        match syscall {
+            mcr_sys::Syscall::Poll | mcr_sys::Syscall::Ppoll => {
+                self.poll_count = self.poll_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Select => {
+                self.select_count = self.select_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Wait4 => {
+                self.wait4_count = self.wait4_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Futex => {
+                self.futex_count = self.futex_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Execve => {
+                self.execve_count = self.execve_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_fork_like(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        clone_args: Option<CloneSyscallArgs>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match syscall {
+            mcr_sys::Syscall::Clone => {
+                self.clone_count = self.clone_count.saturating_add(1);
+                if clone_args.is_some_and(|args| args.has_clone_vfork()) {
+                    self.vfork_clone_count = self.vfork_clone_count.saturating_add(1);
+                } else {
+                    self.fork_clone_count = self.fork_clone_count.saturating_add(1);
+                }
+            }
+            mcr_sys::Syscall::Vfork => {
+                self.vfork_clone_count = self.vfork_clone_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Fork => {
+                self.fork_clone_count = self.fork_clone_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_remap(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.remap_samples_us.push(elapsed.as_micros());
+        }
+    }
+
+    fn record_clone_to_exec(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.clone_to_exec_samples_us.push(elapsed.as_micros());
+        }
+    }
+
+    fn record_pipe_io(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        kind: FileKind,
+        result: &SyscallReturn,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match (syscall, kind) {
+            (mcr_sys::Syscall::Read | mcr_sys::Syscall::Readv, FileKind::PipeRead) => {
+                self.pipe_read_count = self.pipe_read_count.saturating_add(1);
+                if matches!(result, SyscallReturn::Errno(LinuxErrno::EAGAIN)) {
+                    self.pipe_read_empty_count = self.pipe_read_empty_count.saturating_add(1);
+                }
+            }
+            (mcr_sys::Syscall::Write | mcr_sys::Syscall::Writev, FileKind::PipeWrite) => {
+                self.pipe_write_count = self.pipe_write_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_fd_wakeups(&mut self, count: usize) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        let count = count as u64;
+        self.fd_wakeup_count = self.fd_wakeup_count.saturating_add(count);
+        self.pipe_wakeup_count = self.pipe_wakeup_count.saturating_add(count);
+    }
+
+    fn finish_run(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let wall_ms = self
+            .run_started_at
+            .map(|start| start.elapsed().as_millis())
+            .unwrap_or_default();
+        let remap = sample_summary(&mut self.remap_samples_us);
+        let clone_to_exec = sample_summary(&mut self.clone_to_exec_samples_us);
+        eprintln!(
+            "mcr perf-summary: wall_ms={wall_ms} guest_syscall_count={} scheduler_enter_count={} scheduler_sleep_count={} scheduler_sleep_total_us={} scheduler_no_runnable_count={} scheduler_runnable_but_switched_count={}",
+            self.guest_syscall_count,
+            self.scheduler_enter_count,
+            self.scheduler_sleep_count,
+            self.scheduler_sleep_total_us,
+            self.scheduler_no_runnable_count,
+            self.scheduler_runnable_but_switched_count
+        );
+        eprintln!(
+            "mcr perf-summary: pid_switch_count={} same_pid_switch_count={} cross_pid_switch_count={}",
+            self.pid_switch_count, self.same_pid_switch_count, self.cross_pid_switch_count
+        );
+        eprintln!(
+            "mcr perf-summary: remap_count={} remap_total_us={} remap_avg_us={} remap_p50_us={} remap_p95_us={}",
+            remap.count, remap.total_us, remap.avg_us, remap.p50_us, remap.p95_us
+        );
+        eprintln!(
+            "mcr perf-summary: clone_count={} vfork_clone_count={} fork_clone_count={} execve_count={} clone_to_exec_count={} clone_to_exec_total_us={} clone_to_exec_avg_us={}",
+            self.clone_count,
+            self.vfork_clone_count,
+            self.fork_clone_count,
+            self.execve_count,
+            clone_to_exec.count,
+            clone_to_exec.total_us,
+            clone_to_exec.avg_us
+        );
+        eprintln!(
+            "mcr perf-summary: pipe_read_count={} pipe_read_empty_count={} pipe_write_count={} pipe_wakeup_count={} fd_wakeup_count={} poll_count={} select_count={} wait4_count={} futex_count={}",
+            self.pipe_read_count,
+            self.pipe_read_empty_count,
+            self.pipe_write_count,
+            self.pipe_wakeup_count,
+            self.fd_wakeup_count,
+            self.poll_count,
+            self.select_count,
+            self.wait4_count,
+            self.futex_count
+        );
+    }
+}
+
+#[derive(Default)]
+struct SampleSummary {
+    count: usize,
+    total_us: u128,
+    avg_us: u128,
+    p50_us: u128,
+    p95_us: u128,
+}
+
+fn sample_summary(samples: &mut [u128]) -> SampleSummary {
+    if samples.is_empty() {
+        return SampleSummary::default();
+    }
+    samples.sort_unstable();
+    let total_us = samples.iter().sum::<u128>();
+    let count = samples.len();
+    SampleSummary {
+        count,
+        total_us,
+        avg_us: total_us / count as u128,
+        p50_us: percentile_us(samples, 50),
+        p95_us: percentile_us(samples, 95),
+    }
+}
+
+fn percentile_us(samples: &[u128], percentile: usize) -> u128 {
+    let index = samples.len().saturating_sub(1) * percentile / 100;
+    samples[index]
+}
+
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
@@ -5024,11 +5303,13 @@ pub struct RuntimeSubsystems {
     native_image_patch_ranges: NativeImagePatchRangeMap,
     native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
     pending_fork_child_regs: Option<GprState>,
+    perf_summary: RuntimePerfSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingForkExec {
     parent_pid: mcr_sys::GuestPid,
+    created_at: Instant,
 }
 
 fn native_image_patch_maps(
@@ -5086,6 +5367,7 @@ impl RuntimeSubsystems {
             native_image_patch_ranges,
             native_image_patch_metadata: BTreeMap::new(),
             pending_fork_child_regs: None,
+            perf_summary: RuntimePerfSummary::default(),
         })
     }
 
@@ -5124,6 +5406,7 @@ impl RuntimeSubsystems {
             native_image_patch_ranges,
             native_image_patch_metadata: BTreeMap::new(),
             pending_fork_child_regs: None,
+            perf_summary: RuntimePerfSummary::default(),
         })
     }
 
@@ -5472,6 +5755,7 @@ impl FileSyscalls for RuntimeSubsystems {
             )),
             _ => self.files.dispatch_file(request),
         };
+        self.perf_record_pipe_io(request.syscall, arg_i32(request, 0), &outcome.result);
         if matches!(outcome.result, SyscallReturn::Success(_)) {
             if let Err(errno) = self.store_selected_process_fds(pid) {
                 return SyscallOutcome::errno(errno);
@@ -5891,6 +6175,76 @@ impl RuntimeSubsystems {
         Ok(bytes)
     }
 
+    fn perf_begin_run(&mut self) {
+        self.perf_summary.begin_run();
+    }
+
+    fn perf_finish_run(&mut self) {
+        self.perf_summary.finish_run();
+    }
+
+    fn perf_record_scheduler_enter(&mut self) {
+        self.perf_summary.record_scheduler_enter();
+    }
+
+    fn perf_record_no_runnable(&mut self) {
+        self.perf_summary.record_no_runnable();
+    }
+
+    fn perf_record_dispatch(&mut self, tid: mcr_sys::GuestTid, pid: mcr_sys::GuestPid) {
+        let previous_still_runnable =
+            self.perf_summary
+                .last_dispatched
+                .is_some_and(|(last_tid, _)| {
+                    self.tasks
+                        .task(last_tid)
+                        .is_some_and(|task| matches!(task.state(), TaskState::Runnable))
+                });
+        self.perf_summary
+            .record_dispatch(tid, pid, previous_still_runnable);
+    }
+
+    fn perf_record_syscall(&mut self, syscall: mcr_sys::Syscall) {
+        self.perf_summary.record_syscall(syscall);
+    }
+
+    fn perf_record_fork_like(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        clone_args: Option<CloneSyscallArgs>,
+    ) {
+        self.perf_summary.record_fork_like(syscall, clone_args);
+    }
+
+    fn perf_record_remap(&mut self, elapsed: Duration) {
+        self.perf_summary.record_remap(elapsed);
+    }
+
+    fn perf_record_clone_to_exec(&mut self, elapsed: Duration) {
+        self.perf_summary.record_clone_to_exec(elapsed);
+    }
+
+    fn perf_record_fd_wakeups(&mut self, count: usize) {
+        self.perf_summary.record_fd_wakeups(count);
+    }
+
+    fn perf_record_pipe_io(&mut self, syscall: mcr_sys::Syscall, fd: Fd, result: &SyscallReturn) {
+        if !matches!(
+            syscall,
+            mcr_sys::Syscall::Read
+                | mcr_sys::Syscall::Readv
+                | mcr_sys::Syscall::Write
+                | mcr_sys::Syscall::Writev
+        ) {
+            return;
+        }
+        let Ok(entry) = self.files.vfs().fds().get(fd) else {
+            return;
+        };
+        self.perf_summary
+            .record_pipe_io(syscall, entry.file().kind(), result);
+    }
+
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
         self.select_fds_for_process(pid)?;
@@ -5941,40 +6295,45 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        let selected_pid = self.selected_memory_pid;
-        let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
-            Some(
-                self.files
-                    .memory()
-                    .try_clone_runtime()
-                    .map_err(|error| error.errno())?,
-            )
-        } else {
-            None
-        };
-        let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
-        self.drop_selected_memory_allocations();
-        match target_snapshot.try_clone_runtime_at_guest_addresses() {
-            Ok(memory) => {
-                if let Some(snapshot) = selected_snapshot {
-                    self.process_memory.insert(selected_pid, snapshot);
+        let remap_start = Instant::now();
+        let result = (|| {
+            let selected_pid = self.selected_memory_pid;
+            let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
+                Some(
+                    self.files
+                        .memory()
+                        .try_clone_runtime()
+                        .map_err(|error| error.errno())?,
+                )
+            } else {
+                None
+            };
+            let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+            self.drop_selected_memory_allocations();
+            match target_snapshot.try_clone_runtime_at_guest_addresses() {
+                Ok(memory) => {
+                    if let Some(snapshot) = selected_snapshot {
+                        self.process_memory.insert(selected_pid, snapshot);
+                    }
+                    *self.files.memory_mut() = memory;
+                    self.selected_memory_pid = pid;
+                    Ok(())
                 }
-                *self.files.memory_mut() = memory;
-                self.selected_memory_pid = pid;
-                Ok(())
-            }
-            Err(error) => {
-                self.process_memory.insert(pid, target_snapshot);
-                if let Some(snapshot) = selected_snapshot {
-                    let restored = snapshot
-                        .try_clone_runtime_at_guest_addresses()
-                        .map_err(|restore_error| restore_error.errno())?;
-                    self.process_memory.insert(selected_pid, snapshot);
-                    *self.files.memory_mut() = restored;
+                Err(error) => {
+                    self.process_memory.insert(pid, target_snapshot);
+                    if let Some(snapshot) = selected_snapshot {
+                        let restored = snapshot
+                            .try_clone_runtime_at_guest_addresses()
+                            .map_err(|restore_error| restore_error.errno())?;
+                        self.process_memory.insert(selected_pid, snapshot);
+                        *self.files.memory_mut() = restored;
+                    }
+                    Err(error.errno())
                 }
-                Err(error.errno())
             }
-        }
+        })();
+        self.perf_record_remap(remap_start.elapsed());
+        result
     }
 
     fn dispatch_sched_yield(&mut self) -> SyscallOutcome {
@@ -6802,7 +7161,7 @@ impl RuntimeSubsystems {
         let selected_pid = self.selected_fds_pid;
         let selected_fds = self.files.vfs().fds().clone();
         let process_fds = self.process_fds.clone();
-        self.tasks.resume_fd_waiters(|pid, fd, write| {
+        let resumed = self.tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
                 Some(&selected_fds)
             } else {
@@ -6811,6 +7170,7 @@ impl RuntimeSubsystems {
             fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
                 .unwrap_or(true)
         });
+        self.perf_record_fd_wakeups(resumed);
     }
 
     fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
@@ -6863,6 +7223,7 @@ impl RuntimeSubsystems {
         }
         let clone_args =
             (request.syscall == mcr_sys::Syscall::Clone).then(|| clone_args_from_request(request));
+        self.perf_record_fork_like(request.syscall, clone_args);
         let pending_child_regs = self.pending_fork_child_regs.take();
         let outcome = if self.native_execution {
             match pending_child_regs {
@@ -6887,8 +7248,13 @@ impl RuntimeSubsystems {
         let Some(child_pid) = fork_child_pid(&outcome.decoded) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        self.pending_fork_exec
-            .insert(child_pid, PendingForkExec { parent_pid: pid });
+        self.pending_fork_exec.insert(
+            child_pid,
+            PendingForkExec {
+                parent_pid: pid,
+                created_at: Instant::now(),
+            },
+        );
         self.process_fds
             .insert(child_pid, self.files.vfs().fds().clone());
         self.fork_native_fp(request.context.tid, child_pid);
@@ -7006,11 +7372,12 @@ impl RuntimeSubsystems {
         request: &SyscallRequest,
     ) -> Result<(), LinuxErrno> {
         let child_pid = request.context.pid;
-        let parent_pid = self
+        let pending = self
             .pending_fork_exec
             .get(&child_pid)
-            .map(|pending| pending.parent_pid)
+            .copied()
             .ok_or(LinuxErrno::ESRCH)?;
+        let parent_pid = pending.parent_pid;
         self.select_fds_for_process(child_pid)?;
         sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
 
@@ -7045,6 +7412,7 @@ impl RuntimeSubsystems {
             return Err(error.linux_errno());
         }
         self.pending_fork_exec.remove(&child_pid);
+        self.perf_record_clone_to_exec(pending.created_at.elapsed());
         let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
         for socket_id in closed_fd_ids
             .socket_ids

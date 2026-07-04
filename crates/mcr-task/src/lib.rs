@@ -1345,17 +1345,20 @@ impl GuestKernel {
         Ok(())
     }
 
-    pub fn resume_fd_waiters<F>(&mut self, mut ready: F)
+    pub fn resume_fd_waiters<F>(&mut self, mut ready: F) -> usize
     where
         F: FnMut(GuestPid, i32, bool) -> bool,
     {
+        let mut resumed = 0;
         for task in self.tasks.values_mut() {
             if let TaskState::WaitingForFd { fd, write } = task.state
                 && ready(task.pid, fd, write)
             {
                 task.state = TaskState::Runnable;
+                resumed += 1;
             }
         }
+        resumed
     }
 
     pub fn rt_sigaction_current(
