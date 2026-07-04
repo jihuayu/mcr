@@ -1,16 +1,17 @@
 use std::fmt;
 use std::io::{IoSlice, IoSliceMut};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     time::Duration,
 };
 
 use mcr_win::{
     AddressFamily, HostAcceptExSubmission, HostConnectExSubmission, HostError, HostErrorKind,
-    HostIoCompletionPort, HostRioCapability, HostShutdown, HostSocket, HostSocketOptionName,
-    HostSocketOptionValue, NetworkStack, PendingHostAcceptEx, PendingHostConnectEx,
-    SocketCompletionKind, SocketEvents, SocketKind, SocketProtocol as HostSocketProtocol,
+    HostIoCompletionPort, HostRioCapability, HostShutdown, HostSocket, HostSocketIoDirection,
+    HostSocketIoSubmission, HostSocketOptionName, HostSocketOptionValue, NetworkStack,
+    PendingHostAcceptEx, PendingHostConnectEx, PendingHostSocketIo, SocketCompletionKind,
+    SocketEvents, SocketKind, SocketProtocol as HostSocketProtocol,
 };
 
 mod dns_cache;
@@ -747,6 +748,10 @@ impl HostSocketTransport for WinHostSocketTransport {
             pending_accept: None,
             accepted_fast_path: None,
             accept_error: None,
+            pending_recv: None,
+            recv_ready: VecDeque::new(),
+            recv_eof: false,
+            recv_error: None,
             pending_connect: None,
             connect_completed: false,
             connect_error: None,
@@ -762,12 +767,115 @@ struct WinHostSocketHandle {
     pending_accept: Option<PendingHostAcceptEx>,
     accepted_fast_path: Option<(HostSocket, SocketAddress)>,
     accept_error: Option<HostIoError>,
+    pending_recv: Option<PendingHostSocketIo>,
+    recv_ready: VecDeque<u8>,
+    recv_eof: bool,
+    recv_error: Option<HostIoError>,
     pending_connect: Option<PendingHostConnectEx>,
     connect_completed: bool,
     connect_error: Option<HostIoError>,
 }
 
 const WIN_IOCP_COMPLETION_KEY: usize = 1;
+const WIN_IOCP_RECV_BUFFER_SIZE: usize = 16 * 1024;
+
+impl WinHostSocketHandle {
+    fn can_use_iocp_recv(&self) -> bool {
+        self.completion_port.is_some()
+            && self.spec.socket_type == SocketType::Stream
+            && self.spec.effective_protocol() == SocketProtocol::Tcp
+    }
+
+    fn has_recv_readiness(&self) -> bool {
+        !self.recv_ready.is_empty() || self.recv_eof
+    }
+
+    fn submit_recv_fast_path(&mut self) -> Result<(), HostIoError> {
+        if self.pending_recv.is_some() || self.has_recv_readiness() || self.recv_error.is_some() {
+            return Ok(());
+        }
+
+        let submission = self
+            .socket
+            .submit_overlapped_recv(vec![0; WIN_IOCP_RECV_BUFFER_SIZE]);
+        self.apply_recv_submission(submission)
+    }
+
+    fn complete_recv_packet(
+        &mut self,
+        packet: mcr_win::HostIoCompletionPacket,
+    ) -> Result<(), HostIoError> {
+        let Some(pending) = self.pending_recv.take() else {
+            return Ok(());
+        };
+        if pending.matches_completion(packet) {
+            let submission = pending.complete_from_packet(packet);
+            self.apply_recv_submission(submission)?;
+        } else {
+            self.pending_recv = Some(pending);
+        }
+        Ok(())
+    }
+
+    fn apply_recv_submission(
+        &mut self,
+        submission: HostSocketIoSubmission,
+    ) -> Result<(), HostIoError> {
+        match submission {
+            HostSocketIoSubmission::Completed(completion) => {
+                if completion.direction() != HostSocketIoDirection::Receive {
+                    return Err(HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped socket completion direction mismatch",
+                    ));
+                }
+                let bytes_transferred = completion.bytes_transferred();
+                self.cache_recv_completion(bytes_transferred, completion.into_buffer());
+                Ok(())
+            }
+            HostSocketIoSubmission::Failed(failure) => {
+                if failure.direction() != HostSocketIoDirection::Receive {
+                    return Err(HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped socket failure direction mismatch",
+                    ));
+                }
+                let (error, _) = failure.into_parts();
+                self.recv_error = Some(HostIoError::from(error));
+                Ok(())
+            }
+            HostSocketIoSubmission::Pending(pending) => {
+                if pending.direction() != HostSocketIoDirection::Receive {
+                    return Err(HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped socket pending direction mismatch",
+                    ));
+                }
+                self.pending_recv = Some(pending);
+                Ok(())
+            }
+        }
+    }
+
+    fn cache_recv_completion(&mut self, bytes_transferred: usize, buffer: Vec<u8>) {
+        if bytes_transferred == 0 {
+            self.recv_eof = true;
+            return;
+        }
+        self.recv_ready
+            .extend(buffer.into_iter().take(bytes_transferred));
+    }
+
+    fn recv_completion_kind(&self) -> SocketCompletionKind {
+        if self.recv_error.is_some() {
+            SocketCompletionKind::Error
+        } else if self.recv_eof {
+            SocketCompletionKind::PeerClosed
+        } else {
+            SocketCompletionKind::Receive
+        }
+    }
+}
 
 impl HostSocketHandle for WinHostSocketHandle {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
@@ -804,6 +912,10 @@ impl HostSocketHandle for WinHostSocketHandle {
                     pending_accept: None,
                     accepted_fast_path: None,
                     accept_error: None,
+                    pending_recv: None,
+                    recv_ready: VecDeque::new(),
+                    recv_eof: false,
+                    recv_error: None,
                     pending_connect: None,
                     connect_completed: false,
                     connect_error: None,
@@ -843,6 +955,10 @@ impl HostSocketHandle for WinHostSocketHandle {
                 pending_accept: None,
                 accepted_fast_path: None,
                 accept_error: None,
+                pending_recv: None,
+                recv_ready: VecDeque::new(),
+                recv_eof: false,
+                recv_error: None,
                 pending_connect: None,
                 connect_completed: false,
                 connect_error: None,
@@ -962,6 +1078,31 @@ impl HostSocketHandle for WinHostSocketHandle {
     }
 
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if !self.recv_ready.is_empty() {
+            let count = buffer.len().min(self.recv_ready.len());
+            for slot in &mut buffer[..count] {
+                *slot = self
+                    .recv_ready
+                    .pop_front()
+                    .expect("recv cache length was checked");
+            }
+            return Ok(count);
+        }
+        if self.recv_eof {
+            return Ok(0);
+        }
+        if let Some(error) = self.recv_error.take() {
+            return Err(error);
+        }
+        if self.pending_recv.is_some() {
+            return Err(HostIoError::new(
+                LinuxErrno::OperationWouldBlock,
+                "overlapped receive is pending",
+            ));
+        }
         self.socket.recv(buffer).map_err(HostIoError::from)
     }
 
@@ -993,9 +1134,39 @@ impl HostSocketHandle for WinHostSocketHandle {
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, HostIoError> {
-        self.socket
-            .poll(interest, timeout)
-            .map_err(HostIoError::from)
+        let mut readiness = SocketEvents::default();
+        let mut fallback_interest = interest;
+        if interest.readable && self.can_use_iocp_recv() {
+            fallback_interest.readable = false;
+            self.submit_recv_fast_path()?;
+            if !self.has_recv_readiness()
+                && let Some(port) = self.completion_port.as_ref()
+                && self.pending_recv.is_some()
+                && let Some(packet) = port.get(timeout).map_err(HostIoError::from)?
+            {
+                self.complete_recv_packet(packet)?;
+            }
+            if self.has_recv_readiness() {
+                readiness.readable = true;
+            }
+            if self.recv_error.is_some() {
+                readiness.error = true;
+            }
+        }
+
+        if !fallback_interest.is_empty() {
+            let fallback_timeout = if readiness.is_empty() {
+                timeout
+            } else {
+                Some(Duration::ZERO)
+            };
+            let fallback = self
+                .socket
+                .poll(fallback_interest, fallback_timeout)
+                .map_err(HostIoError::from)?;
+            merge_socket_events(&mut readiness, fallback);
+        }
+        Ok(readiness)
     }
 
     fn drain_readiness_completions(
@@ -1003,10 +1174,20 @@ impl HostSocketHandle for WinHostSocketHandle {
         token: SocketReadinessToken,
     ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
         let mut completions = Vec::new();
-        let Some(port) = self.completion_port.as_ref() else {
+        if self.completion_port.is_none() {
             return Ok(completions);
-        };
-        while let Some(packet) = port.get(Some(Duration::ZERO)).map_err(HostIoError::from)? {
+        }
+        loop {
+            let packet = {
+                let port = self
+                    .completion_port
+                    .as_ref()
+                    .expect("completion port was checked");
+                port.get(Some(Duration::ZERO)).map_err(HostIoError::from)?
+            };
+            let Some(packet) = packet else {
+                break;
+            };
             let mut packet = Some(packet);
             if let Some(pending) = self.pending_accept.take() {
                 let current = packet.expect("completion packet is present");
@@ -1034,6 +1215,22 @@ impl HostSocketHandle for WinHostSocketHandle {
                     packet = None;
                 } else {
                     self.pending_accept = Some(pending);
+                    packet = Some(current);
+                }
+            }
+            if let Some(current) = packet
+                && let Some(pending) = self.pending_recv.take()
+            {
+                if pending.matches_completion(current) {
+                    let submission = pending.complete_from_packet(current);
+                    self.apply_recv_submission(submission)?;
+                    completions.push(HostSocketCompletion::new(
+                        token,
+                        self.recv_completion_kind(),
+                    ));
+                    packet = None;
+                } else {
+                    self.pending_recv = Some(pending);
                     packet = Some(current);
                 }
             }
@@ -4588,6 +4785,95 @@ mod tests {
             table.peer_address(accepted).expect("accepted peer"),
             Some(client_addr)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_host_transport_iocp_recv_completion_feeds_readiness() {
+        let stack = NetworkStack::start().expect("network stack");
+        let listener = stack
+            .open_socket(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                HostSocketProtocol::Tcp,
+            )
+            .expect("listener socket");
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let server_addr = SocketAddress::from(listener.local_addr().unwrap());
+
+        let mut table = GuestSocketTable::with_transport(
+            WinHostSocketTransport::new().expect("host transport"),
+        );
+        let client = table
+            .create_socket_from_spec(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+            )
+            .expect("client socket");
+
+        assert_eq!(
+            table
+                .connect(client, server_addr)
+                .expect_err("ConnectEx should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        for _ in 0..10 {
+            let _ = table.poll(
+                client,
+                SocketEvents::write(),
+                Some(Duration::from_millis(50)),
+            );
+            if matches!(
+                table.socket(client).expect("client state").state(),
+                SocketState::Connected { .. }
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            table.socket(client).expect("client state").state(),
+            SocketState::Connected { .. }
+        ));
+
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(server.send(b"iocp-data").unwrap(), 9);
+
+        for _ in 0..10 {
+            let readiness = table
+                .poll(
+                    client,
+                    SocketEvents::read(),
+                    Some(Duration::from_millis(50)),
+                )
+                .expect("read poll");
+            if readiness.readable {
+                break;
+            }
+        }
+
+        let mut buffer = [0; 16];
+        let count = table
+            .recv_connected(client, &mut buffer)
+            .expect("cached IOCP recv");
+
+        assert_eq!(count, 9);
+        assert_eq!(&buffer[..count], b"iocp-data");
     }
 
     #[cfg(windows)]

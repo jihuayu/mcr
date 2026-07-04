@@ -67,3 +67,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
 - Corrected IOCP packet handling so failed overlapped operations with a non-null
   `OVERLAPPED` are surfaced as completion packets carrying the host error code,
   rather than being mistaken for completion-port polling failures.
+- Wired the first IOCP socket data path into `mcr-net` receive readiness.
+  Windows TCP stream handles now submit host-owned `WSARecv` work on read
+  polling, consume matching IOCP packets into an MCR-owned receive cache, report
+  `Receive` / `PeerClosed` / `Error` readiness, and let guest `recv` consume the
+  cached bytes before falling back to the synchronous socket path.
