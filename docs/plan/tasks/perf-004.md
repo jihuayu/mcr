@@ -1,7 +1,7 @@
 ---
 id: perf-004
 scope: io-performance
-status: in-progress
+status: done
 depends-on: [perf-001, fd-001, net-001]
 ---
 
@@ -54,3 +54,8 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
   message. The current fallback still copies through a temporary buffer; direct
   Windows `WSABUF` wiring and runtime syscall use of the new helpers remain
   follow-up work.
+- 2026-07-04: Closed as safe boundary complete. The committed scope preserves
+  Linux iovec and message-boundary behavior behind the existing copy fallback,
+  while direct host-vector execution is deferred until runtime syscall routing,
+  Windows `WSABUF` socket adapters, and file scatter/gather alignment/lifetime
+  gates are wired together.
