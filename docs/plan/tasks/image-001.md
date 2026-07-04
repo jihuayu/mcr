@@ -1,7 +1,7 @@
 ---
 id: image-001
 scope: phase3-image
-status: pending
+status: in-progress
 depends-on: [workload-001]
 ---
 
@@ -36,3 +36,7 @@ cargo test -p mcr-image
 - Store blobs by digest, not tag or mutable path.
 - Verify digest on every blob write and read path that crosses a trust boundary.
 - Do not implement registry pull or image export in this task.
+- Initial checkpoint: added the `mcr-image` crate with OCI media type constants,
+  SHA-256 descriptor digest parsing/normalization, and a local content-addressed
+  blob store that writes and reads under `blobs/sha256/<digest>` with size and
+  digest verification.

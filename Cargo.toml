@@ -2,6 +2,7 @@
 members = [
     "crates/mcr-cli",
     "crates/mcr-elf",
+    "crates/mcr-image",
     "crates/mcr-jit",
     "crates/mcr-net",
     "crates/mcr-runtime",
@@ -23,6 +24,7 @@ rust-version = "1.85"
 getrandom = "0.4.3"
 mcr-cli = { path = "crates/mcr-cli" }
 mcr-elf = { path = "crates/mcr-elf" }
+mcr-image = { path = "crates/mcr-image" }
 mcr-jit = { path = "crates/mcr-jit" }
 mcr-net = { path = "crates/mcr-net" }
 mcr-runtime = { path = "crates/mcr-runtime" }
@@ -32,6 +34,7 @@ mcr-task = { path = "crates/mcr-task" }
 mcr-testkit = { path = "crates/mcr-testkit" }
 mcr-vfs = { path = "crates/mcr-vfs" }
 mcr-win = { path = "crates/mcr-win" }
+sha2 = "0.10.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
