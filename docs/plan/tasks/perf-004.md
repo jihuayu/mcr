@@ -1,7 +1,7 @@
 ---
 id: perf-004
 scope: io-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, fd-001, net-001]
 ---
 
@@ -43,3 +43,14 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
 - File scatter/gather paths must prove alignment, handle, and buffer-lifetime
   constraints before bypassing the existing copy fallback.
 - Unsupported control messages remain whitelist-only and must fail intentionally.
+
+## Checkpoints
+
+- 2026-07-04: Added the `mcr-net` socket/message-vector boundary:
+  `HostSocketHandle` now has vectored send/receive entry points for connected
+  streams and addressed UDP datagrams, and `GuestSocketTable` exposes matching
+  `sendmsg`/`recvmsg`-oriented helpers. Focused tests prove stream scatter/gather
+  routing uses one vectored host entry point and UDP keeps a single datagram
+  message. The current fallback still copies through a temporary buffer; direct
+  Windows `WSABUF` wiring and runtime syscall use of the new helpers remain
+  follow-up work.

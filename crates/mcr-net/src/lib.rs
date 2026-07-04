@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::{IoSlice, IoSliceMut};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
@@ -489,15 +490,89 @@ pub trait HostSocketHandle: fmt::Debug {
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
+    fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+        let buffer = flatten_io_slices(buffers)?;
+        self.send(&buffer)
+    }
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
+    fn send_to_vectored(
+        &mut self,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, HostIoError> {
+        let buffer = flatten_io_slices(buffers)?;
+        self.send_to(&buffer, address)
+    }
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
+    fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+        let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+        let mut buffer = vec![0; capacity];
+        let count = self.recv(&mut buffer)?;
+        scatter_io_slices(buffers, &buffer, count)?;
+        Ok(count)
+    }
     fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError>;
+    fn recv_from_vectored(
+        &mut self,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), HostIoError> {
+        let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+        let mut buffer = vec![0; capacity];
+        let (count, address) = self.recv_from(&mut buffer)?;
+        scatter_io_slices(buffers, &buffer, count)?;
+        Ok((count, address))
+    }
     fn poll(
         &mut self,
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, HostIoError>;
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
+}
+
+fn flatten_io_slices(buffers: &[IoSlice<'_>]) -> Result<Vec<u8>, HostIoError> {
+    let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+    let mut flattened = Vec::with_capacity(capacity);
+    for buffer in buffers {
+        flattened.extend_from_slice(buffer.as_ref());
+    }
+    Ok(flattened)
+}
+
+fn scatter_io_slices(
+    buffers: &mut [IoSliceMut<'_>],
+    bytes: &[u8],
+    count: usize,
+) -> Result<(), HostIoError> {
+    if count > bytes.len() {
+        return Err(HostIoError::new(
+            LinuxErrno::InvalidArgument,
+            "host socket received more bytes than the iovec capacity",
+        ));
+    }
+
+    let mut consumed = 0usize;
+    for buffer in buffers {
+        let remaining = count.saturating_sub(consumed);
+        if remaining == 0 {
+            break;
+        }
+        let write_len = buffer.len().min(remaining);
+        buffer[..write_len].copy_from_slice(&bytes[consumed..consumed + write_len]);
+        consumed += write_len;
+    }
+    Ok(())
+}
+
+fn checked_iovec_total_len(lengths: impl IntoIterator<Item = usize>) -> Result<usize, HostIoError> {
+    lengths.into_iter().try_fold(0usize, |total, len| {
+        total.checked_add(len).ok_or_else(|| {
+            HostIoError::new(
+                LinuxErrno::InvalidArgument,
+                "socket iovec total length overflows usize",
+            )
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -1188,6 +1263,30 @@ impl GuestSocketTable {
             .map_err(|error| self.record_host_error(id, error))
     }
 
+    pub fn send_connected_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &[IoSlice<'_>],
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_io(socket, SocketOperation::SendMsg)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::SendMsg,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::SendMsg)?;
+        entry
+            .handle
+            .send_vectored(buffers)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
     pub fn recv_connected(
         &mut self,
         id: SocketId,
@@ -1209,6 +1308,30 @@ impl GuestSocketTable {
         entry
             .handle
             .recv(buffer)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
+    pub fn recv_connected_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_io(socket, SocketOperation::RecvMsg)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::RecvMsg,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::RecvMsg)?;
+        entry
+            .handle
+            .recv_vectored(buffers)
             .map_err(|error| self.record_host_error(id, error))
     }
 
@@ -1238,6 +1361,32 @@ impl GuestSocketTable {
             .map_err(|error| self.record_host_error(id, error))
     }
 
+    pub fn send_to_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_address_domain(socket.domain, address)?;
+            validate_datagram_io(socket, SocketOperation::SendMsg)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::SendMsg,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::SendMsg)?;
+        entry
+            .handle
+            .send_to_vectored(buffers, address)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
     pub fn recv_from(
         &mut self,
         id: SocketId,
@@ -1259,6 +1408,30 @@ impl GuestSocketTable {
         entry
             .handle
             .recv_from(buffer)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
+    pub fn recv_from_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_datagram_io(socket, SocketOperation::RecvMsg)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::RecvMsg,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::RecvMsg)?;
+        entry
+            .handle
+            .recv_from_vectored(buffers)
             .map_err(|error| self.record_host_error(id, error))
     }
 
@@ -1882,6 +2055,9 @@ fn validate_address_domain(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -1952,6 +2128,234 @@ mod tests {
                 accepted: vec![(Self::with_incoming(incoming), peer)],
                 ..Self::default()
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct VectoredHostState {
+        sent: Vec<u8>,
+        incoming: Vec<u8>,
+        local: SocketAddress,
+        peer: Option<SocketAddress>,
+        send_calls: usize,
+        send_vectored_calls: usize,
+        send_to_calls: usize,
+        send_to_vectored_calls: usize,
+        recv_calls: usize,
+        recv_vectored_calls: usize,
+        recv_from_calls: usize,
+        recv_from_vectored_calls: usize,
+    }
+
+    impl Default for VectoredHostState {
+        fn default() -> Self {
+            Self {
+                sent: Vec::new(),
+                incoming: Vec::new(),
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer: None,
+                send_calls: 0,
+                send_vectored_calls: 0,
+                send_to_calls: 0,
+                send_to_vectored_calls: 0,
+                recv_calls: 0,
+                recv_vectored_calls: 0,
+                recv_from_calls: 0,
+                recv_from_vectored_calls: 0,
+            }
+        }
+    }
+
+    impl VectoredHostState {
+        fn with_incoming(bytes: &[u8]) -> Self {
+            Self {
+                incoming: bytes.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn drain_into(&mut self, buffer: &mut [u8]) -> usize {
+            let count = buffer.len().min(self.incoming.len());
+            buffer[..count].copy_from_slice(&self.incoming[..count]);
+            self.incoming.drain(..count);
+            count
+        }
+    }
+
+    #[derive(Debug)]
+    struct VectoredHostSocketHandle {
+        state: Rc<RefCell<VectoredHostState>>,
+    }
+
+    impl VectoredHostSocketHandle {
+        fn new(state: Rc<RefCell<VectoredHostState>>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl HostSocketHandle for VectoredHostSocketHandle {
+        fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+            self.state.borrow_mut().local = address;
+            Ok(address)
+        }
+
+        fn listen(&mut self, _backlog: u32) -> Result<(), HostIoError> {
+            Ok(())
+        }
+
+        fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+            Err(HostIoError::new(
+                LinuxErrno::OperationWouldBlock,
+                "no pending vectored fake socket connection",
+            ))
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> Result<(), HostIoError> {
+            Ok(())
+        }
+
+        fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
+            self.state.borrow_mut().peer = Some(address);
+            Ok(())
+        }
+
+        fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
+            Ok(self.state.borrow().local)
+        }
+
+        fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
+            self.state.borrow().peer.ok_or_else(|| {
+                HostIoError::new(LinuxErrno::NotConnected, "socket is not connected")
+            })
+        }
+
+        fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_calls += 1;
+            state.sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_vectored_calls += 1;
+            let mut count = 0usize;
+            for buffer in buffers {
+                count = count.checked_add(buffer.len()).ok_or_else(|| {
+                    HostIoError::new(LinuxErrno::InvalidArgument, "sent byte count overflowed")
+                })?;
+                state.sent.extend_from_slice(buffer.as_ref());
+            }
+            Ok(count)
+        }
+
+        fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_to_calls += 1;
+            state.peer = Some(address);
+            state.sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn send_to_vectored(
+            &mut self,
+            buffers: &[IoSlice<'_>],
+            address: SocketAddress,
+        ) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_to_vectored_calls += 1;
+            state.peer = Some(address);
+            let mut count = 0usize;
+            for buffer in buffers {
+                count = count.checked_add(buffer.len()).ok_or_else(|| {
+                    HostIoError::new(LinuxErrno::InvalidArgument, "sent byte count overflowed")
+                })?;
+                state.sent.extend_from_slice(buffer.as_ref());
+            }
+            Ok(count)
+        }
+
+        fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_calls += 1;
+            Ok(state.drain_into(buffer))
+        }
+
+        fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_vectored_calls += 1;
+            let mut total = 0usize;
+            for buffer in buffers {
+                let count = state.drain_into(buffer);
+                total = total.checked_add(count).ok_or_else(|| {
+                    HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "received byte count overflowed",
+                    )
+                })?;
+                if count < buffer.len() {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+
+        fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_from_calls += 1;
+            let count = state.drain_into(buffer);
+            let address = state
+                .peer
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((count, address))
+        }
+
+        fn recv_from_vectored(
+            &mut self,
+            buffers: &mut [IoSliceMut<'_>],
+        ) -> Result<(usize, SocketAddress), HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_from_vectored_calls += 1;
+            let mut total = 0usize;
+            for buffer in buffers {
+                let count = state.drain_into(buffer);
+                total = total.checked_add(count).ok_or_else(|| {
+                    HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "received byte count overflowed",
+                    )
+                })?;
+                if count < buffer.len() {
+                    break;
+                }
+            }
+            let address = state
+                .peer
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((total, address))
+        }
+
+        fn poll(
+            &mut self,
+            interest: SocketEvents,
+            _timeout: Option<Duration>,
+        ) -> Result<SocketEvents, HostIoError> {
+            Ok(SocketEvents {
+                readable: interest.readable && !self.state.borrow().incoming.is_empty(),
+                writable: interest.writable,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            })
+        }
+
+        fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {
+            Ok(())
         }
     }
 
@@ -2412,6 +2816,123 @@ mod tests {
             .expect("recv connected");
         assert_eq!(count, 4);
         assert_eq!(&buffer[..count], b"pong");
+    }
+
+    #[test]
+    fn sendmsg_vectored_stream_uses_single_host_call() {
+        let state = Rc::new(RefCell::new(VectoredHostState::default()));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+        let buffers = [IoSlice::new(b"pi"), IoSlice::new(b""), IoSlice::new(b"ng")];
+
+        table.connect(stream, peer).expect("connect handle");
+        assert_eq!(
+            table
+                .send_connected_vectored(stream, &buffers)
+                .expect("send vectored"),
+            4
+        );
+
+        let state = state.borrow();
+        assert_eq!(state.send_vectored_calls, 1);
+        assert_eq!(state.send_calls, 0);
+        assert_eq!(state.sent.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn recvmsg_vectored_stream_scatters_single_host_call() {
+        let state = Rc::new(RefCell::new(VectoredHostState::with_incoming(b"abcdef")));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+        let mut first = [0; 2];
+        let mut second = [0; 3];
+        let mut third = [0; 1];
+
+        table.connect(stream, peer).expect("connect handle");
+        {
+            let mut buffers = [
+                IoSliceMut::new(&mut first),
+                IoSliceMut::new(&mut second),
+                IoSliceMut::new(&mut third),
+            ];
+            assert_eq!(
+                table
+                    .recv_connected_vectored(stream, &mut buffers)
+                    .expect("recv vectored"),
+                6
+            );
+        }
+
+        assert_eq!(&first, b"ab");
+        assert_eq!(&second, b"cde");
+        assert_eq!(&third, b"f");
+        let state = state.borrow();
+        assert_eq!(state.recv_vectored_calls, 1);
+        assert_eq!(state.recv_calls, 0);
+    }
+
+    #[test]
+    fn sendmsg_recvmsg_vectored_datagram_preserves_single_message() {
+        let state = Rc::new(RefCell::new(VectoredHostState::with_incoming(b"dns!")));
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket_with_handle(
+                SocketSpec::new(
+                    SocketDomain::Inet,
+                    SocketType::Datagram,
+                    SocketProtocol::Udp,
+                )
+                .expect("udp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let server = SocketAddress::inet([127, 0, 0, 1], 53);
+        let query = [IoSlice::new(b"dn"), IoSlice::new(b"s?")];
+
+        assert_eq!(
+            table
+                .send_to_vectored(datagram, &query, server)
+                .expect("send datagram"),
+            4
+        );
+        {
+            let state = state.borrow();
+            assert_eq!(state.send_to_vectored_calls, 1);
+            assert_eq!(state.send_to_calls, 0);
+            assert_eq!(state.sent.as_slice(), b"dns?");
+            assert_eq!(state.peer, Some(server));
+        }
+
+        let mut first = [0; 2];
+        let mut second = [0; 2];
+        let (count, address) = {
+            let mut response = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            table
+                .recv_from_vectored(datagram, &mut response)
+                .expect("recv datagram")
+        };
+
+        assert_eq!(count, 4);
+        assert_eq!(address, server);
+        assert_eq!(&first, b"dn");
+        assert_eq!(&second, b"s!");
+        let state = state.borrow();
+        assert_eq!(state.recv_from_vectored_calls, 1);
+        assert_eq!(state.recv_from_calls, 0);
     }
 
     #[test]

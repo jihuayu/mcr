@@ -216,6 +216,13 @@ Known differences must be modeled explicitly:
 Basic `sendmsg` and `recvmsg` support converts guest iovecs into host buffers.
 Control messages are supported only by explicit whitelist.
 
+The socket transport boundary exposes vectored send/receive entry points for
+connected streams and addressed UDP datagrams. These entry points take owned
+Rust `IoSlice`/`IoSliceMut` views produced after guest-memory validation, so
+host adapters can later map them to `WSABUF` without seeing raw guest pointers.
+Until a host adapter overrides them, the fallback flattens or scatters through a
+single legacy socket call and preserves the current copy-in/copy-out behavior.
+
 Initial ancillary support may include `IP_PKTINFO`, `IPV6_PKTINFO`, TTL, and hop
 limit metadata where Windows exposes compatible information. `SCM_RIGHTS`,
 `SCM_CREDENTIALS`, and timestamp families remain deferred.

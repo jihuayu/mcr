@@ -71,6 +71,13 @@ calls where Windows exposes a compatible vector interface:
 - fallbacks must keep the current copy-in/copy-out behavior rather than exposing
   host buffers directly to guest memory.
 
+The first socket checkpoint establishes the `mcr-net` vectored transport
+boundary before binding it to Winsock-specific calls. Connected stream and
+addressed UDP paths can now route one message through a single vectored host
+entry point; the default host-handle fallback still copies into or out of a
+temporary buffer, while a future Windows adapter can replace that fallback with
+`WSABUF` plumbing under the same socket contract.
+
 ### Metadata And Directory Caches
 
 The VFS should cache Linux inode attributes, directory iteration state, and
