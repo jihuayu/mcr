@@ -81,12 +81,13 @@ calls where Windows exposes a compatible vector interface:
 - fallbacks must keep the current copy-in/copy-out behavior rather than exposing
   host buffers directly to guest memory.
 
-The first socket checkpoint establishes the `mcr-net` vectored transport
-boundary before binding it to Winsock-specific calls. Connected stream and
-addressed UDP paths can now route one message through a single vectored host
-entry point; the default host-handle fallback still copies into or out of a
-temporary buffer, while a future Windows adapter can replace that fallback with
-`WSABUF` plumbing under the same socket contract.
+The socket scatter/gather path is implemented through the `mcr-net` vectored
+transport boundary and the Windows socket adapter. Runtime socket `readv`,
+`writev`, `sendmsg`, and `recvmsg` route guest iovecs into a single vectored
+socket-table operation. The default host-handle fallback still copies through a
+temporary buffer for non-Windows or test handles, while `WinHostSocketHandle`
+uses `WSASend`, `WSARecv`, `WSASendTo`, and `WSARecvFrom` with `WSABUF`
+vectors under the same Linux message and errno contract.
 
 ### Metadata And Directory Caches
 

@@ -54,8 +54,14 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
   message. The current fallback still copies through a temporary buffer; direct
   Windows `WSABUF` wiring and runtime syscall use of the new helpers remain
   follow-up work.
-- 2026-07-04: Closed as safe boundary complete. The committed scope preserves
-  Linux iovec and message-boundary behavior behind the existing copy fallback,
-  while direct host-vector execution is deferred until runtime syscall routing,
-  Windows `WSABUF` socket adapters, and file scatter/gather alignment/lifetime
-  gates are wired together.
+- 2026-07-04: Runtime socket `readv`, `writev`, `sendmsg`, and `recvmsg`
+  now route through the vectored socket table helpers instead of issuing one
+  host socket call per iovec. The Windows host adapter overrides the default
+  flattening fallback with `WSASend`, `WSARecv`, `WSASendTo`, and
+  `WSARecvFrom`, so connected stream and UDP datagram paths use real
+  `WSABUF` scatter/gather calls while preserving Linux message boundaries and
+  the existing unsupported-control-message behavior.
+- 2026-07-04: Closed as socket scatter/gather implementation complete. File
+  scatter/gather remains on the copy fallback because Windows file
+  scatter/gather requires stricter alignment, handle, and buffer-lifetime
+  guarantees than the current regular-file VFS path exposes.
