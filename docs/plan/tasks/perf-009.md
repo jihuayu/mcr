@@ -1,7 +1,7 @@
 ---
 id: perf-009
 scope: network-performance
-status: in-progress
+status: done
 depends-on: [perf-001, net-001]
 ---
 
@@ -45,6 +45,10 @@ cargo test -p mcr-testkit perf_dns -- --ignored --nocapture
   `mcr-testkit perf_dns` filter so the active DNS cache perf gate captures
   insert, lookup-hit, and expiry-purge costs without requiring guest network
   execution.
+- Completed 2026-07-04: focused DNS cache, runtime resolver-file materialization,
+  and ignored `mcr-net`/`mcr-testkit` DNS performance baselines passed. This
+  remains scoped to MCR-owned resolver helpers and DNS proxies; guest DNS
+  datagram interception and generic TCP/TLS pooling stay out of this task.
 
 ## Notes
 
