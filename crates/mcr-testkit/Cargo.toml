@@ -6,3 +6,7 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+mcr-net.workspace = true
+mcr-task.workspace = true

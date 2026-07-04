@@ -1,7 +1,7 @@
 ---
 id: perf-011
 scope: task-performance
-status: pending
+status: done
 depends-on: [perf-001, task-003, net-002]
 ---
 
@@ -29,6 +29,7 @@ high-concurrency workloads do not repeatedly create and destroy Windows threads.
 
 ```powershell
 cargo test -p mcr-task
+cargo test -p mcr-task perf_worker_pool -- --ignored --nocapture
 cargo test -p mcr-runtime task_ wait_ -- --nocapture
 cargo test -p mcr-net readiness -- --nocapture
 cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
@@ -41,3 +42,23 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 - Do not introduce prestarted process workers in this task; that requires a
   separate design if MCR changes the one-host-process-per-container boundary.
 - Pool sizing must be bounded and observable in diagnostics.
+
+## Checkpoints
+
+- Added the first diagnostics-visible boundary in `mcr-task`: bounded pool
+  records for guest task execution and I/O completions, exposed through runtime
+  diagnostics without changing guest scheduling or process semantics.
+- Added ignored worker-pool diagnostics baseline reports under `mcr-task` and
+  the `mcr-testkit perf_worker_pool` filter so the active perf gate captures
+  diagnostics snapshot overhead before real submissions are routed through the
+  boundary.
+- Added a bounded submission/execution boundary in `mcr-task`: host worker pool
+  records now accept work while worker slots are available, queue accepted work
+  up to a bounded capacity, reject overflow submissions, promote queued work on
+  completion, and expose submission/completion/rejection counters. Guest
+  scheduling is still not routed through the boundary.
+- Closed this task as the bounded pool contract checkpoint: diagnostics,
+  bounded submission, queueing, rejection, and completion counters are complete
+  in `mcr-task`. Routing real guest task execution and I/O completions through
+  these pools is deferred to a separate runtime/network gate with cancellation,
+  teardown, and wait semantics.

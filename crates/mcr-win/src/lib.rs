@@ -10,6 +10,7 @@ pub mod files;
 pub mod memory;
 pub mod native_exec;
 pub mod network;
+pub mod overlapped_io;
 pub mod random;
 pub mod sync;
 
@@ -29,7 +30,12 @@ pub use native_exec::{
 };
 pub use network::{
     AddressFamily, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
-    NetworkStack, SocketEvents, SocketKind, SocketPoll, SocketProtocol,
+    NetworkStack, SocketCompletionKind, SocketEvents, SocketFastPathKind, SocketKind, SocketPoll,
+    SocketProtocol,
+};
+pub use overlapped_io::{
+    HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
+    HostIoResult, HostIoSubmission, PendingHostIo,
 };
 pub use random::fill_random;
 pub use sync::{

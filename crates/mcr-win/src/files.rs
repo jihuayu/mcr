@@ -1,6 +1,9 @@
 use std::path::Path;
 
 use crate::error::{HostError, HostOperation, HostResult};
+use crate::overlapped_io::{
+    HostIoDirection, HostIoFallback, HostIoFallbackReason, HostIoSubmission,
+};
 
 /// Host file access requested from the file adapter.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -112,6 +115,30 @@ impl HostFile {
     /// Writes bytes to the host file.
     pub fn write(&self, buf: &[u8]) -> HostResult<usize> {
         write_platform(self, buf)
+    }
+
+    /// Submits a read through the future overlapped I/O boundary.
+    ///
+    /// The current backend keeps using synchronous host I/O and returns a
+    /// fallback submission that owns the buffer until completion.
+    pub fn submit_overlapped_read(&self, buffer: Vec<u8>) -> HostIoSubmission {
+        HostIoSubmission::Fallback(HostIoFallback::new(
+            HostIoDirection::Read,
+            HostIoFallbackReason::SynchronousBackend,
+            buffer,
+        ))
+    }
+
+    /// Submits a write through the future overlapped I/O boundary.
+    ///
+    /// The current backend keeps using synchronous host I/O and returns a
+    /// fallback submission that owns the buffer until completion.
+    pub fn submit_overlapped_write(&self, buffer: Vec<u8>) -> HostIoSubmission {
+        HostIoSubmission::Fallback(HostIoFallback::new(
+            HostIoDirection::Write,
+            HostIoFallbackReason::SynchronousBackend,
+            buffer,
+        ))
     }
 
     /// Flushes host file buffers.

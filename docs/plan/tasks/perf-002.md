@@ -1,7 +1,7 @@
 ---
 id: perf-002
 scope: vfs-performance
-status: pending
+status: done
 depends-on: [perf-001, vfs-004]
 ---
 
@@ -30,7 +30,7 @@ configuration-file reads avoid redundant host metadata and file I/O.
 ```powershell
 cargo test -p mcr-vfs
 cargo test -p mcr-runtime vfs_ -- --nocapture
-cargo test -p mcr-testkit perf_vfs_cache -- --ignored --nocapture
+cargo test -p mcr-vfs perf_baseline_vfs_file_and_directory_paths -- --ignored --nocapture
 ```
 
 ## Notes
@@ -40,3 +40,15 @@ cargo test -p mcr-testkit perf_vfs_cache -- --ignored --nocapture
 - Invalidate affected entries on write-open, unlink, rename, truncate,
   metadata-sidecar updates, and any syscall that can change visible attributes.
 - Preserve Linux delete-while-open and directory iteration behavior.
+- Initial checkpoint: `mcr-vfs` has an inode-and-generation keyed metadata cache
+  and small regular-file read cache with generation invalidation on successful
+  write opens, writes, truncates, link/path mutations, mount changes, and
+  metadata updates.
+- Directory-iteration checkpoint: `mcr-vfs` caches complete directory entry
+  batches by directory inode and VFS generation, then consumes those batches
+  through the existing per-fd directory cursor. Dynamic `/proc/self/fd` listings
+  are intentionally uncached because they depend on the live fd table.
+- Completed 2026-07-04: focused VFS/runtime verification and the ignored
+  `mcr-vfs` VFS performance baseline passed. The original `mcr-testkit
+  perf_vfs_cache` filter has no matching committed test; the committed baseline
+  lives in `crates/mcr-vfs/tests/perf_baseline.rs`.

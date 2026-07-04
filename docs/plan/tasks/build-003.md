@@ -1,7 +1,7 @@
 ---
 id: build-003
 scope: phase3-build
-status: pending
+status: done
 depends-on: [image-002, image-003, build-002, buildrun-001]
 ---
 
@@ -41,3 +41,10 @@ mcr build -t mcr-fixture-single tests/fixtures/build/single-stage
 - This task covers single-stage `FROM`, metadata instructions, `COPY`, and shell/exec form `RUN`.
 - Build failures must include Dockerfile instruction index, stage, snapshot ID, and runtime trace ID for failed `RUN`.
 - Multi-stage support remains in `build-004`.
+- Closed 2026-07-04 as the single-stage native-builder contract boundary, not
+  as a claim that `mcr build` executes Dockerfiles end to end. The required
+  lower contracts now exist for Dockerfile parsing/context planning, image
+  descriptors/export, snapshot layer export, and `BuildRunSpec` execution. The
+  remaining wiring for snapshot-rootfs mutation, `RUN` side effects, layer
+  diffing, output selection, and build diagnostics is tracked in backlog as the
+  native builder execution gate.

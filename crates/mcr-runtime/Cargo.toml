@@ -8,6 +8,7 @@ rust-version.workspace = true
 mcr-jit.workspace = true
 mcr-elf.workspace = true
 mcr-net.workspace = true
+mcr-snapshot.workspace = true
 mcr-sys.workspace = true
 mcr-task.workspace = true
 mcr-vfs.workspace = true

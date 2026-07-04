@@ -1,7 +1,10 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -88,6 +91,7 @@ const FIRST_EPOLL_INODE_ID: InodeId = (1 << 59) + (1 << 58);
 const FIRST_EVENTFD_INODE_ID: InodeId = (1 << 59) + (1 << 57);
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
+const SMALL_READ_CACHE_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsError {
@@ -396,6 +400,30 @@ impl PathTree {
                 kind: PathNodeKind::File,
                 metadata: MetadataSidecar::new(attr),
                 data,
+                deferred_host_path: None,
+            },
+        )?;
+        Ok(inode_id)
+    }
+
+    pub fn create_file_with_host_content(
+        &mut self,
+        path: impl AsRef<str>,
+        host_path: impl Into<PathBuf>,
+        size: u64,
+        mode: u32,
+    ) -> VfsResult<InodeId> {
+        let path = parse_absolute_path(path.as_ref())?;
+        self.ensure_parent_dir(&path)?;
+        let inode_id = self.allocate_inode_id();
+        self.insert_path_node(
+            path,
+            PathNode {
+                inode_id,
+                kind: PathNodeKind::File,
+                metadata: MetadataSidecar::new(LinuxFileAttr::regular(inode_id, mode, size)),
+                data: Vec::new(),
+                deferred_host_path: Some(host_path.into()),
             },
         )?;
         Ok(inode_id)
@@ -579,6 +607,7 @@ impl PathTree {
                 kind,
                 metadata: MetadataSidecar::new(attr),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )?;
         Ok(inode_id)
@@ -638,6 +667,7 @@ impl PathTree {
                 kind: PathNodeKind::Device(kind),
                 metadata: MetadataSidecar::new(LinuxFileAttr::character_device(inode_id, 0o666)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -668,6 +698,7 @@ impl PathTree {
                         kind: PathNodeKind::Proc(kind),
                         metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
                         data: Vec::new(),
+                        deferred_host_path: None,
                     },
                 );
                 return Ok(());
@@ -684,6 +715,7 @@ impl PathTree {
                 kind: PathNodeKind::Proc(kind),
                 metadata: MetadataSidecar::new(kind.attr(inode_id, mode)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -750,6 +782,7 @@ pub struct PathNode {
     kind: PathNodeKind,
     metadata: MetadataSidecar,
     data: Vec<u8>,
+    deferred_host_path: Option<PathBuf>,
 }
 
 impl PathNode {
@@ -759,6 +792,7 @@ impl PathNode {
             kind: PathNodeKind::Directory,
             metadata: MetadataSidecar::new(LinuxFileAttr::directory(inode_id)),
             data: Vec::new(),
+            deferred_host_path: None,
         }
     }
 
@@ -786,6 +820,10 @@ impl PathNode {
         &self.data
     }
 
+    fn deferred_host_path(&self) -> Option<&Path> {
+        self.deferred_host_path.as_deref()
+    }
+
     pub fn set_mode(&mut self, mode: u32) {
         self.metadata.set_mode(mode);
     }
@@ -798,6 +836,7 @@ impl PathNode {
         if !matches!(self.kind, PathNodeKind::File) {
             return Err(VfsError::InvalidPath);
         }
+        self.materialize_deferred_content()?;
         let length = usize::try_from(length).map_err(|_| VfsError::NoSpace)?;
         self.data.resize(length, 0);
         self.metadata.set_size(length as u64);
@@ -808,6 +847,7 @@ impl PathNode {
         if !matches!(self.kind, PathNodeKind::File) {
             return Err(VfsError::InvalidPath);
         }
+        self.materialize_deferred_content()?;
 
         let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
         let end = offset
@@ -819,6 +859,16 @@ impl PathNode {
         self.data[offset..end].copy_from_slice(data);
         self.metadata.set_size(self.data.len() as u64);
         Ok(data.len())
+    }
+
+    fn materialize_deferred_content(&mut self) -> VfsResult<()> {
+        let Some(path) = self.deferred_host_path.clone() else {
+            return Ok(());
+        };
+        let data = fs::read(&path).map_err(|_| VfsError::NoEntry)?;
+        self.data = data;
+        self.deferred_host_path = None;
+        Ok(())
     }
 
     fn increment_link_count(&mut self) -> VfsResult<()> {
@@ -2536,23 +2586,7 @@ impl FdTable {
                     return Err(VfsError::IsDirectory);
                 }
                 let mut description = entry.description();
-                let offset =
-                    usize::try_from(description.offset).map_err(|_| VfsError::InvalidPath)?;
-                let proc_data;
-                let data = match node.kind() {
-                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
-                        proc_data = proc_self.cmdline_bytes();
-                        &proc_data
-                    }
-                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
-                        proc_data = proc_self.environ_bytes();
-                        &proc_data
-                    }
-                    _ => node.data(),
-                };
-                let available = data.get(offset..).unwrap_or(&[]);
-                let count = available.len().min(buffer.len());
-                buffer[..count].copy_from_slice(&available[..count]);
+                let count = read_regular_node_at(node, proc_self, description.offset, buffer)?;
                 description.offset += count as u64;
                 Ok(count)
             }
@@ -2599,23 +2633,7 @@ impl FdTable {
                 if node.attr().is_directory() {
                     return Err(VfsError::IsDirectory);
                 }
-                let proc_data;
-                let data = match node.kind() {
-                    PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
-                        proc_data = proc_self.cmdline_bytes();
-                        &proc_data
-                    }
-                    PathNodeKind::Proc(ProcNodeKind::Environ) => {
-                        proc_data = proc_self.environ_bytes();
-                        &proc_data
-                    }
-                    _ => node.data(),
-                };
-                let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
-                let available = data.get(offset..).unwrap_or(&[]);
-                let count = available.len().min(buffer.len());
-                buffer[..count].copy_from_slice(&available[..count]);
-                Ok(count)
+                read_regular_node_at(node, proc_self, offset, buffer)
             }
             FileKind::Dev(DevNodeKind::Null) => Ok(0),
             FileKind::Dev(DevNodeKind::Zero) => {
@@ -2751,19 +2769,60 @@ impl FdTable {
         fd: Fd,
         max_bytes: usize,
     ) -> VfsResult<Vec<DirectoryEntry>> {
+        let source = self.directory_listing_source(tree, fd)?;
+        let entries = self.directory_entries(tree, &source.path)?;
+        self.consume_directory_entries(fd, max_bytes, &entries)
+    }
+
+    fn directory_listing_source(
+        &self,
+        tree: &PathTree,
+        fd: Fd,
+    ) -> VfsResult<DirectoryListingSource> {
         let entry = self.get(fd)?;
         if !matches!(entry.file.kind, FileKind::Directory) {
             return Err(VfsError::NotDirectory);
         }
 
         let path = entry.path.as_ref().ok_or(VfsError::BadFd)?.clone();
-        let mut children = tree.static_children(&path)?;
-        if is_proc_self_fd_directory(tree, &path) {
+        let inode = tree.lookup_path(&path).ok_or(VfsError::NoEntry)?.inode_id();
+        let cacheable = !is_proc_self_fd_directory(tree, &path);
+        Ok(DirectoryListingSource {
+            inode,
+            path,
+            cacheable,
+        })
+    }
+
+    fn directory_entries(
+        &self,
+        tree: &PathTree,
+        path: &GuestPath,
+    ) -> VfsResult<Vec<DirectoryEntry>> {
+        let mut children = tree.static_children(path)?;
+        if is_proc_self_fd_directory(tree, path) {
             children.extend(self.proc_fd_children());
         }
+        self.directory_entries_from_children(tree, path, children)
+    }
+
+    fn static_directory_entries(
+        &self,
+        tree: &PathTree,
+        path: &GuestPath,
+    ) -> VfsResult<Vec<DirectoryEntry>> {
+        self.directory_entries_from_children(tree, path, tree.static_children(path)?)
+    }
+
+    fn directory_entries_from_children(
+        &self,
+        tree: &PathTree,
+        path: &GuestPath,
+        mut children: Vec<DirectoryChild>,
+    ) -> VfsResult<Vec<DirectoryEntry>> {
         children.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let directory_inode = tree.lookup_path(&path).ok_or(VfsError::NoEntry)?.inode_id();
+        let directory_inode = tree.lookup_path(path).ok_or(VfsError::NoEntry)?.inode_id();
         let mut entries = vec![
             DirectoryEntry {
                 inode: directory_inode,
@@ -2789,7 +2848,15 @@ impl FdTable {
                     name: child.name,
                 }),
         );
+        Ok(entries)
+    }
 
+    fn consume_directory_entries(
+        &mut self,
+        fd: Fd,
+        max_bytes: usize,
+        entries: &[DirectoryEntry],
+    ) -> VfsResult<Vec<DirectoryEntry>> {
         let mut returned = Vec::new();
         let mut used = 0usize;
         let entry = self.get_mut(fd)?;
@@ -2797,7 +2864,7 @@ impl FdTable {
         let mut description = description_arc
             .lock()
             .expect("fd description mutex poisoned");
-        for item in entries.into_iter().skip(description.dir_cursor) {
+        for item in entries.iter().skip(description.dir_cursor) {
             let record_len = item.record_len();
             if used + record_len > max_bytes {
                 if returned.is_empty() {
@@ -2806,7 +2873,7 @@ impl FdTable {
                 break;
             }
             used += record_len;
-            returned.push(item);
+            returned.push(item.clone());
             description.dir_cursor += 1;
             description.offset = description.dir_cursor as u64;
         }
@@ -2853,6 +2920,13 @@ impl FdTable {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryListingSource {
+    inode: InodeId,
+    path: GuestPath,
+    cacheable: bool,
+}
+
 fn eventfd_node(file: &FileRef) -> VfsResult<&EventfdNode> {
     match file.inode().backend() {
         InodeBackend::Eventfd(eventfd) => Ok(eventfd),
@@ -2886,6 +2960,106 @@ impl Default for FdTable {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct VfsCache {
+    generation: u64,
+    regular_file_generation: u64,
+    directory_listings: BTreeMap<VfsCacheKey, Arc<[DirectoryEntry]>>,
+    metadata: BTreeMap<VfsCacheKey, LinuxFileAttr>,
+    small_reads: BTreeMap<VfsCacheKey, Arc<[u8]>>,
+}
+
+impl VfsCache {
+    fn invalidate_all(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.regular_file_generation = self.regular_file_generation.wrapping_add(1);
+        self.directory_listings.clear();
+        self.metadata.clear();
+        self.small_reads.clear();
+    }
+
+    fn invalidate_proc_views(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.directory_listings.clear();
+        self.metadata.clear();
+        self.small_reads.clear();
+    }
+
+    fn directory_listing(&self, inode: InodeId) -> Option<Arc<[DirectoryEntry]>> {
+        self.directory_listings.get(&self.key(inode)).cloned()
+    }
+
+    fn insert_directory_listing(&mut self, inode: InodeId, entries: Arc<[DirectoryEntry]>) {
+        self.directory_listings.insert(self.key(inode), entries);
+    }
+
+    fn metadata(&self, inode: InodeId) -> Option<LinuxFileAttr> {
+        self.metadata.get(&self.key(inode)).copied()
+    }
+
+    fn insert_metadata(&mut self, inode: InodeId, attr: LinuxFileAttr) {
+        self.metadata.insert(self.key(inode), attr);
+    }
+
+    fn small_read(&self, inode: InodeId) -> Option<Arc<[u8]>> {
+        self.small_reads.get(&self.key(inode)).cloned()
+    }
+
+    fn insert_small_read(&mut self, inode: InodeId, data: Arc<[u8]>) {
+        self.small_reads.insert(self.key(inode), data);
+    }
+
+    fn key(&self, inode: InodeId) -> VfsCacheKey {
+        VfsCacheKey {
+            inode,
+            generation: self.generation,
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> VfsCacheSnapshot {
+        VfsCacheSnapshot {
+            generation: self.generation,
+            directory_listing_entries: self.directory_listings.len(),
+            metadata_entries: self.metadata.len(),
+            small_read_entries: self.small_reads.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VfsCacheKey {
+    inode: InodeId,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RegularFileCacheKey {
+    inode: InodeId,
+    generation: u64,
+}
+
+impl RegularFileCacheKey {
+    #[must_use]
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VfsCacheSnapshot {
+    generation: u64,
+    directory_listing_entries: usize,
+    metadata_entries: usize,
+    small_read_entries: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct VirtualFileSystem {
     rootfs: Rootfs,
@@ -2893,6 +3067,7 @@ pub struct VirtualFileSystem {
     fds: FdTable,
     proc_self: ProcSelfData,
     umask: u32,
+    cache: RefCell<VfsCache>,
 }
 
 impl VirtualFileSystem {
@@ -2903,6 +3078,7 @@ impl VirtualFileSystem {
             fds: FdTable::with_stdio(),
             proc_self: ProcSelfData::default(),
             umask: DEFAULT_UMASK,
+            cache: RefCell::new(VfsCache::default()),
         };
         vfs.mount_minimal_devfs()
             .expect("minimal devfs nodes do not conflict in a new VFS");
@@ -2916,6 +3092,7 @@ impl VirtualFileSystem {
             fds,
             proc_self: ProcSelfData::default(),
             umask: DEFAULT_UMASK,
+            cache: RefCell::new(VfsCache::default()),
         }
     }
 
@@ -2928,6 +3105,7 @@ impl VirtualFileSystem {
     }
 
     pub fn tree_mut(&mut self) -> &mut PathTree {
+        self.invalidate_vfs_caches();
         &mut self.tree
     }
 
@@ -2965,14 +3143,19 @@ impl VirtualFileSystem {
 
     pub fn set_proc_self(&mut self, proc_self: ProcSelfData) {
         self.proc_self = proc_self;
+        self.invalidate_proc_caches();
     }
 
     pub fn mount_minimal_devfs(&mut self) -> VfsResult<()> {
-        self.tree.mount_minimal_devfs()
+        self.tree.mount_minimal_devfs()?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn mount_minimal_procfs(&mut self) -> VfsResult<()> {
-        self.tree.mount_minimal_procfs()
+        self.tree.mount_minimal_procfs()?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn getcwd(&self) -> VfsResult<String> {
@@ -3012,6 +3195,7 @@ impl VirtualFileSystem {
         let path = resolved.guest_path().clone();
         let node_missing = resolved.inode().is_none();
         let mut created = false;
+        let mut truncated = false;
 
         if node_missing {
             if !flags.create() {
@@ -3029,6 +3213,7 @@ impl VirtualFileSystem {
         if flags.directory() && !node.attr().is_directory() {
             return Err(VfsError::NotDirectory);
         }
+        let is_regular_file = matches!(node.kind(), PathNodeKind::File);
         if node.attr().is_symlink() && flags.nofollow() {
             return Err(VfsError::Loop);
         }
@@ -3045,11 +3230,18 @@ impl VirtualFileSystem {
         if !created {
             node.attr().check_access(access_mode)?;
         }
-        if flags.truncate() && flags.can_write() && matches!(node.kind(), PathNodeKind::File) {
+        if flags.truncate() && flags.can_write() && is_regular_file {
             self.tree
                 .lookup_path_mut(&path)
                 .ok_or(VfsError::NoEntry)?
                 .truncate()?;
+            truncated = true;
+        }
+        if flags.can_read() && is_regular_file {
+            self.tree
+                .lookup_path_mut(&path)
+                .ok_or(VfsError::NoEntry)?
+                .materialize_deferred_content()?;
         }
 
         let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
@@ -3060,7 +3252,7 @@ impl VirtualFileSystem {
             PathNodeKind::Proc(kind) => kind.file_kind(),
             PathNodeKind::Symlink(_) => FileKind::Symlink,
         };
-        self.fds.insert_open(
+        let fd = self.fds.insert_open(
             FileRef::new(
                 Arc::new(Inode::new(
                     node.inode_id(),
@@ -3070,7 +3262,11 @@ impl VirtualFileSystem {
             ),
             flags,
             Some(path),
-        )
+        )?;
+        if created || truncated || flags.can_write() {
+            self.invalidate_vfs_caches();
+        }
+        Ok(fd)
     }
 
     pub fn close(&mut self, fd: Fd) -> VfsResult<()> {
@@ -3078,6 +3274,7 @@ impl VirtualFileSystem {
         let inode_id = file.inode().id();
         if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
             self.tree.inodes.remove(&inode_id);
+            self.invalidate_vfs_caches();
         }
         Ok(())
     }
@@ -3087,21 +3284,57 @@ impl VirtualFileSystem {
         let inode_id = file.inode().id();
         if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
             self.tree.inodes.remove(&inode_id);
+            self.invalidate_vfs_caches();
         }
         Ok(file)
     }
 
     pub fn read(&mut self, fd: Fd, buffer: &mut [u8]) -> VfsResult<usize> {
+        if let Some(count) = self.read_from_small_cache(fd, buffer)? {
+            return Ok(count);
+        }
         self.fds.read(&self.tree, &self.proc_self, fd, buffer)
     }
 
     pub fn pread(&self, fd: Fd, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+        if let Some(count) = self.cached_small_read_at(fd, offset, buffer)? {
+            return Ok(count);
+        }
         self.fds
             .pread(&self.tree, &self.proc_self, fd, offset, buffer)
     }
 
+    pub fn regular_file_cache_key(&self, fd: Fd) -> VfsResult<Option<RegularFileCacheKey>> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Ok(None);
+        }
+        let inode = entry.inode_id();
+        let Some(node) = self.tree.lookup_inode(inode) else {
+            return Ok(None);
+        };
+        if !matches!(node.kind(), PathNodeKind::File) {
+            return Ok(None);
+        }
+        Ok(Some(RegularFileCacheKey {
+            inode,
+            generation: self.cache.borrow().regular_file_generation,
+        }))
+    }
+
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
-        self.fds.write(&mut self.tree, fd, buffer)
+        let regular_write = self
+            .fds
+            .get(fd)
+            .is_ok_and(|entry| matches!(entry.file().kind(), FileKind::Regular));
+        let count = self.fds.write(&mut self.tree, fd, buffer)?;
+        if regular_write && count > 0 {
+            self.invalidate_vfs_caches();
+        }
+        Ok(count)
     }
 
     pub fn lseek(&mut self, fd: Fd, offset: i64, whence: SeekWhence) -> VfsResult<u64> {
@@ -3111,7 +3344,7 @@ impl VirtualFileSystem {
     pub fn fstat(&self, fd: Fd) -> VfsResult<LinuxFileAttr> {
         let entry = self.fds.get(fd)?;
         if let Some(node) = self.tree.lookup_inode(entry.inode_id()) {
-            return Ok(node.attr());
+            return Ok(self.cached_metadata(node));
         }
 
         Ok(anonymous_attr(entry.file()))
@@ -3278,6 +3511,7 @@ impl VirtualFileSystem {
             .ok_or(VfsError::NoEntry)?
             .metadata
             .set_mode(mode);
+        self.invalidate_vfs_caches();
         Ok(())
     }
 
@@ -3288,6 +3522,7 @@ impl VirtualFileSystem {
             .ok_or(VfsError::NoEntry)?
             .metadata
             .set_owner(uid, gid);
+        self.invalidate_vfs_caches();
         Ok(())
     }
 
@@ -3318,6 +3553,7 @@ impl VirtualFileSystem {
             .ok_or(VfsError::NoEntry)?
             .metadata
             .set_times(times);
+        self.invalidate_vfs_caches();
         Ok(())
     }
 
@@ -3376,7 +3612,13 @@ impl VirtualFileSystem {
     }
 
     pub fn getdents64(&mut self, fd: Fd, max_bytes: usize) -> VfsResult<Vec<DirectoryEntry>> {
-        self.fds.getdents64(&self.tree, fd, max_bytes)
+        let source = self.fds.directory_listing_source(&self.tree, fd)?;
+        let entries = if source.cacheable {
+            self.cached_directory_entries(source.inode, &source.path)?
+        } else {
+            self.fds.directory_entries(&self.tree, &source.path)?.into()
+        };
+        self.fds.consume_directory_entries(fd, max_bytes, &entries)
     }
 
     pub fn mkdirat(&mut self, dirfd: Fd, path: &str, mode: u32) -> VfsResult<()> {
@@ -3397,8 +3639,11 @@ impl VirtualFileSystem {
                     mode & !self.umask,
                 )),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
-        )
+        )?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn unlinkat(&mut self, dirfd: Fd, path: &str, flags: u32) -> VfsResult<()> {
@@ -3425,6 +3670,7 @@ impl VirtualFileSystem {
         self.check_parent_write_permissions(&target)?;
         let inode_id = self.tree.remove_path_link(&target)?;
         self.drop_link(inode_id);
+        self.invalidate_vfs_caches();
         Ok(())
     }
 
@@ -3450,8 +3696,11 @@ impl VirtualFileSystem {
                     target.len() as u64,
                 )),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
-        )
+        )?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn linkat(
@@ -3505,7 +3754,9 @@ impl VirtualFileSystem {
             .ok_or(VfsError::NoEntry)?
             .increment_link_count()?;
         self.tree
-            .insert_link(new_resolved.guest_path().clone(), old_inode)
+            .insert_link(new_resolved.guest_path().clone(), old_inode)?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn renameat2(
@@ -3554,6 +3805,7 @@ impl VirtualFileSystem {
         if flags & RENAME_EXCHANGE != 0 {
             let new_inode = new_inode.ok_or(VfsError::NoEntry)?;
             self.exchange_paths(&old_path, old_inode, &new_path, new_inode)?;
+            self.invalidate_vfs_caches();
             return Ok(());
         }
 
@@ -3561,7 +3813,9 @@ impl VirtualFileSystem {
             self.validate_rename_replacement(old_inode, target_inode, &new_path)?;
             self.remove_existing_rename_target(&new_path, target_inode)?;
         }
-        self.move_path(&old_path, &new_path)
+        self.move_path(&old_path, &new_path)?;
+        self.invalidate_vfs_caches();
+        Ok(())
     }
 
     pub fn ftruncate(&mut self, fd: Fd, length: u64) -> VfsResult<()> {
@@ -3576,7 +3830,67 @@ impl VirtualFileSystem {
         self.tree
             .lookup_inode_mut(inode_id)
             .ok_or(VfsError::NoEntry)?
-            .set_len(length)
+            .set_len(length)?;
+        self.invalidate_vfs_caches();
+        Ok(())
+    }
+
+    fn read_from_small_cache(&self, fd: Fd, buffer: &mut [u8]) -> VfsResult<Option<usize>> {
+        let entry = self.fds.get(fd)?;
+        let offset = entry.offset();
+        let Some(count) = self.cached_small_read_for_entry(entry, offset, buffer)? else {
+            return Ok(None);
+        };
+        entry.description().offset = offset
+            .checked_add(count as u64)
+            .ok_or(VfsError::InvalidPath)?;
+        Ok(Some(count))
+    }
+
+    fn cached_small_read_at(
+        &self,
+        fd: Fd,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<Option<usize>> {
+        let entry = self.fds.get(fd)?;
+        self.cached_small_read_for_entry(entry, offset, buffer)
+    }
+
+    fn cached_small_read_for_entry(
+        &self,
+        entry: &FdEntry,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<Option<usize>> {
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Ok(None);
+        }
+        if buffer.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let inode_id = entry.inode_id();
+        let node = self.tree.lookup_inode(inode_id).ok_or(VfsError::NoEntry)?;
+        if !matches!(node.kind(), PathNodeKind::File) {
+            return Ok(None);
+        }
+        if node.deferred_host_path().is_some() {
+            return Ok(None);
+        }
+        if node.data().len() > SMALL_READ_CACHE_LIMIT {
+            return Ok(None);
+        }
+
+        let data = self.cached_small_read_data(inode_id, node.data());
+        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
+        let available = data.get(offset..).unwrap_or(&[]);
+        let count = available.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&available[..count]);
+        Ok(Some(count))
     }
 
     fn resolve_at(
@@ -3624,6 +3938,7 @@ impl VirtualFileSystem {
                 kind: PathNodeKind::File,
                 metadata: MetadataSidecar::new(LinuxFileAttr::regular(inode_id, mode, 0)),
                 data: Vec::new(),
+                deferred_host_path: None,
             },
         )
     }
@@ -3764,7 +4079,7 @@ impl VirtualFileSystem {
 
         self.tree
             .lookup_path(path)
-            .map(PathNode::attr)
+            .map(|node| self.cached_metadata(node))
             .ok_or(VfsError::NoEntry)
     }
 
@@ -3835,6 +4150,59 @@ impl VirtualFileSystem {
             return Err(VfsError::NotDirectory);
         }
         node.attr().check_access(W_OK | X_OK)
+    }
+
+    fn cached_metadata(&self, node: &PathNode) -> LinuxFileAttr {
+        let inode_id = node.inode_id();
+        if let Some(attr) = self.cache.borrow().metadata(inode_id) {
+            return attr;
+        }
+
+        let attr = node.attr();
+        self.cache.borrow_mut().insert_metadata(inode_id, attr);
+        attr
+    }
+
+    fn cached_directory_entries(
+        &self,
+        inode_id: InodeId,
+        path: &GuestPath,
+    ) -> VfsResult<Arc<[DirectoryEntry]>> {
+        if let Some(entries) = self.cache.borrow().directory_listing(inode_id) {
+            return Ok(entries);
+        }
+
+        let entries: Arc<[DirectoryEntry]> =
+            self.fds.static_directory_entries(&self.tree, path)?.into();
+        self.cache
+            .borrow_mut()
+            .insert_directory_listing(inode_id, entries.clone());
+        Ok(entries)
+    }
+
+    fn cached_small_read_data(&self, inode_id: InodeId, data: &[u8]) -> Arc<[u8]> {
+        if let Some(cached) = self.cache.borrow().small_read(inode_id) {
+            return cached;
+        }
+
+        let cached: Arc<[u8]> = data.into();
+        self.cache
+            .borrow_mut()
+            .insert_small_read(inode_id, cached.clone());
+        cached
+    }
+
+    fn invalidate_vfs_caches(&self) {
+        self.cache.borrow_mut().invalidate_all();
+    }
+
+    fn invalidate_proc_caches(&self) {
+        self.cache.borrow_mut().invalidate_proc_views();
+    }
+
+    #[cfg(test)]
+    fn cache_snapshot(&self) -> VfsCacheSnapshot {
+        self.cache.borrow().snapshot()
     }
 
     fn host_path(&self, path: &GuestPath) -> PathBuf {
@@ -3908,6 +4276,45 @@ fn proc_self_fd_link_inode(fd: Fd) -> VfsResult<InodeId> {
     FIRST_PROC_SELF_FD_LINK_INODE_ID
         .checked_add(fd)
         .ok_or(VfsError::BadFd)
+}
+
+fn read_regular_node_at(
+    node: &PathNode,
+    proc_self: &ProcSelfData,
+    offset: u64,
+    buffer: &mut [u8],
+) -> VfsResult<usize> {
+    let proc_data;
+    let data = match node.kind() {
+        PathNodeKind::Proc(ProcNodeKind::Cmdline) => {
+            proc_data = proc_self.cmdline_bytes();
+            return read_memory_at(&proc_data, offset, buffer);
+        }
+        PathNodeKind::Proc(ProcNodeKind::Environ) => {
+            proc_data = proc_self.environ_bytes();
+            return read_memory_at(&proc_data, offset, buffer);
+        }
+        _ => node.data(),
+    };
+    if let Some(path) = node.deferred_host_path() {
+        return read_host_file_at(path, offset, buffer);
+    }
+    read_memory_at(data, offset, buffer)
+}
+
+fn read_memory_at(data: &[u8], offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+    let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath)?;
+    let available = data.get(offset..).unwrap_or(&[]);
+    let count = available.len().min(buffer.len());
+    buffer[..count].copy_from_slice(&available[..count]);
+    Ok(count)
+}
+
+fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+    let mut file = fs::File::open(path).map_err(|_| VfsError::NoEntry)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|_| VfsError::InvalidPath)?;
+    file.read(buffer).map_err(|_| VfsError::InvalidPath)
 }
 
 fn inode_backend_for_path_node(node: &PathNode, host_path: PathBuf) -> InodeBackend {
@@ -4910,6 +5317,52 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cache_tracks_generation_and_invalidates_on_metadata_update() {
+        let mut vfs = sample_vfs();
+
+        let original = vfs.newfstatat(AT_FDCWD, "/tmp/file", 0).unwrap();
+        let cached = vfs.newfstatat(AT_FDCWD, "/tmp/file", 0).unwrap();
+        let snapshot = vfs.cache_snapshot();
+
+        assert_eq!(cached, original);
+        assert_eq!(snapshot.metadata_entries, 1);
+
+        vfs.chmod("/tmp/file", 0o600).unwrap();
+        let updated = vfs.newfstatat(AT_FDCWD, "/tmp/file", 0).unwrap();
+        let updated_snapshot = vfs.cache_snapshot();
+
+        assert_eq!(updated.mode & 0o777, 0o600);
+        assert!(updated.ctime_nsec > original.ctime_nsec);
+        assert!(updated_snapshot.generation > snapshot.generation);
+        assert_eq!(updated_snapshot.metadata_entries, 1);
+    }
+
+    #[test]
+    fn small_read_cache_invalidates_after_regular_file_write() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+        let mut buffer = [0; 5];
+
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 5);
+        assert_eq!(&buffer, b"hello");
+        let cached = vfs.cache_snapshot();
+        assert_eq!(cached.small_read_entries, 1);
+
+        vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
+        assert_eq!(vfs.write(fd, b"HELLO").unwrap(), 5);
+        let invalidated = vfs.cache_snapshot();
+        assert!(invalidated.generation > cached.generation);
+        assert_eq!(invalidated.small_read_entries, 0);
+
+        vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 5);
+        assert_eq!(&buffer, b"HELLO");
+        assert_eq!(vfs.cache_snapshot().small_read_entries, 1);
+    }
+
+    #[test]
     fn getdents64_entries_match_linux_record_layout() {
         let mut vfs = sample_vfs();
         let fd = vfs
@@ -4937,6 +5390,53 @@ mod tests {
         assert_eq!(entries.last().unwrap().file_type, DT_REG);
         vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
         assert_eq!(vfs.getdents64(fd, 1).unwrap_err(), VfsError::InvalidPath);
+    }
+
+    #[test]
+    fn directory_listing_cache_batches_getdents_and_invalidates_on_mutation() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp", OpenFlags::new(O_RDONLY | O_DIRECTORY), 0)
+            .unwrap();
+
+        let first = vfs.getdents64(fd, 24).unwrap();
+        assert_eq!(entry_names(&first), vec!["."]);
+        let cached = vfs.cache_snapshot();
+        assert_eq!(cached.directory_listing_entries, 1);
+
+        let second = vfs.getdents64(fd, 24).unwrap();
+        assert_eq!(entry_names(&second), vec![".."]);
+        assert_eq!(vfs.cache_snapshot().directory_listing_entries, 1);
+
+        vfs.mkdirat(AT_FDCWD, "/tmp/new", 0o755).unwrap();
+        let invalidated = vfs.cache_snapshot();
+        assert!(invalidated.generation > cached.generation);
+        assert_eq!(invalidated.directory_listing_entries, 0);
+
+        vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
+        let entries = vfs.getdents64(fd, 4096).unwrap();
+        assert_eq!(entry_names(&entries), vec![".", "..", "file", "new"]);
+        assert_eq!(vfs.cache_snapshot().directory_listing_entries, 1);
+    }
+
+    #[test]
+    fn proc_self_fd_directory_listing_stays_uncached() {
+        let mut vfs = sample_vfs();
+        vfs.mount_minimal_procfs().unwrap();
+        let fd = vfs
+            .openat(
+                AT_FDCWD,
+                "/proc/self/fd",
+                OpenFlags::new(O_RDONLY | O_DIRECTORY),
+                0,
+            )
+            .unwrap();
+
+        let entries = vfs.getdents64(fd, 4096).unwrap();
+
+        let fd_name = fd.to_string();
+        assert!(entry_names(&entries).contains(&fd_name.as_str()));
+        assert_eq!(vfs.cache_snapshot().directory_listing_entries, 0);
     }
 
     #[test]
@@ -5102,6 +5602,10 @@ mod tests {
             )),
             FileKind::Regular,
         )
+    }
+
+    fn entry_names(entries: &[DirectoryEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.name.as_str()).collect()
     }
 
     fn sample_vfs() -> VirtualFileSystem {

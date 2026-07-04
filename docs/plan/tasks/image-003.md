@@ -1,7 +1,7 @@
 ---
 id: image-003
 scope: phase3-image
-status: pending
+status: done
 depends-on: [image-001, snapshot-002]
 ---
 
@@ -36,3 +36,16 @@ cargo test -p mcr-snapshot
 - Include environment, working directory, entrypoint, command, history, rootfs diff IDs, and platform metadata.
 - Output must be deterministic for identical inputs.
 - External `docker load` validation belongs to `integ-004`.
+- Initial config checkpoint: added deterministic hand-written OCI image config
+  and manifest JSON serialization in `mcr-image`, covering platform metadata,
+  environment, working directory, entrypoint, command, history, rootfs diff IDs,
+  descriptor ordering, and annotation key ordering. OCI layout and
+  Docker-compatible tar writers remain follow-up work.
+- 2026-07-04 checkpoint: `LocalContentStore::write_oci_layout` now writes
+  deterministic `oci-layout`, `index.json`, and manifest blobs after verifying
+  referenced config and layer blobs.
+- 2026-07-04 checkpoint: `LocalContentStore::docker_tar_bytes` and
+  `write_docker_tar` now write deterministic Docker-compatible archives with
+  `manifest.json`, the config JSON file, layer `layer.tar` entries in manifest
+  order, and optional `repositories` tag metadata. External `docker load`
+  validation remains covered by `integ-004`.

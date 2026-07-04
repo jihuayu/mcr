@@ -10,6 +10,8 @@ use std::process::{Command, ExitStatus, Stdio};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
+pub mod perf;
+
 const DEFAULT_FIXTURE_DIR: &str = "tests/fixtures";
 const FIXTURE_ENV_VAR: &str = "MCR_FIXTURES_DIR";
 const GUEST_BINARY_MANIFEST: &str = "guest-binaries/manifest.mcr";

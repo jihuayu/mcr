@@ -59,6 +59,16 @@ The immediate objective is to avoid parking host worker threads inside blocking
 Windows I/O calls when the guest operation can be represented as a pending MCR
 waitable operation.
 
+The first checkpoint keeps the synchronous backend in place and introduces the
+`mcr-win` host submission boundary. `HostFile::submit_overlapped_read` and
+`HostFile::submit_overlapped_write` return an owned submission that is either
+completed, pending, or explicitly routed through a synchronous fallback. Pending
+records own their buffer until completion or cancellation drain, and fallback
+failures return the same host adapter error shape that the existing synchronous
+file adapter uses. A later checkpoint can open compatible Windows handles with
+overlapped flags and attach events, thread-pool I/O, or IOCP without changing
+the VFS/runtime errno boundary.
+
 ### Vector And Scatter/Gather I/O
 
 Linux `readv`, `writev`, `sendmsg`, and `recvmsg` should avoid per-buffer host
@@ -70,6 +80,14 @@ calls where Windows exposes a compatible vector interface:
   `WSARecvMsg` where this preserves Linux message and ancillary-data behavior;
 - fallbacks must keep the current copy-in/copy-out behavior rather than exposing
   host buffers directly to guest memory.
+
+The socket scatter/gather path is implemented through the `mcr-net` vectored
+transport boundary and the Windows socket adapter. Runtime socket `readv`,
+`writev`, `sendmsg`, and `recvmsg` route guest iovecs into a single vectored
+socket-table operation. The default host-handle fallback still copies through a
+temporary buffer for non-Windows or test handles, while `WinHostSocketHandle`
+uses `WSASend`, `WSARecv`, `WSASendTo`, and `WSARecvFrom` with `WSABUF`
+vectors under the same Linux message and errno contract.
 
 ### Metadata And Directory Caches
 
@@ -83,12 +101,35 @@ path strings alone. Mutating syscalls such as `openat` with write intent,
 `unlinkat`, `renameat2`, `ftruncate`, chmod/chown-like changes, and metadata
 sidecar writes must invalidate affected entries.
 
+The first VFS cache checkpoint keeps this boundary narrow: `mcr-vfs` maintains
+an inode-and-generation keyed metadata cache plus a small regular-file read
+cache. Any successful VFS mutation that can affect attributes, links, paths, or
+file contents advances the generation and drops cached entries. Directory
+listing cache entries are also keyed by inode and generation, store immutable
+listing snapshots, and hand shared entries back to callers on cache hits.
+
 ### File Mapping
 
 Executable files, shared libraries, and read-only data should prefer host-backed
 file mappings where that preserves MCR's guest VMA model. The runtime should use
 lazy population and copy-on-write for private writable mappings so repeated
 `execve` and supported `fork+exec` paths avoid unnecessary copies.
+
+The first reusable boundary caches immutable private file-mapping payloads by
+regular-file inode, VFS generation, file offset, and requested mapping length.
+The cache lives above the VFS and below guest memory materialization: it never
+exposes host paths or handles, writes cached bytes into each guest VMA with the
+requested permissions restored afterward, and bypasses reuse for initially
+writable private mappings until a real copy-on-write page backend exists.
+
+### Rootfs Startup
+
+`run-rootfs` must not copy every regular file in a package rootfs before the
+initial guest executable can run. Rootfs loading should register directory,
+symlink, metadata, and host-backed regular-file nodes first, then materialize
+regular-file bytes only when a readable fd is opened. The initial checkpoint
+keeps writes isolated by materializing a deferred file into the in-memory VFS
+before truncation or write paths mutate it.
 
 ## Network Optimization
 
@@ -104,6 +145,14 @@ level-trigger `epoll` must continue to observe Linux readiness semantics,
 including fd generation checks, close wakeups, timeout behavior, and
 Linux-compatible errno mapping.
 
+The first readiness checkpoint establishes the backend contract without
+switching sockets to IOCP yet: host completion classes map to `SocketEvents`,
+`mcr-net` associates completions with a socket readiness token and generation,
+and the semantic `WSAPoll` path remains the fallback when no completion-backed
+readiness is available. The full backend still needs overlapped operation
+ownership, IOCP registration, worker draining, cancellation, and differential
+tests against the fallback path.
+
 ### AcceptEx And ConnectEx
 
 `AcceptEx` and `ConnectEx` should be added after the IOCP socket lifetime model
@@ -116,12 +165,24 @@ The nonblocking `connect` state machine still reports guest success through the
 Linux socket state and `SO_ERROR` equivalent, even if IOCP completion is the
 host notification source.
 
+The first checkpoint adds the adapter boundary without binding to the real
+Windows extension functions. Host socket handles can return unsupported and keep
+the plain fallback paths, or submit pending `AcceptEx`/`ConnectEx` work that
+feeds the existing readiness-token cache with accept/connect completions. The
+actual Winsock function lookup, overlapped buffer ownership, IOCP registration,
+context update calls, cancellation, and A/B measurement remain separate backend
+work.
+
 ### Registered I/O
 
 Registered I/O (RIO) is a later optional backend for small-message workloads.
 It should not be mixed into the first IOCP pass. A future RIO task must prove
 that registered buffer ownership, cancellation, and completion semantics can be
 hidden behind MCR's socket object and Linux errno model.
+
+The 2026-07-04 `perf-008` decision closes RIO as backlog-only until IOCP
+measurements show a small-message datagram bottleneck and a RIO prototype proves
+enough benefit to justify Windows-only buffer and lifetime complexity.
 
 ### DNS And Connection Reuse
 
@@ -150,6 +211,18 @@ The fast path must preserve guest PID/TID behavior, parent/child wait state,
 close-on-exec, inherited cwd/root/env where applicable, and error reporting when
 `execve` fails.
 
+The first checkpoint keeps that optimization narrow. Fork-like syscalls create
+the child task, wait state, and cloned fd table immediately, but the runtime
+marks the child memory as deferred instead of copying the parent address space.
+If the child reaches `execve` through read-only setup code, the runtime reads
+the exec arguments from parent memory while the deferred snapshot invariant still
+holds, loads the new image directly into the child process, and applies
+close-on-exec to the child fd table. If the parent is about to mutate memory, if
+the child writes memory before exec, if the child uses a non-exec syscall, or if
+`execve` fails, the runtime materializes the child memory from the parent before
+continuing. This keeps parent memory
+uncorrupted and preserves the existing wait/exit fallback behavior.
+
 ### Posix-Spawn-Like Path
 
 Where libc or toolchains express process creation as `posix_spawn`-like
@@ -174,6 +247,18 @@ MCR should use bounded host worker pools for guest tasks and I/O completions so
 high-concurrency workloads do not repeatedly call `CreateThread`. Worker pools
 need cancellation, teardown, and priority rules compatible with guest wait and
 exit behavior.
+
+The first checkpoints add the diagnostics-visible boundary without changing
+guest scheduling. `mcr-task` owns bounded pool configuration records for guest
+task execution and I/O completion work. Runtime diagnostics capture each pool's
+role, maximum workers, queue capacity, active workers, queued jobs, and
+submission/completion/rejection counters.
+
+`mcr-task` also owns a bounded submission boundary that starts work while a role
+has idle worker slots, queues accepted work up to the configured capacity, and
+rejects later submissions with observable counters. This is still a synchronous
+host-side boundary; guest scheduling and I/O are not routed through the pool
+until a later checkpoint wires cancellation, teardown, and wait semantics.
 
 Prestarted process workers are a speculative later optimization. They must not
 break the current one-host-process-per-container boundary unless a separate
@@ -209,6 +294,12 @@ dispatcher path after tracing and diagnostics are preserved. Candidates include
 `getpid`, `gettid`, selected clock queries, `uname`, and other compatibility
 queries that return MCR-owned state.
 
+The first fast path is deliberately narrow: `getpid` and `gettid` bypass the
+general subsystem routing path, but still emit the normal structured enter and
+exit trace events and encode Linux ABI return values through `SyscallReturn`.
+Guest-memory-copying calls, including clock queries that write `timespec`
+structures, stay on the regular dispatcher path.
+
 I/O syscalls may get lighter argument decode and errno mapping paths, but they
 must still copy guest structures safely and route through the owning subsystem.
 
@@ -219,6 +310,38 @@ entries across tasks running the same mapped code where invalidation is clear.
 The syscall layer should avoid repeated dynamic allocation and table lookups on
 hot paths, but the syscall table remains the source of truth for number, name,
 argument, trace, and unsupported behavior.
+
+Native same-ISA syscall patching keeps a per-process record of executable ranges
+already scanned. New ranges are read once to derive both syscall trap patches and
+Windows FS-relative TLS patch candidates. The syscall scanner first checks for
+the `0f 05` byte pair and skips the decoder entirely for candidate-free ranges;
+when candidates exist, decoding stops after the last candidate so large package
+binary tails are not walked after the final possible `syscall`.
+
+Windows FS-relative TLS patching records candidates separately from materializing
+rewrites. When the guest FS base is zero, newly discovered candidates stay in the
+cache but are not rewritten back to their original bytes, avoiding no-op patch
+work for large binaries. When the FS base is unchanged and only new executable
+ranges appear, only the new candidates are materialized; a real FS-base change
+still rewrites the full candidate set to preserve guest TLS semantics. Batched
+code patching groups fixed-width rewrites by host allocation so large syscall or
+TLS patch sets do not repeatedly toggle the same executable mapping's
+protection for each candidate.
+
+Native fault diagnostics include the faulting instruction bytes, a decoded
+instruction summary, the guest FS base, registers, and stack words. These
+diagnostics are part of the performance boundary because they distinguish
+patch-cache throughput regressions from same-ISA execution correctness blockers,
+such as FS-relative TLS instructions whose guest FS base cannot be encoded by
+the current fixed-width absolute rewrite.
+
+When Windows native execution faults on an original FS-relative instruction that
+could not be rewritten into the fixed-width absolute form, the runtime now uses
+a narrow interpreted fallback. It preserves native floating-point state, seeds
+the same-ISA execution core with the guest FS base, executes the current block
+until the next syscall through the JIT memory operand path, and then resumes the
+normal syscall return flow. This keeps high-address TLS loads correct without
+turning unsupported native execution faults into a broad interpreter escape.
 
 ## Measurement Gates
 
@@ -235,3 +358,32 @@ At minimum, the plan needs:
 
 Correctness tests remain required. A faster backend that fails Linux ABI
 compatibility is not acceptable.
+
+## Repeatable Baseline Harness
+
+`perf-001` introduces a baseline harness before any backend tuning. The harness
+prints a line-oriented `mcr_perf_baseline.version=1` report with environment
+metadata, wall-clock milliseconds, operation counts, and derived operations per
+second for each measured path.
+
+The first baseline suites are intentionally split by subsystem boundary:
+
+- `mcr-runtime` measures synthetic guest syscall dispatch and
+  `fork+execve+wait4` process startup paths through `run_rootfs`;
+- `mcr-vfs` measures local small-file create/write/read/close loops and
+  directory `getdents64` plus per-entry `statx` walks;
+- `mcr-net` measures high-concurrency loopback accept/recv/send behavior through
+  `WinHostSocketTransport` plus DNS cache insert, lookup-hit, and expiry-purge
+  costs for the MCR-owned resolver boundary;
+- `mcr-task` measures bounded worker-pool diagnostics snapshots without routing
+  real guest scheduling or I/O submissions through the pool boundary;
+- `mcr-testkit` measures guest shell startup, small-file I/O, directory
+  metadata walks through the materialized Alpine rootfs and `MCR_BIN`; the
+  public-network `curl` and `git ls-remote` measurements are opt-in with
+  `MCR_PERF_PUBLIC_NETWORK=1`, while the `perf_dns` and `perf_worker_pool`
+  filters provide task-specific host-only reports for active perf checkpoints.
+
+These suites are baselines, not performance assertions. They should fail only
+when the measured workload itself fails. Thresholds, trend storage, and
+regression budgets belong in later performance tasks after `workload-001` makes
+the Phase 2 workload matrix stable.

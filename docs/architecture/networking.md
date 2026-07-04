@@ -187,6 +187,33 @@ The Phase 2 epoll subset is level-triggered. `EPOLLONESHOT`, edge-triggered
 semantics, `EPOLLEXCLUSIVE`, and signal-mask variants either remain deferred or
 return explicit Linux-compatible errors until a task expands the contract.
 
+The IOCP backend feeds this same policy through a socket readiness token owned
+by `mcr-net`. Host completions such as accept, connect, receive, send, close,
+and error map to readiness bits under the active token generation; stale
+completions from a replaced or closed host socket are ignored. The current
+Winsock backend still falls back to `WSAPoll` when no completion-backed
+readiness is cached, so IOCP remains an implementation backend rather than a new
+guest-visible wait model.
+
+`AcceptEx` and `ConnectEx` are optional host fast paths behind that same seam.
+The socket adapter may report unsupported and leave the plain `accept` or
+`connect` path unchanged, or it may submit an extension operation that later
+emits an `Accept` or `Connect` completion for the active readiness token. A
+completed `AcceptEx` result must have applied `SO_UPDATE_ACCEPT_CONTEXT` before
+returning an accepted host handle to `mcr-net`. A completed `ConnectEx` result
+must have applied `SO_UPDATE_CONNECT_CONTEXT` before `SO_ERROR`, local address,
+or peer address queries are used to complete the Linux nonblocking connect state
+machine.
+
+## MCR-Owned DNS Resolution
+
+Guest-created UDP/TCP sockets keep their normal ownership even when the payload
+looks like DNS. MCR may cache DNS results only for an MCR-owned resolver helper
+or DNS proxy that performs resolution on behalf of the runtime. That cache lives
+behind `mcr-net::DnsCache`, respects response TTLs, normalizes the DNS query
+name for cache lookup, and clears entries when the guest-visible resolver
+configuration snapshot changes.
+
 ## Socket Options
 
 Socket options are a whitelist, not a passthrough. Initial support should focus
@@ -215,6 +242,13 @@ Known differences must be modeled explicitly:
 
 Basic `sendmsg` and `recvmsg` support converts guest iovecs into host buffers.
 Control messages are supported only by explicit whitelist.
+
+The socket transport boundary exposes vectored send/receive entry points for
+connected streams and addressed UDP datagrams. These entry points take owned
+Rust `IoSlice`/`IoSliceMut` views produced after guest-memory validation, so
+host adapters can later map them to `WSABUF` without seeing raw guest pointers.
+Until a host adapter overrides them, the fallback flattens or scatters through a
+single legacy socket call and preserves the current copy-in/copy-out behavior.
 
 Initial ancillary support may include `IP_PKTINFO`, `IPV6_PKTINFO`, TTL, and hop
 limit metadata where Windows exposes compatible information. `SCM_RIGHTS`,

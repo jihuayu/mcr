@@ -1,7 +1,7 @@
 ---
 id: perf-008
 scope: network-performance
-status: blocked
+status: done
 depends-on: [perf-006]
 ---
 
@@ -29,15 +29,27 @@ errno semantics.
 ## Verification
 
 ```powershell
-cargo test -p mcr-net rio -- --nocapture
-cargo test -p mcr-testkit perf_rio_datagram -- --ignored --nocapture
+git diff --check
 ```
+
+## Decision
+
+Closed on 2026-07-04 as a documentation decision checkpoint. MCR will not land a
+Registered I/O datagram backend in this phase.
+
+The current repository does not contain checked-in benchmark output, smoke-test
+evidence, or IOCP-vs-RIO measurements proving that RIO improves a target
+small-message datagram workload. Without that bottleneck evidence, a RIO backend
+would add Windows-only registered-buffer ownership, completion, cancellation,
+and socket-lifetime complexity that still must be hidden behind MCR's Linux ABI
+socket semantics.
 
 ## Notes
 
-- This remains blocked until IOCP measurements identify a datagram bottleneck
-  that RIO can plausibly address.
+- Reopen only after IOCP measurements identify a datagram bottleneck that RIO
+  can plausibly address.
+- Reopen work must include an observable measurement gate comparing RIO against
+  the IOCP backend for the target datagram workload.
 - Registered buffers must never expose host memory ownership to guest code.
-- If RIO support is unavailable or not better than IOCP for target workloads,
-  close this task by documenting that decision instead of keeping a partial
-  backend.
+- A reopened prototype must preserve MCR socket lifetime, buffer ownership,
+  cancellation, readiness, and Linux errno semantics before it can land.

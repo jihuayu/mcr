@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use mcr_jit::ExecutionError;
 use mcr_net::WinHostSocketTransport;
@@ -18,7 +19,9 @@ pub struct RunRootfsConfig {
     program: Vec<u8>,
     args: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
+    working_dir: Option<String>,
     mvp_emulator: bool,
+    guest_step_limit: Option<u64>,
 }
 
 impl RunRootfsConfig {
@@ -30,7 +33,9 @@ impl RunRootfsConfig {
             args: vec![program.clone()],
             program,
             env: Vec::new(),
+            working_dir: None,
             mvp_emulator: false,
+            guest_step_limit: None,
         }
     }
 
@@ -55,8 +60,20 @@ impl RunRootfsConfig {
     }
 
     #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    #[must_use]
     pub const fn with_mvp_emulator(mut self, enabled: bool) -> Self {
         self.mvp_emulator = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_guest_step_limit(mut self, max_guest_steps: u64) -> Self {
+        self.guest_step_limit = Some(max_guest_steps);
         self
     }
 
@@ -81,8 +98,18 @@ impl RunRootfsConfig {
     }
 
     #[must_use]
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+
+    #[must_use]
     pub const fn mvp_emulator(&self) -> bool {
         self.mvp_emulator
+    }
+
+    #[must_use]
+    pub const fn guest_step_limit(&self) -> Option<u64> {
+        self.guest_step_limit
     }
 }
 
@@ -136,7 +163,7 @@ pub enum RunRootfsError {
     },
     Vfs(mcr_vfs::VfsError),
     Linux(LinuxErrno),
-    GuestRun(crate::GuestRunError),
+    GuestRun(Box<crate::GuestRunError>),
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -207,9 +234,13 @@ fn write_native_fault_details(
     formatter: &mut fmt::Formatter<'_>,
     error: &crate::GuestRunError,
 ) -> fmt::Result {
-    let Some((registers, stack_words)) = native_fault_details(error) else {
+    let Some((registers, fs_base, instruction, stack_words)) = native_fault_details(error) else {
         return Ok(());
     };
+    if let Some(instruction) = instruction {
+        write!(formatter, "\nfault instruction: {instruction}")?;
+    }
+    write!(formatter, "\nfault tls: fs_base=0x{fs_base:016x}")?;
     write!(
         formatter,
         "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rbp=0x{:016x} rsp=0x{:016x}",
@@ -251,15 +282,22 @@ fn write_native_fault_details(
 
 fn native_fault_details(
     error: &crate::GuestRunError,
-) -> Option<(mcr_jit::GuestRegisters, &[mcr_jit::NativeFaultStackWord])> {
+) -> Option<(
+    mcr_jit::GuestRegisters,
+    u64,
+    Option<&mcr_jit::NativeFaultInstruction>,
+    &[mcr_jit::NativeFaultStackWord],
+)> {
     match error {
         crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
             ExecutionError::NativeFault {
                 registers,
+                fs_base,
+                instruction,
                 stack_words,
                 ..
             },
-        )) => Some((*registers, stack_words)),
+        )) => Some((*registers, *fs_base, instruction.as_deref(), stack_words)),
         _ => None,
     }
 }
@@ -275,12 +313,29 @@ fn run_rootfs_linux_errno(errno: LinuxErrno) -> RunRootfsError {
 }
 
 pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsError> {
+    let run_start = Instant::now();
+    crate::host_step_trace(format_args!(
+        "run-rootfs start rootfs={} program={} args={} guest_step_limit={:?}",
+        config.rootfs.display(),
+        bytes_lossy(&config.program),
+        config.args.len(),
+        config.guest_step_limit()
+    ));
     if !config.rootfs.is_dir() {
         return Err(RunRootfsError::MissingRootfs(config.rootfs));
     }
 
+    let load_start = Instant::now();
     let mut vfs = load_rootfs(&config.rootfs)?;
+    if let Some(working_dir) = config.working_dir() {
+        vfs.chdir(working_dir)?;
+    }
+    crate::host_step_trace(format_args!(
+        "run-rootfs rootfs-loaded elapsed_ms={}",
+        crate::host_step_elapsed_ms(load_start)
+    ));
     let mut program_loader = RuntimeFileSystem::new(vfs.clone(), ());
+    let program_load_start = Instant::now();
     let program = program_loader
         .load_guest_program(
             config.program.clone(),
@@ -288,11 +343,18 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
             config.env.clone(),
         )
         .map_err(run_rootfs_linux_errno)?;
+    crate::host_step_trace(format_args!(
+        "run-rootfs program-loaded elapsed_ms={} executable_bytes={} interpreter={}",
+        crate::host_step_elapsed_ms(program_load_start),
+        program.executable().bytes().len(),
+        program.interpreter().is_some()
+    ));
     vfs.set_proc_self(ProcSelfData::new(
         program.executable().path().to_vec(),
         program.argv().to_vec(),
         program.envp().to_vec(),
     ));
+    let runtime_start = Instant::now();
     let transport = WinHostSocketTransport::new().map_err(crate::RuntimeError::from)?;
     let mut runtime = crate::Runtime::with_tracer_vfs_and_socket_transport(
         program,
@@ -301,8 +363,23 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         transport,
     )?;
     runtime.enable_native_execution();
+    crate::host_step_trace(format_args!(
+        "run-rootfs runtime-ready elapsed_ms={}",
+        crate::host_step_elapsed_ms(runtime_start)
+    ));
 
-    match runtime.run_guest_until_exit() {
+    let guest_start = Instant::now();
+    let run_result = match config.guest_step_limit() {
+        Some(max_guest_steps) => runtime.run_guest_until_exit_with_step_limit(max_guest_steps),
+        None => runtime.run_guest_until_exit(),
+    };
+    crate::host_step_trace(format_args!(
+        "run-rootfs guest-run-returned elapsed_ms={} total_elapsed_ms={}",
+        crate::host_step_elapsed_ms(guest_start),
+        crate::host_step_elapsed_ms(run_start)
+    ));
+
+    match run_result {
         Ok(status) => Ok(RunRootfsOutput::new(
             status,
             runtime.vfs().stdout_snapshot(),
@@ -311,7 +388,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
-        Err(error) => Err(RunRootfsError::GuestRun(error)),
+        Err(error) => Err(RunRootfsError::GuestRun(Box::new(error))),
     }
 }
 
@@ -704,16 +781,35 @@ fn read_all(
 }
 
 fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
+    const LARGE_FILE_TRACE_BYTES: u64 = 16 * 1024 * 1024;
+
     let mut tree = PathTree::new();
     let mut entries = Vec::new();
+    let collect_start = Instant::now();
+    crate::host_step_trace(format_args!(
+        "load-rootfs collect start rootfs={}",
+        rootfs.display()
+    ));
     collect_rootfs_entries(rootfs, rootfs, &mut entries)?;
     entries.sort_by_key(|entry| (entry.depth, entry.relative.clone()));
+    crate::host_step_trace(format_args!(
+        "load-rootfs collect done entries={} elapsed_ms={}",
+        entries.len(),
+        crate::host_step_elapsed_ms(collect_start)
+    ));
 
+    let mut directories = 0usize;
+    let mut symlinks = 0usize;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let materialize_start = Instant::now();
     for entry in entries {
         let guest_path = format!("/{}", entry.relative.to_string_lossy().replace('\\', "/"));
         if entry.kind.is_dir() {
+            directories += 1;
             tree.create_dir(&guest_path)?;
         } else if entry.kind.is_symlink() {
+            symlinks += 1;
             let host_path = rootfs.join(&entry.relative);
             let target = fs::read_link(&host_path).map_err(|source| RunRootfsError::Io {
                 path: host_path,
@@ -721,14 +817,36 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
             })?;
             tree.create_symlink(&guest_path, target.to_string_lossy().into_owned())?;
         } else if entry.kind.is_file() {
+            files += 1;
             let host_path = rootfs.join(&entry.relative);
-            let content = fs::read(&host_path).map_err(|source| RunRootfsError::Io {
-                path: host_path,
-                source,
-            })?;
-            tree.create_file_with_content(&guest_path, content, 0o755)?;
+            if entry.len >= LARGE_FILE_TRACE_BYTES {
+                crate::host_step_trace(format_args!(
+                    "load-rootfs large-file-deferred path={} bytes={}",
+                    guest_path, entry.len
+                ));
+            }
+            bytes = bytes.saturating_add(entry.len);
+            tree.create_file_with_host_content(&guest_path, host_path, entry.len, 0o755)?;
+            if crate::host_step_trace_enabled() && files % 256 == 0 {
+                crate::host_step_trace(format_args!(
+                    "load-rootfs register-progress files={} dirs={} symlinks={} deferred_bytes={} elapsed_ms={}",
+                    files,
+                    directories,
+                    symlinks,
+                    bytes,
+                    crate::host_step_elapsed_ms(materialize_start)
+                ));
+            }
         }
     }
+    crate::host_step_trace(format_args!(
+        "load-rootfs registered files={} dirs={} symlinks={} deferred_bytes={} elapsed_ms={}",
+        files,
+        directories,
+        symlinks,
+        bytes,
+        crate::host_step_elapsed_ms(materialize_start)
+    ));
 
     tree.mount_minimal_devfs()?;
     tree.mount_minimal_procfs()?;
@@ -746,6 +864,7 @@ struct RootfsEntry {
     relative: PathBuf,
     depth: usize,
     kind: fs::FileType,
+    len: u64,
 }
 
 fn collect_rootfs_entries(
@@ -776,6 +895,7 @@ fn collect_rootfs_entries(
             relative: relative.clone(),
             depth,
             kind,
+            len: metadata.len(),
         });
         if kind.is_dir() {
             collect_rootfs_entries(rootfs, &path, entries)?;
@@ -844,13 +964,15 @@ impl From<crate::RuntimeError> for RunRootfsError {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
+    use std::sync::{Mutex, MutexGuard};
 
     use mcr_sys::{LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD, LinuxErrno, Syscall};
     use mcr_testkit::elf::{ET_DYN, Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X, PT_INTERP};
-    use mcr_vfs::{AT_FDCWD, O_RDONLY};
+    use mcr_vfs::{AT_FDCWD, O_RDONLY, OpenFlags};
 
-    use super::{RunRootfsConfig, RunRootfsError, run_rootfs};
+    use super::{RunRootfsConfig, RunRootfsError, load_rootfs, run_rootfs};
+
+    static RUN_ROOTFS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn run_rootfs_executes_busybox_echo_smoke() {
@@ -893,6 +1015,25 @@ mod tests {
         .unwrap();
         assert_eq!(cat.status(), 0);
         assert_eq!(cat.stdout(), b"NAME=Alpine\n");
+    }
+
+    #[test]
+    fn load_rootfs_defers_regular_file_content_until_open() {
+        let rootfs = TestRootfs::new("lazy-open");
+        rootfs.write_file("/payload.txt", b"first");
+
+        let mut vfs = load_rootfs(rootfs.path()).unwrap();
+        fs::write(rootfs.host_path("/payload.txt"), b"late!").unwrap();
+        let fd = vfs
+            .openat(AT_FDCWD, "/payload.txt", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        fs::write(rootfs.host_path("/payload.txt"), b"after").unwrap();
+
+        let mut buffer = [0; 8];
+        let count = vfs.read(fd, &mut buffer).unwrap();
+        vfs.close(fd).unwrap();
+
+        assert_eq!(&buffer[..count], b"late!");
     }
 
     #[test]
@@ -1095,6 +1236,29 @@ mod tests {
     }
 
     #[test]
+    fn run_rootfs_applies_initial_working_dir_to_relative_paths() {
+        let rootfs = TestRootfs::new("working-dir");
+        rootfs.write_static_elf("/bin/sh");
+        rootfs.create_dir("/work");
+        rootfs.write_file("/work/message.txt", b"from cwd\n");
+
+        let output = run_rootfs(
+            emulated_config(&rootfs, b"/bin/sh")
+                .with_args([
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"cat message.txt".to_vec(),
+                ])
+                .with_working_dir("/work"),
+        )
+        .unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"from cwd\n");
+        assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
     fn run_rootfs_does_not_use_mvp_emulator_by_default() {
         let rootfs = TestRootfs::new("mvp-disabled");
         rootfs.write_static_elf("/bin/busybox");
@@ -1118,11 +1282,12 @@ mod tests {
 
     #[test]
     fn guest_run_error_reports_native_fault_registers() {
-        let error = RunRootfsError::GuestRun(crate::GuestRunError::GuestExecution(
+        let error = RunRootfsError::GuestRun(Box::new(crate::GuestRunError::GuestExecution(
             crate::GuestExecutionError::Execution(mcr_jit::ExecutionError::NativeFault {
                 signal: -1073741819,
                 rip: 0x7000_004d_5305,
                 address: 0x9139b,
+                fs_base: 0x7000_0000,
                 registers: mcr_jit::GuestRegisters {
                     rax: u64::MAX,
                     rcx: 1,
@@ -1131,15 +1296,25 @@ mod tests {
                     rsp: 0x1001_ffb58,
                     ..mcr_jit::GuestRegisters::default()
                 },
+                instruction: Some(Box::new(mcr_jit::NativeFaultInstruction {
+                    rip: 0x7000_004d_5305,
+                    bytes: vec![0x48, 0x8b, 0x40, 0x28],
+                    decoded: "code=Mov_r64_rm64 mnemonic=Mov len=4 operands=[reg=RAX,mem(seg=DS,base=RAX,index=None,scale=1,disp=0x28)]"
+                        .to_string(),
+                })),
                 stack_words: vec![mcr_jit::NativeFaultStackWord {
                     address: 0x1001_ffb58,
                     value: 0x7000_004d_1234,
                 }],
             }),
-        ));
+        )));
         let rendered = error.to_string();
 
         assert!(rendered.contains("fault registers:"));
+        assert!(rendered.contains("fault instruction:"));
+        assert!(rendered.contains("fault tls: fs_base=0x0000000070000000"));
+        assert!(rendered.contains("bytes=48 8b 40 28"));
+        assert!(rendered.contains("code=Mov_r64_rm64"));
         assert!(rendered.contains("rax=0xffffffffffffffff"));
         assert!(rendered.contains("rdi=0x000000000009139b"));
         assert!(rendered.contains("rsp=0x00000001001ffb58"));
@@ -1157,12 +1332,16 @@ mod tests {
 
     struct TestRootfs {
         path: PathBuf,
+        _native_guard: MutexGuard<'static, ()>,
         _guard: MutexGuard<'static, ()>,
     }
 
     impl TestRootfs {
         fn new(name: &str) -> Self {
-            let guard = crate::test_support::native_execution_test_guard();
+            let native_guard = crate::test_support::native_execution_test_guard();
+            let guard = RUN_ROOTFS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = std::env::temp_dir().join(format!(
                 "mcr-runtime-run-rootfs-{name}-{}-{:?}",
                 std::process::id(),
@@ -1172,6 +1351,7 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self {
                 path,
+                _native_guard: native_guard,
                 _guard: guard,
             }
         }

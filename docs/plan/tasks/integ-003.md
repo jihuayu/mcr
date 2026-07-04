@@ -1,7 +1,7 @@
 ---
 id: integ-003
 scope: phase2-integration
-status: pending
+status: done
 depends-on: [integ-002, net-002]
 ---
 
@@ -47,3 +47,8 @@ mcr run-rootfs alpine-rootfs /bin/sh -c "git clone https://github.com/octocat/He
 - The smoke success criteria must stay within AF_INET/AF_INET6 TCP client flows plus the documented DNS path.
 - Network namespaces, port publishing, raw sockets, packet sockets, and general UDP behavior remain unsupported.
 - Any unsupported epoll flags encountered by curl/git must be rejected or documented with Linux-compatible errno behavior before the smoke is considered stable.
+- Local Windows validation used the materialized Alpine rootfs and
+  `target\debug\mcr.exe`; `curl --version`, `git --version`,
+  `curl -fsSL https://example.com >/dev/null`, and the shallow GitHub clone all
+  passed through the ignored `mcr-testkit` network smoke contract after
+  `net-002` rejected unsupported epoll flags with `EINVAL`.
