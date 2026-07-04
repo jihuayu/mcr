@@ -70,3 +70,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   unfinished accepts on drop, complete from a matching IOCP packet, and apply
   `SO_UPDATE_ACCEPT_CONTEXT`. Wiring this into `mcr-net` accept readiness
   remains in this task.
+- Wired `AcceptEx` into the Windows `mcr-net` host transport. Listening TCP
+  sockets submit `AcceptEx` on the nonblocking accept path, readiness draining
+  consumes the matching IOCP packet, stores the accepted host socket, and reports
+  the normal Linux `Accept` readiness class before registering the accepted
+  guest socket. Plain accept remains the fallback.
