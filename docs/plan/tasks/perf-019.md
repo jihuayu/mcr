@@ -62,3 +62,8 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   `IoCompletion` worker pool in `mcr-net`. The guest syscall still returns only
   after the matching `WSASend` completion, but the host wait now runs inside the
   bounded pool and is visible through worker-pool diagnostics.
+- Routed runtime native patch range scanning through the bounded
+  `GuestTaskExecution` worker pool when the executor is available. The runtime
+  still reads and patches guest memory on the scheduler thread, but syscall/TLS
+  scan work over executable byte ranges now runs as typed worker jobs and
+  contributes to runtime diagnostics.

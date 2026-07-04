@@ -57,8 +57,9 @@ use mcr_sys::{
 };
 use mcr_task::{
     CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
-    GuestProgram, GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID,
-    TaskError, TaskState,
+    GuestProgram, GuestTask, HostWorkerPoolConfig, HostWorkerPoolDiagnostics,
+    HostWorkerPoolExecutor, HostWorkerPoolJob, HostWorkerPoolRole, INITIAL_GUEST_PID,
+    INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -446,7 +447,13 @@ impl RuntimeDiagnostics {
 
     #[must_use]
     fn capture_runtime(subsystems: &RuntimeSubsystems, events: &[SyscallTraceEvent]) -> Self {
-        Self::capture_with_native_execution(&subsystems.tasks, events, subsystems.native_execution)
+        let mut diagnostics = Self::capture_with_native_execution(
+            &subsystems.tasks,
+            events,
+            subsystems.native_execution,
+        );
+        diagnostics.worker_pools = subsystems.host_worker_pool_diagnostics().to_vec();
+        diagnostics
     }
 
     #[must_use]
@@ -4567,58 +4574,152 @@ fn find_executable_native_patches(
     memory: &mut GuestMemory,
     skipped_ranges: &[(u64, u64)],
     previous_fs_base: u64,
+    guest_task_worker_pool: Option<&HostWorkerPoolExecutor>,
 ) -> Result<ExecutableNativePatches, GuestExecutionError> {
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    let _ = previous_fs_base;
-
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
         .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
         .map(|vma| (vma.start(), vma.end()))
         .collect::<Vec<_>>();
-    let mut patches = ExecutableNativePatches::default();
-    for (start, end) in executable_ranges {
-        let len = usize::try_from(end - start)
-            .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
-        let range_start = Instant::now();
-        host_step_trace(format_args!(
-            "runtime native-patch-scan start range=[0x{start:016x}..0x{end:016x}) bytes={len}"
-        ));
-        let mut bytes = vec![0; len];
-        memory.read(start, &mut bytes)?;
-        patches.scanned_ranges.push((start, end));
-        let syscall_patch_start_len = patches.syscall_patches.len();
-        for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
-            patches
-                .syscall_patches
-                .push(ExecutableSyscallPatch { address: site.rip });
-        }
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        let fs_patch_start_len = patches.fs_relative_patches.len();
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        patches.fs_relative_patches.extend(fs_relative_patch_sites(
-            &bytes,
-            start,
+
+    if let Some(pool) = guest_task_worker_pool
+        && let Some(patches) = try_find_executable_native_patches_on_worker_pool(
+            memory,
+            &executable_ranges,
             previous_fs_base,
-        ));
-        host_step_trace(format_args!(
-            "runtime native-patch-scan done range=[0x{start:016x}..0x{end:016x}) syscall_patches={} fs_relative_patches={} elapsed_ms={}",
-            patches.syscall_patches.len() - syscall_patch_start_len,
-            {
-                #[cfg(all(windows, target_arch = "x86_64"))]
-                {
-                    patches.fs_relative_patches.len() - fs_patch_start_len
-                }
-                #[cfg(not(all(windows, target_arch = "x86_64")))]
-                {
-                    0
-                }
-            },
-            host_step_elapsed_ms(range_start)
-        ));
+            pool,
+        )?
+    {
+        return Ok(patches);
+    }
+
+    find_executable_native_patches_synchronously(memory, &executable_ranges, previous_fs_base)
+}
+
+fn find_executable_native_patches_synchronously(
+    memory: &GuestMemory,
+    executable_ranges: &[(u64, u64)],
+    previous_fs_base: u64,
+) -> Result<ExecutableNativePatches, GuestExecutionError> {
+    let mut patches = ExecutableNativePatches::default();
+    for (start, end) in executable_ranges.iter().copied() {
+        let bytes = read_executable_patch_range(memory, start, end)?;
+        merge_executable_native_patches(
+            &mut patches,
+            scan_executable_native_patch_range(start, end, bytes, previous_fs_base),
+        );
     }
     Ok(patches)
+}
+
+fn try_find_executable_native_patches_on_worker_pool(
+    memory: &GuestMemory,
+    executable_ranges: &[(u64, u64)],
+    previous_fs_base: u64,
+    pool: &HostWorkerPoolExecutor,
+) -> Result<Option<ExecutableNativePatches>, GuestExecutionError> {
+    let mut jobs = Vec::with_capacity(executable_ranges.len());
+    for (start, end) in executable_ranges.iter().copied() {
+        let bytes = read_executable_patch_range(memory, start, end)?;
+        match pool.submit_result(move || {
+            scan_executable_native_patch_range(start, end, bytes, previous_fs_base)
+        }) {
+            Ok(job) => jobs.push(job),
+            Err(error) => {
+                host_step_trace(format_args!(
+                    "runtime native-patch-scan worker submit fallback range=[0x{start:016x}..0x{end:016x}) error={error}"
+                ));
+                drain_native_patch_scan_jobs(jobs);
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut patches = ExecutableNativePatches::default();
+    for job in jobs {
+        match job.recv() {
+            Ok(range_patches) => merge_executable_native_patches(&mut patches, range_patches),
+            Err(error) => {
+                host_step_trace(format_args!(
+                    "runtime native-patch-scan worker receive fallback error={error}"
+                ));
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(patches))
+}
+
+fn drain_native_patch_scan_jobs(jobs: Vec<HostWorkerPoolJob<ExecutableNativePatches>>) {
+    for job in jobs {
+        let _ = job.recv();
+    }
+}
+
+fn read_executable_patch_range(
+    memory: &GuestMemory,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, GuestExecutionError> {
+    let len = usize::try_from(end - start)
+        .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+    let mut bytes = vec![0; len];
+    memory.read(start, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn scan_executable_native_patch_range(
+    start: u64,
+    end: u64,
+    bytes: Vec<u8>,
+    previous_fs_base: u64,
+) -> ExecutableNativePatches {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = previous_fs_base;
+
+    let range_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime native-patch-scan start range=[0x{start:016x}..0x{end:016x}) bytes={}",
+        bytes.len()
+    ));
+    let mut patches = ExecutableNativePatches::default();
+    patches.scanned_ranges.push((start, end));
+    for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
+        patches
+            .syscall_patches
+            .push(ExecutableSyscallPatch { address: site.rip });
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    patches
+        .fs_relative_patches
+        .extend(fs_relative_patch_sites(&bytes, start, previous_fs_base));
+    host_step_trace(format_args!(
+        "runtime native-patch-scan done range=[0x{start:016x}..0x{end:016x}) syscall_patches={} fs_relative_patches={} elapsed_ms={}",
+        patches.syscall_patches.len(),
+        {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                patches.fs_relative_patches.len()
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                0
+            }
+        },
+        host_step_elapsed_ms(range_start)
+    ));
+    patches
+}
+
+fn merge_executable_native_patches(
+    target: &mut ExecutableNativePatches,
+    range: ExecutableNativePatches,
+) {
+    target.scanned_ranges.extend(range.scanned_ranges);
+    target.syscall_patches.extend(range.syscall_patches);
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    target.fs_relative_patches.extend(range.fs_relative_patches);
 }
 
 fn apply_executable_syscall_patches(
@@ -5438,6 +5539,7 @@ fn percentile_us(samples: &[u128], percentile: usize) -> u128 {
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
+    guest_task_worker_pool: Option<Arc<HostWorkerPoolExecutor>>,
     files: RuntimeFileSystem<GuestMemory>,
     file_backed_mapping_cache: FileBackedMappingCache,
     process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
@@ -5480,6 +5582,14 @@ fn native_image_patch_maps(
     )
 }
 
+fn start_guest_task_worker_pool() -> Option<Arc<HostWorkerPoolExecutor>> {
+    HostWorkerPoolExecutor::new(HostWorkerPoolConfig::default_for(
+        HostWorkerPoolRole::GuestTaskExecution,
+    ))
+    .ok()
+    .map(Arc::new)
+}
+
 impl RuntimeSubsystems {
     pub fn new(program: GuestProgram) -> Result<Self, RuntimeError> {
         Self::with_vfs(program, Self::default_vfs())
@@ -5502,6 +5612,7 @@ impl RuntimeSubsystems {
             native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
+            guest_task_worker_pool: start_guest_task_worker_pool(),
             files: RuntimeFileSystem::new(vfs, memory),
             file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
@@ -5541,6 +5652,7 @@ impl RuntimeSubsystems {
             native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
+            guest_task_worker_pool: start_guest_task_worker_pool(),
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
             file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
@@ -5589,6 +5701,14 @@ impl RuntimeSubsystems {
 
     fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
         self.native_fp.insert(tid, state);
+    }
+
+    fn host_worker_pool_diagnostics(&self) -> [HostWorkerPoolDiagnostics; 2] {
+        let mut diagnostics = self.tasks.host_worker_pool_diagnostics();
+        if let Some(pool) = self.guest_task_worker_pool.as_ref() {
+            diagnostics[0] = pool.diagnostics();
+        }
+        diagnostics
     }
 
     fn cached_native_patch_metadata(
@@ -5674,6 +5794,7 @@ impl RuntimeSubsystems {
 
         let scanned_ranges = cache.scanned_ranges.clone();
         let scanned_metadata;
+        let guest_task_worker_pool = self.guest_task_worker_pool.clone();
         host_step_trace(format_args!(
             "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
             scanned_ranges.len()
@@ -5682,7 +5803,12 @@ impl RuntimeSubsystems {
             let memory = self
                 .memory_for_process_mut(pid)
                 .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-            let patches = find_executable_native_patches(memory, &scanned_ranges, cache.fs_base)?;
+            let patches = find_executable_native_patches(
+                memory,
+                &scanned_ranges,
+                cache.fs_base,
+                guest_task_worker_pool.as_deref(),
+            )?;
             scanned_metadata = native_patch_metadata_from_patches(&patches);
             apply_executable_syscall_patches(memory, &patches.syscall_patches)?;
             #[cfg(all(windows, target_arch = "x86_64"))]
@@ -16012,6 +16138,16 @@ mod tests {
         ))
         .unwrap();
         let pid = INITIAL_GUEST_PID;
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .native_image_patch_keys
+            .clear();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .native_image_patch_ranges
+            .clear();
 
         runtime
             .dispatcher
@@ -16076,6 +16212,38 @@ mod tests {
                 .iter()
                 .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
         );
+    }
+
+    #[test]
+    fn native_patch_scanner_uses_guest_task_worker_pool() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[0x0f, 0x05, 0x90],
+        ))
+        .unwrap();
+        let pool = mcr_task::HostWorkerPoolExecutor::new(
+            mcr_task::HostWorkerPoolConfig::with_queue_capacity(
+                mcr_task::HostWorkerPoolRole::GuestTaskExecution,
+                1,
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let patches = find_executable_native_patches(runtime.memory_mut(), &[], 0, Some(&pool))
+            .expect("native patch scanning should succeed");
+
+        assert_eq!(
+            patches.syscall_patches,
+            vec![ExecutableSyscallPatch { address: 0x401000 }]
+        );
+        assert_eq!(
+            pool.diagnostics().role(),
+            mcr_task::HostWorkerPoolRole::GuestTaskExecution
+        );
+        assert!(pool.diagnostics().submitted_jobs() >= 1);
     }
 
     #[test]
