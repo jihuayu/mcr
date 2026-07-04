@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rootfs_defers_regular_file_content_until_open() {
+    fn load_rootfs_defers_regular_file_content_until_host_read() {
         let rootfs = TestRootfs::new("lazy-open");
         rootfs.write_file("/payload.txt", b"first");
 
@@ -1033,7 +1033,7 @@ mod tests {
         let count = vfs.read(fd, &mut buffer).unwrap();
         vfs.close(fd).unwrap();
 
-        assert_eq!(&buffer[..count], b"late!");
+        assert_eq!(&buffer[..count], b"after");
     }
 
     #[test]
