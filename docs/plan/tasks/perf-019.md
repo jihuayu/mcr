@@ -58,3 +58,7 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   now returns a `HostWorkerPoolJob<T>` handle that preserves bounded submission
   semantics while allowing runtime/network callers to wait for typed I/O or
   guest-task results without creating ad hoc channels outside the pool boundary.
+- Routed the blocking Windows IOCP stream send completion wait through the
+  `IoCompletion` worker pool in `mcr-net`. The guest syscall still returns only
+  after the matching `WSASend` completion, but the host wait now runs inside the
+  bounded pool and is visible through worker-pool diagnostics.

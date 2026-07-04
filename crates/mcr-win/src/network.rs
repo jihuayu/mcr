@@ -2367,6 +2367,12 @@ struct WsaOverlapped {
 }
 
 #[cfg(windows)]
+// SAFETY: `WsaOverlapped` owns a Windows event handle and plain OVERLAPPED
+// fields. Pending socket operations move this owner to a worker thread without
+// sharing mutable access to the same OVERLAPPED allocation.
+unsafe impl Send for WsaOverlapped {}
+
+#[cfg(windows)]
 impl WsaOverlapped {
     const fn new(event: crate::windows::Handle) -> Self {
         Self {

@@ -131,6 +131,7 @@ dependencies = [
 name = "mcr-net"
 version = "0.1.0"
 dependencies = [
+ "mcr-task",
  "mcr-win",
 ]
 

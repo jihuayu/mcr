@@ -3,9 +3,14 @@ use std::io::{IoSlice, IoSliceMut};
 use std::{
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::Arc,
     time::Duration,
 };
 
+use mcr_task::{
+    HostWorkerPoolConfig, HostWorkerPoolExecutor, HostWorkerPoolJobError, HostWorkerPoolRole,
+    HostWorkerPoolSubmitError,
+};
 use mcr_win::{
     AddressFamily, HostAcceptExSubmission, HostConnectExSubmission, HostError, HostErrorKind,
     HostIoCompletionPort, HostRioCapability, HostShutdown, HostSocket, HostSocketIoDirection,
@@ -702,12 +707,33 @@ fn checked_iovec_total_len(lengths: impl IntoIterator<Item = usize>) -> Result<u
 #[derive(Debug)]
 pub struct WinHostSocketTransport {
     stack: NetworkStack,
+    io_completion_pool: Option<Arc<HostWorkerPoolExecutor>>,
 }
 
 impl WinHostSocketTransport {
     pub fn new() -> Result<Self, HostIoError> {
+        let io_completion_pool = HostWorkerPoolExecutor::new(HostWorkerPoolConfig::default_for(
+            HostWorkerPoolRole::IoCompletion,
+        ))
+        .map(Arc::new)
+        .map_err(|error| {
+            HostIoError::new(
+                LinuxErrno::OperationNotSupported,
+                format!("start IO completion worker pool: {error}"),
+            )
+        })?;
         Ok(Self {
             stack: NetworkStack::start().map_err(HostIoError::from)?,
+            io_completion_pool: Some(io_completion_pool),
+        })
+    }
+
+    pub fn with_io_completion_pool(
+        io_completion_pool: Arc<HostWorkerPoolExecutor>,
+    ) -> Result<Self, HostIoError> {
+        Ok(Self {
+            stack: NetworkStack::start().map_err(HostIoError::from)?,
+            io_completion_pool: Some(io_completion_pool),
         })
     }
 }
@@ -723,6 +749,7 @@ impl HostSocketTransport for WinHostSocketTransport {
         let protocol = host_protocol_from_socket_protocol(spec.effective_protocol());
         let (socket, completion_port) = match HostIoCompletionPort::new() {
             Ok(port) => {
+                let port = Arc::new(port);
                 let socket = self
                     .stack
                     .open_socket_with_iocp(family, kind, protocol, &port, WIN_IOCP_COMPLETION_KEY)
@@ -745,6 +772,7 @@ impl HostSocketTransport for WinHostSocketTransport {
             socket,
             spec,
             completion_port,
+            io_completion_pool: self.io_completion_pool.clone(),
             pending_accept: None,
             accepted_fast_path: None,
             accept_error: None,
@@ -763,7 +791,8 @@ impl HostSocketTransport for WinHostSocketTransport {
 struct WinHostSocketHandle {
     socket: HostSocket,
     spec: SocketSpec,
-    completion_port: Option<HostIoCompletionPort>,
+    completion_port: Option<Arc<HostIoCompletionPort>>,
+    io_completion_pool: Option<Arc<HostWorkerPoolExecutor>>,
     pending_accept: Option<PendingHostAcceptEx>,
     accepted_fast_path: Option<(HostSocket, SocketAddress)>,
     accept_error: Option<HostIoError>,
@@ -789,6 +818,9 @@ impl WinHostSocketHandle {
     fn can_use_iocp_send(&self) -> bool {
         self.completion_port.is_some()
             && !self.spec.flags.nonblocking
+            && self.pending_accept.is_none()
+            && self.pending_connect.is_none()
+            && self.pending_recv.is_none()
             && self.spec.socket_type == SocketType::Stream
             && self.spec.effective_protocol() == SocketProtocol::Tcp
     }
@@ -920,6 +952,19 @@ impl WinHostSocketHandle {
     }
 
     fn wait_send_completion(&mut self, pending: PendingHostSocketIo) -> Result<usize, HostIoError> {
+        if let Some(pool) = self.io_completion_pool.as_ref()
+            && let Some(port) = self.completion_port.as_ref()
+        {
+            let job = pool
+                .submit_result({
+                    let port = port.clone();
+                    move || wait_socket_io_completion_on_worker(port, pending)
+                })
+                .map_err(worker_submit_error)?;
+            let submission = job.recv().map_err(worker_job_error)??;
+            return self.finish_send_submission(submission);
+        }
+
         loop {
             let packet = {
                 let port = self.completion_port.as_ref().ok_or_else(|| {
@@ -939,6 +984,35 @@ impl WinHostSocketHandle {
             self.complete_recv_packet(packet)?;
         }
     }
+}
+
+fn wait_socket_io_completion_on_worker(
+    port: Arc<HostIoCompletionPort>,
+    pending: PendingHostSocketIo,
+) -> Result<HostSocketIoSubmission, HostIoError> {
+    loop {
+        let Some(packet) = port.get(None).map_err(HostIoError::from)? else {
+            continue;
+        };
+        if pending.matches_completion(packet) {
+            return Ok(pending.complete_from_packet(packet));
+        }
+    }
+}
+
+fn worker_submit_error(error: HostWorkerPoolSubmitError) -> HostIoError {
+    HostIoError::new(
+        LinuxErrno::OperationWouldBlock,
+        format!("IO completion worker submit failed: {error}"),
+    )
+}
+
+fn worker_job_error(error: HostWorkerPoolJobError) -> HostIoError {
+    let errno = match error {
+        HostWorkerPoolJobError::Panicked => LinuxErrno::ConnectionReset,
+        HostWorkerPoolJobError::TimedOut => LinuxErrno::TimedOut,
+    };
+    HostIoError::new(errno, format!("IO completion worker failed: {error}"))
 }
 
 impl HostSocketHandle for WinHostSocketHandle {
@@ -973,6 +1047,7 @@ impl HostSocketHandle for WinHostSocketHandle {
                     socket,
                     spec,
                     completion_port: None,
+                    io_completion_pool: self.io_completion_pool.clone(),
                     pending_accept: None,
                     accepted_fast_path: None,
                     accept_error: None,
@@ -1016,6 +1091,7 @@ impl HostSocketHandle for WinHostSocketHandle {
                 socket,
                 spec: self.spec,
                 completion_port: None,
+                io_completion_pool: self.io_completion_pool.clone(),
                 pending_accept: None,
                 accepted_fast_path: None,
                 accept_error: None,
@@ -4948,6 +5024,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn win_host_transport_iocp_send_moves_stream_bytes() {
+        let worker_pool = Arc::new(
+            HostWorkerPoolExecutor::new(
+                HostWorkerPoolConfig::with_queue_capacity(HostWorkerPoolRole::IoCompletion, 1, 4)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
         let stack = NetworkStack::start().expect("network stack");
         let listener = stack
             .open_socket(
@@ -4967,7 +5050,8 @@ mod tests {
         let server_addr = SocketAddress::from(listener.local_addr().unwrap());
 
         let mut table = GuestSocketTable::with_transport(
-            WinHostSocketTransport::new().expect("host transport"),
+            WinHostSocketTransport::with_io_completion_pool(worker_pool.clone())
+                .expect("host transport"),
         );
         let client = table
             .create_socket_from_spec(
@@ -5019,6 +5103,7 @@ mod tests {
         let count = server.recv(&mut buffer).unwrap();
         assert_eq!(count, 9);
         assert_eq!(&buffer[..count], b"iocp-send");
+        assert_eq!(worker_pool.diagnostics().completed_jobs(), 1);
     }
 
     #[cfg(windows)]
