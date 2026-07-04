@@ -34,5 +34,9 @@ MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored network_smoke_contract
 
 - Normal `cargo test --workspace` must not require internet access, GitHub access, CA certificates, or materialized rootfs payloads.
 - The opt-in smokes must run through `mcr run-rootfs alpine-rootfs /bin/sh -c ...`, not the host shell.
-- The public-network smoke set must include `curl --version`, `curl -fsSL https://example.com >/dev/null`, `git --version`, and `git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world`.
+- The public-network smoke matrix must include `curl --version`,
+  `curl -fsSL https://example.com >/dev/null`, `git --version`,
+  `git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null`,
+  `git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world-shallow`,
+  and `git clone https://github.com/octocat/Hello-World.git /tmp/hello-world-full`.
 - The implementation must not check in rootfs archives, extracted rootfs directories, or cloned repositories.

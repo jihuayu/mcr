@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+//! Runtime errors preserve native fault diagnostics and guest register snapshots.
 
 mod build_run;
 pub mod memory;
@@ -59,9 +60,6 @@ use mcr_vfs::{
     OpenFlags, ProcSelfData, RegularFileCacheKey, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
-
-#[cfg(test)]
-static NATIVE_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -130,6 +128,19 @@ const LINUX_STATFS_SIZE: usize = 120;
 const LINUX_EXT_SUPER_MAGIC: u64 = 0xef53;
 const LINUX_TMPFS_MAGIC: u64 = 0x0102_1994;
 const LINUX_STATFS_BLOCK_SIZE: u64 = 4096;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static NATIVE_EXECUTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn native_execution_test_guard() -> MutexGuard<'static, ()> {
+        NATIVE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinuxOpenHow {
@@ -7409,9 +7420,7 @@ mod tests {
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
 
     fn native_execution_test_guard() -> MutexGuard<'static, ()> {
-        crate::NATIVE_EXECUTION_TEST_LOCK
-            .lock()
-            .expect("native execution test lock should not be poisoned")
+        crate::test_support::native_execution_test_guard()
     }
     use mcr_vfs::{
         AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,

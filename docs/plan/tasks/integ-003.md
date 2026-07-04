@@ -35,7 +35,9 @@ cargo test --workspace
 mcr run-rootfs alpine-rootfs /bin/sh -c "curl --version"
 mcr run-rootfs alpine-rootfs /bin/sh -c "git --version"
 mcr run-rootfs alpine-rootfs /bin/sh -c "curl -fsSL https://example.com >/dev/null"
-mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world"
+mcr run-rootfs alpine-rootfs /bin/sh -c "git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null"
+mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world-shallow"
+mcr run-rootfs alpine-rootfs /bin/sh -c "git clone https://github.com/octocat/Hello-World.git /tmp/hello-world-full"
 ```
 
 ## Notes

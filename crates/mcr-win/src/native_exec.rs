@@ -138,6 +138,7 @@ mod windows_x86_64 {
         registers: *mut HostCpuRegisters,
         host_fs: u64,
         host_rflags: u64,
+        active_thread_id: u32,
         fault_code: u32,
         fault_address: u64,
     }
@@ -402,6 +403,8 @@ mod windows_x86_64 {
             registers,
             host_fs: 0,
             host_rflags: 0x202,
+            // SAFETY: `GetCurrentThreadId` has no preconditions and returns the caller's ID.
+            active_thread_id: unsafe { GetCurrentThreadId() },
             fault_code: 0,
             fault_address: 0,
         };
@@ -460,6 +463,10 @@ mod windows_x86_64 {
 
         // SAFETY: Windows invokes vectored handlers with valid exception and context pointers.
         let state = unsafe { &mut *state };
+        // SAFETY: `GetCurrentThreadId` has no preconditions and returns the handler thread's ID.
+        if unsafe { GetCurrentThreadId() } != state.active_thread_id {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         let pointers = unsafe { &mut *exception_info };
         if pointers.exception_record.is_null() || pointers.context_record.is_null() {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -528,6 +535,7 @@ mod windows_x86_64 {
             first: u32,
             handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
         ) -> *mut c_void;
+        fn GetCurrentThreadId() -> u32;
         fn RemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     }
 }

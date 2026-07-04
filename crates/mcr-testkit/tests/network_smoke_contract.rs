@@ -1,10 +1,13 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::{env, fs};
 
 use mcr_testkit::{FixtureRoot, Result, SmokeCommand};
 
 const ALPINE_ROOTFS: &str = "alpine-rootfs";
+// Ignored network smokes share one materialized rootfs and write under /tmp.
+static NETWORK_SMOKE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NetworkSmokeContract {
@@ -28,17 +31,29 @@ const GIT_VERSION: NetworkSmokeContract = NetworkSmokeContract {
     script: "git --version",
     cleanup_guest_path: None,
 };
-const GIT_CLONE_HELLO_WORLD: NetworkSmokeContract = NetworkSmokeContract {
-    name: "git clone Hello-World",
-    script: "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world",
-    cleanup_guest_path: Some("/tmp/hello-world"),
+const GIT_LS_REMOTE_HELLO_WORLD: NetworkSmokeContract = NetworkSmokeContract {
+    name: "git ls-remote Hello-World",
+    script: "git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null",
+    cleanup_guest_path: None,
+};
+const GIT_CLONE_HELLO_WORLD_SHALLOW: NetworkSmokeContract = NetworkSmokeContract {
+    name: "git clone Hello-World shallow",
+    script: "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world-shallow",
+    cleanup_guest_path: Some("/tmp/hello-world-shallow"),
+};
+const GIT_CLONE_HELLO_WORLD_FULL: NetworkSmokeContract = NetworkSmokeContract {
+    name: "git clone Hello-World full",
+    script: "git clone https://github.com/octocat/Hello-World.git /tmp/hello-world-full",
+    cleanup_guest_path: Some("/tmp/hello-world-full"),
 };
 
 const NETWORK_SMOKE_CONTRACTS: &[NetworkSmokeContract] = &[
     CURL_VERSION,
     CURL_EXAMPLE,
     GIT_VERSION,
-    GIT_CLONE_HELLO_WORLD,
+    GIT_LS_REMOTE_HELLO_WORLD,
+    GIT_CLONE_HELLO_WORLD_SHALLOW,
+    GIT_CLONE_HELLO_WORLD_FULL,
 ];
 
 #[derive(Debug)]
@@ -137,11 +152,26 @@ fn network_smoke_contract_git_version() -> Result<()> {
 
 #[test]
 #[ignore = "requires MCR_BIN, materialized alpine-rootfs with curl/git/CA, and public network"]
-fn network_smoke_contract_git_clone_hello_world() -> Result<()> {
-    run_network_smoke(GIT_CLONE_HELLO_WORLD)
+fn network_smoke_contract_git_ls_remote_hello_world() -> Result<()> {
+    run_network_smoke(GIT_LS_REMOTE_HELLO_WORLD)
+}
+
+#[test]
+#[ignore = "requires MCR_BIN, materialized alpine-rootfs with curl/git/CA, and public network"]
+fn network_smoke_contract_git_clone_hello_world_shallow() -> Result<()> {
+    run_network_smoke(GIT_CLONE_HELLO_WORLD_SHALLOW)
+}
+
+#[test]
+#[ignore = "requires MCR_BIN, materialized alpine-rootfs with curl/git/CA, and public network"]
+fn network_smoke_contract_git_clone_hello_world_full() -> Result<()> {
+    run_network_smoke(GIT_CLONE_HELLO_WORLD_FULL)
 }
 
 fn run_network_smoke(contract: NetworkSmokeContract) -> Result<()> {
+    let _guard = NETWORK_SMOKE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(context) = NetworkSmokeContext::discover()? else {
         return Ok(());
     };

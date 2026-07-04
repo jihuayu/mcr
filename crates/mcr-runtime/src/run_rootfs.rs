@@ -1338,8 +1338,10 @@ mod tests {
 
     impl TestRootfs {
         fn new(name: &str) -> Self {
-            let native_guard = crate::NATIVE_EXECUTION_TEST_LOCK.lock().unwrap();
-            let guard = RUN_ROOTFS_TEST_LOCK.lock().unwrap();
+            let native_guard = crate::test_support::native_execution_test_guard();
+            let guard = RUN_ROOTFS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = std::env::temp_dir().join(format!(
                 "mcr-runtime-run-rootfs-{name}-{}-{:?}",
                 std::process::id(),
