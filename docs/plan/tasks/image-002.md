@@ -1,7 +1,7 @@
 ---
 id: image-002
 scope: phase3-image
-status: pending
+status: in-progress
 depends-on: [image-001, snapshot-001]
 ---
 
@@ -36,3 +36,10 @@ cargo test -p mcr-snapshot
 - Reject image indexes without a compatible `linux/amd64` manifest.
 - Use deterministic fixture images or a local registry for tests.
 - This task does not write final image outputs.
+- Initial pull-boundary checkpoint: added typed OCI reference parsing,
+  `linux/amd64` image-index manifest selection, manifest-to-pull planning, and
+  digest/size-verified layer blobs. Uncompressed OCI tar layers can now cross
+  into `mcr-snapshot` as read-only base-layer snapshots through deterministic
+  in-memory tests.
+- Remaining work: registry HTTP transport, auth/token handling, remote blob
+  fetching, and gzip layer decompression are still outside this checkpoint.

@@ -115,6 +115,7 @@ dependencies = [
 name = "mcr-image"
 version = "0.1.0"
 dependencies = [
+ "mcr-snapshot",
  "sha2",
 ]
 
