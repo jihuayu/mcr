@@ -11,6 +11,7 @@ on:
         options:
           - shell
           - network
+          - performance
           - all
 
 jobs:
@@ -48,3 +49,13 @@ jobs:
         run: |
           $env:MCR_BIN = (Resolve-Path target/debug/mcr.exe).Path
           cargo test -p mcr-testkit --test network_smoke_contract -- --ignored network_smoke_contract --nocapture
+
+      - name: Run performance baselines
+        if: ${{ inputs.suite == 'performance' || inputs.suite == 'all' }}
+        shell: pwsh
+        run: |
+          $env:MCR_BIN = (Resolve-Path target/debug/mcr.exe).Path
+          cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
+          cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
+          cargo test -p mcr-net perf_baseline -- --ignored --nocapture
+          cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture

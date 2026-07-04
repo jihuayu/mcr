@@ -187,6 +187,24 @@ Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
 `/bin/sh`, `-c`, and the guest command. They do not execute the command string
 through the host shell.
 
+Ignored performance baselines print `mcr_perf_baseline.version=1` reports with
+environment metadata, wall time, operation counts, and derived throughput. They
+are measurement gates, not tuning changes or pass/fail thresholds. Run local
+subsystem baselines with:
+
+```powershell
+cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
+cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
+cargo test -p mcr-net perf_baseline -- --ignored --nocapture
+```
+
+The guest workload baseline additionally requires `MCR_BIN`, a materialized
+`alpine-rootfs`, and public network access for `curl` and `git ls-remote`:
+
+```powershell
+MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
+```
+
 Linux x86-64 guest smokes must be treated as x86_64-host validation. Do not
 expand `mcr-jit` into a broad x86 interpreter to make those smokes pass on an
 ARM developer machine. Use the manual `x86_64 Runtime Smokes` GitHub Actions
@@ -195,6 +213,7 @@ workflow for the required proof:
 ```powershell
 gh workflow run x86-runtime-smoke.yml -f suite=shell
 gh workflow run x86-runtime-smoke.yml -f suite=network
+gh workflow run x86-runtime-smoke.yml -f suite=performance
 ```
 
 For local ARM development, run the same commands inside an x86_64 VM/container.

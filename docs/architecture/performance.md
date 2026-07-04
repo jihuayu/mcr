@@ -235,3 +235,27 @@ At minimum, the plan needs:
 
 Correctness tests remain required. A faster backend that fails Linux ABI
 compatibility is not acceptable.
+
+## Repeatable Baseline Harness
+
+`perf-001` introduces a baseline harness before any backend tuning. The harness
+prints a line-oriented `mcr_perf_baseline.version=1` report with environment
+metadata, wall-clock milliseconds, operation counts, and derived operations per
+second for each measured path.
+
+The first baseline suites are intentionally split by subsystem boundary:
+
+- `mcr-runtime` measures synthetic guest syscall dispatch and
+  `fork+execve+wait4` process startup paths through `run_rootfs`;
+- `mcr-vfs` measures local small-file create/write/read/close loops and
+  directory `getdents64` plus per-entry `statx` walks;
+- `mcr-net` measures high-concurrency loopback accept/recv/send behavior through
+  `WinHostSocketTransport`;
+- `mcr-testkit` measures guest shell startup, small-file I/O, directory
+  metadata walks, `curl`, and `git ls-remote` through the materialized Alpine
+  rootfs and `MCR_BIN`.
+
+These suites are baselines, not performance assertions. They should fail only
+when the measured workload itself fails. Thresholds, trend storage, and
+regression budgets belong in later performance tasks after `workload-001` makes
+the Phase 2 workload matrix stable.
