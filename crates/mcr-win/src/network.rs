@@ -437,6 +437,47 @@ impl PendingHostSocketIo {
     fn mark_completed_platform(&mut self) {}
 }
 
+/// Registered I/O capability reported by the host for a socket.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct HostRioCapability {
+    supported: bool,
+    error_code: Option<i32>,
+    function_count: usize,
+}
+
+impl HostRioCapability {
+    const fn supported(function_count: usize) -> Self {
+        Self {
+            supported: true,
+            error_code: None,
+            function_count,
+        }
+    }
+
+    const fn unsupported(error_code: Option<i32>) -> Self {
+        Self {
+            supported: false,
+            error_code,
+            function_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        self.supported
+    }
+
+    #[must_use]
+    pub const fn error_code(self) -> Option<i32> {
+        self.error_code
+    }
+
+    #[must_use]
+    pub const fn function_count(self) -> usize {
+        self.function_count
+    }
+}
+
 /// Winsock runtime lifetime guard.
 #[derive(Debug)]
 pub struct NetworkStack {
@@ -582,6 +623,11 @@ impl HostSocket {
     /// Looks up a Winsock extension function pointer for this socket.
     pub fn extension_function(&self, kind: SocketFastPathKind) -> HostResult<usize> {
         extension_function_platform(self, kind)
+    }
+
+    /// Queries whether Registered I/O is available for this socket.
+    pub fn rio_capability(&self) -> HostResult<HostRioCapability> {
+        rio_capability_platform(self)
     }
 
     /// Submits an overlapped receive. The socket must be associated with an IOCP.
@@ -782,6 +828,11 @@ fn extension_function_platform(
     _kind: SocketFastPathKind,
 ) -> HostResult<usize> {
     Err(HostError::unsupported(HostOperation::GetSocketOption))
+}
+
+#[cfg(not(windows))]
+fn rio_capability_platform(_socket: &HostSocket) -> HostResult<HostRioCapability> {
+    Ok(HostRioCapability::unsupported(None))
 }
 
 #[cfg(not(windows))]
@@ -1221,6 +1272,41 @@ fn extension_function_platform(socket: &HostSocket, kind: SocketFastPathKind) ->
         return Err(HostError::invalid_input(HostOperation::GetSocketOption));
     }
     Ok(function)
+}
+
+#[cfg(windows)]
+fn rio_capability_platform(socket: &HostSocket) -> HostResult<HostRioCapability> {
+    let mut guid = WSAID_MULTIPLE_RIO;
+    let mut table = RioExtensionFunctionTable::default();
+    let mut bytes_returned = 0u32;
+    let status = unsafe {
+        // SAFETY: Input and output buffers point to initialized stack storage for this call.
+        WSAIoctl(
+            socket.raw(),
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            std::ptr::from_mut(&mut guid).cast(),
+            std::mem::size_of::<Guid>() as u32,
+            std::ptr::from_mut(&mut table).cast(),
+            std::mem::size_of::<RioExtensionFunctionTable>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Ok(HostRioCapability::unsupported(Some(
+            crate::windows::wsa_last_error(),
+        )));
+    }
+    if bytes_returned < std::mem::size_of::<u32>() as u32 || table.cb_size == 0 {
+        return Ok(HostRioCapability::unsupported(None));
+    }
+    let function_count = table
+        .functions
+        .iter()
+        .filter(|function| **function != 0)
+        .count();
+    Ok(HostRioCapability::supported(function_count))
 }
 
 #[cfg(windows)]
@@ -1676,6 +1762,35 @@ const WSAID_CONNECTEX: Guid = Guid {
     data3: 0x4660,
     data4: [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
 };
+
+#[cfg(windows)]
+const WSAID_MULTIPLE_RIO: Guid = Guid {
+    data1: 0x8509_e081,
+    data2: 0x96dd,
+    data3: 0x4005,
+    data4: [0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f],
+};
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RioExtensionFunctionTable {
+    cb_size: u32,
+    functions: [usize; RIO_FUNCTION_COUNT],
+}
+
+#[cfg(windows)]
+impl Default for RioExtensionFunctionTable {
+    fn default() -> Self {
+        Self {
+            cb_size: std::mem::size_of::<Self>() as u32,
+            functions: [0; RIO_FUNCTION_COUNT],
+        }
+    }
+}
+
+#[cfg(windows)]
+const RIO_FUNCTION_COUNT: usize = 13;
 
 #[cfg(windows)]
 #[derive(Debug)]
@@ -2215,6 +2330,23 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rio_capability_reports_supported_or_explicit_fallback() {
+        let stack = NetworkStack::start().unwrap();
+        let socket = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+
+        let capability = socket.rio_capability().unwrap();
+        if capability.is_supported() {
+            assert_eq!(capability.error_code(), None);
+            assert!(capability.function_count() > 0);
+        } else {
+            assert_eq!(capability.function_count(), 0);
+        }
     }
 
     #[cfg(windows)]

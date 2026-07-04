@@ -44,3 +44,11 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
 - If the host does not support RIO, tests must prove explicit fallback behavior.
 - Registered buffers must not bypass guest memory validation or outlive their
   owning runtime state.
+
+## Checkpoints
+
+- Added the `mcr-win` Registered I/O capability gate. `HostSocket::rio_capability`
+  probes `WSAID_MULTIPLE_RIO` with `WSAIoctl` and reports either a supported
+  RIO function-table shape or an explicit unsupported fallback. No RIO data path
+  is enabled yet; future work must still provide opt-in measurement evidence,
+  registered-buffer lifetime proofs, and comparison against the IOCP backend.
