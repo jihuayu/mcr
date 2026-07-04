@@ -9,4 +9,6 @@ workspace = true
 
 [dev-dependencies]
 mcr-net.workspace = true
+mcr-runtime.workspace = true
+mcr-sys.workspace = true
 mcr-task.workspace = true

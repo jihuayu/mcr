@@ -5,6 +5,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use mcr_net::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
+use mcr_runtime::{GUEST_PAGE_SIZE, GuestLibcIntrinsic, GuestMemory};
+use mcr_sys::{
+    LINUX_MAP_ANONYMOUS, LINUX_MAP_PRIVATE, LINUX_PROT_READ, LINUX_PROT_WRITE, MmapSyscallArgs,
+};
 use mcr_task::{HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPools};
 use mcr_testkit::perf::{PerfBaselineReport, PerfMeasurement, measure_wall_time};
 use mcr_testkit::{FixtureRoot, Result, SmokeCommand};
@@ -227,17 +231,24 @@ fn enforce_guest_perf_gate(workload: GuestPerfWorkload, wall_time: Duration) {
         return;
     }
 
-    let threshold_key = perf_threshold_env_key(workload.name);
+    enforce_wall_time_gate(workload.name, wall_time, workload.gate_max_wall_ms);
+}
+
+fn enforce_wall_time_gate(name: &str, wall_time: Duration, default_max_wall_ms: u64) {
+    if env::var_os("MCR_PERF_ENFORCE_GATES").is_none() {
+        return;
+    }
+
+    let threshold_key = perf_threshold_env_key(name);
     let max_wall_ms = env::var(&threshold_key)
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value > 0.0)
-        .unwrap_or(workload.gate_max_wall_ms as f64);
+        .unwrap_or(default_max_wall_ms as f64);
     let actual_wall_ms = wall_time.as_secs_f64() * 1_000.0;
     assert!(
         actual_wall_ms <= max_wall_ms,
-        "guest perf workload `{}` exceeded wall-time gate: actual {actual_wall_ms:.3}ms > max {max_wall_ms:.3}ms; override with {threshold_key}",
-        workload.name
+        "perf workload `{name}` exceeded wall-time gate: actual {actual_wall_ms:.3}ms > max {max_wall_ms:.3}ms; override with {threshold_key}",
     );
 }
 
@@ -298,6 +309,74 @@ fn perf_dns_cache_baseline() {
 fn perf_worker_pool_diagnostics_baseline() {
     let report =
         worker_pool_diagnostics_baseline_report("mcr-testkit worker-pool diagnostics baseline");
+
+    println!("{report}");
+}
+
+#[test]
+#[ignore = "captures runtime libc intrinsic dispatch performance baseline output"]
+fn perf_libc_intrinsic_baseline() {
+    let iterations = env_usize("MCR_PERF_LIBC_INTRINSIC_ITERATIONS", 16_384);
+    let mut memory = GuestMemory::new(0x0100_0000).expect("guest memory");
+    let base = memory
+        .mmap(MmapSyscallArgs {
+            addr: 0,
+            length: GUEST_PAGE_SIZE * 3,
+            prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+            flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            fd: -1,
+            offset: 0,
+        })
+        .expect("intrinsic scratch mapping");
+    let src = base;
+    let dst = base + GUEST_PAGE_SIZE;
+    let other = base + GUEST_PAGE_SIZE * 2;
+    let mut payload = vec![b'a'; 511];
+    payload.push(0);
+    memory.write(src, &payload).expect("seed src");
+    memory.write(other, &payload).expect("seed other");
+
+    let (checksum, wall_time) = measure_wall_time(|| {
+        let mut checksum = 0u64;
+        for index in 0..iterations {
+            checksum ^= memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memcpy, dst, src, 256)
+                .expect("memcpy");
+            checksum ^= memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memchr, dst, b'z'.into(), 256)
+                .expect("memchr");
+            checksum ^= memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memcmp, dst, src, 256)
+                .expect("memcmp");
+            checksum ^= memory
+                .dispatch_libc_intrinsic(
+                    GuestLibcIntrinsic::Memset,
+                    other,
+                    (index & 0xff) as u64,
+                    128,
+                )
+                .expect("memset");
+            checksum ^= memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Strlen { max_len: 512 }, src, 0, 0)
+                .expect("strlen");
+        }
+        checksum
+    });
+    std::hint::black_box(checksum);
+
+    let mut report = PerfBaselineReport::new("mcr-testkit libc intrinsic performance baseline");
+    report.push(
+        PerfMeasurement::new(
+            "libc_intrinsic_dispatch",
+            (iterations * 5) as u64,
+            wall_time,
+        )
+        .with_field("iterations", iterations)
+        .with_field("routines", "memcpy,memchr,memcmp,memset,strlen")
+        .with_field("bytes_per_copy", 256)
+        .with_field("checksum", checksum),
+    );
+    enforce_wall_time_gate("libc_intrinsic_dispatch", wall_time, 5_000);
 
     println!("{report}");
 }

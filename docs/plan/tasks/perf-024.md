@@ -58,3 +58,8 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   `curl` and `git ls-remote` thresholds are enforced only when
   `MCR_PERF_ENFORCE_PUBLIC_NETWORK=1` is also set. Each workload can be
   overridden with `MCR_PERF_MAX_WALL_MS_<WORKLOAD_NAME>`.
+- Added an ignored host-only libc intrinsic dispatch baseline. It exercises the
+  runtime `GuestLibcIntrinsic` dispatch contract for `memcpy`, `memchr`,
+  `memcmp`, `memset`, and `strlen`, emits normal `mcr_perf_baseline` output, and
+  participates in `MCR_PERF_ENFORCE_GATES=1` through
+  `MCR_PERF_MAX_WALL_MS_LIBC_INTRINSIC_DISPATCH`.
