@@ -60,3 +60,9 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   tries that host mapping path before falling back to `pread`. The guest VMA is
   still runtime-owned and copied into guest memory; page-level VMA/COW reuse is
   the remaining integration step.
+- Runtime process-memory clones now reuse non-writable guest allocations by
+  sharing their host allocation owner in flexible-address mode. The first
+  write/protection mutation detaches the allocation into a private copy before
+  updating bytes or host protections, so read-only executable/library pages can
+  be reused across fork snapshots while writable mappings keep private process
+  semantics.
