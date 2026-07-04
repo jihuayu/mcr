@@ -3834,6 +3834,28 @@ impl EventSyscalls for RuntimeSubsystems {
 }
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
+    fn supports_fast_task(&self, request: &SyscallRequest) -> bool {
+        matches!(
+            request.syscall,
+            mcr_sys::Syscall::Getpid | mcr_sys::Syscall::Gettid
+        )
+    }
+
+    fn dispatch_fast_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let Some(task) = self.tasks.task(request.context.tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if task.pid() != request.context.pid {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+
+        match request.syscall {
+            mcr_sys::Syscall::Getpid => SyscallOutcome::success(u64::from(task.pid())),
+            mcr_sys::Syscall::Gettid => SyscallOutcome::success(u64::from(task.tid())),
+            _ => SyscallOutcome::unsupported(),
+        }
+    }
+
     fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         match request.syscall {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
@@ -11808,6 +11830,48 @@ mod tests {
         assert!(matches!(
             runtime.tracer().events(),
             [SyscallTraceEvent::Enter(_), SyscallTraceEvent::Exit(_)]
+        ));
+    }
+
+    #[test]
+    fn runtime_getpid_gettid_fast_path_preserves_trace_and_esrch() {
+        let mut runtime = Runtime::with_tracer(
+            test_program("/bin/app", 0x401000),
+            InMemorySyscallTracer::new(),
+        )
+        .unwrap();
+
+        let getpid = runtime.dispatch_syscall(context(Syscall::Getpid, [0; 6]));
+        let gettid = runtime.dispatch_syscall(context(Syscall::Gettid, [0; 6]));
+        let invalid_gettid = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            INITIAL_GUEST_TID + 99,
+            Syscall::Gettid,
+            [0; 6],
+        ));
+
+        assert_eq!(
+            getpid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_PID))
+        );
+        assert_eq!(
+            gettid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            invalid_gettid.result,
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+        assert!(matches!(
+            runtime.tracer().events(),
+            [
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_),
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_),
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_)
+            ]
         ));
     }
 

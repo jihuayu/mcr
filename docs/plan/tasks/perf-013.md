@@ -1,7 +1,7 @@
 ---
 id: perf-013
 scope: syscall-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, sys-001]
 ---
 
@@ -35,9 +35,15 @@ cargo test -p mcr-testkit perf_syscall_fast_path -- --ignored --nocapture
 
 ## Notes
 
+- 2026-07-04 checkpoint: `getpid` and `gettid` now use a no-memory-side-effect
+  dispatcher fast path in `mcr-sys`/`mcr-runtime`, with the same enter/exit trace
+  event shape and `SyscallReturn` Linux ABI encoding as the regular path.
 - Initial candidates are `getpid`, `gettid`, selected clock queries, `uname`,
   and other compatibility queries backed entirely by MCR-owned state.
 - Preserve structured trace events or document any reduced trace mode as an
   explicit diagnostic tradeoff.
 - I/O syscalls may get lighter decode helpers later, but still need safe guest
   memory copy-in/copy-out and subsystem routing.
+- Remaining candidates such as `uname` and clock queries that copy structures
+  into guest memory stay on the regular dispatcher path until their memory
+  semantics have focused coverage.

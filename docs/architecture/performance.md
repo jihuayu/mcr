@@ -209,6 +209,12 @@ dispatcher path after tracing and diagnostics are preserved. Candidates include
 `getpid`, `gettid`, selected clock queries, `uname`, and other compatibility
 queries that return MCR-owned state.
 
+The first fast path is deliberately narrow: `getpid` and `gettid` bypass the
+general subsystem routing path, but still emit the normal structured enter and
+exit trace events and encode Linux ABI return values through `SyscallReturn`.
+Guest-memory-copying calls, including clock queries that write `timespec`
+structures, stay on the regular dispatcher path.
+
 I/O syscalls may get lighter argument decode and errno mapping paths, but they
 must still copy guest structures safely and route through the owning subsystem.
 

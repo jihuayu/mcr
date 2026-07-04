@@ -356,6 +356,14 @@ pub trait TaskSyscalls {
     fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         unsupported_outcome(request)
     }
+
+    fn supports_fast_task(&self, _request: &SyscallRequest) -> bool {
+        false
+    }
+
+    fn dispatch_fast_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        unsupported_outcome(request)
+    }
 }
 
 pub trait TimeSyscalls {
@@ -442,6 +450,10 @@ where
 {
     pub fn dispatch(&mut self, context: GuestContext) -> SyscallDispatchResult {
         let request = SyscallRequest::from_guest_context(context);
+        if let Some(result) = self.dispatch_fast_no_memory_syscall(&request) {
+            return result;
+        }
+
         let Some(descriptor) = syscall_descriptor(request.syscall) else {
             let event = UnsupportedSyscallEvent::new(request.context, request.number, request.args)
                 .with_decoded_fields(decode_syscall_fields(request.syscall, request.args));
@@ -451,15 +463,9 @@ where
         };
 
         let decoded = decode_syscall_fields(request.syscall, request.args);
-        self.tracer
-            .record(SyscallTraceEvent::Enter(SyscallEnterEvent {
-                context: request.context,
-                syscall: request.syscall,
-                args: request.args,
-                decoded: decoded.clone(),
-            }));
+        self.record_enter(&request, decoded.clone());
 
-        let mut outcome = match descriptor.subsystem {
+        let outcome = match descriptor.subsystem {
             SyscallSubsystem::File => self.subsystems.dispatch_file(&request),
             SyscallSubsystem::Memory => self.subsystems.dispatch_memory(&request),
             SyscallSubsystem::Task => self.subsystems.dispatch_task(&request),
@@ -467,6 +473,41 @@ where
             SyscallSubsystem::Network => self.subsystems.dispatch_network(&request),
             SyscallSubsystem::Event => self.subsystems.dispatch_event(&request),
         };
+        self.record_outcome(&request, decoded, outcome)
+    }
+
+    fn dispatch_fast_no_memory_syscall(
+        &mut self,
+        request: &SyscallRequest,
+    ) -> Option<SyscallDispatchResult> {
+        if !matches!(request.syscall, Syscall::Getpid | Syscall::Gettid)
+            || !self.subsystems.supports_fast_task(request)
+        {
+            return None;
+        }
+
+        let decoded = decode_syscall_fields(request.syscall, request.args);
+        self.record_enter(request, decoded.clone());
+        let outcome = self.subsystems.dispatch_fast_task(request);
+        Some(self.record_outcome(request, decoded, outcome))
+    }
+
+    fn record_enter(&mut self, request: &SyscallRequest, decoded: Vec<TraceField>) {
+        self.tracer
+            .record(SyscallTraceEvent::Enter(SyscallEnterEvent {
+                context: request.context,
+                syscall: request.syscall,
+                args: request.args,
+                decoded,
+            }));
+    }
+
+    fn record_outcome(
+        &mut self,
+        request: &SyscallRequest,
+        decoded: Vec<TraceField>,
+        mut outcome: SyscallOutcome,
+    ) -> SyscallDispatchResult {
         let result = outcome.result;
         let mut exit_decoded = decoded;
         exit_decoded.append(&mut outcome.decoded);
@@ -1190,6 +1231,39 @@ mod tests {
     impl NetworkSyscalls for RecordingSubsystems {}
     impl EventSyscalls for RecordingSubsystems {}
 
+    #[derive(Default)]
+    struct FastTaskSubsystems {
+        fast_task_syscalls: Vec<Syscall>,
+        task_syscalls: Vec<Syscall>,
+    }
+
+    impl FileSyscalls for FastTaskSubsystems {}
+    impl MemorySyscalls for FastTaskSubsystems {}
+
+    impl TaskSyscalls for FastTaskSubsystems {
+        fn supports_fast_task(&self, request: &SyscallRequest) -> bool {
+            matches!(request.syscall, Syscall::Getpid | Syscall::Gettid)
+        }
+
+        fn dispatch_fast_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+            self.fast_task_syscalls.push(request.syscall);
+            match request.syscall {
+                Syscall::Getpid => SyscallOutcome::success(u64::from(request.context.pid)),
+                Syscall::Gettid => SyscallOutcome::success(u64::from(request.context.tid)),
+                _ => SyscallOutcome::unsupported(),
+            }
+        }
+
+        fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+            self.task_syscalls.push(request.syscall);
+            SyscallOutcome::success(99)
+        }
+    }
+
+    impl TimeSyscalls for FastTaskSubsystems {}
+    impl NetworkSyscalls for FastTaskSubsystems {}
+    impl EventSyscalls for FastTaskSubsystems {}
+
     #[test]
     fn dispatcher_calls_subsystem_and_records_enter_exit_trace() {
         let registers = SyscallRegisters {
@@ -1233,6 +1307,48 @@ mod tests {
                 assert!(event.host_error.is_none());
             }
             other => panic!("expected exit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatcher_getpid_fast_path_records_standard_trace() {
+        let registers = SyscallRegisters {
+            rax: Syscall::Getpid.number().raw(),
+            rip: 0x401234,
+            ..SyscallRegisters::default()
+        };
+        let mut dispatcher = SyscallDispatcher::with_tracer(
+            FastTaskSubsystems::default(),
+            InMemorySyscallTracer::new(),
+        );
+
+        let result = dispatcher.dispatch(GuestContext::new(77, 78, registers));
+
+        assert_eq!(result.result, SyscallReturn::Success(77));
+        assert_eq!(result.encoded_rax, 77);
+        assert_eq!(
+            dispatcher.subsystems().fast_task_syscalls,
+            vec![Syscall::Getpid]
+        );
+        assert!(dispatcher.subsystems().task_syscalls.is_empty());
+
+        match dispatcher.tracer().events() {
+            [
+                SyscallTraceEvent::Enter(enter),
+                SyscallTraceEvent::Exit(exit),
+            ] => {
+                assert_eq!(enter.context.pid, 77);
+                assert_eq!(enter.context.tid, 78);
+                assert_eq!(enter.context.rip, 0x401234);
+                assert_eq!(enter.syscall, Syscall::Getpid);
+                assert!(enter.decoded.is_empty());
+                assert_eq!(exit.syscall, Syscall::Getpid);
+                assert_eq!(exit.args.raw(), [0; 6]);
+                assert_eq!(exit.result, SyscallReturn::Success(77));
+                assert!(exit.decoded.is_empty());
+                assert!(exit.host_error.is_none());
+            }
+            other => panic!("expected enter/exit events, got {other:?}"),
         }
     }
 
