@@ -31,13 +31,16 @@ readiness, scheduling, or native execution. A package-rootfs rerun with
 Node, and Cargo each exceeded a 30s process timeout without returning a guest
 step-limit diagnostic. The remaining blocker is therefore likely inside a single
 native/host-side execution window, patch/materialization path, or equivalent
-long operation rather than repeated guest-step progress.
+long operation rather than repeated guest-step progress. `MCR_HOSTSTEP_TRACE=1`
+now emits opt-in host-side timing for rootfs loading, program loading, native
+entry/return, native patch scanning, and fork-exec memory materialization to
+pinpoint that window.
 
 | Command | Current result | Required follow-up |
 |---|---|---|
-| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault, and instruction-aware syscall patching cleared the Go `newosproc` clone failure caused by rewriting the `0x50f00` clone-flags immediate. The command now starts without that fatal error but exceeded a 30s process timeout under `--guest-step-limit 200` with no guest diagnostic. | Diagnose the native/host-side execution window or patch/materialization path that can block longer than the guest step-limit loop. |
-| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Exceeded a 30s process timeout on local Windows x86-64 with a package-backed Alpine Node rootfs under `--guest-step-limit 200` with no guest diagnostic. | Diagnose the native/host-side execution window or patch/materialization path that can block longer than the guest step-limit loop. |
-| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Exceeded a 30s process timeout on local Windows x86-64 with a package-backed Alpine Cargo rootfs under `--guest-step-limit 200` with no guest diagnostic. | Diagnose the native/host-side execution window, patch/materialization path, or filesystem-heavy host-side operation that can block longer than the guest step-limit loop. |
+| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault, and instruction-aware syscall patching cleared the Go `newosproc` clone failure caused by rewriting the `0x50f00` clone-flags immediate. The command now starts without that fatal error but exceeded a 30s process timeout under `--guest-step-limit 200` with no guest diagnostic. | Rerun with `MCR_HOSTSTEP_TRACE=1` and diagnose the native/host-side execution window or patch/materialization path that can block longer than the guest step-limit loop. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Exceeded a 30s process timeout on local Windows x86-64 with a package-backed Alpine Node rootfs under `--guest-step-limit 200` with no guest diagnostic. | Rerun with `MCR_HOSTSTEP_TRACE=1` and diagnose the native/host-side execution window or patch/materialization path that can block longer than the guest step-limit loop. |
+| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Exceeded a 30s process timeout on local Windows x86-64 with a package-backed Alpine Cargo rootfs under `--guest-step-limit 200` with no guest diagnostic. | Rerun with `MCR_HOSTSTEP_TRACE=1` and diagnose the native/host-side execution window, patch/materialization path, or filesystem-heavy host-side operation that can block longer than the guest step-limit loop. |
 
 ## Resolved Build Direction
 

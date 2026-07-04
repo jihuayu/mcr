@@ -69,3 +69,8 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   guest step-limit diagnostic. That means the remaining blocker is likely inside
   a single native/host-side execution window, patch/materialization path, or
   equivalent long operation rather than repeated guest-step progress.
+- Added opt-in host-side step tracing behind `MCR_HOSTSTEP_TRACE=1` around
+  rootfs loading, program loading, native entry/return, native patch scanning,
+  and fork-exec memory materialization. The next package-rootfs run should use
+  this trace to identify which host-side window blocks before the guest
+  step-limit loop can report a stall category.

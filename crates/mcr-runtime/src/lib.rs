@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 pub use memory::{
@@ -59,6 +59,22 @@ use mcr_win::SocketEvents;
 static NATIVE_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
+
+pub(crate) fn host_step_trace_enabled() -> bool {
+    std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
+}
+
+pub(crate) fn host_step_trace(message: fmt::Arguments<'_>) {
+    if host_step_trace_enabled() {
+        eprintln!("mcr hoststep: {message}");
+    }
+}
+
+pub(crate) fn host_step_elapsed_ms(start: Instant) -> u128 {
+    start.elapsed().as_millis()
+}
 
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -3372,10 +3388,18 @@ where
 
     let before_rip = gpr.rip();
     if dispatcher.subsystems().has_pending_fork_exec_children(pid) {
+        let materialize_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime materialize-fork-children start parent_pid={pid}"
+        ));
         dispatcher
             .subsystems_mut()
             .materialize_pending_fork_exec_children(pid)
             .map_err(GuestExecutionError::Memory)?;
+        host_step_trace(format_args!(
+            "runtime materialize-fork-children done parent_pid={pid} elapsed_ms={}",
+            host_step_elapsed_ms(materialize_start)
+        ));
     }
     if dispatcher.subsystems().has_pending_fork_exec_child(pid)
         && let Some(step) =
@@ -3487,6 +3511,9 @@ where
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
         .fs_base();
+    host_step_trace(format_args!(
+        "runtime native-step start pid={pid} tid={tid} rip=0x{before_rip:016x} fs_base=0x{fs_base:016x}"
+    ));
     {
         let memory = dispatcher
             .subsystems_mut()
@@ -3510,7 +3537,17 @@ where
         let mut native_registers = host_registers_from_gpr(gpr);
         native_registers.xmm = native_fp.xmm;
         native_registers.mxcsr = native_fp.mxcsr;
+        let native_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime native-enter pid={pid} tid={tid} rip=0x{:016x}",
+            native_registers.rip
+        ));
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
+        host_step_trace(format_args!(
+            "runtime native-return pid={pid} tid={tid} rip=0x{:016x} elapsed_ms={}",
+            native_registers.rip,
+            host_step_elapsed_ms(native_start)
+        ));
         let stack_words = native_fault_stack_words(memory, native_registers.rsp);
         native_result
             .map_err(|error| native_execution_error(error, native_registers, stack_words))?;
@@ -3682,13 +3719,20 @@ fn find_executable_native_patches(
     for (start, end) in executable_ranges {
         let len = usize::try_from(end - start)
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+        let range_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime native-patch-scan start range=[0x{start:016x}..0x{end:016x}) bytes={len}"
+        ));
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
+        let syscall_patch_start_len = patches.syscall_patches.len();
         for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
             patches
                 .syscall_patches
                 .push(ExecutableSyscallPatch { address: site.rip });
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let fs_patch_start_len = patches.fs_relative_patches.len();
         #[cfg(all(windows, target_arch = "x86_64"))]
         for offset in 0..bytes.len() {
             if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
@@ -3699,6 +3743,21 @@ fn find_executable_native_patches(
                     .push((start + offset as u64, FsRelativePatch { original }));
             }
         }
+        host_step_trace(format_args!(
+            "runtime native-patch-scan done range=[0x{start:016x}..0x{end:016x}) syscall_patches={} fs_relative_patches={} elapsed_ms={}",
+            patches.syscall_patches.len() - syscall_patch_start_len,
+            {
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                {
+                    patches.fs_relative_patches.len() - fs_patch_start_len
+                }
+                #[cfg(not(all(windows, target_arch = "x86_64")))]
+                {
+                    0
+                }
+            },
+            host_step_elapsed_ms(range_start)
+        ));
     }
     Ok(patches)
 }
@@ -3707,9 +3766,19 @@ fn apply_executable_syscall_patches(
     memory: &mut GuestMemory,
     patches: &[ExecutableSyscallPatch],
 ) -> Result<(), GuestExecutionError> {
+    let patch_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime syscall-patch apply start patches={}",
+        patches.len()
+    ));
     for patch in patches {
         memory.patch_code(patch.address, &[0xcc, 0x90])?;
     }
+    host_step_trace(format_args!(
+        "runtime syscall-patch apply done patches={} elapsed_ms={}",
+        patches.len(),
+        host_step_elapsed_ms(patch_start)
+    ));
     Ok(())
 }
 
@@ -3719,10 +3788,20 @@ fn apply_fs_relative_patches(
     fs_base: u64,
     patches: &BTreeMap<u64, FsRelativePatch>,
 ) -> Result<(), GuestExecutionError> {
+    let patch_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime fs-relative-patch apply start patches={} fs_base=0x{fs_base:016x}",
+        patches.len()
+    ));
     for (address, patch) in patches {
         let bytes = fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original);
         memory.patch_code(*address, &bytes)?;
     }
+    host_step_trace(format_args!(
+        "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
+        patches.len(),
+        host_step_elapsed_ms(patch_start)
+    ));
     Ok(())
 }
 
@@ -4179,8 +4258,13 @@ impl RuntimeSubsystems {
         pid: mcr_sys::GuestPid,
         fs_base: u64,
     ) -> Result<(), GuestExecutionError> {
+        let patch_start = Instant::now();
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
         let scanned_ranges = cache.scanned_ranges.clone();
+        host_step_trace(format_args!(
+            "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
+            scanned_ranges.len()
+        ));
         {
             let memory = self
                 .memory_for_process_mut(pid)
@@ -4212,6 +4296,11 @@ impl RuntimeSubsystems {
             .collect::<Vec<_>>();
         cache.fs_base = fs_base;
         cache.scanned_ranges = scanned_now;
+        host_step_trace(format_args!(
+            "runtime native-patch-cache done pid={pid} ranges={} elapsed_ms={}",
+            cache.scanned_ranges.len(),
+            host_step_elapsed_ms(patch_start)
+        ));
         self.native_patch_caches.insert(pid, cache);
         Ok(())
     }
@@ -5134,11 +5223,16 @@ impl RuntimeSubsystems {
         &mut self,
         child_pid: mcr_sys::GuestPid,
     ) -> Result<(), GuestMemoryError> {
+        let materialize_start = Instant::now();
         let pending = self
             .pending_fork_exec
             .get(&child_pid)
             .copied()
             .ok_or(GuestMemoryError::NotMapped)?;
+        host_step_trace(format_args!(
+            "runtime materialize-fork-child start parent_pid={} child_pid={child_pid}",
+            pending.parent_pid
+        ));
         let memory = self
             .memory_for_process(pending.parent_pid)
             .ok_or(GuestMemoryError::NotMapped)?
@@ -5148,6 +5242,11 @@ impl RuntimeSubsystems {
         if let Some(cache) = self.native_patch_caches.get(&pending.parent_pid).cloned() {
             self.native_patch_caches.insert(child_pid, cache);
         }
+        host_step_trace(format_args!(
+            "runtime materialize-fork-child done parent_pid={} child_pid={child_pid} elapsed_ms={}",
+            pending.parent_pid,
+            host_step_elapsed_ms(materialize_start)
+        ));
         Ok(())
     }
 

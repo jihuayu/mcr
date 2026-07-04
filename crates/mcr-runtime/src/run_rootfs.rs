@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use mcr_jit::ExecutionError;
 use mcr_net::WinHostSocketTransport;
@@ -288,12 +289,26 @@ fn run_rootfs_linux_errno(errno: LinuxErrno) -> RunRootfsError {
 }
 
 pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsError> {
+    let run_start = Instant::now();
+    crate::host_step_trace(format_args!(
+        "run-rootfs start rootfs={} program={} args={} guest_step_limit={:?}",
+        config.rootfs.display(),
+        bytes_lossy(&config.program),
+        config.args.len(),
+        config.guest_step_limit()
+    ));
     if !config.rootfs.is_dir() {
         return Err(RunRootfsError::MissingRootfs(config.rootfs));
     }
 
+    let load_start = Instant::now();
     let mut vfs = load_rootfs(&config.rootfs)?;
+    crate::host_step_trace(format_args!(
+        "run-rootfs rootfs-loaded elapsed_ms={}",
+        crate::host_step_elapsed_ms(load_start)
+    ));
     let mut program_loader = RuntimeFileSystem::new(vfs.clone(), ());
+    let program_load_start = Instant::now();
     let program = program_loader
         .load_guest_program(
             config.program.clone(),
@@ -301,11 +316,18 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
             config.env.clone(),
         )
         .map_err(run_rootfs_linux_errno)?;
+    crate::host_step_trace(format_args!(
+        "run-rootfs program-loaded elapsed_ms={} executable_bytes={} interpreter={}",
+        crate::host_step_elapsed_ms(program_load_start),
+        program.executable().bytes().len(),
+        program.interpreter().is_some()
+    ));
     vfs.set_proc_self(ProcSelfData::new(
         program.executable().path().to_vec(),
         program.argv().to_vec(),
         program.envp().to_vec(),
     ));
+    let runtime_start = Instant::now();
     let transport = WinHostSocketTransport::new().map_err(crate::RuntimeError::from)?;
     let mut runtime = crate::Runtime::with_tracer_vfs_and_socket_transport(
         program,
@@ -314,11 +336,21 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         transport,
     )?;
     runtime.enable_native_execution();
+    crate::host_step_trace(format_args!(
+        "run-rootfs runtime-ready elapsed_ms={}",
+        crate::host_step_elapsed_ms(runtime_start)
+    ));
 
+    let guest_start = Instant::now();
     let run_result = match config.guest_step_limit() {
         Some(max_guest_steps) => runtime.run_guest_until_exit_with_step_limit(max_guest_steps),
         None => runtime.run_guest_until_exit(),
     };
+    crate::host_step_trace(format_args!(
+        "run-rootfs guest-run-returned elapsed_ms={} total_elapsed_ms={}",
+        crate::host_step_elapsed_ms(guest_start),
+        crate::host_step_elapsed_ms(run_start)
+    ));
 
     match run_result {
         Ok(status) => Ok(RunRootfsOutput::new(
@@ -722,16 +754,35 @@ fn read_all(
 }
 
 fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
+    const LARGE_FILE_TRACE_BYTES: u64 = 16 * 1024 * 1024;
+
     let mut tree = PathTree::new();
     let mut entries = Vec::new();
+    let collect_start = Instant::now();
+    crate::host_step_trace(format_args!(
+        "load-rootfs collect start rootfs={}",
+        rootfs.display()
+    ));
     collect_rootfs_entries(rootfs, rootfs, &mut entries)?;
     entries.sort_by_key(|entry| (entry.depth, entry.relative.clone()));
+    crate::host_step_trace(format_args!(
+        "load-rootfs collect done entries={} elapsed_ms={}",
+        entries.len(),
+        crate::host_step_elapsed_ms(collect_start)
+    ));
 
+    let mut directories = 0usize;
+    let mut symlinks = 0usize;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let materialize_start = Instant::now();
     for entry in entries {
         let guest_path = format!("/{}", entry.relative.to_string_lossy().replace('\\', "/"));
         if entry.kind.is_dir() {
+            directories += 1;
             tree.create_dir(&guest_path)?;
         } else if entry.kind.is_symlink() {
+            symlinks += 1;
             let host_path = rootfs.join(&entry.relative);
             let target = fs::read_link(&host_path).map_err(|source| RunRootfsError::Io {
                 path: host_path,
@@ -739,14 +790,49 @@ fn load_rootfs(rootfs: &Path) -> Result<VirtualFileSystem, RunRootfsError> {
             })?;
             tree.create_symlink(&guest_path, target.to_string_lossy().into_owned())?;
         } else if entry.kind.is_file() {
+            files += 1;
             let host_path = rootfs.join(&entry.relative);
+            if entry.len >= LARGE_FILE_TRACE_BYTES {
+                crate::host_step_trace(format_args!(
+                    "load-rootfs large-file-read start path={} bytes={}",
+                    guest_path, entry.len
+                ));
+            }
+            let file_start = Instant::now();
             let content = fs::read(&host_path).map_err(|source| RunRootfsError::Io {
                 path: host_path,
                 source,
             })?;
+            bytes = bytes.saturating_add(content.len() as u64);
+            if entry.len >= LARGE_FILE_TRACE_BYTES {
+                crate::host_step_trace(format_args!(
+                    "load-rootfs large-file-read done path={} bytes={} elapsed_ms={}",
+                    guest_path,
+                    content.len(),
+                    crate::host_step_elapsed_ms(file_start)
+                ));
+            }
             tree.create_file_with_content(&guest_path, content, 0o755)?;
+            if crate::host_step_trace_enabled() && files % 256 == 0 {
+                crate::host_step_trace(format_args!(
+                    "load-rootfs progress files={} dirs={} symlinks={} bytes={} elapsed_ms={}",
+                    files,
+                    directories,
+                    symlinks,
+                    bytes,
+                    crate::host_step_elapsed_ms(materialize_start)
+                ));
+            }
         }
     }
+    crate::host_step_trace(format_args!(
+        "load-rootfs materialized files={} dirs={} symlinks={} bytes={} elapsed_ms={}",
+        files,
+        directories,
+        symlinks,
+        bytes,
+        crate::host_step_elapsed_ms(materialize_start)
+    ));
 
     tree.mount_minimal_devfs()?;
     tree.mount_minimal_procfs()?;
@@ -764,6 +850,7 @@ struct RootfsEntry {
     relative: PathBuf,
     depth: usize,
     kind: fs::FileType,
+    len: u64,
 }
 
 fn collect_rootfs_entries(
@@ -794,6 +881,7 @@ fn collect_rootfs_entries(
             relative: relative.clone(),
             depth,
             kind,
+            len: metadata.len(),
         });
         if kind.is_dir() {
             collect_rootfs_entries(rootfs, &path, entries)?;
