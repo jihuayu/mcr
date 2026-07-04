@@ -55,9 +55,9 @@ use mcr_sys::{
     SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
-    CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProcess, GuestProgram,
-    GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError,
-    TaskState,
+    CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
+    GuestProgram, GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID,
+    TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -208,6 +208,7 @@ struct FutexWaitEntry {
 }
 
 impl FutexWaitEntry {
+    #[cfg(test)]
     fn new(value: u32) -> Self {
         Self {
             value: AtomicU32::new(value),
@@ -222,6 +223,7 @@ struct FutexRegistry {
 }
 
 impl FutexRegistry {
+    #[cfg(test)]
     fn wait(
         &mut self,
         uaddr: u64,
@@ -283,6 +285,7 @@ impl FutexRegistry {
         woken
     }
 
+    #[cfg(test)]
     fn finish_wait(&self, uaddr: u64, entry: &Arc<FutexWaitEntry>) {
         decrement_waiter(&entry.waiters);
         self.prune_entry(uaddr, entry);
@@ -331,6 +334,7 @@ fn reserve_wake_count(waiters: &AtomicU64, count: u64) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn decrement_waiter(waiters: &AtomicU64) {
     let mut current = waiters.load(Ordering::SeqCst);
     while current != 0 {
@@ -564,6 +568,7 @@ pub struct RuntimeStallDiagnostic {
     runnable_tasks: usize,
     fd_wait_tasks: usize,
     child_wait_tasks: usize,
+    futex_wait_tasks: usize,
 }
 
 impl RuntimeStallDiagnostic {
@@ -588,6 +593,11 @@ impl RuntimeStallDiagnostic {
             .tasks()
             .iter()
             .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForChild))
+            .count();
+        let futex_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForFutex { .. }))
             .count();
 
         let (kind, reason) = if let Some(syscall) = diagnostics.in_flight_syscall() {
@@ -617,6 +627,11 @@ impl RuntimeStallDiagnostic {
                 RuntimeStallKind::Scheduling,
                 format!("{child_wait_tasks} task(s) waiting for child process completion"),
             )
+        } else if futex_wait_tasks > 0 {
+            (
+                RuntimeStallKind::GuestWaitFutex,
+                format!("{futex_wait_tasks} task(s) waiting for futex wake"),
+            )
         } else if diagnostics.native_execution_enabled() && runnable_tasks > 0 {
             (
                 RuntimeStallKind::NativeExecution,
@@ -642,6 +657,7 @@ impl RuntimeStallDiagnostic {
             runnable_tasks,
             fd_wait_tasks,
             child_wait_tasks,
+            futex_wait_tasks,
         }
     }
 
@@ -679,6 +695,11 @@ impl RuntimeStallDiagnostic {
     pub const fn child_wait_tasks(&self) -> usize {
         self.child_wait_tasks
     }
+
+    #[must_use]
+    pub const fn futex_wait_tasks(&self) -> usize {
+        self.futex_wait_tasks
+    }
 }
 
 impl fmt::Display for RuntimeStallDiagnostic {
@@ -704,8 +725,8 @@ impl fmt::Display for RuntimeStallDiagnostic {
         }
         write!(
             formatter,
-            "; tasks runnable={} fd_wait={} child_wait={}",
-            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks
+            "; tasks runnable={} fd_wait={} child_wait={} futex_wait={}",
+            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks, self.futex_wait_tasks
         )
     }
 }
@@ -907,6 +928,7 @@ pub enum DiagnosticTaskState {
     Runnable,
     WaitingForChild,
     WaitingForFd { fd: i32, write: bool },
+    WaitingForFutex { uaddr: u64 },
     Exited { status: i32 },
 }
 
@@ -919,6 +941,7 @@ impl DiagnosticTaskState {
                 Self::WaitingForChild
             }
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
+            TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
             TaskState::Exited { status } => Self::Exited { status },
         }
     }
@@ -3868,7 +3891,9 @@ where
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         let blocked_after_syscall = matches!(
             task.state(),
-            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. }
+            TaskState::WaitingForChild { .. }
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForFutex { .. }
         );
         let final_regs = if task.regs() == gpr || blocked_after_syscall {
             let updated_regs = gpr_from_registers(registers);
@@ -7244,6 +7269,8 @@ impl RuntimeSubsystems {
             write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
             self.store_selected_process_memory(pid)?;
             self.futexes.wake(clear_child_tid, u32::MAX);
+            self.tasks
+                .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
         }
 
         let process_exited = matches!(
@@ -7638,48 +7665,71 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_memory_for_process(pid) {
             return SyscallOutcome::errno(errno);
         }
-        outcome(self.futex(FutexSyscallArgs::new(
-            arg(request, 0),
-            arg_u32(request, 1),
-            arg_u32(request, 2),
-            arg(request, 3),
-            arg(request, 4),
-            arg_u32(request, 5),
-        )))
+        self.futex(
+            request.context.pid,
+            request.context.tid,
+            FutexSyscallArgs::new(
+                arg(request, 0),
+                arg_u32(request, 1),
+                arg_u32(request, 2),
+                arg(request, 3),
+                arg(request, 4),
+                arg_u32(request, 5),
+            ),
+        )
     }
 
-    fn futex(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+    fn futex(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        args: FutexSyscallArgs,
+    ) -> SyscallOutcome {
         if args.op & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG) != 0 {
-            return Err(LinuxErrno::EINVAL);
-        }
-        if !args.is_private() {
-            return Err(LinuxErrno::ENOSYS);
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         if args.uaddr % 4 != 0 {
-            return Err(LinuxErrno::EINVAL);
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
 
         match args.command() {
-            LINUX_FUTEX_WAIT => self.futex_wait(args),
-            LINUX_FUTEX_WAKE => Ok(self.futex_wake(args)),
-            _ => Err(LinuxErrno::EINVAL),
+            LINUX_FUTEX_WAIT => self.futex_wait(pid, tid, args),
+            LINUX_FUTEX_WAKE => SyscallOutcome::success(self.futex_wake(pid, args)),
+            _ => SyscallOutcome::errno(LinuxErrno::EINVAL),
         }
     }
 
-    fn futex_wait(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
-        let value = read_guest_u32(self.files.memory(), args.uaddr)?;
+    fn futex_wait(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        args: FutexSyscallArgs,
+    ) -> SyscallOutcome {
+        let value = match read_guest_u32(self.files.memory(), args.uaddr) {
+            Ok(value) => value,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
         if value != args.val {
-            return Err(LinuxErrno::EAGAIN);
+            return SyscallOutcome::errno(LinuxErrno::EAGAIN);
         }
-        let timeout = read_futex_timeout(self.files.memory(), args.timeout)?;
-        let memory = self.files.memory();
-        self.futexes.wait(args.uaddr, value, timeout, || {
-            read_guest_u32(memory, args.uaddr).is_ok_and(|current| current != args.val)
-        })
+        let timeout = match read_futex_timeout(self.files.memory(), args.timeout) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        if timeout.is_some() {
+            return SyscallOutcome::errno(LinuxErrno::ETIMEDOUT);
+        }
+
+        let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        match self.tasks.block_task_for_futex(tid, key) {
+            Ok(()) => SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex"),
+            Err(error) => error.into_outcome(),
+        }
     }
 
-    fn futex_wake(&mut self, args: FutexSyscallArgs) -> u64 {
-        self.futexes.wake(args.uaddr, args.val)
+    fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
+        let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        self.tasks.wake_futex_waiters(key, args.val) as u64
     }
 
     fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -9888,20 +9938,81 @@ mod tests {
     }
 
     #[test]
-    fn process_shared_futex_wait_and_wake_return_enosys() {
+    fn process_shared_futex_wait_mismatch_and_wake_are_supported() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0u32.to_le_bytes())
+            .unwrap();
 
         let wait = runtime.dispatch_syscall(context(
             Syscall::Futex,
-            [0x402000, u64::from(LINUX_FUTEX_WAIT), 0, 0, 0, 0],
+            [0x402000, u64::from(LINUX_FUTEX_WAIT), 1, 0, 0, 0],
         ));
         let wake = runtime.dispatch_syscall(context(
             Syscall::Futex,
             [0x402000, u64::from(LINUX_FUTEX_WAKE), 1, 0, 0, 0],
         ));
 
-        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
-        assert_eq!(wake.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+        assert_eq!(wake.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn futex_wait_blocks_guest_task_and_wake_resumes_it() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &7u32.to_le_bytes())
+            .unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_SYSVSEM;
+
+        let clone = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+        assert_eq!(clone.result, SyscallReturn::Success(2));
+
+        let wait = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                7,
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForFutex {
+                key: FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true)
+            }
+        );
+
+        let wake = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            2,
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(wake.result, SyscallReturn::Success(1));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
     }
 
     #[test]
