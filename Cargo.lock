@@ -85,6 +85,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcr-snapshot"
+version = "0.1.0"
+
+[[package]]
 name = "mcr-sys"
 version = "0.1.0"
 

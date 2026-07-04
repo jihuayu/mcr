@@ -5,6 +5,7 @@ members = [
     "crates/mcr-jit",
     "crates/mcr-net",
     "crates/mcr-runtime",
+    "crates/mcr-snapshot",
     "crates/mcr-sys",
     "crates/mcr-task",
     "crates/mcr-testkit",
@@ -25,6 +26,7 @@ mcr-elf = { path = "crates/mcr-elf" }
 mcr-jit = { path = "crates/mcr-jit" }
 mcr-net = { path = "crates/mcr-net" }
 mcr-runtime = { path = "crates/mcr-runtime" }
+mcr-snapshot = { path = "crates/mcr-snapshot" }
 mcr-sys = { path = "crates/mcr-sys" }
 mcr-task = { path = "crates/mcr-task" }
 mcr-testkit = { path = "crates/mcr-testkit" }
