@@ -79,6 +79,7 @@ pub enum Syscall {
     Setregid,
     Getpgid,
     Getsid,
+    Sigaltstack,
     Statfs,
     Fstatfs,
     Nanosleep,
@@ -209,6 +210,7 @@ impl Syscall {
     pub const SETREGID: SyscallNumber = SyscallNumber::new(114);
     pub const GETPGID: SyscallNumber = SyscallNumber::new(121);
     pub const GETSID: SyscallNumber = SyscallNumber::new(124);
+    pub const SIGALTSTACK: SyscallNumber = SyscallNumber::new(131);
     pub const STATFS: SyscallNumber = SyscallNumber::new(137);
     pub const FSTATFS: SyscallNumber = SyscallNumber::new(138);
     pub const NANOSLEEP: SyscallNumber = SyscallNumber::new(35);
@@ -380,6 +382,7 @@ impl Syscall {
             114 => Self::Setregid,
             121 => Self::Getpgid,
             124 => Self::Getsid,
+            131 => Self::Sigaltstack,
             137 => Self::Statfs,
             138 => Self::Fstatfs,
             157 => Self::Prctl,
@@ -472,6 +475,7 @@ impl Syscall {
             Self::Setregid => Self::SETREGID,
             Self::Getpgid => Self::GETPGID,
             Self::Getsid => Self::GETSID,
+            Self::Sigaltstack => Self::SIGALTSTACK,
             Self::Statfs => Self::STATFS,
             Self::Fstatfs => Self::FSTATFS,
             Self::Nanosleep => Self::NANOSLEEP,
@@ -605,6 +609,7 @@ impl Syscall {
             Self::Setregid => "setregid",
             Self::Getpgid => "getpgid",
             Self::Getsid => "getsid",
+            Self::Sigaltstack => "sigaltstack",
             Self::Statfs => "statfs",
             Self::Fstatfs => "fstatfs",
             Self::Nanosleep => "nanosleep",
@@ -734,6 +739,7 @@ mod tests {
             (Syscall::SYSINFO, Syscall::Sysinfo, "sysinfo"),
             (Syscall::GETPGID, Syscall::Getpgid, "getpgid"),
             (Syscall::GETSID, Syscall::Getsid, "getsid"),
+            (Syscall::SIGALTSTACK, Syscall::Sigaltstack, "sigaltstack"),
             (Syscall::STATFS, Syscall::Statfs, "statfs"),
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
             (Syscall::PRCTL, Syscall::Prctl, "prctl"),

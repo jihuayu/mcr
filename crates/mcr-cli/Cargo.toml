@@ -9,6 +9,7 @@ name = "mcr"
 path = "src/main.rs"
 
 [dependencies]
+mcr-build.workspace = true
 mcr-runtime.workspace = true
 
 [dev-dependencies]

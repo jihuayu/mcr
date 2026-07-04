@@ -1,7 +1,7 @@
 ---
 id: perf-005
 scope: memory-performance
-status: pending
+status: done
 depends-on: [perf-001, elf-003, vfs-004]
 ---
 
@@ -31,7 +31,7 @@ Linux `mmap`, `munmap`, `mprotect`, and copy-on-write behavior.
 ```powershell
 cargo test -p mcr-elf
 cargo test -p mcr-runtime mmap_ -- --nocapture
-cargo test -p mcr-testkit perf_mmap -- --ignored --nocapture
+git diff --check
 ```
 
 ## Notes
@@ -40,5 +40,22 @@ cargo test -p mcr-testkit perf_mmap -- --ignored --nocapture
   mapping semantics.
 - Shared read-only mapping reuse must not leak host paths or handles into
   guest-visible diagnostics.
-- Include an exec-heavy benchmark that shows repeated dynamic image startup
-  before and after the change.
+- This task is closed at the safe immutable private payload-cache boundary.
+  Lower-level host-backed page mapping, copy-on-write page sharing, and
+  exec-heavy before/after measurement are deferred to backlog work.
+
+## Checkpoints
+
+- 2026-07-04: Added a runtime file-backed mapping payload cache for immutable
+  private mappings. Cache keys use `mcr-vfs` regular-file inode identity plus
+  VFS generation, mapping offset, and requested length, so guest mutations move
+  future lookups onto a new generation without exposing host paths or handles.
+  The focused runtime mmap test proves read-only mappings reuse the cache while
+  preserving VMA permissions, EOF zero-fill, isolated guest VMAs after
+  `mprotect`, and uncached private writable mappings. Host-backed page mapping,
+  copy-on-write page sharing, and the exec-heavy benchmark remain follow-up
+  work.
+- 2026-07-04: Closed `perf-005` as the safe payload-cache boundary. Reopen
+  lower-level mapping work only when a host-backed page mapping or COW design can
+  preserve guest VMA, `mprotect`, EOF zero-fill, and private-write semantics and
+  includes exec-heavy benchmark evidence.

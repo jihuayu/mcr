@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::{IoSlice, IoSliceMut};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
@@ -7,9 +8,13 @@ use std::{
 
 use mcr_win::{
     AddressFamily, HostError, HostErrorKind, HostShutdown, HostSocket, HostSocketOptionName,
-    HostSocketOptionValue, NetworkStack, SocketEvents, SocketKind,
+    HostSocketOptionValue, NetworkStack, SocketCompletionKind, SocketEvents, SocketKind,
     SocketProtocol as HostSocketProtocol,
 };
+
+mod dns_cache;
+
+pub use dns_cache::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -68,6 +73,81 @@ impl fmt::Display for SocketId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SocketReadinessToken {
+    socket: SocketId,
+    generation: u64,
+}
+
+impl SocketReadinessToken {
+    #[must_use]
+    pub const fn new(socket: SocketId, generation: u64) -> Self {
+        Self { socket, generation }
+    }
+
+    #[must_use]
+    pub const fn socket(self) -> SocketId {
+        self.socket
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostSocketCompletion {
+    token: SocketReadinessToken,
+    kind: SocketCompletionKind,
+}
+
+impl HostSocketCompletion {
+    #[must_use]
+    pub const fn new(token: SocketReadinessToken, kind: SocketCompletionKind) -> Self {
+        Self { token, kind }
+    }
+
+    #[must_use]
+    pub const fn token(self) -> SocketReadinessToken {
+        self.token
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> SocketCompletionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn readiness(self) -> SocketEvents {
+        self.kind.readiness()
+    }
+}
+
+#[derive(Debug)]
+pub enum SocketAcceptFastPath {
+    Unsupported,
+    Pending,
+    Accepted {
+        handle: Box<dyn HostSocketHandle>,
+        peer: SocketAddress,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketConnectFastPath {
+    Unsupported,
+    Pending,
+    Connected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketConnectFastPathCompletion {
+    Inactive,
+    Pending,
+    Completed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,22 +562,136 @@ pub trait HostSocketTransport {
 pub trait HostSocketHandle: fmt::Debug {
     fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError>;
     fn listen(&mut self, backlog: u32) -> Result<(), HostIoError>;
+    /// Attempts to submit or finish an adapter-owned `AcceptEx` operation.
+    ///
+    /// `Pending` means the adapter owns the in-flight operation and must later
+    /// return an `Accept` completion for the supplied readiness token. `Accepted`
+    /// means any host `SO_UPDATE_ACCEPT_CONTEXT` work has already completed and
+    /// guest-visible address and option queries may observe the accepted socket.
+    /// `Unsupported` keeps the plain `accept` fallback path unchanged.
+    fn accept_fast_path(
+        &mut self,
+        _token: SocketReadinessToken,
+        _spec: SocketSpec,
+    ) -> Result<SocketAcceptFastPath, HostIoError> {
+        Ok(SocketAcceptFastPath::Unsupported)
+    }
     fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError>;
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError>;
+    /// Attempts to submit an adapter-owned `ConnectEx` operation.
+    ///
+    /// `Pending` means the Linux socket remains `Connecting` until a matching
+    /// `Connect` completion is drained through the readiness token and
+    /// `complete_connect_fast_path` reports completion. `Unsupported` keeps the
+    /// plain `connect` fallback path unchanged.
+    fn connect_fast_path(
+        &mut self,
+        _token: SocketReadinessToken,
+        _address: SocketAddress,
+    ) -> Result<SocketConnectFastPath, HostIoError> {
+        Ok(SocketConnectFastPath::Unsupported)
+    }
     fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError>;
+    /// Advances `ConnectEx` completion state before `SO_ERROR`, local address,
+    /// or peer address queries are used to complete the Linux state machine.
+    fn complete_connect_fast_path(
+        &mut self,
+    ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
+        Ok(SocketConnectFastPathCompletion::Inactive)
+    }
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError>;
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError>;
+    fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+        let buffer = flatten_io_slices(buffers)?;
+        self.send(&buffer)
+    }
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError>;
+    fn send_to_vectored(
+        &mut self,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, HostIoError> {
+        let buffer = flatten_io_slices(buffers)?;
+        self.send_to(&buffer, address)
+    }
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError>;
+    fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+        let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+        let mut buffer = vec![0; capacity];
+        let count = self.recv(&mut buffer)?;
+        scatter_io_slices(buffers, &buffer, count)?;
+        Ok(count)
+    }
     fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError>;
+    fn recv_from_vectored(
+        &mut self,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), HostIoError> {
+        let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+        let mut buffer = vec![0; capacity];
+        let (count, address) = self.recv_from(&mut buffer)?;
+        scatter_io_slices(buffers, &buffer, count)?;
+        Ok((count, address))
+    }
     fn poll(
         &mut self,
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, HostIoError>;
+    fn drain_readiness_completions(
+        &mut self,
+        _token: SocketReadinessToken,
+    ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
+        Ok(Vec::new())
+    }
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
+}
+
+fn flatten_io_slices(buffers: &[IoSlice<'_>]) -> Result<Vec<u8>, HostIoError> {
+    let capacity = checked_iovec_total_len(buffers.iter().map(|buffer| buffer.len()))?;
+    let mut flattened = Vec::with_capacity(capacity);
+    for buffer in buffers {
+        flattened.extend_from_slice(buffer.as_ref());
+    }
+    Ok(flattened)
+}
+
+fn scatter_io_slices(
+    buffers: &mut [IoSliceMut<'_>],
+    bytes: &[u8],
+    count: usize,
+) -> Result<(), HostIoError> {
+    if count > bytes.len() {
+        return Err(HostIoError::new(
+            LinuxErrno::InvalidArgument,
+            "host socket received more bytes than the iovec capacity",
+        ));
+    }
+
+    let mut consumed = 0usize;
+    for buffer in buffers {
+        let remaining = count.saturating_sub(consumed);
+        if remaining == 0 {
+            break;
+        }
+        let write_len = buffer.len().min(remaining);
+        buffer[..write_len].copy_from_slice(&bytes[consumed..consumed + write_len]);
+        consumed += write_len;
+    }
+    Ok(())
+}
+
+fn checked_iovec_total_len(lengths: impl IntoIterator<Item = usize>) -> Result<usize, HostIoError> {
+    lengths.into_iter().try_fold(0usize, |total, len| {
+        total.checked_add(len).ok_or_else(|| {
+            HostIoError::new(
+                LinuxErrno::InvalidArgument,
+                "socket iovec total length overflows usize",
+            )
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -600,9 +794,25 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket.send(buffer).map_err(HostIoError::from)
     }
 
+    fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+        self.socket
+            .send_vectored(buffers)
+            .map_err(HostIoError::from)
+    }
+
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
         self.socket
             .send_to(buffer, SocketAddr::from(address))
+            .map_err(HostIoError::from)
+    }
+
+    fn send_to_vectored(
+        &mut self,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, HostIoError> {
+        self.socket
+            .send_to_vectored(buffers, SocketAddr::from(address))
             .map_err(HostIoError::from)
     }
 
@@ -610,9 +820,25 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket.recv(buffer).map_err(HostIoError::from)
     }
 
+    fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+        self.socket
+            .recv_vectored(buffers)
+            .map_err(HostIoError::from)
+    }
+
     fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
         self.socket
             .recv_from(buffer)
+            .map(|(count, address)| (count, SocketAddress::from(address)))
+            .map_err(HostIoError::from)
+    }
+
+    fn recv_from_vectored(
+        &mut self,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), HostIoError> {
+        self.socket
+            .recv_from_vectored(buffers)
             .map(|(count, address)| (count, SocketAddress::from(address)))
             .map_err(HostIoError::from)
     }
@@ -650,6 +876,62 @@ impl HostSocketTransport for NoopHostSocketTransport {
 #[derive(Debug)]
 struct HostSocketEntry {
     handle: Box<dyn HostSocketHandle>,
+    readiness_token: SocketReadinessToken,
+}
+
+#[derive(Debug, Default)]
+struct SocketReadinessCache {
+    ready: BTreeMap<SocketReadinessToken, SocketEvents>,
+}
+
+impl SocketReadinessCache {
+    fn apply_completion(
+        &mut self,
+        active_token: SocketReadinessToken,
+        completion: HostSocketCompletion,
+    ) {
+        if completion.token() != active_token {
+            return;
+        }
+
+        let readiness = self.ready.entry(active_token).or_default();
+        merge_socket_events(readiness, completion.readiness());
+    }
+
+    fn readiness(
+        &self,
+        active_token: SocketReadinessToken,
+        interest: SocketEvents,
+    ) -> Option<SocketEvents> {
+        self.ready
+            .get(&active_token)
+            .map(|readiness| socket_readiness_for_interest(*readiness, interest))
+            .filter(|readiness| !readiness.is_empty())
+    }
+
+    fn clear_socket(&mut self, id: SocketId) {
+        self.ready.retain(|token, _| token.socket() != id);
+    }
+}
+
+fn merge_socket_events(target: &mut SocketEvents, update: SocketEvents) {
+    target.readable |= update.readable;
+    target.writable |= update.writable;
+    target.priority |= update.priority;
+    target.error |= update.error;
+    target.hang_up |= update.hang_up;
+    target.invalid |= update.invalid;
+}
+
+fn socket_readiness_for_interest(readiness: SocketEvents, interest: SocketEvents) -> SocketEvents {
+    SocketEvents {
+        readable: readiness.readable && interest.readable,
+        writable: readiness.writable && interest.writable,
+        priority: readiness.priority && interest.priority,
+        error: readiness.error,
+        hang_up: readiness.hang_up,
+        invalid: readiness.invalid,
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -789,23 +1071,32 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Default)]
 pub struct GuestSocketTable {
     next_id: u64,
+    next_readiness_generation: u64,
     sockets: BTreeMap<SocketId, GuestSocket>,
     host_handles: BTreeMap<SocketId, HostSocketEntry>,
+    readiness_cache: SocketReadinessCache,
     transport: Option<Box<dyn HostSocketTransport>>,
+}
+
+impl Default for GuestSocketTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Debug for GuestSocketTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GuestSocketTable")
             .field("next_id", &self.next_id)
+            .field("next_readiness_generation", &self.next_readiness_generation)
             .field("sockets", &self.sockets)
             .field(
                 "host_handles",
                 &self.host_handles.keys().collect::<Vec<_>>(),
             )
+            .field("readiness_cache", &self.readiness_cache)
             .field("has_transport", &self.transport.is_some())
             .finish()
     }
@@ -816,8 +1107,10 @@ impl GuestSocketTable {
     pub fn new() -> Self {
         Self {
             next_id: SocketId::MIN.get(),
+            next_readiness_generation: 1,
             sockets: BTreeMap::new(),
             host_handles: BTreeMap::new(),
+            readiness_cache: SocketReadinessCache::default(),
             transport: None,
         }
     }
@@ -826,8 +1119,10 @@ impl GuestSocketTable {
     pub fn with_transport(transport: impl HostSocketTransport + 'static) -> Self {
         Self {
             next_id: SocketId::MIN.get(),
+            next_readiness_generation: 1,
             sockets: BTreeMap::new(),
             host_handles: BTreeMap::new(),
+            readiness_cache: SocketReadinessCache::default(),
             transport: Some(Box::new(transport)),
         }
     }
@@ -856,9 +1151,16 @@ impl GuestSocketTable {
     ) -> Result<SocketId, SocketError> {
         validate_socket_protocol(spec.socket_type, spec.protocol)?;
         let id = self.allocate_id()?;
+        let readiness_token = self.allocate_readiness_token(id)?;
         let previous_socket = self.sockets.insert(id, GuestSocket::new(id, spec));
         debug_assert!(previous_socket.is_none());
-        let previous_handle = self.host_handles.insert(id, HostSocketEntry { handle });
+        let previous_handle = self.host_handles.insert(
+            id,
+            HostSocketEntry {
+                handle,
+                readiness_token,
+            },
+        );
         debug_assert!(previous_handle.is_none());
         Ok(id)
     }
@@ -1130,14 +1432,33 @@ impl GuestSocketTable {
             .state
             .local_address()
             .unwrap_or_else(|| SocketAddress::unspecified_for_domain(spec.domain));
+        let fast_path = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Accept)?;
+            let token = entry.readiness_token;
+            entry
+                .handle
+                .accept_fast_path(token, spec)
+                .map_err(SocketError::from_host)?
+        };
+        match fast_path {
+            SocketAcceptFastPath::Accepted { handle, peer } => {
+                return self.register_accepted_socket(spec, handle, local, peer);
+            }
+            SocketAcceptFastPath::Pending => {
+                return Err(SocketError::would_block(
+                    SocketOperation::Accept,
+                    "AcceptEx operation is pending",
+                ));
+            }
+            SocketAcceptFastPath::Unsupported => {}
+        }
+
         let (handle, peer) = self
             .ensure_host_entry_mut(id, SocketOperation::Accept)?
             .handle
             .accept()
             .map_err(SocketError::from_host)?;
-        let accepted = self.create_socket_with_handle(spec, handle)?;
-        self.socket_mut(accepted)?.state = SocketState::Connected { local, peer };
-        Ok((accepted, peer))
+        self.register_accepted_socket(spec, handle, local, peer)
     }
 
     pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
@@ -1188,6 +1509,30 @@ impl GuestSocketTable {
             .map_err(|error| self.record_host_error(id, error))
     }
 
+    pub fn send_connected_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &[IoSlice<'_>],
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_io(socket, SocketOperation::SendMsg)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::SendMsg,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::SendMsg)?;
+        entry
+            .handle
+            .send_vectored(buffers)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
     pub fn recv_connected(
         &mut self,
         id: SocketId,
@@ -1209,6 +1554,30 @@ impl GuestSocketTable {
         entry
             .handle
             .recv(buffer)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
+    pub fn recv_connected_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_connected_io(socket, SocketOperation::RecvMsg)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::RecvMsg,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.host_entry_mut(id, SocketOperation::RecvMsg)?;
+        entry
+            .handle
+            .recv_vectored(buffers)
             .map_err(|error| self.record_host_error(id, error))
     }
 
@@ -1238,6 +1607,32 @@ impl GuestSocketTable {
             .map_err(|error| self.record_host_error(id, error))
     }
 
+    pub fn send_to_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_address_domain(socket.domain, address)?;
+            validate_datagram_io(socket, SocketOperation::SendMsg)?;
+            if socket.shutdown.write {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::SendMsg,
+                    LinuxErrno::Shutdown,
+                    "socket write side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::SendMsg)?;
+        entry
+            .handle
+            .send_to_vectored(buffers, address)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
     pub fn recv_from(
         &mut self,
         id: SocketId,
@@ -1262,6 +1657,30 @@ impl GuestSocketTable {
             .map_err(|error| self.record_host_error(id, error))
     }
 
+    pub fn recv_from_vectored(
+        &mut self,
+        id: SocketId,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), SocketError> {
+        {
+            let socket = self.socket(id)?;
+            validate_datagram_io(socket, SocketOperation::RecvMsg)?;
+            if socket.shutdown.read {
+                return Err(SocketError::invalid_state(
+                    SocketOperation::RecvMsg,
+                    LinuxErrno::Shutdown,
+                    "socket read side is shut down",
+                ));
+            }
+        }
+
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::RecvMsg)?;
+        entry
+            .handle
+            .recv_from_vectored(buffers)
+            .map_err(|error| self.record_host_error(id, error))
+    }
+
     pub fn poll(
         &mut self,
         id: SocketId,
@@ -1272,11 +1691,33 @@ impl GuestSocketTable {
             return Err(SocketError::BadSocket { id });
         }
 
-        let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
-        let readiness = entry
-            .handle
-            .poll(interest, timeout)
-            .map_err(SocketError::from_host)?;
+        let (token, completions) = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
+            let token = entry.readiness_token;
+            let completions = entry
+                .handle
+                .drain_readiness_completions(token)
+                .map_err(SocketError::from_host)?;
+            (token, completions)
+        };
+        for completion in completions {
+            self.readiness_cache.apply_completion(token, completion);
+        }
+
+        if let Some(readiness) = self.readiness_cache.readiness(token, interest) {
+            if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+                self.finish_nonblocking_connect(id)?;
+            }
+            return Ok(readiness);
+        }
+
+        let readiness = {
+            let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
+            entry
+                .handle
+                .poll(interest, timeout)
+                .map_err(SocketError::from_host)?
+        };
         if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
             self.finish_nonblocking_connect(id)?;
         }
@@ -1334,17 +1775,26 @@ impl GuestSocketTable {
         if !self.host_handles.contains_key(&id) {
             let spec = self.socket_spec(id)?;
             let options = self.socket(id)?.options();
-            let transport = self.transport.as_ref().ok_or_else(|| {
-                SocketError::unsupported(
-                    operation,
-                    LinuxErrno::FunctionNotImplemented,
-                    "host socket transport is not configured",
-                )
-            })?;
-            let handle = transport
-                .open_socket(spec, options)
-                .map_err(SocketError::from_host)?;
-            self.host_handles.insert(id, HostSocketEntry { handle });
+            let handle = {
+                let transport = self.transport.as_ref().ok_or_else(|| {
+                    SocketError::unsupported(
+                        operation,
+                        LinuxErrno::FunctionNotImplemented,
+                        "host socket transport is not configured",
+                    )
+                })?;
+                transport
+                    .open_socket(spec, options)
+                    .map_err(SocketError::from_host)?
+            };
+            let readiness_token = self.allocate_readiness_token(id)?;
+            self.host_handles.insert(
+                id,
+                HostSocketEntry {
+                    handle,
+                    readiness_token,
+                },
+            );
         }
         self.host_entry_mut(id, operation)
     }
@@ -1360,10 +1810,23 @@ impl GuestSocketTable {
                 && socket.effective_protocol() == SocketProtocol::Udp
         };
         let entry = self.ensure_host_entry_mut(id, SocketOperation::Connect)?;
-        entry
+        match entry
             .handle
-            .connect(address)
-            .map_err(SocketError::from_host)?;
+            .connect_fast_path(entry.readiness_token, address)
+            .map_err(SocketError::from_host)?
+        {
+            SocketConnectFastPath::Connected => {}
+            SocketConnectFastPath::Pending => {
+                return Err(SocketError::would_block(
+                    SocketOperation::Connect,
+                    "ConnectEx operation is pending",
+                ));
+            }
+            SocketConnectFastPath::Unsupported => entry
+                .handle
+                .connect(address)
+                .map_err(SocketError::from_host)?,
+        }
         let local = entry.handle.local_addr().map_err(SocketError::from_host)?;
         if is_udp_datagram {
             return Ok((local, address));
@@ -1384,6 +1847,14 @@ impl GuestSocketTable {
             return Ok(());
         };
         let (local, peer) = if let Some(entry) = self.host_handles.get_mut(&id) {
+            if entry
+                .handle
+                .complete_connect_fast_path()
+                .map_err(SocketError::from_host)?
+                == SocketConnectFastPathCompletion::Pending
+            {
+                return Ok(());
+            }
             if let Some(error) = entry.handle.take_error().map_err(SocketError::from_host)? {
                 let errno = error.linux_errno();
                 let socket = self.socket_mut(id)?;
@@ -1404,6 +1875,18 @@ impl GuestSocketTable {
         socket.state = SocketState::Connected { local, peer };
         socket.last_error = None;
         Ok(())
+    }
+
+    fn register_accepted_socket(
+        &mut self,
+        spec: SocketSpec,
+        handle: Box<dyn HostSocketHandle>,
+        local: SocketAddress,
+        peer: SocketAddress,
+    ) -> Result<(SocketId, SocketAddress), SocketError> {
+        let accepted = self.create_socket_with_handle(spec, handle)?;
+        self.socket_mut(accepted)?.state = SocketState::Connected { local, peer };
+        Ok((accepted, peer))
     }
 
     fn socket_spec(&self, id: SocketId) -> Result<SocketSpec, SocketError> {
@@ -1431,6 +1914,7 @@ impl GuestSocketTable {
                     write: true,
                 };
                 self.host_handles.remove(&id);
+                self.readiness_cache.clear_socket(id);
                 Ok(())
             }
         }
@@ -1456,6 +1940,24 @@ impl GuestSocketTable {
         })?;
         self.next_id = self.next_id.checked_add(1).unwrap_or(0);
         Ok(id)
+    }
+
+    fn allocate_readiness_token(
+        &mut self,
+        id: SocketId,
+    ) -> Result<SocketReadinessToken, SocketError> {
+        let generation = self.next_readiness_generation;
+        self.next_readiness_generation =
+            self.next_readiness_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    SocketError::invalid_input(
+                        SocketOperation::AllocateSocketId,
+                        LinuxErrno::InvalidArgument,
+                        "socket readiness generation space is exhausted",
+                    )
+                })?;
+        Ok(SocketReadinessToken::new(id, generation))
     }
 }
 
@@ -1882,6 +2384,11 @@ fn validate_address_domain(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use mcr_win::SocketFastPathKind;
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -1894,10 +2401,30 @@ mod tests {
         connect_error: Option<HostIoError>,
         socket_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
+        readiness_completions: Vec<ReadinessCompletionFixture>,
+        fallback_readiness: Option<SocketEvents>,
+        poll_calls: Option<Rc<Cell<usize>>>,
+        accept_calls: Option<Rc<Cell<usize>>>,
+        connect_calls: Option<Rc<Cell<usize>>>,
+        fast_path_accept: Option<FastPathAcceptFixture>,
+        fast_path_connect: Option<FastPathConnectFixture>,
         accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
         nonblocking: bool,
+    }
+
+    #[derive(Debug)]
+    struct FastPathAcceptFixture {
+        accepted: Option<(Box<FakeHostSocketHandle>, SocketAddress)>,
+        submitted: bool,
+        ready: bool,
+    }
+
+    #[derive(Debug)]
+    struct FastPathConnectFixture {
+        submitted: bool,
+        ready: bool,
     }
 
     impl FakeHostSocketHandle {
@@ -1953,6 +2480,300 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn with_counted_accepted(
+            peer: SocketAddress,
+            incoming: &[u8],
+            accept_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                accept_calls: Some(accept_calls),
+                ..Self::with_accepted(peer, incoming)
+            }
+        }
+
+        fn with_acceptex(
+            peer: SocketAddress,
+            incoming: &[u8],
+            accept_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                accept_calls: Some(accept_calls),
+                fast_path_accept: Some(FastPathAcceptFixture {
+                    accepted: Some((Box::new(Self::with_incoming(incoming)), peer)),
+                    submitted: false,
+                    ready: false,
+                }),
+                ..Self::default()
+            }
+        }
+
+        fn with_counted_connect(local: SocketAddress, connect_calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                local: Some(local),
+                connect_calls: Some(connect_calls),
+                ..Self::default()
+            }
+        }
+
+        fn with_connectex(local: SocketAddress, connect_calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                local: Some(local),
+                connect_calls: Some(connect_calls),
+                fast_path_connect: Some(FastPathConnectFixture {
+                    submitted: false,
+                    ready: false,
+                }),
+                ..Self::default()
+            }
+        }
+
+        fn with_readiness(
+            completions: Vec<ReadinessCompletionFixture>,
+            fallback_readiness: Option<SocketEvents>,
+            poll_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                readiness_completions: completions,
+                fallback_readiness,
+                poll_calls: Some(poll_calls),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct VectoredHostState {
+        sent: Vec<u8>,
+        incoming: Vec<u8>,
+        local: SocketAddress,
+        peer: Option<SocketAddress>,
+        send_calls: usize,
+        send_vectored_calls: usize,
+        send_to_calls: usize,
+        send_to_vectored_calls: usize,
+        recv_calls: usize,
+        recv_vectored_calls: usize,
+        recv_from_calls: usize,
+        recv_from_vectored_calls: usize,
+    }
+
+    impl Default for VectoredHostState {
+        fn default() -> Self {
+            Self {
+                sent: Vec::new(),
+                incoming: Vec::new(),
+                local: SocketAddress::inet([0, 0, 0, 0], 0),
+                peer: None,
+                send_calls: 0,
+                send_vectored_calls: 0,
+                send_to_calls: 0,
+                send_to_vectored_calls: 0,
+                recv_calls: 0,
+                recv_vectored_calls: 0,
+                recv_from_calls: 0,
+                recv_from_vectored_calls: 0,
+            }
+        }
+    }
+
+    impl VectoredHostState {
+        fn with_incoming(bytes: &[u8]) -> Self {
+            Self {
+                incoming: bytes.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn drain_into(&mut self, buffer: &mut [u8]) -> usize {
+            let count = buffer.len().min(self.incoming.len());
+            buffer[..count].copy_from_slice(&self.incoming[..count]);
+            self.incoming.drain(..count);
+            count
+        }
+    }
+
+    #[derive(Debug)]
+    struct VectoredHostSocketHandle {
+        state: Rc<RefCell<VectoredHostState>>,
+    }
+
+    impl VectoredHostSocketHandle {
+        fn new(state: Rc<RefCell<VectoredHostState>>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl HostSocketHandle for VectoredHostSocketHandle {
+        fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
+            self.state.borrow_mut().local = address;
+            Ok(address)
+        }
+
+        fn listen(&mut self, _backlog: u32) -> Result<(), HostIoError> {
+            Ok(())
+        }
+
+        fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+            Err(HostIoError::new(
+                LinuxErrno::OperationWouldBlock,
+                "no pending vectored fake socket connection",
+            ))
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> Result<(), HostIoError> {
+            Ok(())
+        }
+
+        fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
+            self.state.borrow_mut().peer = Some(address);
+            Ok(())
+        }
+
+        fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> Result<SocketAddress, HostIoError> {
+            Ok(self.state.borrow().local)
+        }
+
+        fn peer_addr(&self) -> Result<SocketAddress, HostIoError> {
+            self.state.borrow().peer.ok_or_else(|| {
+                HostIoError::new(LinuxErrno::NotConnected, "socket is not connected")
+            })
+        }
+
+        fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_calls += 1;
+            state.sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_vectored_calls += 1;
+            let mut count = 0usize;
+            for buffer in buffers {
+                count = count.checked_add(buffer.len()).ok_or_else(|| {
+                    HostIoError::new(LinuxErrno::InvalidArgument, "sent byte count overflowed")
+                })?;
+                state.sent.extend_from_slice(buffer.as_ref());
+            }
+            Ok(count)
+        }
+
+        fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_to_calls += 1;
+            state.peer = Some(address);
+            state.sent.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn send_to_vectored(
+            &mut self,
+            buffers: &[IoSlice<'_>],
+            address: SocketAddress,
+        ) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.send_to_vectored_calls += 1;
+            state.peer = Some(address);
+            let mut count = 0usize;
+            for buffer in buffers {
+                count = count.checked_add(buffer.len()).ok_or_else(|| {
+                    HostIoError::new(LinuxErrno::InvalidArgument, "sent byte count overflowed")
+                })?;
+                state.sent.extend_from_slice(buffer.as_ref());
+            }
+            Ok(count)
+        }
+
+        fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_calls += 1;
+            Ok(state.drain_into(buffer))
+        }
+
+        fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_vectored_calls += 1;
+            let mut total = 0usize;
+            for buffer in buffers {
+                let count = state.drain_into(buffer);
+                total = total.checked_add(count).ok_or_else(|| {
+                    HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "received byte count overflowed",
+                    )
+                })?;
+                if count < buffer.len() {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+
+        fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_from_calls += 1;
+            let count = state.drain_into(buffer);
+            let address = state
+                .peer
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((count, address))
+        }
+
+        fn recv_from_vectored(
+            &mut self,
+            buffers: &mut [IoSliceMut<'_>],
+        ) -> Result<(usize, SocketAddress), HostIoError> {
+            let mut state = self.state.borrow_mut();
+            state.recv_from_vectored_calls += 1;
+            let mut total = 0usize;
+            for buffer in buffers {
+                let count = state.drain_into(buffer);
+                total = total.checked_add(count).ok_or_else(|| {
+                    HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "received byte count overflowed",
+                    )
+                })?;
+                if count < buffer.len() {
+                    break;
+                }
+            }
+            let address = state
+                .peer
+                .unwrap_or_else(|| SocketAddress::inet([127, 0, 0, 1], 53));
+            Ok((total, address))
+        }
+
+        fn poll(
+            &mut self,
+            interest: SocketEvents,
+            _timeout: Option<Duration>,
+        ) -> Result<SocketEvents, HostIoError> {
+            Ok(SocketEvents {
+                readable: interest.readable && !self.state.borrow().incoming.is_empty(),
+                writable: interest.writable,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            })
+        }
+
+        fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReadinessCompletionFixture {
+        Current(SocketCompletionKind),
+        Stale(SocketCompletionKind),
     }
 
     impl HostSocketHandle for FakeHostSocketHandle {
@@ -1966,7 +2787,31 @@ mod tests {
             Ok(())
         }
 
+        fn accept_fast_path(
+            &mut self,
+            _token: SocketReadinessToken,
+            _spec: SocketSpec,
+        ) -> Result<SocketAcceptFastPath, HostIoError> {
+            let Some(fast_path) = self.fast_path_accept.as_mut() else {
+                return Ok(SocketAcceptFastPath::Unsupported);
+            };
+            if fast_path.ready {
+                let Some((handle, peer)) = fast_path.accepted.take() else {
+                    return Err(HostIoError::new(
+                        LinuxErrno::OperationWouldBlock,
+                        "AcceptEx fixture has no accepted socket",
+                    ));
+                };
+                return Ok(SocketAcceptFastPath::Accepted { handle, peer });
+            }
+            fast_path.submitted = true;
+            Ok(SocketAcceptFastPath::Pending)
+        }
+
         fn accept(&mut self) -> Result<(Box<dyn HostSocketHandle>, SocketAddress), HostIoError> {
+            if let Some(calls) = &self.accept_calls {
+                calls.set(calls.get() + 1);
+            }
             if self.accepted.is_empty() {
                 return Err(HostIoError::new(
                     LinuxErrno::OperationWouldBlock,
@@ -1982,7 +2827,23 @@ mod tests {
             Ok(())
         }
 
+        fn connect_fast_path(
+            &mut self,
+            _token: SocketReadinessToken,
+            address: SocketAddress,
+        ) -> Result<SocketConnectFastPath, HostIoError> {
+            let Some(fast_path) = self.fast_path_connect.as_mut() else {
+                return Ok(SocketConnectFastPath::Unsupported);
+            };
+            fast_path.submitted = true;
+            self.connected = Some(address);
+            Ok(SocketConnectFastPath::Pending)
+        }
+
         fn connect(&mut self, address: SocketAddress) -> Result<(), HostIoError> {
+            if let Some(calls) = &self.connect_calls {
+                calls.set(calls.get() + 1);
+            }
             if let Some(error) = self.connect_error.take() {
                 if error.linux_errno() == LinuxErrno::OperationWouldBlock {
                     self.connected = Some(address);
@@ -1991,6 +2852,22 @@ mod tests {
             }
             self.connected = Some(address);
             Ok(())
+        }
+
+        fn complete_connect_fast_path(
+            &mut self,
+        ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
+            let Some(fast_path) = self.fast_path_connect.as_ref() else {
+                return Ok(SocketConnectFastPathCompletion::Inactive);
+            };
+            if !fast_path.submitted {
+                return Ok(SocketConnectFastPathCompletion::Inactive);
+            }
+            if fast_path.ready {
+                Ok(SocketConnectFastPathCompletion::Completed)
+            } else {
+                Ok(SocketConnectFastPathCompletion::Pending)
+            }
         }
 
         fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
@@ -2051,6 +2928,12 @@ mod tests {
             interest: SocketEvents,
             _timeout: Option<Duration>,
         ) -> Result<SocketEvents, HostIoError> {
+            if let Some(calls) = &self.poll_calls {
+                calls.set(calls.get() + 1);
+            }
+            if let Some(readiness) = self.fallback_readiness {
+                return Ok(readiness);
+            }
             Ok(SocketEvents {
                 readable: interest.readable && !self.incoming.is_empty(),
                 writable: interest.writable,
@@ -2059,6 +2942,49 @@ mod tests {
                 hang_up: false,
                 invalid: false,
             })
+        }
+
+        fn drain_readiness_completions(
+            &mut self,
+            token: SocketReadinessToken,
+        ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
+            let mut completions = self
+                .readiness_completions
+                .drain(..)
+                .map(|completion| match completion {
+                    ReadinessCompletionFixture::Current(kind) => {
+                        HostSocketCompletion::new(token, kind)
+                    }
+                    ReadinessCompletionFixture::Stale(kind) => HostSocketCompletion::new(
+                        SocketReadinessToken::new(
+                            token.socket(),
+                            token.generation().saturating_add(1),
+                        ),
+                        kind,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            if let Some(fast_path) = self.fast_path_accept.as_mut()
+                && fast_path.submitted
+                && !fast_path.ready
+            {
+                fast_path.ready = true;
+                completions.push(HostSocketCompletion::new(
+                    token,
+                    SocketFastPathKind::AcceptEx.completion_kind(),
+                ));
+            }
+            if let Some(fast_path) = self.fast_path_connect.as_mut()
+                && fast_path.submitted
+                && !fast_path.ready
+            {
+                fast_path.ready = true;
+                completions.push(HostSocketCompletion::new(
+                    token,
+                    SocketFastPathKind::ConnectEx.completion_kind(),
+                ));
+            }
+            Ok(completions)
         }
 
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {
@@ -2415,6 +3341,123 @@ mod tests {
     }
 
     #[test]
+    fn sendmsg_vectored_stream_uses_single_host_call() {
+        let state = Rc::new(RefCell::new(VectoredHostState::default()));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+        let buffers = [IoSlice::new(b"pi"), IoSlice::new(b""), IoSlice::new(b"ng")];
+
+        table.connect(stream, peer).expect("connect handle");
+        assert_eq!(
+            table
+                .send_connected_vectored(stream, &buffers)
+                .expect("send vectored"),
+            4
+        );
+
+        let state = state.borrow();
+        assert_eq!(state.send_vectored_calls, 1);
+        assert_eq!(state.send_calls, 0);
+        assert_eq!(state.sent.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn recvmsg_vectored_stream_scatters_single_host_call() {
+        let state = Rc::new(RefCell::new(VectoredHostState::with_incoming(b"abcdef")));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+        let mut first = [0; 2];
+        let mut second = [0; 3];
+        let mut third = [0; 1];
+
+        table.connect(stream, peer).expect("connect handle");
+        {
+            let mut buffers = [
+                IoSliceMut::new(&mut first),
+                IoSliceMut::new(&mut second),
+                IoSliceMut::new(&mut third),
+            ];
+            assert_eq!(
+                table
+                    .recv_connected_vectored(stream, &mut buffers)
+                    .expect("recv vectored"),
+                6
+            );
+        }
+
+        assert_eq!(&first, b"ab");
+        assert_eq!(&second, b"cde");
+        assert_eq!(&third, b"f");
+        let state = state.borrow();
+        assert_eq!(state.recv_vectored_calls, 1);
+        assert_eq!(state.recv_calls, 0);
+    }
+
+    #[test]
+    fn sendmsg_recvmsg_vectored_datagram_preserves_single_message() {
+        let state = Rc::new(RefCell::new(VectoredHostState::with_incoming(b"dns!")));
+        let mut table = GuestSocketTable::new();
+        let datagram = table
+            .create_socket_with_handle(
+                SocketSpec::new(
+                    SocketDomain::Inet,
+                    SocketType::Datagram,
+                    SocketProtocol::Udp,
+                )
+                .expect("udp spec"),
+                Box::new(VectoredHostSocketHandle::new(Rc::clone(&state))),
+            )
+            .expect("socket with handle");
+        let server = SocketAddress::inet([127, 0, 0, 1], 53);
+        let query = [IoSlice::new(b"dn"), IoSlice::new(b"s?")];
+
+        assert_eq!(
+            table
+                .send_to_vectored(datagram, &query, server)
+                .expect("send datagram"),
+            4
+        );
+        {
+            let state = state.borrow();
+            assert_eq!(state.send_to_vectored_calls, 1);
+            assert_eq!(state.send_to_calls, 0);
+            assert_eq!(state.sent.as_slice(), b"dns?");
+            assert_eq!(state.peer, Some(server));
+        }
+
+        let mut first = [0; 2];
+        let mut second = [0; 2];
+        let (count, address) = {
+            let mut response = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            table
+                .recv_from_vectored(datagram, &mut response)
+                .expect("recv datagram")
+        };
+
+        assert_eq!(count, 4);
+        assert_eq!(address, server);
+        assert_eq!(&first, b"dn");
+        assert_eq!(&second, b"s!");
+        let state = state.borrow();
+        assert_eq!(state.recv_from_vectored_calls, 1);
+        assert_eq!(state.recv_from_calls, 0);
+    }
+
+    #[test]
     fn connected_udp_socket_handle_sends_and_receives_bytes() {
         let mut table = GuestSocketTable::new();
         let datagram = table
@@ -2499,6 +3542,243 @@ mod tests {
                 .state()
                 .local_address(),
             Some(local)
+        );
+    }
+
+    #[test]
+    fn iocp_readiness_receive_completion_feeds_poll_without_wsapoll_fallback() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            vec![ReadinessCompletionFixture::Current(
+                SocketCompletionKind::Receive,
+            )],
+            None,
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::read(), Some(Duration::from_secs(30)))
+            .expect("completion readiness");
+
+        assert!(readiness.readable);
+        assert!(!readiness.writable);
+        assert_eq!(poll_calls.get(), 0);
+    }
+
+    #[test]
+    fn iocp_readiness_ignores_stale_completion_generation() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            vec![ReadinessCompletionFixture::Stale(
+                SocketCompletionKind::Receive,
+            )],
+            Some(SocketEvents::default()),
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::read(), Some(Duration::ZERO))
+            .expect("fallback readiness");
+
+        assert!(readiness.is_empty());
+        assert_eq!(poll_calls.get(), 1);
+    }
+
+    #[test]
+    fn iocp_readiness_uses_wsapoll_fallback_without_completion() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            Vec::new(),
+            Some(SocketEvents::write()),
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+            .expect("fallback readiness");
+
+        assert!(readiness.writable);
+        assert!(!readiness.readable);
+        assert_eq!(poll_calls.get(), 1);
+    }
+
+    #[test]
+    fn acceptex_unsupported_uses_plain_accept_fallback() {
+        let accept_calls = Rc::new(Cell::new(0));
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let listener_handle = FakeHostSocketHandle::with_counted_accepted(
+            peer,
+            b"fallback",
+            Rc::clone(&accept_calls),
+        );
+        let mut table = GuestSocketTable::with_transport(NoopHostSocketTransport);
+        let listener = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(listener_handle),
+            )
+            .expect("listener");
+        let local = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(listener, local).expect("bind");
+        table.listen(listener, 1).expect("listen");
+        let (accepted, accepted_peer) = table.accept(listener).expect("plain accept fallback");
+
+        assert_eq!(accepted_peer, peer);
+        assert_eq!(accept_calls.get(), 1);
+        assert_eq!(
+            table.socket(accepted).expect("accepted").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn acceptex_pending_completion_feeds_readiness_then_accepts_without_plain_fallback() {
+        let accept_calls = Rc::new(Cell::new(0));
+        let poll_calls = Rc::new(Cell::new(0));
+        let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut listener_handle =
+            FakeHostSocketHandle::with_acceptex(peer, b"accepted", Rc::clone(&accept_calls));
+        listener_handle.poll_calls = Some(Rc::clone(&poll_calls));
+        let mut table = GuestSocketTable::with_transport(NoopHostSocketTransport);
+        let listener = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(listener_handle),
+            )
+            .expect("listener");
+        let local = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.bind(listener, local).expect("bind");
+        table.listen(listener, 1).expect("listen");
+        assert_eq!(
+            table
+                .accept(listener)
+                .expect_err("AcceptEx submit should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationWouldBlock
+        );
+        assert_eq!(accept_calls.get(), 0);
+
+        let readiness = table
+            .poll(listener, SocketEvents::read(), Some(Duration::ZERO))
+            .expect("AcceptEx readiness");
+        assert!(readiness.readable);
+        assert_eq!(poll_calls.get(), 0);
+
+        let (accepted, accepted_peer) = table.accept(listener).expect("completed AcceptEx");
+        assert_eq!(accepted_peer, peer);
+        assert_eq!(accept_calls.get(), 0);
+        assert_eq!(
+            table.socket(accepted).expect("accepted").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn connectex_unsupported_uses_plain_connect_fallback() {
+        let connect_calls = Rc::new(Cell::new(0));
+        let local = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::with_counted_connect(
+                    local,
+                    Rc::clone(&connect_calls),
+                )),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        table.connect(stream, peer).expect("plain connect fallback");
+
+        assert_eq!(connect_calls.get(), 1);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected { local, peer }
+        );
+    }
+
+    #[test]
+    fn connectex_pending_completion_preserves_nonblocking_state_and_so_error() {
+        let connect_calls = Rc::new(Cell::new(0));
+        let poll_calls = Rc::new(Cell::new(0));
+        let local = SocketAddress::inet([127, 0, 0, 1], 49152);
+        let mut handle = FakeHostSocketHandle::with_connectex(local, Rc::clone(&connect_calls));
+        handle.poll_calls = Some(Rc::clone(&poll_calls));
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with handle");
+        let peer = SocketAddress::inet([127, 0, 0, 1], 8080);
+
+        assert_eq!(
+            table
+                .connect(stream, peer)
+                .expect_err("ConnectEx submit should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connecting(peer)
+        );
+
+        let readiness = table
+            .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+            .expect("ConnectEx readiness");
+        assert!(readiness.writable);
+        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Connected { local, peer }
+        );
+        assert_eq!(
+            table
+                .get_option(stream, SocketOptionName::SocketError)
+                .expect("SO_ERROR"),
+            0
         );
     }
 

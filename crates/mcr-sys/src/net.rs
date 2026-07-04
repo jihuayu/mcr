@@ -59,6 +59,8 @@ pub const LINUX_EPOLLPRI: u32 = 0x0000_0002;
 pub const LINUX_EPOLLOUT: u32 = 0x0000_0004;
 pub const LINUX_EPOLLERR: u32 = 0x0000_0008;
 pub const LINUX_EPOLLHUP: u32 = 0x0000_0010;
+pub const LINUX_EPOLLEXCLUSIVE: u32 = 1 << 28;
+pub const LINUX_EPOLLONESHOT: u32 = 1 << 30;
 pub const LINUX_EPOLLET: u32 = 1 << 31;
 pub const LINUX_EPOLL_CLOEXEC: u32 = 0o2000000;
 
@@ -314,15 +316,16 @@ mod tests {
     use super::{
         Accept4SyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_EPOLL_CLOEXEC,
         LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
-        LINUX_EPOLLET, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI,
-        LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR,
-        LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
-        LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM, LINUX_SHUT_RD,
-        LINUX_SHUT_RDWR, LINUX_SHUT_WR, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
-        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, LinuxCmsghdr, LinuxEpollEvent,
-        LinuxMsghdr, LinuxPollfd, LinuxSockaddr, LinuxSockaddrIn, LinuxSockaddrIn6,
-        LinuxSockaddrStorage, LinuxSockaddrUn, SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs,
-        ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs, SockoptSyscallArgs,
+        LINUX_EPOLLET, LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT,
+        LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
+        LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL,
+        LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND,
+        LINUX_POLLWRNORM, LINUX_SHUT_RD, LINUX_SHUT_RDWR, LINUX_SHUT_WR, LINUX_SOCK_CLOEXEC,
+        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+        LINUX_TCP_NODELAY, LinuxCmsghdr, LinuxEpollEvent, LinuxMsghdr, LinuxPollfd, LinuxSockaddr,
+        LinuxSockaddrIn, LinuxSockaddrIn6, LinuxSockaddrStorage, LinuxSockaddrUn,
+        SendRecvFromSyscallArgs, SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs,
+        SocketSyscallArgs, SockoptSyscallArgs,
     };
 
     #[test]
@@ -360,6 +363,8 @@ mod tests {
         assert_eq!(LINUX_EPOLLOUT, 0x0000_0004);
         assert_eq!(LINUX_EPOLLERR, 0x0000_0008);
         assert_eq!(LINUX_EPOLLHUP, 0x0000_0010);
+        assert_eq!(LINUX_EPOLLEXCLUSIVE, 1 << 28);
+        assert_eq!(LINUX_EPOLLONESHOT, 1 << 30);
         assert_eq!(LINUX_EPOLLET, 1 << 31);
         assert_eq!(LINUX_EPOLL_CLOEXEC, 0o2000000);
     }

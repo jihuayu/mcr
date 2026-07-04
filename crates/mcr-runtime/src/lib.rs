@@ -1,20 +1,25 @@
 #![allow(clippy::result_large_err)]
 //! Runtime errors preserve native fault diagnostics and guest register snapshots.
 
+mod build_run;
 pub mod memory;
 pub mod run_rootfs;
 
 use std::{
     collections::BTreeMap,
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, IoSlice, IoSliceMut},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
+pub use build_run::{
+    BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
+};
 pub use memory::{
     DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
     GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
@@ -23,7 +28,7 @@ pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootf
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
 use mcr_jit::{
-    DecodedMnemonic, ExecutionError, GuestBlock, GuestRegisters, LinearInstructionScanner,
+    ExecutionError, GuestBlock, GuestRegisters, LinearInstructionScanner, NativeFaultInstruction,
     NativeFaultStackWord, SameIsaExecutionCore,
 };
 use mcr_net::{
@@ -48,16 +53,33 @@ use mcr_sys::{
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProcess, GuestProgram,
-    GuestTask, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
+    GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError,
+    TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
     FdReadiness, FdTable, FileKind, FileRef, FileTimes, LinuxFileAttr, LinuxFsKind, LinuxStatfs,
-    OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    OpenFlags, ProcSelfData, RegularFileCacheKey, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
+
+pub(crate) fn host_step_trace_enabled() -> bool {
+    std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
+}
+
+pub(crate) fn host_step_trace(message: fmt::Arguments<'_>) {
+    if host_step_trace_enabled() {
+        eprintln!("mcr hoststep: {message}");
+    }
+}
+
+pub(crate) fn host_step_elapsed_ms(start: Instant) -> u128 {
+    start.elapsed().as_millis()
+}
 
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -81,6 +103,12 @@ const LINUX_PR_GET_THP_DISABLE: u64 = 42;
 const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
 const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+const LINUX_SS_DISABLE: u32 = 2;
+const LINUX_SS_AUTODISARM: u32 = 1 << 31;
+const LINUX_SS_SUPPORTED_FLAGS: u32 = LINUX_SS_DISABLE | LINUX_SS_AUTODISARM;
+const LINUX_MINSIGSTKSZ: u64 = 2048;
+const LINUX_STACK_T_FLAGS_OFFSET: u64 = 8;
+const LINUX_STACK_T_SIZE_OFFSET: u64 = 16;
 const LINUX_UTIME_NOW: i64 = 0x3fffffff;
 const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
@@ -335,6 +363,31 @@ impl EpollRegistry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestSignalAltStack {
+    sp: u64,
+    flags: u32,
+    size: u64,
+}
+
+impl GuestSignalAltStack {
+    const DISABLED: Self = Self {
+        sp: 0,
+        flags: LINUX_SS_DISABLE,
+        size: 0,
+    };
+
+    const fn disabled(self) -> bool {
+        self.flags & LINUX_SS_DISABLE != 0
+    }
+}
+
+impl Default for GuestSignalAltStack {
+    fn default() -> Self {
+        Self::DISABLED
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMemoryAccessError {
     Fault,
 }
@@ -345,12 +398,30 @@ pub struct RuntimeDiagnostics {
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
+    tasks: Vec<DiagnosticTask>,
+    worker_pools: Vec<HostWorkerPoolDiagnostics>,
     last_syscall: Option<DiagnosticSyscall>,
+    in_flight_syscall: Option<DiagnosticSyscall>,
+    native_execution_enabled: bool,
 }
 
 impl RuntimeDiagnostics {
     #[must_use]
     pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
+        Self::capture_with_native_execution(kernel, events, false)
+    }
+
+    #[must_use]
+    fn capture_runtime(subsystems: &RuntimeSubsystems, events: &[SyscallTraceEvent]) -> Self {
+        Self::capture_with_native_execution(&subsystems.tasks, events, subsystems.native_execution)
+    }
+
+    #[must_use]
+    fn capture_with_native_execution(
+        kernel: &GuestKernel,
+        events: &[SyscallTraceEvent],
+        native_execution_enabled: bool,
+    ) -> Self {
         let process = kernel
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process");
@@ -366,7 +437,14 @@ impl RuntimeDiagnostics {
                 .iter()
                 .map(DiagnosticVma::from_guest_vma)
                 .collect(),
+            tasks: kernel
+                .tasks()
+                .map(DiagnosticTask::from_guest_task)
+                .collect(),
+            worker_pools: kernel.host_worker_pool_diagnostics().to_vec(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
+            in_flight_syscall: in_flight_syscall(events),
+            native_execution_enabled,
         }
     }
 
@@ -394,6 +472,239 @@ impl RuntimeDiagnostics {
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
     }
+
+    #[must_use]
+    pub const fn in_flight_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.in_flight_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> &[DiagnosticTask] {
+        &self.tasks
+    }
+
+    #[must_use]
+    pub fn worker_pools(&self) -> &[HostWorkerPoolDiagnostics] {
+        &self.worker_pools
+    }
+
+    #[must_use]
+    pub const fn native_execution_enabled(&self) -> bool {
+        self.native_execution_enabled
+    }
+
+    #[must_use]
+    pub fn stall_diagnostic(&self) -> RuntimeStallDiagnostic {
+        RuntimeStallDiagnostic::from_diagnostics(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStallKind {
+    GuestWaitFutex,
+    Readiness,
+    Scheduling,
+    NativeExecution,
+    Unknown,
+}
+
+impl RuntimeStallKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GuestWaitFutex => "guest wait/futex",
+            Self::Readiness => "readiness",
+            Self::Scheduling => "scheduling",
+            Self::NativeExecution => "native execution",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeStallKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStallDiagnostic {
+    kind: RuntimeStallKind,
+    reason: String,
+    in_flight_syscall: Option<DiagnosticSyscall>,
+    last_syscall: Option<DiagnosticSyscall>,
+    runnable_tasks: usize,
+    fd_wait_tasks: usize,
+    child_wait_tasks: usize,
+}
+
+impl RuntimeStallDiagnostic {
+    #[must_use]
+    fn capture_runtime(subsystems: &RuntimeSubsystems, events: &[SyscallTraceEvent]) -> Self {
+        RuntimeDiagnostics::capture_runtime(subsystems, events).stall_diagnostic()
+    }
+
+    #[must_use]
+    pub fn from_diagnostics(diagnostics: &RuntimeDiagnostics) -> Self {
+        let runnable_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::Runnable))
+            .count();
+        let fd_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForFd { .. }))
+            .count();
+        let child_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForChild))
+            .count();
+
+        let (kind, reason) = if let Some(syscall) = diagnostics.in_flight_syscall() {
+            if syscall.name() == "futex" {
+                (
+                    RuntimeStallKind::GuestWaitFutex,
+                    format!("in-flight futex syscall at rip=0x{:x}", syscall.rip()),
+                )
+            } else if readiness_syscall_name(syscall.name()) {
+                (
+                    RuntimeStallKind::Readiness,
+                    format!("in-flight readiness syscall `{}`", syscall.name()),
+                )
+            } else {
+                (
+                    RuntimeStallKind::Unknown,
+                    format!("in-flight syscall `{}`", syscall.name()),
+                )
+            }
+        } else if fd_wait_tasks > 0 {
+            (
+                RuntimeStallKind::Readiness,
+                format!("{fd_wait_tasks} task(s) waiting for fd readiness"),
+            )
+        } else if child_wait_tasks > 0 {
+            (
+                RuntimeStallKind::Scheduling,
+                format!("{child_wait_tasks} task(s) waiting for child process completion"),
+            )
+        } else if diagnostics.native_execution_enabled() && runnable_tasks > 0 {
+            (
+                RuntimeStallKind::NativeExecution,
+                format!("{runnable_tasks} runnable task(s) in native execution mode"),
+            )
+        } else if runnable_tasks == 0 && !diagnostics.tasks().is_empty() {
+            (
+                RuntimeStallKind::Scheduling,
+                "no runnable guest tasks remain".to_owned(),
+            )
+        } else {
+            (
+                RuntimeStallKind::Unknown,
+                "no known stall signal captured".to_owned(),
+            )
+        };
+
+        Self {
+            kind,
+            reason,
+            in_flight_syscall: diagnostics.in_flight_syscall().cloned(),
+            last_syscall: diagnostics.last_syscall().cloned(),
+            runnable_tasks,
+            fd_wait_tasks,
+            child_wait_tasks,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeStallKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub const fn in_flight_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.in_flight_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.last_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub const fn runnable_tasks(&self) -> usize {
+        self.runnable_tasks
+    }
+
+    #[must_use]
+    pub const fn fd_wait_tasks(&self) -> usize {
+        self.fd_wait_tasks
+    }
+
+    #[must_use]
+    pub const fn child_wait_tasks(&self) -> usize {
+        self.child_wait_tasks
+    }
+}
+
+impl fmt::Display for RuntimeStallDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} stall: {}", self.kind, self.reason)?;
+        if let Some(syscall) = &self.in_flight_syscall {
+            write!(
+                formatter,
+                "; in-flight syscall={}({}) rip=0x{:x}",
+                syscall.name(),
+                syscall.number(),
+                syscall.rip()
+            )?;
+        }
+        if let Some(syscall) = &self.last_syscall {
+            write!(
+                formatter,
+                "; last syscall={}({}) result={:?}",
+                syscall.name(),
+                syscall.number(),
+                syscall.result()
+            )?;
+        }
+        write!(
+            formatter,
+            "; tasks runnable={} fd_wait={} child_wait={}",
+            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks
+        )
+    }
+}
+
+fn readiness_syscall_name(name: &str) -> bool {
+    matches!(name, "poll" | "ppoll" | "epoll_wait" | "epoll_pwait2")
+}
+
+fn in_flight_syscall(events: &[SyscallTraceEvent]) -> Option<DiagnosticSyscall> {
+    let mut completed = Vec::new();
+    for event in events.iter().rev() {
+        match event {
+            SyscallTraceEvent::Enter(event) => {
+                let key = (event.context.pid, event.context.tid);
+                if !completed.contains(&key) {
+                    return Some(DiagnosticSyscall::from_enter_event(event));
+                }
+            }
+            SyscallTraceEvent::Exit(event) => {
+                completed.push((event.context.pid, event.context.tid));
+            }
+            SyscallTraceEvent::Unsupported(event) => {
+                completed.push((event.context.pid, event.context.tid));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,6 +835,68 @@ impl DiagnosticVmaKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticTask {
+    pid: mcr_sys::GuestPid,
+    tid: mcr_sys::GuestTid,
+    rip: u64,
+    state: DiagnosticTaskState,
+}
+
+impl DiagnosticTask {
+    #[must_use]
+    pub fn from_guest_task(task: &GuestTask) -> Self {
+        Self {
+            pid: task.pid(),
+            tid: task.tid(),
+            rip: task.regs().rip(),
+            state: DiagnosticTaskState::from_task_state(task.state()),
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> mcr_sys::GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn tid(&self) -> mcr_sys::GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> DiagnosticTaskState {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticTaskState {
+    Runnable,
+    WaitingForChild,
+    WaitingForFd { fd: i32, write: bool },
+    Exited { status: i32 },
+}
+
+impl DiagnosticTaskState {
+    #[must_use]
+    pub const fn from_task_state(state: TaskState) -> Self {
+        match state {
+            TaskState::Runnable => Self::Runnable,
+            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. } => {
+                Self::WaitingForChild
+            }
+            TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
+            TaskState::Exited { status } => Self::Exited { status },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticSyscall {
     name: String,
     number: u64,
@@ -551,6 +924,17 @@ impl DiagnosticSyscall {
                 result: Some(event.result),
                 rip: event.context.rip,
             }),
+        }
+    }
+
+    #[must_use]
+    pub fn from_enter_event(event: &mcr_sys::SyscallEnterEvent) -> Self {
+        Self {
+            name: event.syscall.name().to_owned(),
+            number: event.syscall.number().raw(),
+            args: event.args.raw(),
+            result: None,
+            rip: event.context.rip,
         }
     }
 
@@ -624,7 +1008,22 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
 
     #[must_use]
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        RuntimeDiagnostics::capture(self.kernel(), self.tracer().events())
+        RuntimeDiagnostics::capture_runtime(self.dispatcher.subsystems(), self.tracer().events())
+    }
+
+    #[must_use]
+    pub fn stall_diagnostic(&self) -> RuntimeStallDiagnostic {
+        RuntimeStallDiagnostic::capture_runtime(
+            self.dispatcher.subsystems(),
+            self.tracer().events(),
+        )
+    }
+
+    pub fn run_guest_until_exit_with_step_limit(
+        &mut self,
+        max_guest_steps: u64,
+    ) -> Result<i32, GuestRunError> {
+        run_guest_until_exit_with_diagnostic_step_limit(&mut self.dispatcher, max_guest_steps)
     }
 
     #[must_use]
@@ -845,23 +1244,7 @@ where
     M: GuestMemoryAccess,
 {
     fn read_guest_vector(&self, vector_addr: u64) -> Result<Vec<Vec<u8>>, LinuxErrno> {
-        const MAX_VECTOR_ITEMS: usize = 4096;
-        if vector_addr == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut values = Vec::new();
-        for index in 0..MAX_VECTOR_ITEMS {
-            let item_addr = vector_addr
-                .checked_add((index * 8) as u64)
-                .ok_or(LinuxErrno::EFAULT)?;
-            let ptr = read_guest_u64(&self.memory, item_addr)?;
-            if ptr == 0 {
-                return Ok(values);
-            }
-            values.push(read_guest_c_bytes(&self.memory, ptr)?);
-        }
-        Err(LinuxErrno::E2BIG)
+        read_guest_vector(&self.memory, vector_addr)
     }
 
     fn sys_socket(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1008,42 +1391,18 @@ where
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
-        if self.socket_is_udp_datagram(socket_id)? {
-            let buffer = self.read_iovec_bytes(&iovecs)?;
-            let count = if let Some(datagram_address) = address {
-                self.sockets
-                    .send_to(socket_id, &buffer, datagram_address)
-                    .map_err(net_errno)?
-            } else {
-                self.sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?
-            };
-            return Ok(count as u64);
-        }
-
-        let mut total = 0u64;
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            self.memory
-                .read_bytes(iovec.iov_base, &mut buffer)
-                .map_err(memory_errno)?;
-            let count = if let Some(address) = address {
-                self.sockets
-                    .send_to(socket_id, &buffer, address)
-                    .map_err(net_errno)?
-            } else {
-                self.sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?
-            };
-            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-            if count < len {
-                break;
-            }
-        }
-        Ok(total)
+        let buffers = self.read_iovec_buffers(&iovecs)?;
+        let slices = io_slices(&buffers);
+        let count = if let Some(address) = address {
+            self.sockets
+                .send_to_vectored(socket_id, &slices, address)
+                .map_err(net_errno)?
+        } else {
+            self.sockets
+                .send_connected_vectored(socket_id, &slices)
+                .map_err(net_errno)?
+        };
+        Ok(count as u64)
     }
 
     fn sys_recvmsg(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1065,15 +1424,13 @@ where
         let total = if (message.msg_name != 0 || message.msg_namelen != 0)
             && self.socket_is_udp_datagram(socket_id)?
         {
-            let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
-                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                total.checked_add(len).ok_or(LinuxErrno::EINVAL)
-            })?;
-            let mut buffer = vec![0; capacity];
-            let (count, address) = self
-                .sockets
-                .recv_from(socket_id, &mut buffer)
-                .map_err(net_errno)?;
+            let mut buffers = iovec_output_buffers(&iovecs)?;
+            let (count, address) = {
+                let mut slices = io_slices_mut(&mut buffers);
+                self.sockets
+                    .recv_from_vectored(socket_id, &mut slices)
+                    .map_err(net_errno)?
+            };
             write_socket_address_to_msghdr_name(
                 &mut self.memory,
                 args.msg,
@@ -1081,7 +1438,7 @@ where
                 message.msg_namelen,
                 address,
             )?;
-            self.write_iovec_bytes(&iovecs, &buffer[..count])?;
+            self.write_iovec_buffers(&iovecs, &buffers, count)?;
             count as u64
         } else {
             if message.msg_name != 0 {
@@ -1337,23 +1694,13 @@ where
         let fd = arg_i32(request, 0);
         let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
         if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
-            let mut total = 0u64;
-            for item in iov {
-                let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                let mut buffer = vec![0; len];
-                self.memory
-                    .read_bytes(item.iov_base, &mut buffer)
-                    .map_err(memory_errno)?;
-                let count = self
-                    .sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?;
-                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-                if count < len {
-                    break;
-                }
-            }
-            return Ok(total);
+            let buffers = self.read_iovec_buffers(&iov)?;
+            let slices = io_slices(&buffers);
+            let count = self
+                .sockets
+                .send_connected_vectored(socket_id, &slices)
+                .map_err(net_errno)?;
+            return Ok(count as u64);
         }
 
         let mut total = 0u64;
@@ -1874,36 +2221,37 @@ where
         Ok(iovecs)
     }
 
-    fn read_iovec_bytes(&self, iovecs: &[LinuxIovec]) -> Result<Vec<u8>, LinuxErrno> {
-        let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            total.checked_add(len).ok_or(LinuxErrno::EINVAL)
-        })?;
-        let mut buffer = Vec::with_capacity(capacity);
+    fn read_iovec_buffers(&self, iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+        let mut buffers = Vec::with_capacity(iovecs.len());
         for iovec in iovecs {
             let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let start = buffer.len();
-            buffer.resize(start + len, 0);
+            let mut buffer = vec![0; len];
             self.memory
-                .read_bytes(iovec.iov_base, &mut buffer[start..])
+                .read_bytes(iovec.iov_base, &mut buffer)
                 .map_err(memory_errno)?;
+            buffers.push(buffer);
         }
-        Ok(buffer)
+        Ok(buffers)
     }
 
-    fn write_iovec_bytes(&mut self, iovecs: &[LinuxIovec], bytes: &[u8]) -> Result<(), LinuxErrno> {
+    fn write_iovec_buffers(
+        &mut self,
+        iovecs: &[LinuxIovec],
+        buffers: &[Vec<u8>],
+        bytes_written: usize,
+    ) -> Result<(), LinuxErrno> {
         let mut consumed = 0usize;
-        for iovec in iovecs {
+        for (iovec, buffer) in iovecs.iter().zip(buffers) {
             let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let remaining = bytes.len().saturating_sub(consumed);
+            let remaining = bytes_written.saturating_sub(consumed);
             let write_len = len.min(remaining);
             if write_len > 0 {
                 self.memory
-                    .write_bytes(iovec.iov_base, &bytes[consumed..consumed + write_len])
+                    .write_bytes(iovec.iov_base, &buffer[..write_len])
                     .map_err(memory_errno)?;
             }
             consumed += write_len;
-            if consumed >= bytes.len() {
+            if consumed >= bytes_written {
                 break;
             }
         }
@@ -1915,23 +2263,15 @@ where
         socket_id: SocketId,
         iovecs: &[LinuxIovec],
     ) -> Result<u64, LinuxErrno> {
-        let mut total = 0u64;
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            let count = self
-                .sockets
-                .recv_connected(socket_id, &mut buffer)
-                .map_err(net_errno)?;
-            self.memory
-                .write_bytes(iovec.iov_base, &buffer[..count])
-                .map_err(memory_errno)?;
-            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-            if count < len {
-                break;
-            }
-        }
-        Ok(total)
+        let mut buffers = iovec_output_buffers(iovecs)?;
+        let count = {
+            let mut slices = io_slices_mut(&mut buffers);
+            self.sockets
+                .recv_connected_vectored(socket_id, &mut slices)
+                .map_err(net_errno)?
+        };
+        self.write_iovec_buffers(iovecs, &buffers, count)?;
+        Ok(count as u64)
     }
 
     fn socket_is_udp_datagram(&self, id: SocketId) -> Result<bool, LinuxErrno> {
@@ -1957,6 +2297,28 @@ where
             .write_bytes(addr, &encode_linux_statfs(statfs))
             .map_err(memory_errno)
     }
+}
+
+fn io_slices(buffers: &[Vec<u8>]) -> Vec<IoSlice<'_>> {
+    buffers.iter().map(|buffer| IoSlice::new(buffer)).collect()
+}
+
+fn io_slices_mut(buffers: &mut [Vec<u8>]) -> Vec<IoSliceMut<'_>> {
+    buffers
+        .iter_mut()
+        .map(|buffer| IoSliceMut::new(buffer))
+        .collect()
+}
+
+fn iovec_output_buffers(iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+    iovecs
+        .iter()
+        .map(|iovec| {
+            usize::try_from(iovec.iov_len)
+                .map(|len| vec![0; len])
+                .map_err(|_| LinuxErrno::EINVAL)
+        })
+        .collect()
 }
 
 fn outcome(result: Result<u64, LinuxErrno>) -> SyscallOutcome {
@@ -2425,7 +2787,11 @@ impl Runtime {
 
     #[must_use]
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
-        self.dispatcher.subsystems_mut().memory_mut()
+        let subsystems = self.dispatcher.subsystems_mut();
+        subsystems
+            .prepare_memory_mut_for_process(mcr_task::INITIAL_GUEST_PID)
+            .expect("initial guest process memory is present");
+        subsystems.memory_mut()
     }
 
     #[must_use]
@@ -2435,7 +2801,9 @@ impl Runtime {
 
     #[must_use]
     pub fn memory_for_process_mut(&mut self, pid: mcr_sys::GuestPid) -> Option<&mut GuestMemory> {
-        self.dispatcher.subsystems_mut().memory_for_process_mut(pid)
+        let subsystems = self.dispatcher.subsystems_mut();
+        subsystems.prepare_memory_mut_for_process(pid).ok()?;
+        subsystems.memory_for_process_mut(pid)
     }
 
     #[must_use]
@@ -2494,7 +2862,11 @@ where
 
     #[must_use]
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
-        self.dispatcher.subsystems_mut().memory_mut()
+        let subsystems = self.dispatcher.subsystems_mut();
+        subsystems
+            .prepare_memory_mut_for_process(mcr_task::INITIAL_GUEST_PID)
+            .expect("initial guest process memory is present");
+        subsystems.memory_mut()
     }
 
     #[must_use]
@@ -2504,7 +2876,9 @@ where
 
     #[must_use]
     pub fn memory_for_process_mut(&mut self, pid: mcr_sys::GuestPid) -> Option<&mut GuestMemory> {
-        self.dispatcher.subsystems_mut().memory_for_process_mut(pid)
+        let subsystems = self.dispatcher.subsystems_mut();
+        subsystems.prepare_memory_mut_for_process(pid).ok()?;
+        subsystems.memory_for_process_mut(pid)
     }
 
     #[must_use]
@@ -2668,6 +3042,10 @@ pub enum GuestRunError {
     WaitResume {
         errno: LinuxErrno,
     },
+    StepLimitExceeded {
+        steps: u64,
+        diagnostic: RuntimeStallDiagnostic,
+    },
     GuestExecution(GuestExecutionError),
 }
 
@@ -2680,6 +3058,7 @@ impl GuestRunError {
             | Self::InitialTaskNotRunnable { .. }
             | Self::NoRunnableTasks => LinuxErrno::ESRCH,
             Self::WaitResume { errno } => *errno,
+            Self::StepLimitExceeded { .. } => LinuxErrno::ETIMEDOUT,
             Self::GuestExecution(error) => error.linux_errno(),
         }
     }
@@ -2699,6 +3078,12 @@ impl fmt::Display for GuestRunError {
             Self::NoRunnableTasks => write!(formatter, "no runnable guest tasks remain"),
             Self::WaitResume { errno } => {
                 write!(formatter, "failed to resume waiting guest task: {errno}")
+            }
+            Self::StepLimitExceeded { steps, diagnostic } => {
+                write!(
+                    formatter,
+                    "guest execution step limit exceeded after {steps} step(s): {diagnostic}"
+                )
             }
             Self::GuestExecution(error) => error.fmt(formatter),
         }
@@ -2732,6 +3117,34 @@ fn run_guest_until_exit_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
+    run_guest_until_exit_loop(dispatcher, None, |_| {
+        unreachable!("step-limit diagnostic is only captured when a limit is set")
+    })
+}
+
+fn run_guest_until_exit_with_diagnostic_step_limit(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, RuntimeDiagnosticsTracer>,
+    max_guest_steps: u64,
+) -> Result<i32, GuestRunError> {
+    run_guest_until_exit_loop(dispatcher, Some(max_guest_steps), |dispatcher| {
+        RuntimeStallDiagnostic::capture_runtime(
+            dispatcher.subsystems(),
+            dispatcher.tracer().events(),
+        )
+    })
+}
+
+fn run_guest_until_exit_loop<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    max_guest_steps: Option<u64>,
+    mut capture_diagnostic: impl FnMut(
+        &SyscallDispatcher<RuntimeSubsystems, T>,
+    ) -> RuntimeStallDiagnostic,
+) -> Result<i32, GuestRunError>
+where
+    T: SyscallTracer,
+{
+    let mut guest_steps = 0u64;
     loop {
         if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
             return Ok(status);
@@ -2741,7 +3154,10 @@ where
             .resume_waiting_tasks()
             .map_err(|errno| GuestRunError::WaitResume { errno })?;
         dispatcher.subsystems_mut().resume_fd_waiters();
-        let runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
+        let mut runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
+        dispatcher
+            .subsystems()
+            .prioritize_pending_fork_exec_tids(&mut runnable_tids);
         if runnable_tids.is_empty() {
             return Err(GuestRunError::NoRunnableTasks);
         }
@@ -2756,7 +3172,14 @@ where
             ) {
                 continue;
             }
+            if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
+                return Err(GuestRunError::StepLimitExceeded {
+                    steps: guest_steps,
+                    diagnostic: capture_diagnostic(dispatcher),
+                });
+            }
             dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+            guest_steps = guest_steps.saturating_add(1);
             if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
                 break;
             }
@@ -2808,6 +3231,144 @@ fn is_nonreturning_exit_syscall(
         )
 }
 
+struct ReadOnlyGuestMemory<'a> {
+    memory: &'a GuestMemory,
+}
+
+const fn runtime_memory_operand_error(error: GuestMemoryError) -> mcr_jit::GuestMemoryOperandError {
+    match error {
+        GuestMemoryError::NotMapped => mcr_jit::GuestMemoryOperandError::NotMapped,
+        GuestMemoryError::AccessDenied => mcr_jit::GuestMemoryOperandError::AccessDenied,
+        GuestMemoryError::InvalidAddress
+        | GuestMemoryError::InvalidLength
+        | GuestMemoryError::InvalidProtection
+        | GuestMemoryError::InvalidFlags
+        | GuestMemoryError::InvalidOffset
+        | GuestMemoryError::BadFileDescriptor
+        | GuestMemoryError::AddressInUse
+        | GuestMemoryError::OutOfMemory
+        | GuestMemoryError::RegionTooLarge
+        | GuestMemoryError::Host(_) => mcr_jit::GuestMemoryOperandError::Fault,
+    }
+}
+
+impl mcr_jit::GuestMemoryOperandAccess for ReadOnlyGuestMemory<'_> {
+    fn read_memory_operand(
+        &self,
+        address: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), mcr_jit::GuestMemoryOperandError> {
+        self.memory
+            .read(address, buffer)
+            .map_err(runtime_memory_operand_error)
+    }
+
+    fn write_memory_operand(
+        &mut self,
+        _address: u64,
+        _bytes: &[u8],
+    ) -> Result<(), mcr_jit::GuestMemoryOperandError> {
+        Err(mcr_jit::GuestMemoryOperandError::AccessDenied)
+    }
+}
+
+fn try_dispatch_pending_fork_exec_child_task<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    gpr: GprState,
+    before_rip: u64,
+) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
+
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
+    let trap = {
+        let Some(memory) = dispatcher.subsystems().memory_for_process(pid) else {
+            dispatcher
+                .subsystems_mut()
+                .materialize_pending_fork_exec_child_memory(pid)
+                .map_err(GuestExecutionError::Memory)?;
+            return Ok(None);
+        };
+        let block = read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?;
+        let mut read_only_memory = ReadOnlyGuestMemory { memory };
+        SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
+            GuestBlock::new(&block, before_rip),
+            registers_from_gpr_with_fs_base(gpr, fs_base),
+            &mut read_only_memory,
+        )
+    };
+    let Ok(trap) = trap else {
+        dispatcher
+            .subsystems_mut()
+            .materialize_pending_fork_exec_child_memory(pid)
+            .map_err(GuestExecutionError::Memory)?;
+        return Ok(None);
+    };
+    let syscall_registers = trap.registers().syscall_registers();
+    if !matches!(
+        syscall_registers.syscall(),
+        mcr_sys::Syscall::Execve | mcr_sys::Syscall::Exit | mcr_sys::Syscall::ExitGroup
+    ) {
+        dispatcher
+            .subsystems_mut()
+            .materialize_pending_fork_exec_child_memory(pid)
+            .map_err(GuestExecutionError::Memory)?;
+        return Ok(None);
+    }
+
+    let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+    if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
+        let trap_regs = gpr_from_registers(trap.registers());
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        if task.regs() == gpr {
+            task.set_regs(trap_regs);
+        }
+        return Ok(Some(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            task.regs().rip(),
+            dispatch_result.encoded_rax,
+            task.state(),
+        )));
+    }
+
+    let mut registers = trap.registers();
+    registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == gpr {
+        let updated_regs = gpr_from_registers(registers);
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(Some(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    )))
+}
+
 fn dispatch_guest_task_with_dispatcher<T>(
     dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
     tid: mcr_sys::GuestTid,
@@ -2832,6 +3393,26 @@ where
     }
 
     let before_rip = gpr.rip();
+    if dispatcher.subsystems().has_pending_fork_exec_children(pid) {
+        let materialize_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime materialize-fork-children start parent_pid={pid}"
+        ));
+        dispatcher
+            .subsystems_mut()
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(GuestExecutionError::Memory)?;
+        host_step_trace(format_args!(
+            "runtime materialize-fork-children done parent_pid={pid} elapsed_ms={}",
+            host_step_elapsed_ms(materialize_start)
+        ));
+    }
+    if dispatcher.subsystems().has_pending_fork_exec_child(pid)
+        && let Some(step) =
+            try_dispatch_pending_fork_exec_child_task(dispatcher, tid, pid, gpr, before_rip)?
+    {
+        return Ok(step);
+    }
     #[cfg(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(windows, target_arch = "x86_64")
@@ -2847,6 +3428,13 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
     };
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
     let trap = {
         let memory = dispatcher
             .subsystems_mut()
@@ -2854,7 +3442,7 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, before_rip),
-            registers_from_gpr(gpr),
+            registers_from_gpr_with_fs_base(gpr, fs_base),
             memory,
         )?
     };
@@ -2906,6 +3494,82 @@ where
     ))
 }
 
+fn dispatch_interpreted_guest_task_from_registers<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    expected_task_regs: GprState,
+    registers: GuestRegisters,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
+
+    let block = {
+        let memory = dispatcher
+            .subsystems()
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        read_guest_block(memory, registers.rip, MAX_GUEST_BLOCK_BYTES)?
+    };
+    let trap = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
+            GuestBlock::new(&block, registers.rip),
+            registers,
+            memory,
+        )?
+    };
+
+    let syscall_registers = trap.registers().syscall_registers();
+    let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+    if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
+        let trap_regs = gpr_from_registers(trap.registers());
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        if task.regs() == expected_task_regs {
+            task.set_regs(trap_regs);
+        }
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            task.regs().rip(),
+            dispatch_result.encoded_rax,
+            task.state(),
+        ));
+    }
+
+    let mut registers = trap.registers();
+    registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
+    let updated_regs = gpr_from_registers(registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == expected_task_regs {
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    ))
+}
+
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -2936,6 +3600,9 @@ where
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
         .fs_base();
+    host_step_trace(format_args!(
+        "runtime native-step start pid={pid} tid={tid} rip=0x{before_rip:016x} fs_base=0x{fs_base:016x}"
+    ));
     {
         let memory = dispatcher
             .subsystems_mut()
@@ -2959,10 +3626,56 @@ where
         let mut native_registers = host_registers_from_gpr(gpr);
         native_registers.xmm = native_fp.xmm;
         native_registers.mxcsr = native_fp.mxcsr;
+        let native_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime native-enter pid={pid} tid={tid} rip=0x{:016x}",
+            native_registers.rip
+        ));
         let native_result = mcr_win::execute_x86_64_until_trap(&mut native_registers, fs_base);
+        host_step_trace(format_args!(
+            "runtime native-return pid={pid} tid={tid} rip=0x{:016x} elapsed_ms={}",
+            native_registers.rip,
+            host_step_elapsed_ms(native_start)
+        ));
+        let fault_instruction = native_fault_instruction(memory, native_registers.rip);
         let stack_words = native_fault_stack_words(memory, native_registers.rsp);
-        native_result
-            .map_err(|error| native_execution_error(error, native_registers, stack_words))?;
+        if let Err(error) = native_result {
+            if let Some(instruction) = fault_instruction.as_ref() {
+                host_step_trace(format_args!(
+                    "runtime native-fault pid={pid} tid={tid} {instruction}"
+                ));
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if matches!(&error, mcr_win::NativeExecutionError::GuestFault { .. })
+                && fault_instruction
+                    .as_ref()
+                    .is_some_and(native_fault_is_unrewritten_fs_relative)
+            {
+                host_step_trace(format_args!(
+                    "runtime native-fs-fallback pid={pid} tid={tid} rip=0x{:016x} fs_base=0x{fs_base:016x}",
+                    native_registers.rip
+                ));
+                dispatcher.subsystems_mut().set_native_fp(
+                    tid,
+                    mcr_win::HostFloatingPointState {
+                        xmm: native_registers.xmm,
+                        mxcsr: native_registers.mxcsr,
+                    },
+                );
+                let mut registers = guest_registers_from_host(native_registers);
+                registers.fs_base = fs_base;
+                return dispatch_interpreted_guest_task_from_registers(
+                    dispatcher, tid, pid, before_rip, gpr, registers,
+                );
+            }
+            return Err(native_execution_error(
+                error,
+                native_registers,
+                fs_base,
+                fault_instruction,
+                stack_words,
+            ));
+        }
         dispatcher.subsystems_mut().set_native_fp(
             tid,
             mcr_win::HostFloatingPointState {
@@ -3066,10 +3779,38 @@ struct ExecutableSyscallPatch {
     address: u64,
 }
 
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug, Default)]
+struct ExecutableNativePatches {
+    scanned_ranges: Vec<(u64, u64)>,
+    syscall_patches: Vec<ExecutableSyscallPatch>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fs_relative_patches: Vec<FsRelativePatchSite>,
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FsRelativePatch {
     original: [u8; 9],
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+struct FsRelativePatchSite {
+    address: u64,
+    patch: FsRelativePatch,
+    materialized: bool,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsRelativePatchWork {
+    None,
+    New,
+    All,
 }
 
 #[cfg(any(
@@ -3639,52 +4380,92 @@ fn push_cache_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-fn scan_native_patch_metadata(
+fn native_patch_metadata_from_patches(patches: &ExecutableNativePatches) -> NativePatchMetadata {
+    NativePatchMetadata {
+        scanned_ranges: patches.scanned_ranges.clone(),
+        syscall_patches: patches.syscall_patches.clone(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: patches
+            .fs_relative_patches
+            .iter()
+            .map(|site| (site.address, site.patch))
+            .collect(),
+    }
+}
+
+fn find_executable_native_patches(
     memory: &mut GuestMemory,
     skipped_ranges: &[(u64, u64)],
     previous_fs_base: u64,
-) -> Result<NativePatchMetadata, GuestExecutionError> {
+) -> Result<ExecutableNativePatches, GuestExecutionError> {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    let _ = previous_fs_base;
+
     let executable_ranges = memory
         .vmas()
         .filter(|vma| vma.protection().execute)
         .filter(|vma| !range_is_covered(vma.start(), vma.end(), skipped_ranges))
         .map(|vma| (vma.start(), vma.end()))
         .collect::<Vec<_>>();
-    let mut metadata = NativePatchMetadata::default();
+    let mut patches = ExecutableNativePatches::default();
     for (start, end) in executable_ranges {
         let len = usize::try_from(end - start)
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+        let range_start = Instant::now();
+        host_step_trace(format_args!(
+            "runtime native-patch-scan start range=[0x{start:016x}..0x{end:016x}) bytes={len}"
+        ));
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        metadata.scanned_ranges.push((start, end));
-        for instruction in LinearInstructionScanner::new().scan(GuestBlock::new(&bytes, start)) {
-            let offset = usize::try_from(instruction.rip - start)
-                .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
-            if instruction.mnemonic == DecodedMnemonic::Syscall {
-                metadata.syscall_patches.push(ExecutableSyscallPatch {
-                    address: instruction.rip,
-                });
-            }
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
-                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
-            }) {
-                metadata
-                    .fs_relative_patches
-                    .insert(instruction.rip, FsRelativePatch { original });
-            }
+        patches.scanned_ranges.push((start, end));
+        let syscall_patch_start_len = patches.syscall_patches.len();
+        for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
+            patches
+                .syscall_patches
+                .push(ExecutableSyscallPatch { address: site.rip });
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let fs_patch_start_len = patches.fs_relative_patches.len();
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        patches.fs_relative_patches.extend(fs_relative_patch_sites(
+            &bytes,
+            start,
+            previous_fs_base,
+        ));
+        host_step_trace(format_args!(
+            "runtime native-patch-scan done range=[0x{start:016x}..0x{end:016x}) syscall_patches={} fs_relative_patches={} elapsed_ms={}",
+            patches.syscall_patches.len() - syscall_patch_start_len,
+            {
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                {
+                    patches.fs_relative_patches.len() - fs_patch_start_len
+                }
+                #[cfg(not(all(windows, target_arch = "x86_64")))]
+                {
+                    0
+                }
+            },
+            host_step_elapsed_ms(range_start)
+        ));
     }
-    Ok(metadata)
+    Ok(patches)
 }
 
-fn apply_syscall_patches(
+fn apply_executable_syscall_patches(
     memory: &mut GuestMemory,
     patches: &[ExecutableSyscallPatch],
 ) -> Result<(), GuestExecutionError> {
-    for patch in patches {
-        memory.patch_code(patch.address, &[0xcc, 0x90])?;
-    }
+    let patch_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime syscall-patch apply start patches={}",
+        patches.len()
+    ));
+    memory.patch_code_fixed(patches.iter().map(|patch| (patch.address, [0xcc, 0x90])))?;
+    host_step_trace(format_args!(
+        "runtime syscall-patch apply done patches={} elapsed_ms={}",
+        patches.len(),
+        host_step_elapsed_ms(patch_start)
+    ));
     Ok(())
 }
 
@@ -3693,9 +4474,17 @@ fn apply_native_patch_metadata(
     fs_base: u64,
     metadata: &NativePatchMetadata,
 ) -> Result<(), GuestExecutionError> {
-    apply_syscall_patches(memory, &metadata.syscall_patches)?;
+    apply_executable_syscall_patches(memory, &metadata.syscall_patches)?;
     #[cfg(all(windows, target_arch = "x86_64"))]
-    apply_fs_relative_patches(memory, fs_base, &metadata.fs_relative_patches)?;
+    apply_fs_relative_patch_entries(
+        memory,
+        fs_base,
+        metadata.fs_relative_patches.len(),
+        metadata
+            .fs_relative_patches
+            .iter()
+            .map(|(&address, &patch)| (address, patch)),
+    )?;
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
         let _ = fs_base;
@@ -3775,15 +4564,49 @@ fn rebase_native_patch_address(address: u64, source_base: u64, target_base: u64)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn apply_fs_relative_patches(
+fn fs_relative_patch_work(
+    cached_fs_base: u64,
+    fs_base: u64,
+    cached_patch_count: usize,
+    new_unmaterialized_patch_count: usize,
+    new_materialized_patch_count: usize,
+) -> FsRelativePatchWork {
+    if cached_fs_base != fs_base {
+        if fs_base != 0 || cached_patch_count > 0 || new_materialized_patch_count > 0 {
+            FsRelativePatchWork::All
+        } else {
+            FsRelativePatchWork::None
+        }
+    } else if fs_base != 0 && new_unmaterialized_patch_count > 0 {
+        FsRelativePatchWork::New
+    } else {
+        FsRelativePatchWork::None
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn apply_fs_relative_patch_entries(
     memory: &mut GuestMemory,
     fs_base: u64,
-    patches: &BTreeMap<u64, FsRelativePatch>,
+    patch_count: usize,
+    patches: impl IntoIterator<Item = (u64, FsRelativePatch)>,
 ) -> Result<(), GuestExecutionError> {
-    for (address, patch) in patches {
-        let bytes = fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original);
-        memory.patch_code(*address, &bytes)?;
-    }
+    let patch_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime fs-relative-patch apply start patches={} fs_base=0x{fs_base:016x}",
+        patch_count
+    ));
+    memory.patch_code_fixed(patches.into_iter().map(|(address, patch)| {
+        (
+            address,
+            fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original),
+        )
+    }))?;
+    host_step_trace(format_args!(
+        "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
+        patch_count,
+        host_step_elapsed_ms(patch_start)
+    ));
     Ok(())
 }
 
@@ -3801,6 +4624,42 @@ fn address_in_ranges(address: u64, ranges: &[(u64, u64)]) -> bool {
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
     left_start < right_end && right_start < left_end
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch_sites(
+    bytes: &[u8],
+    range_start: u64,
+    previous_fs_base: u64,
+) -> Vec<FsRelativePatchSite> {
+    let mut patches = Vec::new();
+    for instruction in LinearInstructionScanner::new().scan(GuestBlock::new(bytes, range_start)) {
+        let Some(offset) = instruction
+            .rip
+            .checked_sub(range_start)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            continue;
+        };
+        if let Some(original) = fs_relative_original(&bytes[offset..]) {
+            patches.push(FsRelativePatchSite {
+                address: instruction.rip,
+                patch: FsRelativePatch { original },
+                materialized: false,
+            });
+        } else if previous_fs_base != 0
+            && let Some(original) =
+                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
+        {
+            patches.push(FsRelativePatchSite {
+                address: instruction.rip,
+                patch: FsRelativePatch { original },
+                materialized: true,
+            });
+        }
+    }
+
+    patches
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -3913,6 +4772,8 @@ fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> Option<(Fd, 
 fn native_execution_error(
     error: mcr_win::NativeExecutionError,
     registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: Option<NativeFaultInstruction>,
     stack_words: Vec<NativeFaultStackWord>,
 ) -> GuestExecutionError {
     match error {
@@ -3924,7 +4785,9 @@ fn native_execution_error(
             signal,
             rip,
             address,
+            fs_base,
             registers: guest_registers_from_host(registers),
+            instruction: instruction.map(Box::new),
             stack_words,
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
@@ -3934,11 +4797,20 @@ fn native_execution_error(
                 signal: 0,
                 rip: 0,
                 address: 0,
+                fs_base,
                 registers: GuestRegisters::default(),
+                instruction: None,
                 stack_words: Vec::new(),
             })
         }
     }
+}
+
+fn native_fault_instruction(memory: &GuestMemory, rip: u64) -> Option<NativeFaultInstruction> {
+    const MAX_INSTRUCTION_BYTES: usize = 15;
+
+    let bytes = read_guest_block(memory, rip, MAX_INSTRUCTION_BYTES).ok()?;
+    mcr_jit::decode_native_fault_instruction(&bytes, rip)
 }
 
 fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultStackWord> {
@@ -3955,6 +4827,11 @@ fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultSt
             })
         })
         .collect()
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn native_fault_is_unrewritten_fs_relative(instruction: &NativeFaultInstruction) -> bool {
+    fs_relative_original(&instruction.bytes).is_some()
 }
 
 fn read_guest_block(
@@ -3996,6 +4873,14 @@ fn registers_from_gpr(value: GprState) -> GuestRegisters {
         r15: value.r15(),
         rip: value.rip(),
         rflags: value.rflags(),
+        fs_base: 0,
+    }
+}
+
+fn registers_from_gpr_with_fs_base(value: GprState, fs_base: u64) -> GuestRegisters {
+    GuestRegisters {
+        fs_base,
+        ..registers_from_gpr(value)
     }
 }
 
@@ -4064,14 +4949,68 @@ fn guest_registers_from_host(value: mcr_win::HostCpuRegisters) -> GuestRegisters
         r15: value.r15,
         rip: value.rip,
         rflags: value.rflags,
+        fs_base: 0,
     }
+}
+
+#[derive(Debug, Default)]
+struct FileBackedMappingCache {
+    entries: BTreeMap<FileBackedMappingCacheKey, Arc<[u8]>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl FileBackedMappingCache {
+    fn lookup(&mut self, key: FileBackedMappingCacheKey) -> Option<Arc<[u8]>> {
+        let bytes = self.entries.get(&key)?;
+        self.hits += 1;
+        Some(bytes.clone())
+    }
+
+    fn record_miss(&mut self) {
+        self.misses += 1;
+    }
+
+    fn insert(&mut self, key: FileBackedMappingCacheKey, bytes: Vec<u8>) -> Arc<[u8]> {
+        self.entries
+            .retain(|cached, _| cached.file.generation() == key.file.generation());
+        let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+        self.entries.insert(key, bytes.clone());
+        bytes
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> FileBackedMappingCacheSnapshot {
+        FileBackedMappingCacheSnapshot {
+            entries: self.entries.len(),
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileBackedMappingCacheKey {
+    file: RegularFileCacheKey,
+    offset: u64,
+    length: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileBackedMappingCacheSnapshot {
+    entries: usize,
+    hits: usize,
+    misses: usize,
 }
 
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
     files: RuntimeFileSystem<GuestMemory>,
+    file_backed_mapping_cache: FileBackedMappingCache,
     process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
+    pending_fork_exec: BTreeMap<mcr_sys::GuestPid, PendingForkExec>,
     selected_memory_pid: mcr_sys::GuestPid,
     process_fds: BTreeMap<mcr_sys::GuestPid, FdTable>,
     selected_fds_pid: mcr_sys::GuestPid,
@@ -4079,11 +5018,17 @@ pub struct RuntimeSubsystems {
     epolls: EpollRegistry,
     native_execution: bool,
     native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
+    signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
     native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
     native_image_patch_keys: NativeImagePatchKeyMap,
     native_image_patch_ranges: NativeImagePatchRangeMap,
     native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
     pending_fork_child_regs: Option<GprState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingForkExec {
+    parent_pid: mcr_sys::GuestPid,
 }
 
 fn native_image_patch_maps(
@@ -4125,7 +5070,9 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
+            file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
+            pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
             process_fds: BTreeMap::new(),
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
@@ -4133,6 +5080,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
             native_image_patch_keys,
             native_image_patch_ranges,
@@ -4160,7 +5108,9 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
+            file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
+            pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
             process_fds: BTreeMap::new(),
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
@@ -4168,6 +5118,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
             native_image_patch_keys,
             native_image_patch_ranges,
@@ -4190,6 +5141,11 @@ impl RuntimeSubsystems {
             }
         }
         self.native_execution = true;
+    }
+
+    #[cfg(test)]
+    fn file_backed_mapping_cache_snapshot(&self) -> FileBackedMappingCacheSnapshot {
+        self.file_backed_mapping_cache.snapshot()
     }
 
     fn native_fp(&self, tid: mcr_sys::GuestTid) -> Option<&mcr_win::HostFloatingPointState> {
@@ -4228,6 +5184,7 @@ impl RuntimeSubsystems {
         pid: mcr_sys::GuestPid,
         fs_base: u64,
     ) -> Result<(), GuestExecutionError> {
+        let patch_start = Instant::now();
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
         let mut store_image_metadata = None;
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
@@ -4282,17 +5239,78 @@ impl RuntimeSubsystems {
 
         let scanned_ranges = cache.scanned_ranges.clone();
         let scanned_metadata;
+        host_step_trace(format_args!(
+            "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
+            scanned_ranges.len()
+        ));
         {
             let memory = self
                 .memory_for_process_mut(pid)
                 .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-            scanned_metadata = scan_native_patch_metadata(memory, &scanned_ranges, cache.fs_base)?;
-            apply_syscall_patches(memory, &scanned_metadata.syscall_patches)?;
+            let patches = find_executable_native_patches(memory, &scanned_ranges, cache.fs_base)?;
+            scanned_metadata = native_patch_metadata_from_patches(&patches);
+            apply_executable_syscall_patches(memory, &patches.syscall_patches)?;
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
-                let added_fs_patch = cache.merge_metadata(&scanned_metadata);
-                if cache.fs_base != fs_base || added_fs_patch {
-                    apply_fs_relative_patches(memory, fs_base, &cache.fs_relative_patches)?;
+                let cached_fs_patch_count = cache.fs_relative_patches.len();
+                let mut new_unmaterialized_fs_patch_addresses = Vec::new();
+                let mut new_materialized_fs_patch_addresses = Vec::new();
+                for site in patches.fs_relative_patches {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        cache.fs_relative_patches.entry(site.address)
+                    {
+                        entry.insert(site.patch);
+                        if site.materialized {
+                            new_materialized_fs_patch_addresses.push(site.address);
+                        } else {
+                            new_unmaterialized_fs_patch_addresses.push(site.address);
+                        }
+                    }
+                }
+                match fs_relative_patch_work(
+                    cache.fs_base,
+                    fs_base,
+                    cached_fs_patch_count,
+                    new_unmaterialized_fs_patch_addresses.len(),
+                    new_materialized_fs_patch_addresses.len(),
+                ) {
+                    FsRelativePatchWork::All => {
+                        apply_fs_relative_patch_entries(
+                            memory,
+                            fs_base,
+                            cache.fs_relative_patches.len(),
+                            cache
+                                .fs_relative_patches
+                                .iter()
+                                .map(|(&address, &patch)| (address, patch)),
+                        )?;
+                    }
+                    FsRelativePatchWork::New => {
+                        apply_fs_relative_patch_entries(
+                            memory,
+                            fs_base,
+                            new_unmaterialized_fs_patch_addresses.len(),
+                            new_unmaterialized_fs_patch_addresses
+                                .iter()
+                                .filter_map(|address| {
+                                    cache
+                                        .fs_relative_patches
+                                        .get(address)
+                                        .map(|&patch| (*address, patch))
+                                }),
+                        )?;
+                    }
+                    FsRelativePatchWork::None
+                        if !new_unmaterialized_fs_patch_addresses.is_empty()
+                            || !new_materialized_fs_patch_addresses.is_empty() =>
+                    {
+                        host_step_trace(format_args!(
+                            "runtime fs-relative-patch apply skipped patches={} fs_base=0x{fs_base:016x}",
+                            new_unmaterialized_fs_patch_addresses.len()
+                                + new_materialized_fs_patch_addresses.len()
+                        ));
+                    }
+                    FsRelativePatchWork::None => {}
                 }
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -4335,6 +5353,11 @@ impl RuntimeSubsystems {
             .collect::<Vec<_>>();
         cache.fs_base = fs_base;
         cache.scanned_ranges = scanned_now;
+        host_step_trace(format_args!(
+            "runtime native-patch-cache done pid={pid} ranges={} elapsed_ms={}",
+            cache.scanned_ranges.len(),
+            host_step_elapsed_ms(patch_start)
+        ));
         self.native_patch_caches.insert(pid, cache);
         Ok(())
     }
@@ -4357,20 +5380,6 @@ impl RuntimeSubsystems {
         };
         if let Some(cache) = self.native_patch_caches.get_mut(&pid) {
             cache.invalidate_range(start, end);
-        }
-    }
-
-    fn set_native_image_patch_key(
-        &mut self,
-        pid: mcr_sys::GuestPid,
-        image: &mcr_elf::GuestMemoryImage,
-    ) {
-        if let Some((key, ranges)) = native_image_patch_key_and_ranges(image) {
-            self.native_image_patch_keys.insert(pid, key);
-            self.native_image_patch_ranges.insert(pid, ranges);
-        } else {
-            self.native_image_patch_keys.remove(&pid);
-            self.native_image_patch_ranges.remove(&pid);
         }
     }
 
@@ -4410,8 +5419,16 @@ impl RuntimeSubsystems {
     pub fn memory_for_process(&self, pid: mcr_sys::GuestPid) -> Option<&GuestMemory> {
         if pid == self.selected_memory_pid {
             Some(self.files.memory())
+        } else if let Some(memory) = self.process_memory.get(&pid) {
+            Some(memory)
+        } else if let Some(pending) = self.pending_fork_exec.get(&pid) {
+            if pending.parent_pid == self.selected_memory_pid {
+                Some(self.files.memory())
+            } else {
+                self.process_memory.get(&pending.parent_pid)
+            }
         } else {
-            self.process_memory.get(&pid)
+            None
         }
     }
 
@@ -4437,6 +5454,12 @@ impl RuntimeSubsystems {
 impl FileSyscalls for RuntimeSubsystems {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
+        if let Err(errno) = self
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
@@ -4463,6 +5486,12 @@ impl FileSyscalls for RuntimeSubsystems {
 impl MemorySyscalls for RuntimeSubsystems {
     fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
+        if let Err(errno) = self
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         if matches!(request.syscall, mcr_sys::Syscall::Mmap) {
             if let Err(errno) = self.select_process_context(pid) {
                 return SyscallOutcome::errno(errno);
@@ -4509,6 +5538,12 @@ impl MemorySyscalls for RuntimeSubsystems {
 impl TimeSyscalls for RuntimeSubsystems {
     fn dispatch_time(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
+        if let Err(errno) = self
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         if let Err(errno) = self.select_memory_for_process(pid) {
             return SyscallOutcome::errno(errno);
         }
@@ -4541,6 +5576,12 @@ impl TimeSyscalls for RuntimeSubsystems {
 impl NetworkSyscalls for RuntimeSubsystems {
     fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
+        if let Err(errno) = self
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
@@ -4558,6 +5599,13 @@ impl NetworkSyscalls for RuntimeSubsystems {
 }
 impl EventSyscalls for RuntimeSubsystems {
     fn dispatch_event(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self
+            .materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         match request.syscall {
             mcr_sys::Syscall::Poll => self.dispatch_poll(request),
             mcr_sys::Syscall::Ppoll => self.dispatch_ppoll(request),
@@ -4572,11 +5620,46 @@ impl EventSyscalls for RuntimeSubsystems {
 }
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
+    fn supports_fast_task(&self, request: &SyscallRequest) -> bool {
+        if self.pending_fork_exec.contains_key(&request.context.pid) {
+            return false;
+        }
+        matches!(
+            request.syscall,
+            mcr_sys::Syscall::Getpid | mcr_sys::Syscall::Gettid
+        )
+    }
+
+    fn dispatch_fast_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let Some(task) = self.tasks.task(request.context.tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if task.pid() != request.context.pid {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+
+        match request.syscall {
+            mcr_sys::Syscall::Getpid => SyscallOutcome::success(u64::from(task.pid())),
+            mcr_sys::Syscall::Gettid => SyscallOutcome::success(u64::from(task.tid())),
+            _ => SyscallOutcome::unsupported(),
+        }
+    }
+
     fn dispatch_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        if !matches!(
+            request.syscall,
+            mcr_sys::Syscall::Execve | mcr_sys::Syscall::Wait4
+        ) && let Err(errno) = self
+            .materialize_pending_fork_exec_children(request.context.pid)
+            .map_err(|error| error.errno())
+        {
+            return SyscallOutcome::errno(errno);
+        }
         match request.syscall {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
+            mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
             mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
             mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
@@ -4698,7 +5781,7 @@ impl RuntimeSubsystems {
             .mmap(args)
             .map_err(|error| error.errno())?;
         if !args.is_anonymous() {
-            self.populate_file_backed_mmap(mapped, length, prot, fd, offset)?;
+            self.populate_file_backed_mmap(mapped, length, prot, flags, fd, offset)?;
         }
         Ok(mapped)
     }
@@ -4708,6 +5791,7 @@ impl RuntimeSubsystems {
         mapped: u64,
         length: u64,
         prot: u32,
+        flags: u32,
         fd: Fd,
         offset: i64,
     ) -> Result<(), LinuxErrno> {
@@ -4715,13 +5799,7 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
         let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
-        let mut bytes = vec![0; len];
-        let count = self
-            .files
-            .vfs()
-            .pread(fd, offset as u64, &mut bytes)
-            .map_err(vfs_errno)?;
-        zero_elf_load_bss_tail(self.files.vfs(), fd, offset as u64, &mut bytes[..count]);
+        let bytes = self.file_backed_mmap_bytes(fd, offset as u64, len, prot, flags)?;
         let writable = mcr_sys::MprotectSyscallArgs {
             addr: mapped,
             length,
@@ -4731,7 +5809,7 @@ impl RuntimeSubsystems {
             .memory_mut()
             .mprotect(writable)
             .map_err(|error| error.errno())?;
-        let write_result = self.files.memory_mut().write(mapped, &bytes[..count]);
+        let write_result = self.files.memory_mut().write(mapped, bytes.as_ref());
         let restore_result = self
             .files
             .memory_mut()
@@ -4745,6 +5823,73 @@ impl RuntimeSubsystems {
         Ok(())
     }
 
+    fn file_backed_mmap_bytes(
+        &mut self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<Arc<[u8]>, LinuxErrno> {
+        let cache_key = self.file_backed_mmap_cache_key(fd, offset, len, prot, flags)?;
+        if let Some(key) = cache_key {
+            if let Some(bytes) = self.file_backed_mapping_cache.lookup(key) {
+                return Ok(bytes);
+            }
+            self.file_backed_mapping_cache.record_miss();
+            let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
+            return Ok(self.file_backed_mapping_cache.insert(key, bytes));
+        }
+
+        let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
+        Ok(Arc::from(bytes.into_boxed_slice()))
+    }
+
+    fn file_backed_mmap_cache_key(
+        &self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<Option<FileBackedMappingCacheKey>, LinuxErrno> {
+        if prot & mcr_sys::LINUX_PROT_WRITE != 0 || flags & mcr_sys::LINUX_MAP_PRIVATE == 0 {
+            return Ok(None);
+        }
+
+        let Some(file) = self
+            .files
+            .vfs()
+            .regular_file_cache_key(fd)
+            .map_err(vfs_errno)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(FileBackedMappingCacheKey {
+            file,
+            offset,
+            length: len,
+        }))
+    }
+
+    fn read_file_backed_mmap_bytes(
+        &self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        let mut bytes = vec![0; len];
+        let count = self
+            .files
+            .vfs()
+            .pread(fd, offset, &mut bytes)
+            .map_err(vfs_errno)?;
+        zero_elf_load_bss_tail(self.files.vfs(), fd, offset, &mut bytes[..count]);
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
         self.select_fds_for_process(pid)?;
@@ -4753,6 +5898,10 @@ impl RuntimeSubsystems {
     }
 
     fn select_memory_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        if self.pending_fork_exec.contains_key(&pid) {
+            self.materialize_pending_fork_exec_child_memory(pid)
+                .map_err(|error| error.errno())?;
+        }
         if pid == self.selected_memory_pid {
             if self.native_execution && !self.files.memory().uses_fixed_guest_host_addresses() {
                 self.materialize_selected_memory_at_guest_addresses()?;
@@ -4775,6 +5924,16 @@ impl RuntimeSubsystems {
         *self.files.memory_mut() = memory;
         self.selected_memory_pid = pid;
         Ok(())
+    }
+
+    fn prepare_memory_mut_for_process(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        if self.pending_fork_exec.contains_key(&pid) {
+            self.materialize_pending_fork_exec_child_memory(pid)
+                .map_err(|error| error.errno())?;
+        }
+        self.materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())?;
+        self.select_memory_for_process(pid)
     }
 
     fn select_native_memory_for_process(
@@ -5082,6 +6241,88 @@ impl RuntimeSubsystems {
         drop(selected);
     }
 
+    fn has_pending_fork_exec_child(&self, pid: mcr_sys::GuestPid) -> bool {
+        self.pending_fork_exec.contains_key(&pid)
+    }
+
+    fn has_pending_fork_exec_children(&self, parent_pid: mcr_sys::GuestPid) -> bool {
+        self.pending_fork_exec
+            .values()
+            .any(|pending| pending.parent_pid == parent_pid)
+    }
+
+    fn prioritize_pending_fork_exec_tids(&self, tids: &mut [mcr_sys::GuestTid]) {
+        tids.sort_by_key(|tid| {
+            let pending_child = self
+                .tasks
+                .task(*tid)
+                .is_some_and(|task| self.pending_fork_exec.contains_key(&task.pid()));
+            (!pending_child, *tid)
+        });
+    }
+
+    fn materialize_pending_fork_exec_children(
+        &mut self,
+        parent_pid: mcr_sys::GuestPid,
+    ) -> Result<(), GuestMemoryError> {
+        let child_pids = self
+            .pending_fork_exec
+            .iter()
+            .filter_map(|(child_pid, pending)| {
+                (pending.parent_pid == parent_pid).then_some(*child_pid)
+            })
+            .collect::<Vec<_>>();
+        for child_pid in child_pids {
+            self.materialize_pending_fork_exec_child_memory(child_pid)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_pending_fork_exec_child_memory(
+        &mut self,
+        child_pid: mcr_sys::GuestPid,
+    ) -> Result<(), GuestMemoryError> {
+        let materialize_start = Instant::now();
+        let pending = self
+            .pending_fork_exec
+            .get(&child_pid)
+            .copied()
+            .ok_or(GuestMemoryError::NotMapped)?;
+        host_step_trace(format_args!(
+            "runtime materialize-fork-child start parent_pid={} child_pid={child_pid}",
+            pending.parent_pid
+        ));
+        let memory = self
+            .memory_for_process(pending.parent_pid)
+            .ok_or(GuestMemoryError::NotMapped)?
+            .try_clone_runtime()?;
+        self.pending_fork_exec.remove(&child_pid);
+        self.process_memory.insert(child_pid, memory);
+        if let Some(cache) = self.native_patch_caches.get(&pending.parent_pid).cloned() {
+            self.native_patch_caches.insert(child_pid, cache);
+        }
+        if let Some(key) = self
+            .native_image_patch_keys
+            .get(&pending.parent_pid)
+            .cloned()
+        {
+            self.native_image_patch_keys.insert(child_pid, key);
+        }
+        if let Some(ranges) = self
+            .native_image_patch_ranges
+            .get(&pending.parent_pid)
+            .cloned()
+        {
+            self.native_image_patch_ranges.insert(child_pid, ranges);
+        }
+        host_step_trace(format_args!(
+            "runtime materialize-fork-child done parent_pid={} child_pid={child_pid} elapsed_ms={}",
+            pending.parent_pid,
+            host_step_elapsed_ms(materialize_start)
+        ));
+        Ok(())
+    }
+
     fn store_selected_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         if pid != self.selected_memory_pid {
             return Err(LinuxErrno::ESRCH);
@@ -5180,7 +6421,7 @@ impl RuntimeSubsystems {
     }
 
     fn drop_native_patch_cache_for_process(&mut self, pid: mcr_sys::GuestPid) {
-        self.invalidate_native_patch_cache(pid);
+        self.native_patch_caches.remove(&pid);
         self.native_image_patch_keys.remove(&pid);
         self.native_image_patch_ranges.remove(&pid);
     }
@@ -5340,6 +6581,9 @@ impl RuntimeSubsystems {
     }
 
     fn drop_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
+        self.materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())?;
+        self.pending_fork_exec.remove(&pid);
         if pid == self.selected_memory_pid {
             if pid != mcr_task::INITIAL_GUEST_PID {
                 self.restore_initial_memory_after_selected_drop()?;
@@ -5430,6 +6674,47 @@ impl RuntimeSubsystems {
             }
             SyscallReturn::Errno(errno) => Err(errno),
         }
+    }
+
+    fn dispatch_sigaltstack(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.sigaltstack(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    fn sigaltstack(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let pid = request.context.pid;
+        let tid = request.context.tid;
+        self.select_memory_for_process(pid)?;
+        let ss = arg(request, 0);
+        let old_ss = arg(request, 1);
+        let current = self
+            .signal_alt_stacks
+            .get(&tid)
+            .copied()
+            .unwrap_or_default();
+        let requested = if ss == 0 {
+            None
+        } else {
+            let stack = read_guest_stack_t(self.files.memory(), ss)?;
+            validate_sigaltstack(stack)?;
+            Some(stack)
+        };
+
+        if old_ss != 0 {
+            write_guest_stack_t(self.files.memory_mut(), old_ss, current)?;
+        }
+
+        if let Some(requested) = requested {
+            if requested.disabled() {
+                self.signal_alt_stacks.remove(&tid);
+            } else {
+                self.signal_alt_stacks.insert(tid, requested);
+            }
+        }
+
+        self.store_selected_process_memory(pid)
     }
 
     fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -5562,6 +6847,8 @@ impl RuntimeSubsystems {
         if wstatus == 0 {
             return Ok(());
         }
+        self.materialize_pending_fork_exec_children(pid)
+            .map_err(|error| error.errno())?;
         self.memory_for_process_mut(pid)
             .ok_or(LinuxErrno::ESRCH)?
             .write(wstatus, &wait_status.to_le_bytes())
@@ -5599,33 +6886,12 @@ impl RuntimeSubsystems {
         let Some(child_pid) = fork_child_pid(&outcome.decoded) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        match self.files.memory().try_clone_runtime() {
-            Ok(memory) => {
-                self.process_memory.insert(child_pid, memory);
-                self.process_fds
-                    .insert(child_pid, self.files.vfs().fds().clone());
-                if let Some(cache) = self.native_patch_caches.get(&pid).cloned() {
-                    self.native_patch_caches.insert(child_pid, cache);
-                }
-                if let Some(key) = self.native_image_patch_keys.get(&pid).cloned() {
-                    self.native_image_patch_keys.insert(child_pid, key);
-                }
-                if let Some(ranges) = self.native_image_patch_ranges.get(&pid).cloned() {
-                    self.native_image_patch_ranges.insert(child_pid, ranges);
-                }
-                self.fork_native_fp(request.context.tid, child_pid);
-                outcome
-            }
-            Err(error) => {
-                self.tasks
-                    .wait4_child(
-                        pid,
-                        mcr_sys::Wait4SyscallArgs::new(child_pid as i32, 0, 0, 0),
-                    )
-                    .ok();
-                SyscallOutcome::errno(error.errno())
-            }
-        }
+        self.pending_fork_exec
+            .insert(child_pid, PendingForkExec { parent_pid: pid });
+        self.process_fds
+            .insert(child_pid, self.files.vfs().fds().clone());
+        self.fork_native_fp(request.context.tid, child_pid);
+        outcome.with_decoded_field("fork_memory", "deferred_exec")
     }
 
     fn dispatch_native_fork_like_task(
@@ -5678,12 +6944,20 @@ impl RuntimeSubsystems {
 
     fn dispatch_execve(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         match self.execve(request) {
-            Ok(()) => SyscallOutcome::success(0),
+            Ok(true) => {
+                SyscallOutcome::success(0).with_decoded_field("exec_fast_path", "fork_exec")
+            }
+            Ok(false) => SyscallOutcome::success(0),
             Err(errno) => SyscallOutcome::errno(errno),
         }
     }
 
-    fn execve(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+    fn execve(&mut self, request: &SyscallRequest) -> Result<bool, LinuxErrno> {
+        if self.pending_fork_exec.contains_key(&request.context.pid) {
+            return self.execve_pending_fork_exec_child(request).map(|()| true);
+        }
+        self.materialize_pending_fork_exec_children(request.context.pid)
+            .map_err(|error| error.errno())?;
         self.select_process_context(request.context.pid)?;
         let filename = read_guest_c_bytes(self.files.memory(), arg(request, 0))?;
         let argv = self.files.read_guest_vector(arg(request, 1))?;
@@ -5718,10 +6992,88 @@ impl RuntimeSubsystems {
         }
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
         self.native_fp.remove(&request.context.tid);
+        self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.native_patch_caches.remove(&request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
-        self.store_selected_process_memory(request.context.pid)
+        self.store_selected_process_memory(request.context.pid)?;
+        Ok(false)
+    }
+
+    fn execve_pending_fork_exec_child(
+        &mut self,
+        request: &SyscallRequest,
+    ) -> Result<(), LinuxErrno> {
+        let child_pid = request.context.pid;
+        let parent_pid = self
+            .pending_fork_exec
+            .get(&child_pid)
+            .map(|pending| pending.parent_pid)
+            .ok_or(LinuxErrno::ESRCH)?;
+        self.select_fds_for_process(child_pid)?;
+        sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
+
+        let args = (|| {
+            let memory = self
+                .memory_for_process(parent_pid)
+                .ok_or(LinuxErrno::ESRCH)?;
+            let filename = read_guest_c_bytes(memory, arg(request, 0))?;
+            let argv = read_guest_vector(memory, arg(request, 1))?;
+            let envp = read_guest_vector(memory, arg(request, 2))?;
+            Ok((filename, argv, envp))
+        })();
+        let (filename, argv, envp) = match args {
+            Ok(args) => args,
+            Err(errno) => {
+                self.materialize_pending_fork_exec_child_memory(child_pid)
+                    .map_err(|error| error.errno())?;
+                return Err(errno);
+            }
+        };
+        let program = match self.files.load_guest_program(filename, argv, envp) {
+            Ok(program) => program,
+            Err(errno) => {
+                self.materialize_pending_fork_exec_child_memory(child_pid)
+                    .map_err(|error| error.errno())?;
+                return Err(errno);
+            }
+        };
+        if let Err(error) = self.tasks.exec_task(request.context.tid, program) {
+            self.materialize_pending_fork_exec_child_memory(child_pid)
+                .map_err(|error| error.errno())?;
+            return Err(error.linux_errno());
+        }
+        self.pending_fork_exec.remove(&child_pid);
+        let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
+        for socket_id in closed_fd_ids
+            .socket_ids
+            .into_iter()
+            .filter_map(SocketId::new)
+        {
+            if self.socket_fd_ref_count_excluding_current(child_pid, socket_id)
+                + self.files.vfs().socket_fd_count(socket_id.get())
+                == 0
+            {
+                self.files
+                    .sockets_mut()
+                    .close(socket_id)
+                    .map_err(net_errno)?;
+            }
+        }
+        for epoll_id in closed_fd_ids.epoll_ids {
+            if self.epoll_fd_ref_count_excluding_current(child_pid, epoll_id)
+                + self.files.vfs().epoll_fd_count(epoll_id)
+                == 0
+            {
+                self.epolls.close(epoll_id);
+            }
+        }
+        sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
+        self.native_fp.remove(&request.context.tid);
+        self.signal_alt_stacks.remove(&request.context.tid);
+        self.replace_memory_from_image(child_pid)?;
+        self.native_patch_caches.remove(&child_pid);
+        self.store_selected_process_fds(child_pid)
     }
 
     fn replace_memory_from_image(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -5732,16 +7084,30 @@ impl RuntimeSubsystems {
             .image()
             .memory()
             .clone();
-        self.set_native_image_patch_key(pid, &image);
         if pid == self.selected_memory_pid {
             self.drop_selected_memory_allocations();
             let memory = self.memory_from_process_image(&image)?;
             *self.files.memory_mut() = memory;
         } else {
             let memory = self.memory_from_process_image(&image)?;
-            *self.memory_for_process_mut(pid).ok_or(LinuxErrno::ESRCH)? = memory;
+            self.process_memory.insert(pid, memory);
         }
+        self.set_native_image_patch_key(pid, &image);
         Ok(())
+    }
+
+    fn set_native_image_patch_key(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        image: &mcr_elf::GuestMemoryImage,
+    ) {
+        if let Some((key, ranges)) = native_image_patch_key_and_ranges(image) {
+            self.native_image_patch_keys.insert(pid, key);
+            self.native_image_patch_ranges.insert(pid, ranges);
+        } else {
+            self.native_image_patch_keys.remove(&pid);
+            self.native_image_patch_ranges.remove(&pid);
+        }
     }
 
     fn memory_from_process_image(
@@ -6077,6 +7443,7 @@ impl RuntimeSubsystems {
         match operation {
             LINUX_EPOLL_CTL_ADD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
+                validate_epoll_events(event.events)?;
                 let instance = self.epolls.instance_mut(epoll_id)?;
                 if instance.watches.contains_key(&fd) {
                     return Err(LinuxErrno::EEXIST);
@@ -6092,6 +7459,7 @@ impl RuntimeSubsystems {
             }
             LINUX_EPOLL_CTL_MOD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
+                validate_epoll_events(event.events)?;
                 let instance = self.epolls.instance_mut(epoll_id)?;
                 let watch = instance.watches.get_mut(&fd).ok_or(LinuxErrno::ENOENT)?;
                 watch.events = event.events;
@@ -6182,6 +7550,16 @@ impl RuntimeSubsystems {
 
 const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
+
+const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
+    LINUX_EPOLLIN | LINUX_EPOLLPRI | LINUX_EPOLLOUT | LINUX_EPOLLERR | LINUX_EPOLLHUP;
+
+fn validate_epoll_events(events: u32) -> Result<(), LinuxErrno> {
+    if events & !LINUX_EPOLL_SUPPORTED_EVENTS != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(())
+}
 
 fn zero_elf_load_bss_tail(vfs: &VirtualFileSystem, fd: Fd, mapped_offset: u64, bytes: &mut [u8]) {
     if bytes.is_empty() {
@@ -6725,6 +8103,59 @@ fn wait_status_from_decoded(decoded: &[TraceField]) -> Option<u32> {
         })
 }
 
+fn read_guest_stack_t(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<GuestSignalAltStack, LinuxErrno> {
+    Ok(GuestSignalAltStack {
+        sp: read_guest_u64(memory, addr)?,
+        flags: read_guest_u32(
+            memory,
+            addr.checked_add(LINUX_STACK_T_FLAGS_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?,
+        size: read_guest_u64(
+            memory,
+            addr.checked_add(LINUX_STACK_T_SIZE_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?,
+    })
+}
+
+fn write_guest_stack_t(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    stack: GuestSignalAltStack,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &stack.sp.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(LINUX_STACK_T_FLAGS_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+            &stack.flags.to_le_bytes(),
+        )
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(LINUX_STACK_T_SIZE_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+            &stack.size.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn validate_sigaltstack(stack: GuestSignalAltStack) -> Result<(), LinuxErrno> {
+    if stack.flags & !LINUX_SS_SUPPORTED_FLAGS != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    if !stack.disabled() && stack.size < LINUX_MINSIGSTKSZ {
+        return Err(LinuxErrno::ENOMEM);
+    }
+    Ok(())
+}
+
 fn read_futex_timeout(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -6791,6 +8222,29 @@ fn read_guest_c_bytes(memory: &impl GuestMemoryAccess, addr: u64) -> Result<Vec<
         bytes.push(byte[0]);
     }
     Err(LinuxErrno::ENAMETOOLONG)
+}
+
+fn read_guest_vector(
+    memory: &impl GuestMemoryAccess,
+    vector_addr: u64,
+) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+    const MAX_VECTOR_ITEMS: usize = 4096;
+    if vector_addr == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::new();
+    for index in 0..MAX_VECTOR_ITEMS {
+        let item_addr = vector_addr
+            .checked_add((index * 8) as u64)
+            .ok_or(LinuxErrno::EFAULT)?;
+        let ptr = read_guest_u64(memory, item_addr)?;
+        if ptr == 0 {
+            return Ok(values);
+        }
+        values.push(read_guest_c_bytes(memory, ptr)?);
+    }
+    Err(LinuxErrno::E2BIG)
 }
 
 fn guest_bytes_to_path(bytes: &[u8]) -> Result<String, LinuxErrno> {
@@ -6897,7 +8351,7 @@ impl SyscallTracer for RuntimeDiagnosticsTracer {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::MutexGuard};
 
     use mcr_net::SocketState;
     use mcr_sys::{
@@ -6905,17 +8359,23 @@ mod tests {
         LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
         LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
         LINUX_CLONE_THREAD, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
-        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
+        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLET,
+        LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT, LINUX_EPOLLOUT,
+        LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
         LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
         LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
         LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
         LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
-        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallRegisters,
-        SyscallReturn, SyscallTraceEvent,
+        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallArgs,
+        SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent, TraceContext,
+        Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
+
+    fn native_execution_test_guard() -> MutexGuard<'static, ()> {
+        crate::test_support::native_execution_test_guard()
+    }
     use mcr_vfs::{
         AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
         O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PathTree, RENAME_NOREPLACE, Rootfs,
@@ -7410,6 +8870,172 @@ mod tests {
         runtime.memory().read(0x7000_0100, &mut bytes).unwrap();
         assert_eq!(&bytes[..8], b"LOADDATA");
         assert_eq!(&bytes[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn runtime_file_backed_mmap_reuses_read_only_cache_and_keeps_private_vmas() {
+        let page_size = usize::try_from(GUEST_PAGE_SIZE).unwrap();
+        let data = (0u16..5000)
+            .map(|index| u8::try_from(index % 251 + 1).unwrap())
+            .collect::<Vec<_>>();
+        let mut tree = PathTree::new();
+        tree.create_dir("/tmp").unwrap();
+        tree.create_file_with_content("/tmp/large", data.clone(), 0o644)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/app", 0x401000), tree);
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/large\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+
+        let first_addr = 0x7000_0000;
+        let first = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                first_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(first.result, SyscallReturn::Success(first_addr));
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .file_backed_mapping_cache_snapshot(),
+            FileBackedMappingCacheSnapshot {
+                entries: 1,
+                hits: 0,
+                misses: 1
+            }
+        );
+        let first_vma = runtime.memory().vma_containing(first_addr).unwrap();
+        assert_eq!(
+            first_vma.protection(),
+            GuestMemoryProtection::new(true, false, false)
+        );
+        assert!(matches!(
+            first_vma.kind(),
+            GuestVmaKind::FileBacked {
+                fd: 3,
+                offset: 4096,
+                shared: false
+            }
+        ));
+
+        let mapped_file_bytes = data.len() - page_size;
+        let tail_probe = mapped_file_bytes - 4;
+        let mut tail = [0xff; 8];
+        runtime
+            .memory()
+            .read(first_addr + tail_probe as u64, &mut tail)
+            .unwrap();
+        assert_eq!(&tail[..4], &data[data.len() - 4..]);
+        assert_eq!(&tail[4..], &[0; 4]);
+
+        let second_addr = first_addr + GUEST_PAGE_SIZE;
+        let second = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                second_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(second.result, SyscallReturn::Success(second_addr));
+        let after_read_only = runtime
+            .dispatcher
+            .subsystems()
+            .file_backed_mapping_cache_snapshot();
+        assert_eq!(
+            after_read_only,
+            FileBackedMappingCacheSnapshot {
+                entries: 1,
+                hits: 1,
+                misses: 1
+            }
+        );
+
+        runtime
+            .memory_mut()
+            .mprotect(mcr_sys::MprotectSyscallArgs {
+                addr: first_addr,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+            })
+            .unwrap();
+        runtime.memory_mut().write(first_addr, b"Q").unwrap();
+        let mut second_byte = [0];
+        runtime
+            .memory()
+            .read(second_addr, &mut second_byte)
+            .unwrap();
+        assert_eq!(second_byte, [data[page_size]]);
+
+        let writable_first_addr = first_addr + GUEST_PAGE_SIZE * 2;
+        let writable_first = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                writable_first_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(
+            writable_first.result,
+            SyscallReturn::Success(writable_first_addr)
+        );
+        let writable_second_addr = first_addr + GUEST_PAGE_SIZE * 3;
+        let writable_second = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                writable_second_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(
+            writable_second.result,
+            SyscallReturn::Success(writable_second_addr)
+        );
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .file_backed_mapping_cache_snapshot(),
+            after_read_only
+        );
+        runtime
+            .memory_mut()
+            .write(writable_first_addr, b"W")
+            .unwrap();
+        let mut writable_second_byte = [0];
+        runtime
+            .memory()
+            .read(writable_second_addr, &mut writable_second_byte)
+            .unwrap();
+        assert_eq!(writable_second_byte, [data[page_size]]);
     }
 
     #[test]
@@ -8740,6 +10366,148 @@ mod tests {
     }
 
     #[test]
+    fn epoll_ctl_rejects_unsupported_event_flags() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(5)
+        );
+
+        for unsupported in [
+            LINUX_EPOLLET,
+            LINUX_EPOLLONESHOT,
+            LINUX_EPOLLEXCLUSIVE,
+            0x0000_2000,
+        ] {
+            write_epoll_event_for_test(
+                runtime.memory_mut(),
+                0x402100,
+                LINUX_EPOLLIN | unsupported,
+                1,
+            );
+            assert_eq!(
+                runtime
+                    .dispatch_syscall(context(
+                        Syscall::EpollCtl,
+                        [
+                            5,
+                            u64::from(LINUX_EPOLL_CTL_ADD),
+                            read_fd as u64,
+                            0x402100,
+                            0,
+                            0,
+                        ],
+                    ))
+                    .result,
+                SyscallReturn::Errno(LinuxErrno::EINVAL)
+            );
+        }
+
+        write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 1);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_ADD),
+                        read_fd as u64,
+                        0x402100,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_epoll_event_for_test(
+            runtime.memory_mut(),
+            0x402110,
+            LINUX_EPOLLIN | LINUX_EPOLLET,
+            2,
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_MOD),
+                        read_fd as u64,
+                        0x402110,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn sigaltstack_reports_disabled_stack_and_persists_enabled_stack() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 0, 8192);
+
+        let set = runtime.dispatch_syscall(context(
+            Syscall::Sigaltstack,
+            [0x402000, 0x402020, 0, 0, 0, 0],
+        ));
+        assert_eq!(set.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402020), 0);
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402020 + LINUX_STACK_T_FLAGS_OFFSET),
+            LINUX_SS_DISABLE
+        );
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402020 + LINUX_STACK_T_SIZE_OFFSET),
+            0
+        );
+
+        let query =
+            runtime.dispatch_syscall(context(Syscall::Sigaltstack, [0, 0x402040, 0, 0, 0, 0]));
+        assert_eq!(query.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402040), 0x7000_0000);
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402040 + LINUX_STACK_T_FLAGS_OFFSET),
+            0
+        );
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402040 + LINUX_STACK_T_SIZE_OFFSET),
+            8192
+        );
+    }
+
+    #[test]
+    fn sigaltstack_rejects_bad_flags_and_too_small_enabled_stack() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 4, 8192);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 0, 1024);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOMEM)
+        );
+    }
+
+    #[test]
     fn epoll_wait_reports_closed_watch_as_hup_error() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         assert_eq!(
@@ -9139,6 +10907,7 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(transport.sent_bytes(), b"abcd");
+        assert_eq!(transport.sent_calls(), vec![b"abcd".to_vec()]);
 
         assert_eq!(
             dispatch(&mut runtime, Syscall::Readv, [3, 0x5000, 2, 0, 0, 0]),
@@ -9146,6 +10915,7 @@ mod tests {
         );
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(transport.recv_calls(), 1);
     }
 
     #[test]
@@ -9196,12 +10966,14 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(transport.sent_bytes(), b"abcd");
+        assert_eq!(transport.sent_calls(), vec![b"abcd".to_vec()]);
         assert_eq!(
             dispatch_network(&mut runtime, Syscall::Recvmsg, [3, 0x5100, 0, 0, 0, 0],),
             SyscallReturn::Success(6)
         );
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(transport.recv_calls(), 1);
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
     }
 
@@ -10668,6 +12440,10 @@ mod tests {
             self.state.borrow().sent_calls.clone()
         }
 
+        fn recv_calls(&self) -> usize {
+            self.state.borrow().recv_calls
+        }
+
         fn push_incoming(&self, bytes: &[u8]) {
             self.state.borrow_mut().incoming.extend_from_slice(bytes);
         }
@@ -10700,6 +12476,7 @@ mod tests {
     struct TestSocketState {
         sent: Vec<u8>,
         sent_calls: Vec<Vec<u8>>,
+        recv_calls: usize,
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
         connect_would_block_once: bool,
@@ -10819,6 +12596,7 @@ mod tests {
 
         fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, mcr_net::HostIoError> {
             let mut state = self.state.borrow_mut();
+            state.recv_calls += 1;
             let count = buffer.len().min(state.incoming.len());
             buffer[..count].copy_from_slice(&state.incoming[..count]);
             state.incoming.drain(..count);
@@ -11071,6 +12849,16 @@ mod tests {
         u16::from_le_bytes(bytes)
     }
 
+    fn write_stack_t(memory: &mut GuestMemory, addr: u64, sp: u64, flags: u32, size: u64) {
+        memory.write(addr, &sp.to_le_bytes()).unwrap();
+        memory
+            .write(addr + LINUX_STACK_T_FLAGS_OFFSET, &flags.to_le_bytes())
+            .unwrap();
+        memory
+            .write(addr + LINUX_STACK_T_SIZE_OFFSET, &size.to_le_bytes())
+            .unwrap();
+    }
+
     fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {
         memory.write(addr, &fd.to_le_bytes()).unwrap();
         memory.write(addr + 4, &events.to_le_bytes()).unwrap();
@@ -11167,6 +12955,7 @@ mod tests {
             r14: 15,
             r15: 16,
             rip: 17,
+            fs_base: 0,
             rflags: 18,
         };
 
@@ -11310,6 +13099,47 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 77 }
         );
+    }
+
+    #[test]
+    fn guest_execution_dispatches_syscall_after_fs_relative_guest_memory_load() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, // mov rax,fs:[0x28]
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0x600000,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x600028, &Syscall::Getpid.number().raw().to_le_bytes())
+            .unwrap();
+        let arch = runtime.dispatch_syscall(context(
+            Syscall::ArchPrctl,
+            [ARCH_SET_FS, 0x600000, 0, 0, 0, 0],
+        ));
+        assert_eq!(arch.result, SyscallReturn::Success(0));
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("fs-relative load feeds guest syscall dispatch");
+
+        assert_eq!(step.before_rip(), 0x401000);
+        assert_eq!(step.after_rip(), 0x40100b);
+        assert_eq!(step.encoded_rax(), u64::from(INITIAL_GUEST_PID));
     }
 
     #[test]
@@ -12010,6 +13840,214 @@ mod tests {
     }
 
     #[test]
+    fn fork_exec_defers_memory_clone_until_child_execve() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/new",
+            test_program_bytes_with_marker(0x501000, 0x5a),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.memory_mut().write(0x402000, b"parent").unwrap();
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+        let mut parent_bytes = [0; 6];
+        runtime.memory().read(0x402000, &mut parent_bytes).unwrap();
+        assert_eq!(&parent_bytes, b"parent");
+        assert_eq!(
+            runtime
+                .memory_for_process(2)
+                .unwrap()
+                .read(0x402000, &mut [0; 1]),
+            Err(GuestMemoryError::NotMapped)
+        );
+    }
+
+    #[test]
+    fn parent_memory_mutation_materializes_deferred_fork_child_first() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.memory_mut().write(0x402000, b"parent").unwrap();
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+
+        runtime.memory_mut().write(0x402000, b"PARENT").unwrap();
+
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        let mut parent_bytes = [0; 6];
+        runtime.memory().read(0x402000, &mut parent_bytes).unwrap();
+        let mut child_bytes = [0; 6];
+        runtime
+            .memory_for_process(2)
+            .unwrap()
+            .read(0x402000, &mut child_bytes)
+            .unwrap();
+        assert_eq!(&parent_bytes, b"PARENT");
+        assert_eq!(&child_bytes, b"parent");
+    }
+
+    #[test]
+    fn deferred_fork_exec_failure_preserves_child_memory() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.memory_mut().write(0x402000, b"parent").unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/bin/missing\0")
+            .unwrap();
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Errno(LinuxErrno::ENOENT));
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/old"
+        );
+        let mut child_bytes = [0; 6];
+        runtime
+            .memory_for_process(2)
+            .unwrap()
+            .read(0x402000, &mut child_bytes)
+            .unwrap();
+        assert_eq!(&child_bytes, b"parent");
+    }
+
+    #[test]
+    fn pending_fork_child_can_exec_from_read_only_parent_memory() {
+        let mut exec_code = Vec::new();
+        exec_code.extend_from_slice(&[0x48, 0xbf]);
+        exec_code.extend_from_slice(&0x402100u64.to_le_bytes());
+        exec_code.extend_from_slice(&[0x31, 0xf6, 0x31, 0xd2, 0xb8]);
+        exec_code.extend_from_slice(&(Syscall::Execve.number().raw() as u32).to_le_bytes());
+        exec_code.extend_from_slice(&[0x0f, 0x05]);
+
+        let old_program = test_program_with_entry_code("/bin/old", 0x401000, &exec_code);
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", old_program.executable().bytes().to_vec(), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/new",
+            test_program_bytes_with_marker(0x501000, 0x5a),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(old_program, tree);
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        runtime
+            .kernel_mut()
+            .task_mut(2)
+            .unwrap()
+            .set_regs(GprState::new(0x401000, 0x8000_0000));
+
+        let step = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, 2)
+            .expect("pending child executes execve from parent memory");
+
+        assert_eq!(step.tid(), 2);
+        assert_eq!(step.task_state(), TaskState::Runnable);
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/new"
+        );
+        assert_eq!(runtime.kernel().task(2).unwrap().regs().rip(), 0x501000);
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+    }
+
+    #[test]
     fn memory_syscalls_route_to_request_process_memory() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
@@ -12042,7 +14080,7 @@ mod tests {
 
     #[test]
     fn native_fork_keeps_parent_and_child_memory_isolated() {
-        let _guard = crate::test_support::native_execution_test_guard();
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
             0x401000,
@@ -12087,7 +14125,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_execution_uses_patchable_low_mmap_base() {
-        let _guard = crate::test_support::native_execution_test_guard();
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime.enable_native_execution();
 
@@ -12367,6 +14405,48 @@ mod tests {
         assert!(matches!(
             runtime.tracer().events(),
             [SyscallTraceEvent::Enter(_), SyscallTraceEvent::Exit(_)]
+        ));
+    }
+
+    #[test]
+    fn runtime_getpid_gettid_fast_path_preserves_trace_and_esrch() {
+        let mut runtime = Runtime::with_tracer(
+            test_program("/bin/app", 0x401000),
+            InMemorySyscallTracer::new(),
+        )
+        .unwrap();
+
+        let getpid = runtime.dispatch_syscall(context(Syscall::Getpid, [0; 6]));
+        let gettid = runtime.dispatch_syscall(context(Syscall::Gettid, [0; 6]));
+        let invalid_gettid = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            INITIAL_GUEST_TID + 99,
+            Syscall::Gettid,
+            [0; 6],
+        ));
+
+        assert_eq!(
+            getpid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_PID))
+        );
+        assert_eq!(
+            gettid.result,
+            SyscallReturn::Success(u64::from(INITIAL_GUEST_TID))
+        );
+        assert_eq!(
+            invalid_gettid.result,
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+        assert!(matches!(
+            runtime.tracer().events(),
+            [
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_),
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_),
+                SyscallTraceEvent::Enter(_),
+                SyscallTraceEvent::Exit(_)
+            ]
         ));
     }
 
@@ -12707,6 +14787,7 @@ mod tests {
 
     #[test]
     fn native_patch_cache_scans_only_new_executable_ranges() {
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
             0x401000,
@@ -12800,6 +14881,26 @@ mod tests {
             guest_bytes(runtime.memory(), 0x401000, code.len()),
             [0xe8, 0x0f, 0x05, 0xfe, 0xff, 0xcc, 0x90]
         );
+    }
+
+    #[test]
+    fn native_patch_cache_does_not_rewrite_syscall_bytes_inside_immediate() {
+        let _guard = native_execution_test_guard();
+        let code = [
+            0xc7, 0x04, 0x24, 0x00, 0x0f, 0x05, 0x00, // mov dword ptr [rsp],0x50f00
+            0x0f, 0x05, // syscall
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(INITIAL_GUEST_PID, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 7), code[..7]);
+        assert_eq!(guest_bytes(runtime.memory(), 0x401007, 2), [0xcc, 0x90]);
     }
 
     #[test]
@@ -13009,6 +15110,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_patch_cache_rewrites_fs_relative_tls_accesses_per_base() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13042,7 +15144,113 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
+    fn native_patch_cache_defers_zero_fs_base_tls_rewrites() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            fs_load
+        );
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .fs_relative_patches
+                .len(),
+            1,
+            "zero-base native patching should record TLS candidates for a later nonzero base"
+        );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_keeps_high_fs_relative_original_for_fault_fallback() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(INITIAL_GUEST_PID, 0x7000_0020_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            fs_load
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("fs-relative fault instruction decodes");
+        assert!(native_fault_is_unrewritten_fs_relative(&instruction));
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_skips_new_zero_base_fs_patch_work() {
+        assert_eq!(
+            fs_relative_patch_work(0, 0, 0, 45_171, 0),
+            FsRelativePatchWork::None
+        );
+        assert_eq!(
+            fs_relative_patch_work(0, 0x7000_0000, 0, 45_171, 0),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 0, 45_171, 0),
+            FsRelativePatchWork::None
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 0, 0, 1),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 1, 0, 0),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0x7000_0000, 0, 1, 0),
+            FsRelativePatchWork::New
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0x7000_0000, 0, 0, 1),
+            FsRelativePatchWork::None
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
     fn native_patch_cache_survives_memory_rematerialization() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13075,6 +15283,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_patch_cache_recovers_existing_fs_replacement_after_invalidation() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13143,6 +15352,13 @@ mod tests {
             &[b"/bin/app".to_vec(), b"--flag".to_vec()]
         );
         assert_eq!(diagnostics.envp(), &[b"A=B".to_vec()]);
+        assert_eq!(diagnostics.worker_pools().len(), 2);
+        assert!(
+            diagnostics
+                .worker_pools()
+                .iter()
+                .all(|pool| pool.max_workers() > 0 && pool.active_workers() == 0)
+        );
         assert!(diagnostics.vmas().iter().any(|vma| {
             vma.start() <= 0x401000
                 && 0x401000 < vma.end()
@@ -13163,6 +15379,97 @@ mod tests {
         assert_eq!(last.args(), [0; 6]);
         assert_eq!(last.result(), Some(SyscallReturn::Success(1)));
         assert_eq!(last.rip(), 0x401234);
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_guest_wait_futex() {
+        let runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let events = vec![syscall_enter_event(
+            Syscall::Futex,
+            [0x402000, u64::from(LINUX_FUTEX_WAIT), 7, 0, 0, 0],
+        )];
+
+        let diagnostic = RuntimeDiagnostics::capture(runtime.kernel(), &events).stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::GuestWaitFutex);
+        assert_eq!(diagnostic.in_flight_syscall().unwrap().name(), "futex");
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_readiness_wait() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .kernel_mut()
+            .block_task_for_fd(INITIAL_GUEST_TID, 3, false)
+            .unwrap();
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::Readiness);
+        assert_eq!(diagnostic.fd_wait_tasks(), 1);
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_scheduling_wait() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        let child_pid = runtime.kernel_mut().fork_child(INITIAL_GUEST_TID).unwrap();
+        let wait = runtime.kernel_mut().wait4_current(
+            INITIAL_GUEST_TID,
+            Wait4SyscallArgs::new(child_pid as i32, 0x402000, 0, 0),
+        );
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::Scheduling);
+        assert_eq!(diagnostic.child_wait_tasks(), 1);
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_native_execution_window() {
+        let _guard = native_execution_test_guard();
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.enable_native_execution();
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::NativeExecution);
+        assert_eq!(diagnostic.runnable_tasks(), 1);
+    }
+
+    #[test]
+    fn bounded_guest_run_reports_timeout_stall_diagnostic() {
+        let _guard = native_execution_test_guard();
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&(Syscall::Getpid.number().raw() as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05, 0xeb, 0xf7]);
+        let mut runtime = RuntimeWithTracer::with_diagnostics(test_program_with_entry_code(
+            "/bin/spin",
+            0x401000,
+            &code,
+        ))
+        .unwrap();
+        runtime.enable_native_execution();
+
+        let error = runtime
+            .run_guest_until_exit_with_step_limit(3)
+            .expect_err("looping guest should hit the diagnostic step limit");
+
+        match error {
+            GuestRunError::StepLimitExceeded { steps, diagnostic } => {
+                assert_eq!(steps, 3);
+                assert_eq!(diagnostic.kind(), RuntimeStallKind::NativeExecution);
+                assert_eq!(diagnostic.last_syscall().unwrap().name(), "getpid");
+                assert_eq!(
+                    diagnostic.last_syscall().unwrap().result(),
+                    Some(SyscallReturn::Success(1))
+                );
+            }
+            other => panic!("expected step-limit diagnostic, got {other:?}"),
+        }
     }
 
     #[test]
@@ -13193,6 +15500,19 @@ mod tests {
         );
     }
 
+    fn syscall_enter_event(syscall: Syscall, args: [u64; 6]) -> SyscallTraceEvent {
+        SyscallTraceEvent::Enter(SyscallEnterEvent {
+            context: TraceContext {
+                pid: INITIAL_GUEST_PID,
+                tid: INITIAL_GUEST_TID,
+                rip: 0x401234,
+            },
+            syscall,
+            args: SyscallArgs::new(args),
+            decoded: Vec::new(),
+        })
+    }
+
     fn context(syscall: Syscall, args: [u64; 6]) -> GuestContext {
         context_for(INITIAL_GUEST_PID, INITIAL_GUEST_TID, syscall, args)
     }
@@ -13214,14 +15534,6 @@ mod tests {
         )
     }
 
-    fn unique_test_dir(name: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("mcr-{name}-{}-{nanos}", std::process::id()))
-    }
-
     fn set_initial_syscall_regs(runtime: &mut Runtime, rip: u64, syscall: Syscall, args: [u64; 6]) {
         let rsp = runtime
             .kernel()
@@ -13239,6 +15551,14 @@ mod tests {
                 syscall.number().raw(),
                 args,
             ));
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mcr-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn test_program(path: &str, entrypoint: u64) -> GuestProgram {

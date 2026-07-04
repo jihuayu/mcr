@@ -232,6 +232,112 @@ impl Default for LinearInstructionScanner {
     }
 }
 
+#[must_use]
+pub fn syscall_instruction_sites(bytes: &[u8], rip: u64) -> Vec<SyscallSite> {
+    let Some(last_candidate) = last_syscall_byte_pair(bytes) else {
+        return Vec::new();
+    };
+
+    let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
+    let mut sites = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if !instruction.is_invalid() && instruction.mnemonic() == Mnemonic::Syscall {
+            sites.push(SyscallSite {
+                rip: instruction.ip(),
+                next_rip: instruction.ip() + instruction.len() as u64,
+            });
+        }
+        if decoder.position() > last_candidate {
+            break;
+        }
+    }
+    sites
+}
+
+fn last_syscall_byte_pair(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(2)
+        .rposition(|window| matches!(window, [0x0f, 0x05]))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeFaultInstruction {
+    pub rip: u64,
+    pub bytes: Vec<u8>,
+    pub decoded: String,
+}
+
+impl fmt::Display for NativeFaultInstruction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "rip=0x{:016x} bytes={} decoded={}",
+            self.rip,
+            format_bytes(&self.bytes),
+            self.decoded
+        )
+    }
+}
+
+pub fn decode_native_fault_instruction(bytes: &[u8], rip: u64) -> Option<NativeFaultInstruction> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return None;
+    }
+    let len = instruction.len().min(bytes.len());
+    Some(NativeFaultInstruction {
+        rip,
+        bytes: bytes[..len].to_vec(),
+        decoded: describe_instruction(&instruction),
+    })
+}
+
+fn describe_instruction(instruction: &Instruction) -> String {
+    let operands = (0..instruction.op_count())
+        .map(|operand| describe_operand(instruction, operand))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "code={:?} mnemonic={:?} len={} operands=[{}]",
+        instruction.code(),
+        instruction.mnemonic(),
+        instruction.len(),
+        operands
+    )
+}
+
+fn describe_operand(instruction: &Instruction, operand: u32) -> String {
+    match instruction.op_kind(operand) {
+        OpKind::Register => format!("reg={:?}", instruction.op_register(operand)),
+        OpKind::Memory => format!(
+            "mem(seg={:?},base={:?},index={:?},scale={},disp=0x{:x})",
+            instruction.memory_segment(),
+            instruction.memory_base(),
+            instruction.memory_index(),
+            instruction.memory_index_scale(),
+            instruction.memory_displacement64()
+        ),
+        kind => format!("{kind:?}"),
+    }
+}
+
+fn format_bytes(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn decoded_mnemonic(instruction: &Instruction) -> DecodedMnemonic {
     if instruction.mnemonic() == Mnemonic::Syscall {
         DecodedMnemonic::Syscall
@@ -276,6 +382,7 @@ pub struct GuestRegisters {
     pub r15: u64,
     pub rip: u64,
     pub rflags: u64,
+    pub fs_base: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -527,7 +634,9 @@ pub enum ExecutionError {
         signal: i32,
         rip: u64,
         address: u64,
+        fs_base: u64,
         registers: GuestRegisters,
+        instruction: Option<Box<NativeFaultInstruction>>,
         stack_words: Vec<NativeFaultStackWord>,
     },
 }
@@ -569,12 +678,20 @@ impl fmt::Display for ExecutionError {
                 signal,
                 rip,
                 address,
+                fs_base,
                 registers: _,
+                instruction,
                 stack_words: _,
-            } => write!(
-                f,
-                "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}"
-            ),
+            } => {
+                write!(
+                    f,
+                    "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}, fs_base 0x{fs_base:016x}"
+                )?;
+                if let Some(instruction) = instruction {
+                    write!(f, ", instruction {instruction}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1517,9 +1634,22 @@ fn effective_address(
     registers: &GuestRegisters,
     instruction: &Instruction,
 ) -> Result<u64, ExecutionError> {
+    let segment_base = match instruction.memory_segment() {
+        Register::FS => registers.fs_base,
+        Register::None | Register::DS | Register::ES | Register::SS => 0,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid {
+                    rip: instruction.ip(),
+                },
+            });
+        }
+    };
     let base = match instruction.memory_base() {
         Register::None => 0,
-        Register::RIP | Register::EIP => return Ok(instruction.ip_rel_memory_address()),
+        Register::RIP | Register::EIP => {
+            return Ok(segment_base.wrapping_add(instruction.ip_rel_memory_address()));
+        }
         base => read_reg64(registers, base)?,
     };
     let index = match instruction.memory_index() {
@@ -1528,7 +1658,8 @@ fn effective_address(
             read_reg64(registers, index)?.wrapping_mul(u64::from(instruction.memory_index_scale()))
         }
     };
-    Ok(base
+    Ok(segment_base
+        .wrapping_add(base)
         .wrapping_add(index)
         .wrapping_add(instruction.memory_displacement64()))
 }
@@ -2068,7 +2199,8 @@ mod tests {
     use super::{
         BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError,
         GuestBlock, GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters,
-        LinearInstructionScanner, SameIsaExecutionCore, TrampolineCore,
+        LinearInstructionScanner, SameIsaExecutionCore, SyscallSite, TrampolineCore,
+        decode_native_fault_instruction, syscall_instruction_sites,
     };
     use std::collections::BTreeMap;
 
@@ -2170,6 +2302,54 @@ mod tests {
     }
 
     #[test]
+    fn syscall_site_scan_ignores_immediate_bytes() {
+        let sites = syscall_instruction_sites(
+            &[
+                0xc7, 0x04, 0x24, 0x00, 0x0f, 0x05, 0x00, // mov dword ptr [rsp],0x50f00
+                0x0f, 0x05, // syscall
+            ],
+            0x401000,
+        );
+
+        assert_eq!(
+            sites,
+            [SyscallSite {
+                rip: 0x401007,
+                next_rip: 0x401009
+            }]
+        );
+    }
+
+    #[test]
+    fn syscall_site_scan_skips_candidate_free_ranges() {
+        let sites = syscall_instruction_sites(&[0x90; 1024], 0x401000);
+
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn native_fault_instruction_decodes_memory_operand() {
+        let instruction =
+            decode_native_fault_instruction(&[0x48, 0x8b, 0x40, 0x28, 0x90], 0x7000_0075_1bd6)
+                .expect("fault instruction should decode");
+
+        assert_eq!(instruction.rip, 0x7000_0075_1bd6);
+        assert_eq!(instruction.bytes, [0x48, 0x8b, 0x40, 0x28]);
+        assert!(
+            instruction.decoded.contains("code=Mov_r64_rm64"),
+            "{}",
+            instruction.decoded
+        );
+        assert!(
+            instruction
+                .decoded
+                .contains("mem(seg=DS,base=RAX,index=None,scale=1,disp=0x28)"),
+            "{}",
+            instruction.decoded
+        );
+    }
+
+    #[test]
     fn decoder_stops_at_control_flow_before_later_syscall() {
         let block = GuestBlock::new(
             &[
@@ -2262,6 +2442,7 @@ mod tests {
             r14: 0x1414,
             r15: 0x1515,
             rip: site.rip,
+            fs_base: 0,
             rflags: 0x202,
         };
         let original = registers;
@@ -2735,6 +2916,33 @@ mod tests {
         assert_eq!(trap.registers().rax, 0x0708_091a_2b3c_4d5e);
         assert_eq!(memory.read_u64(0x700010), 0x0708_091a_2b3c_4d5e);
         assert_eq!(trap.site().rip, 0x461008);
+    }
+
+    #[test]
+    fn execution_core_applies_fs_base_to_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, // mov rax,fs:[0x28]
+                0x0f, 0x05, // syscall
+            ],
+            0x461080,
+        );
+        let registers = GuestRegisters {
+            fs_base: 0x7000_0020_0000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(
+            0x7000_0020_0028,
+            &Syscall::Getpid.number().raw().to_le_bytes(),
+        );
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute fs-relative load before syscall");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x461089);
     }
 
     #[test]

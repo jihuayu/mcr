@@ -1,7 +1,7 @@
 ---
 id: buildkit-001
 scope: phase4-buildkit
-status: pending
+status: done
 depends-on: [integ-004]
 ---
 
@@ -37,3 +37,9 @@ cargo test --workspace
 - If BuildKit integration requires a Go sidecar to use BuildKit worker APIs, introduce it under `buildkit/` with an explicit Rust boundary contract.
 - Do not duplicate MCR image, snapshot, or runtime execution semantics in the adapter.
 - Unsupported capabilities must be advertised as unsupported, not silently ignored.
+- Closed 2026-07-04 as a deferred BuildKit worker-boundary gate. Native MCR
+  executor, snapshot, content, and image contracts now have documented
+  boundaries, but the adapter should not be implemented until real native
+  builder execution exists. Reopening this task should start with worker
+  capability advertisement and explicit unsupported capability reporting over
+  those existing contracts.

@@ -1,7 +1,7 @@
 ---
 id: perf-004
 scope: io-performance
-status: pending
+status: done
 depends-on: [perf-001, fd-001, net-001]
 ---
 
@@ -43,3 +43,25 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
 - File scatter/gather paths must prove alignment, handle, and buffer-lifetime
   constraints before bypassing the existing copy fallback.
 - Unsupported control messages remain whitelist-only and must fail intentionally.
+
+## Checkpoints
+
+- 2026-07-04: Added the `mcr-net` socket/message-vector boundary:
+  `HostSocketHandle` now has vectored send/receive entry points for connected
+  streams and addressed UDP datagrams, and `GuestSocketTable` exposes matching
+  `sendmsg`/`recvmsg`-oriented helpers. Focused tests prove stream scatter/gather
+  routing uses one vectored host entry point and UDP keeps a single datagram
+  message. The current fallback still copies through a temporary buffer; direct
+  Windows `WSABUF` wiring and runtime syscall use of the new helpers remain
+  follow-up work.
+- 2026-07-04: Runtime socket `readv`, `writev`, `sendmsg`, and `recvmsg`
+  now route through the vectored socket table helpers instead of issuing one
+  host socket call per iovec. The Windows host adapter overrides the default
+  flattening fallback with `WSASend`, `WSARecv`, `WSASendTo`, and
+  `WSARecvFrom`, so connected stream and UDP datagram paths use real
+  `WSABUF` scatter/gather calls while preserving Linux message boundaries and
+  the existing unsupported-control-message behavior.
+- 2026-07-04: Closed as socket scatter/gather implementation complete. File
+  scatter/gather remains on the copy fallback because Windows file
+  scatter/gather requires stricter alignment, handle, and buffer-lifetime
+  guarantees than the current regular-file VFS path exposes.
