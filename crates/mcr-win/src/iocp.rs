@@ -86,6 +86,12 @@ impl Drop for HostIoCompletionPort {
     }
 }
 
+#[cfg(windows)]
+unsafe impl Send for HostIoCompletionPort {}
+
+#[cfg(windows)]
+unsafe impl Sync for HostIoCompletionPort {}
+
 #[cfg(not(windows))]
 fn create_iocp_platform() -> HostResult<HostIoCompletionPort> {
     Err(HostError::unsupported(
