@@ -192,6 +192,46 @@ impl Default for BlockDecoder {
     }
 }
 
+pub struct LinearInstructionScanner;
+
+impl LinearInstructionScanner {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub fn scan(&self, block: GuestBlock<'_>) -> Vec<DecodedInstruction> {
+        let mut decoder = Decoder::with_ip(
+            X86_64_BITNESS,
+            block.bytes(),
+            block.rip(),
+            DecoderOptions::NONE,
+        );
+        let mut instructions = Vec::new();
+
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            if instruction.is_invalid() {
+                continue;
+            }
+            instructions.push(DecodedInstruction {
+                rip: instruction.ip(),
+                len: instruction.len(),
+                mnemonic: decoded_mnemonic(&instruction),
+            });
+        }
+
+        instructions
+    }
+}
+
+impl Default for LinearInstructionScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn decoded_mnemonic(instruction: &Instruction) -> DecodedMnemonic {
     if instruction.mnemonic() == Mnemonic::Syscall {
         DecodedMnemonic::Syscall
@@ -2028,7 +2068,7 @@ mod tests {
     use super::{
         BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError,
         GuestBlock, GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters,
-        SameIsaExecutionCore, TrampolineCore,
+        LinearInstructionScanner, SameIsaExecutionCore, TrampolineCore,
     };
     use std::collections::BTreeMap;
 
@@ -2177,6 +2217,25 @@ mod tests {
                 flow: DecodedFlowControl::Exception,
             }
         );
+    }
+
+    #[test]
+    fn linear_scanner_ignores_syscall_bytes_inside_instruction_operands() {
+        let instructions = LinearInstructionScanner::new().scan(GuestBlock::new(
+            &[
+                0xe8, 0x0f, 0x05, 0xfe, 0xff, // call with 0f 05 in displacement
+                0x0f, 0x05, // real syscall instruction
+            ],
+            0x8149cc,
+        ));
+        let syscall_rips = instructions
+            .iter()
+            .filter_map(|instruction| {
+                (instruction.mnemonic == DecodedMnemonic::Syscall).then_some(instruction.rip)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(syscall_rips, [0x8149d1]);
     }
 
     #[test]

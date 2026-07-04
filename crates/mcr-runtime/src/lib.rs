@@ -22,7 +22,8 @@ pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootf
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
 use mcr_jit::{
-    ExecutionError, GuestBlock, GuestRegisters, NativeFaultStackWord, SameIsaExecutionCore,
+    DecodedMnemonic, ExecutionError, GuestBlock, GuestRegisters, LinearInstructionScanner,
+    NativeFaultStackWord, SameIsaExecutionCore,
 };
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
@@ -3119,12 +3120,9 @@ fn find_executable_syscall_patches(
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        for offset in 0..bytes.len() {
-            if bytes
-                .get(offset..offset.saturating_add(2))
-                .is_some_and(|window| window == [0x0f, 0x05])
-            {
-                let address = start + offset as u64;
+        for instruction in LinearInstructionScanner::new().scan(GuestBlock::new(&bytes, start)) {
+            if instruction.mnemonic == DecodedMnemonic::Syscall {
+                let address = instruction.rip;
                 patches.push(ExecutableSyscallPatch { address });
             }
         }
@@ -3150,11 +3148,13 @@ fn find_executable_fs_relative_patches(
             .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
-        for offset in 0..bytes.len() {
+        for instruction in LinearInstructionScanner::new().scan(GuestBlock::new(&bytes, start)) {
+            let offset = usize::try_from(instruction.rip - start)
+                .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
             if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
                 fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
             }) {
-                patches.push((start + offset as u64, FsRelativePatch { original }));
+                patches.push((instruction.rip, FsRelativePatch { original }));
             }
         }
     }
@@ -12019,6 +12019,57 @@ mod tests {
                 .scanned_ranges
                 .iter()
                 .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
+        );
+    }
+
+    #[test]
+    fn native_patch_cache_ignores_syscall_bytes_inside_instruction_operands() {
+        let code = [
+            0xe8, 0x0f, 0x05, 0xfe, 0xff, // call with 0f 05 in displacement
+            0x0f, 0x05, // real syscall instruction
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, code.len()),
+            [0xe8, 0x0f, 0x05, 0xfe, 0xff, 0xcc, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_ignores_fs_relative_bytes_inside_instruction_operands() {
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = vec![
+            0x48, 0xb8, // movabs rax, imm64
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0,
+        ];
+        code.extend_from_slice(&fs_load);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, 10),
+            [0x48, 0xb8, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0]
+        );
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x40100a, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90]
         );
     }
 
