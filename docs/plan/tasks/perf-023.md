@@ -63,3 +63,9 @@ cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
   (`name`, `name@VERSION`, and `name@@VERSION`) so future native patch or loader
   discovery can map resolved targets to the safe dispatch contract without
   duplicating string matching.
+- Added the native trap dispatch side of libc intrinsic replacement. Runtime can
+  register a process-local intrinsic target, patch the target entry with the
+  same native trap shape used by syscall patches, execute the safe
+  `GuestLibcIntrinsic` contract from SysV argument registers, pop the guest
+  return address, and resume the caller with ABI-shaped `rax`. Automatic dynsym
+  / PLT discovery is still the remaining target-identification step.

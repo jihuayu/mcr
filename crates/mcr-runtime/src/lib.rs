@@ -3857,6 +3857,14 @@ where
         );
 
         let mut registers = guest_registers_from_host(native_registers);
+        if let Some(intrinsic) = dispatcher
+            .subsystems()
+            .libc_intrinsic_patch(pid, registers.rip)
+        {
+            return dispatch_native_libc_intrinsic_task(
+                dispatcher, tid, pid, before_rip, registers, intrinsic,
+            );
+        }
         let site = mcr_jit::SyscallSite {
             rip: registers.rip,
             next_rip: registers.rip + 2,
@@ -3944,6 +3952,58 @@ where
             final_regs.rax(),
             task.state(),
         ))
+    }
+}
+
+fn dispatch_native_libc_intrinsic_task<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    mut registers: GuestRegisters,
+    intrinsic: GuestLibcIntrinsic,
+) -> Result<GuestExecutionStep, GuestExecutionError> {
+    let memory = dispatcher
+        .subsystems_mut()
+        .memory_for_process_mut(pid)
+        .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+    let mut return_address = [0; 8];
+    memory.read(registers.rsp, &mut return_address)?;
+    let return_rip = u64::from_le_bytes(return_address);
+    let result = memory
+        .dispatch_libc_intrinsic(intrinsic, registers.rdi, registers.rsi, registers.rdx)
+        .map_err(guest_libc_intrinsic_execution_error)?;
+    registers.rax = result;
+    registers.rsp = registers
+        .rsp
+        .checked_add(8)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    registers.rip = return_rip;
+    let gpr = gpr_from_registers(registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    task.set_regs(gpr);
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        gpr.rip(),
+        gpr.rax(),
+        task.state(),
+    ))
+}
+
+fn guest_libc_intrinsic_execution_error(error: GuestLibcIntrinsicError) -> GuestExecutionError {
+    match error {
+        GuestLibcIntrinsicError::Memory(error) => GuestExecutionError::Memory(error),
+        GuestLibcIntrinsicError::UnsupportedOverlap
+        | GuestLibcIntrinsicError::UnterminatedString => {
+            GuestExecutionError::Memory(GuestMemoryError::InvalidAddress)
+        }
     }
 }
 
@@ -5556,6 +5616,7 @@ pub struct RuntimeSubsystems {
     native_image_patch_keys: NativeImagePatchKeyMap,
     native_image_patch_ranges: NativeImagePatchRangeMap,
     native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
+    libc_intrinsic_patches: BTreeMap<(mcr_sys::GuestPid, u64), GuestLibcIntrinsic>,
     pending_fork_child_regs: Option<GprState>,
     perf_summary: RuntimePerfSummary,
 }
@@ -5629,6 +5690,7 @@ impl RuntimeSubsystems {
             native_image_patch_keys,
             native_image_patch_ranges,
             native_image_patch_metadata: BTreeMap::new(),
+            libc_intrinsic_patches: BTreeMap::new(),
             pending_fork_child_regs: None,
             perf_summary: RuntimePerfSummary::default(),
         })
@@ -5669,6 +5731,7 @@ impl RuntimeSubsystems {
             native_image_patch_keys,
             native_image_patch_ranges,
             native_image_patch_metadata: BTreeMap::new(),
+            libc_intrinsic_patches: BTreeMap::new(),
             pending_fork_child_regs: None,
             perf_summary: RuntimePerfSummary::default(),
         })
@@ -5709,6 +5772,29 @@ impl RuntimeSubsystems {
             diagnostics[0] = pool.diagnostics();
         }
         diagnostics
+    }
+
+    pub fn register_libc_intrinsic_patch(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        address: u64,
+        intrinsic: GuestLibcIntrinsic,
+    ) -> Result<(), GuestExecutionError> {
+        let memory = self
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        memory.patch_code_fixed([(address, [0xcc, 0x90])])?;
+        self.libc_intrinsic_patches
+            .insert((pid, address), intrinsic);
+        Ok(())
+    }
+
+    fn libc_intrinsic_patch(
+        &self,
+        pid: mcr_sys::GuestPid,
+        address: u64,
+    ) -> Option<GuestLibcIntrinsic> {
+        self.libc_intrinsic_patches.get(&(pid, address)).copied()
     }
 
     fn cached_native_patch_metadata(
@@ -6977,6 +7063,16 @@ impl RuntimeSubsystems {
         {
             self.native_image_patch_ranges.insert(child_pid, ranges);
         }
+        let inherited_intrinsic_patches = self
+            .libc_intrinsic_patches
+            .iter()
+            .filter(|((pid, _), _)| *pid == pending.parent_pid)
+            .map(|((_, address), intrinsic)| (*address, *intrinsic))
+            .collect::<Vec<_>>();
+        for (address, intrinsic) in inherited_intrinsic_patches {
+            self.libc_intrinsic_patches
+                .insert((child_pid, address), intrinsic);
+        }
         host_step_trace(format_args!(
             "runtime materialize-fork-child done parent_pid={} child_pid={child_pid} elapsed_ms={}",
             pending.parent_pid,
@@ -7086,6 +7182,8 @@ impl RuntimeSubsystems {
         self.native_patch_caches.remove(&pid);
         self.native_image_patch_keys.remove(&pid);
         self.native_image_patch_ranges.remove(&pid);
+        self.libc_intrinsic_patches
+            .retain(|(patch_pid, _), _| *patch_pid != pid);
     }
 
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -7683,6 +7781,8 @@ impl RuntimeSubsystems {
         self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.native_patch_caches.remove(&request.context.pid);
+        self.libc_intrinsic_patches
+            .retain(|(pid, _), _| *pid != request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)?;
         Ok(false)
@@ -7763,6 +7863,8 @@ impl RuntimeSubsystems {
         self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(child_pid)?;
         self.native_patch_caches.remove(&child_pid);
+        self.libc_intrinsic_patches
+            .retain(|(pid, _), _| *pid != child_pid);
         self.store_selected_process_fds(child_pid)
     }
 
@@ -16244,6 +16346,69 @@ mod tests {
             mcr_task::HostWorkerPoolRole::GuestTaskExecution
         );
         assert!(pool.diagnostics().submitted_jobs() >= 1);
+    }
+
+    #[test]
+    fn native_libc_intrinsic_patch_dispatches_and_returns_to_caller() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[0x90, 0x90, 0x90],
+        ))
+        .unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .register_libc_intrinsic_patch(INITIAL_GUEST_PID, 0x401000, GuestLibcIntrinsic::Memcpy)
+            .unwrap();
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+
+        let dst = 0x600000;
+        let src = 0x601000;
+        let stack = 0x602000;
+        for addr in [dst, src, stack] {
+            runtime
+                .memory_mut()
+                .mmap(mcr_sys::MmapSyscallArgs {
+                    addr,
+                    length: GUEST_PAGE_SIZE,
+                    prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    fd: -1,
+                    offset: 0,
+                })
+                .unwrap();
+        }
+        runtime.memory_mut().write(src, b"copy").unwrap();
+        runtime
+            .memory_mut()
+            .write(stack, &0x402000u64.to_le_bytes())
+            .unwrap();
+        let registers = mcr_jit::GuestRegisters {
+            rip: 0x401000,
+            rsp: stack,
+            rdi: dst,
+            rsi: src,
+            rdx: 4,
+            ..mcr_jit::GuestRegisters::default()
+        };
+
+        let step = dispatch_native_libc_intrinsic_task(
+            &mut runtime.dispatcher,
+            INITIAL_GUEST_TID,
+            INITIAL_GUEST_PID,
+            0x401000,
+            registers,
+            GuestLibcIntrinsic::Memcpy,
+        )
+        .unwrap();
+
+        assert_eq!(step.after_rip(), 0x402000);
+        assert_eq!(step.encoded_rax(), dst);
+        assert_eq!(guest_bytes(runtime.memory(), dst, 4), *b"copy");
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(task.regs().rip(), 0x402000);
+        assert_eq!(task.regs().rsp(), stack + 8);
     }
 
     #[test]
