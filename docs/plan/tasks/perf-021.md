@@ -1,7 +1,7 @@
 ---
 id: perf-021
 scope: network-performance
-status: pending
+status: done
 depends-on: [perf-007, perf-020]
 ---
 
@@ -75,3 +75,6 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   consumes the matching IOCP packet, stores the accepted host socket, and reports
   the normal Linux `Accept` readiness class before registering the accepted
   guest socket. Plain accept remains the fallback.
+- Closed as implemented. Targeted verification covered `mcr-win` `AcceptEx` and
+  `ConnectEx`, `mcr-net` `AcceptEx` and `ConnectEx`, and runtime accept/connect
+  syscall tests.
