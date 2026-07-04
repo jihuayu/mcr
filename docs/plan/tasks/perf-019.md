@@ -1,7 +1,7 @@
 ---
 id: perf-019
 scope: task-performance
-status: ready
+status: done
 depends-on: [perf-011, perf-015]
 ---
 
@@ -67,3 +67,8 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   still reads and patches guest memory on the scheduler thread, but syscall/TLS
   scan work over executable byte ranges now runs as typed worker jobs and
   contributes to runtime diagnostics.
+- Closed 2026-07-04: `mcr-task` exposes typed bounded job results, `mcr-net`
+  routes blocking IOCP send completion waits through the `IoCompletion` pool,
+  and native patch range scanning runs on the `GuestTaskExecution` pool when
+  available. Worker-pool diagnostics are now covered by an ignored performance
+  gate, and targeted runtime/network tests verify the routed paths.

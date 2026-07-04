@@ -1,7 +1,7 @@
 ---
 id: perf-016
 scope: io-performance
-status: ready
+status: done
 depends-on: [perf-003, perf-015]
 ---
 
@@ -87,3 +87,9 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   `submit_overlapped_read_at` / `submit_overlapped_write_at` and updates the
   MCR readiness counters only after host completion. Unsupported hosts keep the
   in-memory pipe fallback.
+- Closed 2026-07-04: regular-file offset reads, deferred rootfs reads, and VFS
+  pipe byte movement now use real Windows overlapped host handles where the
+  adapter can create them. Unsupported hosts and unsupported descriptor shapes
+  keep the synchronous/in-memory fallback. Targeted verification covered
+  `mcr-win` overlapped operations, VFS pipe behavior, runtime pipe/poll/epoll
+  behavior, and release guest file/directory gates.
