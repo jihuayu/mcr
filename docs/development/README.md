@@ -301,7 +301,9 @@ The delivery order is:
 9. Phase 2 procfs/devfs;
 10. Phase 2 network/eventing;
 11. performance viability for shell/network metadata paths;
-12. Phase 2 workload smoke matrix.
+12. promoted performance backend gates:
+    `perf-016` through `perf-024`;
+13. Phase 2 workload smoke matrix.
 
 Tasks with no path overlap may be parallelized in separate worktrees, but dependent integration tasks wait for predecessor tasks to land.
 

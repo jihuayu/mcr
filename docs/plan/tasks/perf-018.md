@@ -1,0 +1,49 @@
+---
+id: perf-018
+scope: memory-performance
+status: ready
+depends-on: [perf-005, perf-012, perf-015]
+---
+
+# perf-018: Implement Host-Backed Mapping And COW Page Reuse
+
+## Objective
+
+Move beyond immutable payload caching by adding host-backed executable/read-only
+mapping reuse and copy-on-write page reuse where Linux VMA permissions,
+`mprotect`, EOF zero-fill, private writable mappings, and invalidation semantics
+are proven together.
+
+## Context
+
+- `docs/architecture/runtime.md`
+- `docs/architecture/performance.md`
+- `docs/plan/tasks/perf-005.md`
+- `docs/plan/tasks/perf-012.md`
+
+## Path
+
+- `crates/mcr-runtime/src/memory.rs`
+- `crates/mcr-runtime/src/lib.rs`
+- `crates/mcr-vfs/`
+- `crates/mcr-win/`
+- `crates/mcr-testkit/`
+- `docs/architecture/performance.md`
+- `docs/plan/tasks/perf-018.md`
+
+## Verification
+
+```powershell
+cargo test -p mcr-runtime file_backed mmap mprotect clone native_patch -- --nocapture
+cargo test -p mcr-vfs cache metadata -- --nocapture
+cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
+```
+
+## Notes
+
+- Guest VMA identity and permissions remain runtime-owned; host paths and
+  handles must not leak into guest-visible state.
+- Private writable mappings must preserve Linux copy-on-write behavior and
+  fault isolation between parent and child processes.
+- Cache invalidation must include VFS generation changes, truncation, writes,
+  metadata changes, and exec rematerialization.

@@ -2,9 +2,25 @@
 
 Targeted shell/network metadata performance is no longer a later backlog item.
 `perf-015` closed the first front-loaded gate by reducing the `git ls-remote`
-latency cliff with opt-in summary tracing and sticky scheduling. Broad IOCP,
-overlapped file/pipe, worker-pool routing, and memory-manager backend rewrites
-remain separate performance gates unless a task explicitly promotes them.
+latency cliff with opt-in summary tracing and sticky scheduling.
+
+## Promoted Performance Track
+
+These items are promoted from backlog into the active performance goal. Each
+item must still land as a narrow task commit with measurements and correctness
+checks.
+
+| Item | Active task | Gate |
+|---|---|---|
+| Real overlapped file and pipe backend | `perf-016` | Prove Windows overlapped handle mode, completion source, cancellation/drain, and runtime readiness integration against the synchronous fallback. |
+| Regular-file scatter/gather | `perf-017` | Bypass the copy fallback only when alignment, handle mode, and guest buffer lifetime are proven safe; keep fallback for unsupported shapes. |
+| Host-backed mapping and COW page reuse | `perf-018` | Prove VMA permissions, EOF zero-fill, private writable semantics, invalidation, and exec-heavy benchmark benefit. |
+| Runtime and network worker-pool routing | `perf-019` | Route real guest task and I/O completion work through bounded pools without breaking wait, exit, cancellation, or teardown semantics. |
+| Windows IOCP socket backend | `perf-020` | Replace the WSAPoll-only backend where supported while preserving Linux readiness, timeout, close wakeup, and errno behavior. |
+| AcceptEx/ConnectEx backend | `perf-021` | Use host accept/connect fast paths behind the IOCP lifetime model with context update and fallback comparison tests. |
+| Registered I/O network backend | `perf-022` | Add an opt-in RIO path only with measurement evidence and buffer/lifetime proof against the IOCP backend. |
+| Libc intrinsic replacement | `perf-023` | Replace measured hot libc memory/string routines only when target identification, guest memory faults, and overlap semantics are proven. |
+| Performance regression gates | `perf-024` | Convert the selected local baselines into enforceable release-mode gates with stored before/after evidence. |
 
 ## Deferred Or Later Than Phase 2
 
@@ -22,12 +38,6 @@ remain separate performance gates unless a task explicitly promotes them.
 | BuildKit adapter implementation gates | Phase 4 | `buildkit-001` through `buildkit-003` are closed as deferred adapter gates. Reopen after native builder execution exists, then add worker capability advertisement, source/file/exec mapping to MCR contracts, cache reference mapping, cancellation/progress translation, and `buildctl` smoke output comparison. |
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
 | Full overlay lower/upper layer implementation | Phase 3 | VFS must remain compatible with it, but export semantics belong to builder work. |
-| Overlapped file and pipe backend | Later optimization | `perf-003` closed with the `mcr-win` submission boundary and synchronous fallback only. Reopen for real backend work covering overlapped handle flags, event/thread-pool/IOCP completion source, runtime wait wiring, close/cancel drain semantics, and fallback comparison tests. |
-| File scatter/gather backend | Later optimization | `perf-004` now routes socket `readv`/`writev`/`sendmsg`/`recvmsg` through vectored runtime helpers and Windows `WSABUF` socket calls. Reopen only for regular-file scatter/gather after alignment, handle-mode, and guest-buffer lifetime constraints are modeled safely. |
-| Host-backed file mapping and COW page reuse | Measurement gate | `perf-005` closed with the safe immutable private payload-cache boundary only. Reopen for real host-backed page mapping or COW page sharing when guest VMA permissions, `mprotect`, EOF zero-fill, private writable mapping semantics, cache invalidation, and exec-heavy benchmark evidence can be proven together. |
-| Windows IOCP socket backend | Measurement gate | `perf-006` closed only the safe readiness-token boundary. Reopen real backend work for `CreateIoCompletionPort` registration, overlapped operation ownership, worker draining, cancellation/drain lifecycle, fallback comparison tests, and network perf smoke evidence; `WSAPoll` plus runtime readiness queue remains the Phase 2 correctness backend. |
-| AcceptEx/ConnectEx backend | Measurement gate | `perf-007` closed only the adapter contract over readiness tokens. Reopen real fast-path work for Winsock extension lookup, overlapped buffer ownership, `SO_UPDATE_ACCEPT_CONTEXT`/`SO_UPDATE_CONNECT_CONTEXT`, cancellation, fallback comparison tests, and accept/connect perf smoke evidence after the IOCP lifetime model is ready. |
-| Registered I/O network backend | Measurement gate | `perf-008` closed without implementation; reopen only if IOCP measurements expose a small-message datagram bottleneck and a RIO prototype proves benefit without Windows-only buffer or lifetime leakage. |
 | General UDP socket semantics | Later compatibility | Phase 2 only needs UDP if it is the chosen implementation detail for DNS. |
 | Edge-triggered epoll and one-shot/exclusive watches | Later compatibility | Phase 2 readiness is level-triggered for CLI/network tool smoke tests. |
 | AF_UNIX compatibility | Later compatibility | TCP client behavior is the Phase 2 networking proof. |
@@ -35,8 +45,6 @@ remain separate performance gates unless a task explicitly promotes them.
 | Process-shared futex | Later compatibility | Current model intentionally keeps one host process per container. |
 | Strong sandboxing | Later product line | Current product trust model is trusted development workloads. |
 | Cross-architecture guest execution | Later product line | Same-ISA x86-64 is required to keep MVP feasible. |
-| Libc intrinsic replacement | Measurement gate | `perf-014` closed as a decision checkpoint without implementation. Reopen only after `perf-012` stabilizes native block caching, ignored perf benchmarks prove libc string or memory routines are a material hotspot, and fault/overlap semantics can be proven. |
-| Runtime and network worker-pool routing | Measurement gate | `perf-011` closed with the bounded `mcr-task` pool contract only. Reopen for routing real guest task execution and I/O completions through worker pools after cancellation, teardown, wait/exit semantics, runtime scheduling integration, network completion integration, and differential fallback tests are defined. |
 
 ## Phase 2 Workload Blockers
 
