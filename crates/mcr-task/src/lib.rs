@@ -398,6 +398,7 @@ impl GprState {
 pub enum TaskState {
     Runnable,
     WaitingForChild { args: Wait4SyscallArgs },
+    WaitingForVfork { child_pid: GuestPid },
     WaitingForFd { fd: i32, write: bool },
     Exited { status: i32 },
 }
@@ -866,7 +867,7 @@ impl GuestKernel {
             Syscall::Setpgid => self.setpgid_current(task.pid, arg(request, 0), arg(request, 1)),
             Syscall::Setsid => self.setsid_current(task.pid),
             Syscall::Fork => self.fork_like_current(tid, "fork", child_return_rip(request)),
-            Syscall::Vfork => self.fork_like_current(tid, "vfork", child_return_rip(request)),
+            Syscall::Vfork => self.vfork_current(tid),
             Syscall::Clone => self.clone_current_with_return(
                 tid,
                 CloneSyscallArgs::new(
@@ -944,7 +945,12 @@ impl GuestKernel {
     }
 
     pub fn vfork_current(&mut self, tid: GuestTid) -> SyscallOutcome {
-        self.fork_like_current(tid, "vfork", current_syscall_return_rip(self, tid))
+        self.fork_like_current_and_maybe_block_parent(
+            tid,
+            "vfork",
+            current_syscall_return_rip(self, tid),
+            true,
+        )
     }
 
     pub fn clone_current(&mut self, tid: GuestTid, args: CloneSyscallArgs) -> SyscallOutcome {
@@ -1035,7 +1041,9 @@ impl GuestKernel {
         tid: GuestTid,
         child_regs: GprState,
     ) -> SyscallOutcome {
-        self.fork_like_current_with_child_regs(tid, "vfork", child_regs)
+        self.fork_like_current_with_child_regs_and_maybe_block_parent(
+            tid, "vfork", child_regs, true,
+        )
     }
 
     pub fn clone_current_with_child_regs(
@@ -1051,8 +1059,14 @@ impl GuestKernel {
             return TaskError::InvalidCloneFlags(args.flags).into_outcome();
         }
 
-        self.fork_like_current_with_child_regs(tid, "clone", child_regs)
-            .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
+        let child_regs = clone_fork_like_child_regs(args, child_regs);
+        self.fork_like_current_with_child_regs_and_maybe_block_parent(
+            tid,
+            "clone",
+            child_regs,
+            args.has_clone_vfork(),
+        )
+        .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
     }
 
     fn clone_current_with_return(
@@ -1075,7 +1089,7 @@ impl GuestKernel {
             return TaskError::InvalidCloneFlags(args.flags).into_outcome();
         }
 
-        self.fork_like_current(tid, "clone", child_return_rip)
+        self.clone_fork_like_current(tid, args, child_return_rip)
             .with_decoded_field("clone_flags", format!("{:#x}", args.flags))
     }
 
@@ -1180,6 +1194,7 @@ impl GuestKernel {
         task.robust_list = None;
         task.clear_child_tid = None;
 
+        self.resume_vfork_parent(pid);
         Ok(())
     }
 
@@ -1200,6 +1215,7 @@ impl GuestKernel {
             if let Some(process) = self.processes.get_mut(&pid) {
                 process.exit_state = ExitState::Exited { status };
             }
+            self.resume_vfork_parent(pid);
         }
 
         SyscallOutcome::success(0)
@@ -1218,6 +1234,7 @@ impl GuestKernel {
         if let Some(process) = self.processes.get_mut(&pid) {
             process.exit_state = ExitState::Exited { status };
         }
+        self.resume_vfork_parent(pid);
 
         SyscallOutcome::success(0)
             .with_decoded_field("guest_pid", pid.to_string())
@@ -1271,9 +1288,10 @@ impl GuestKernel {
             .values()
             .filter_map(|task| match task.state {
                 TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
-                TaskState::Runnable | TaskState::WaitingForFd { .. } | TaskState::Exited { .. } => {
-                    None
-                }
+                TaskState::Runnable
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForFd { .. }
+                | TaskState::Exited { .. } => None,
             })
             .collect();
         let mut completed = Vec::new();
@@ -1535,10 +1553,23 @@ impl GuestKernel {
         syscall: &'static str,
         child_return_rip: GuestAddress,
     ) -> SyscallOutcome {
+        self.fork_like_current_and_maybe_block_parent(tid, syscall, child_return_rip, false)
+    }
+
+    fn fork_like_current_and_maybe_block_parent(
+        &mut self,
+        tid: GuestTid,
+        syscall: &'static str,
+        child_return_rip: GuestAddress,
+        block_parent_for_vfork: bool,
+    ) -> SyscallOutcome {
         match self.fork_child_task(tid) {
             Ok((child_pid, child_tid)) => {
                 if let Some(child_task) = self.task_mut(child_tid) {
                     child_task.regs = child_task.regs.with_syscall_return(child_return_rip, 0);
+                }
+                if block_parent_for_vfork && let Some(parent_task) = self.task_mut(tid) {
+                    parent_task.state = TaskState::WaitingForVfork { child_pid };
                 }
                 SyscallOutcome::success(u64::from(child_pid))
                     .with_decoded_field("guest_pid", child_pid.to_string())
@@ -1554,16 +1585,63 @@ impl GuestKernel {
         syscall: &'static str,
         child_regs: GprState,
     ) -> SyscallOutcome {
+        self.fork_like_current_with_child_regs_and_maybe_block_parent(
+            tid, syscall, child_regs, false,
+        )
+    }
+
+    fn fork_like_current_with_child_regs_and_maybe_block_parent(
+        &mut self,
+        tid: GuestTid,
+        syscall: &'static str,
+        child_regs: GprState,
+        block_parent_for_vfork: bool,
+    ) -> SyscallOutcome {
         match self.fork_child_task(tid) {
             Ok((child_pid, child_tid)) => {
                 if let Some(child_task) = self.task_mut(child_tid) {
                     child_task.regs = child_regs;
+                }
+                if block_parent_for_vfork && let Some(parent_task) = self.task_mut(tid) {
+                    parent_task.state = TaskState::WaitingForVfork { child_pid };
                 }
                 SyscallOutcome::success(u64::from(child_pid))
                     .with_decoded_field("guest_pid", child_pid.to_string())
                     .with_decoded_field("fork_kind", syscall)
             }
             Err(error) => error.into_outcome(),
+        }
+    }
+
+    fn clone_fork_like_current(
+        &mut self,
+        tid: GuestTid,
+        args: CloneSyscallArgs,
+        child_return_rip: GuestAddress,
+    ) -> SyscallOutcome {
+        let Some(parent_regs) = self.task(tid).map(|task| task.regs) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        let child_regs =
+            clone_fork_like_child_regs(args, parent_regs.with_syscall_return(child_return_rip, 0));
+        self.fork_like_current_with_child_regs_and_maybe_block_parent(
+            tid,
+            "clone",
+            child_regs,
+            args.has_clone_vfork(),
+        )
+    }
+
+    fn resume_vfork_parent(&mut self, child_pid: GuestPid) {
+        let Some(parent_pid) = self.process(child_pid).and_then(GuestProcess::parent) else {
+            return;
+        };
+        for task in self.tasks.values_mut() {
+            if task.pid == parent_pid
+                && matches!(task.state, TaskState::WaitingForVfork { child_pid: waiting_pid } if waiting_pid == child_pid)
+            {
+                task.state = TaskState::Runnable;
+            }
         }
     }
 
@@ -1848,6 +1926,13 @@ const fn is_supported_fork_like_clone(flags: u64) -> bool {
     (exit_signal == 0 || exit_signal == LINUX_SIGCHLD)
         && (semantic_flags == 0 || semantic_flags == (LINUX_CLONE_VM | LINUX_CLONE_VFORK))
         && flags & !(LINUX_CLONE_EXIT_SIGNAL_MASK | LINUX_CLONE_VM | LINUX_CLONE_VFORK) == 0
+}
+
+fn clone_fork_like_child_regs(args: CloneSyscallArgs, mut child_regs: GprState) -> GprState {
+    if args.child_stack != 0 {
+        child_regs.rsp = args.child_stack;
+    }
+    child_regs
 }
 
 const fn is_supported_thread_clone(flags: u64) -> bool {
@@ -2174,7 +2259,12 @@ mod tests {
         assert_eq!(kernel.process(2).unwrap().parent(), Some(INITIAL_GUEST_PID));
         assert_eq!(kernel.task(2).unwrap().regs().rax(), 0);
         assert_eq!(kernel.task(2).unwrap().regs().rip(), 0x401236);
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForVfork { child_pid: 2 }
+        );
 
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
         assert_eq!(
             dispatch_task_syscall(
                 &mut kernel,
@@ -2182,6 +2272,77 @@ mod tests {
                 [LINUX_CLONE_VM | LINUX_CLONE_THREAD, 0, 0, 0, 0, 0],
             ),
             SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn clone_vfork_uses_child_stack_and_resumes_parent_after_exec() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Clone,
+                [
+                    LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
+                    0x7000_0000,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(2)
+        );
+
+        let parent = kernel.task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(parent.state(), TaskState::WaitingForVfork { child_pid: 2 });
+        assert_eq!(kernel.runnable_tids(), vec![2]);
+        let child = kernel.task(2).unwrap();
+        assert_eq!(child.regs().rsp(), 0x7000_0000);
+        assert_eq!(child.regs().rax(), 0);
+
+        kernel
+            .exec_task(2, test_program("/bin/child", 0x501000))
+            .unwrap();
+
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert_eq!(kernel.task(2).unwrap().state(), TaskState::Runnable);
+        assert!(kernel.process(2).is_some());
+    }
+
+    #[test]
+    fn vfork_parent_resumes_when_child_exits_without_reaping_child() {
+        let mut kernel = GuestKernel::new(test_program("/bin/parent", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(&mut kernel, Syscall::Vfork, [0; 6]),
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForVfork { child_pid: 2 }
+        );
+
+        assert_eq!(kernel.exit_group(2, 37).result, SyscallReturn::Success(0));
+
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            kernel.process(2).unwrap().exit_state(),
+            ExitState::Exited { status: 37 }
+        );
+        assert!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .children()
+                .contains(&2)
         );
     }
 

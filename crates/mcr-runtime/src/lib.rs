@@ -3034,8 +3034,11 @@ where
             .tasks
             .task_mut(tid)
             .ok_or(GuestExecutionError::MissingTask(tid))?;
-        let blocked_for_wait = matches!(task.state(), TaskState::WaitingForChild { .. });
-        let final_regs = if task.regs() == gpr || blocked_for_wait {
+        let blocked_after_syscall = matches!(
+            task.state(),
+            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. }
+        );
+        let final_regs = if task.regs() == gpr || blocked_after_syscall {
             let updated_regs = gpr_from_registers(registers);
             task.set_regs(updated_regs);
             updated_regs
