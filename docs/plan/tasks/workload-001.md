@@ -101,6 +101,8 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   FS-relative TLS loads after the guest FS base has moved above the current
   absolute rewrite range (`node`: `mov rax, fs:[0x28]` at RIP
   `0x700000751bd6`, FS base `0x700000277c90`; `cargo`: `mov rax, fs:[0]` at
-  RIP `0x7006680a`, FS base `0x700010ba1140`). The remaining blocker is
-  therefore the native execution/JIT fallback boundary for high-address
-  FS-relative TLS accesses, not patch-cache throughput.
+  RIP `0x7006680a`, FS base `0x700010ba1140`). The remaining workload blocker
+  is therefore the native execution/JIT fallback boundary for high-address
+  FS-relative TLS accesses that cannot be represented by the fixed-width
+  absolute rewrite, not patch-cache throughput; `perf-012` is closed as
+  cache/range work.

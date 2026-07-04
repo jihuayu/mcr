@@ -1,7 +1,7 @@
 ---
 id: perf-012
 scope: jit-performance
-status: in-progress
+status: done
 depends-on: [perf-001, jit-001]
 ---
 
@@ -53,7 +53,7 @@ cargo test -p mcr-testkit perf_native_execution -- --ignored --nocapture
   syscall patching and TLS semantics remain intact. Fixed-width code patching
   is also batched by host allocation to avoid per-candidate protection toggles
   when large Node or Rust executable ranges need thousands of rewrites.
-- Remaining blocker: after the FS-relative patch apply checkpoint, local
+- Post-cache validation: after the FS-relative patch apply checkpoint, local
   package-rootfs `node -v` and `cargo --version` no longer time out in native
   patch application. They return guest runtime errors from native execution
   faults at null address instead (`node`: RIP `0x700357c6`; `cargo`: RIP
@@ -68,3 +68,11 @@ cargo test -p mcr-testkit perf_native_execution -- --ignored --nocapture
   `0x700000751bd6` with FS base `0x700000277c90`; `cargo --version` faulted on
   `64 48 8b 04 25 00 00 00 00` (`mov rax, fs:[0]`) at RIP `0x7006680a` with
   FS base `0x700010ba1140`.
+- 2026-07-04 closure: the native cache/range work for this task is complete:
+  executable scan filtering, single-read syscall and FS/TLS patch planning,
+  zero-FS no-op skip, unchanged-base new-candidate materialization, and batched
+  fixed-width patch writes are implemented. The remaining Node/Cargo package
+  workload blocker is outside cache throughput: high-address guest FS-base TLS
+  loads cannot be represented by the current fixed-width absolute rewrite, so
+  `workload-001` and the backlog track the native execution or JIT fallback
+  boundary for those accesses.

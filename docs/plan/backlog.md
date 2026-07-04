@@ -28,34 +28,28 @@
 
 ## Phase 2 Workload Blockers
 
-2026-07-04 perf-012 reduced native executable patch startup work by avoiding
-decoder passes for candidate-free ranges and deriving syscall and FS/TLS patch
-plans from one range read. workload-001 now has a deterministic runtime step
-limit diagnostic that classifies timeout snapshots as guest wait/futex,
-readiness, scheduling, or native execution. A package-rootfs rerun with
-`mcr run-rootfs --guest-step-limit` confirmed `python -V` completes, while Go,
-Node, and Cargo each exceeded a 30s process timeout without returning a guest
-step-limit diagnostic. The remaining blocker is therefore likely inside a single
-native/host-side execution window, patch/materialization path, or equivalent
-long operation rather than repeated guest-step progress. `MCR_HOSTSTEP_TRACE=1`
-now emits opt-in host-side timing for rootfs loading, program loading, native
-entry/return, native patch scanning, and fork-exec memory materialization to
-pinpoint that window.
+2026-07-04 perf-012 closed the native executable cache/range throughput work:
+syscall scanning filters `0f 05` before decode, derives syscall and FS/TLS plans
+from one range read, records zero-FS TLS candidates without no-op
+materialization, materializes only new candidates when FS base is unchanged, and
+batches fixed-width patch writes by host allocation. Native fault diagnostics
+now render instruction bytes, a decoded instruction summary, FS base, registers,
+and stack words. Package-rootfs reruns no longer show Node/Cargo blocked in
+patch-cache scan/apply; they fail in same-ISA execution on high-address guest
+FS-base TLS loads that cannot be encoded by the current fixed-width absolute
+rewrite. Track that as a workload/native-execution fallback boundary, not a
+perf-012 cache blocker.
 
-2026-07-04 host-step tracing with `MCR_HOSTSTEP_TRACE=1` narrowed the no-output
-timeouts. `go version` did not reach guest execution within 30s because
-`run-rootfs` was still eagerly materializing the package rootfs
-(`5120/7782` files and `362243289/417985720` bytes after `27364ms`). `node -v`
-and `cargo --version` reached native execution, but the 30s timeout landed in
-host patch work: Node was applying `45171` FS-relative patches with
-`fs_base=0`, while Cargo was rescanning/reapplying the Rust executable ranges
-and was killed while applying `1942` FS-relative patches.
+`MCR_HOSTSTEP_TRACE=1` remains the opt-in host-side timing path for rootfs
+loading, program loading, native entry/return, native patch scanning, and
+fork-exec memory materialization when a workload stalls inside a single
+host/native window instead of returning a guest step-limit diagnostic.
 
 | Command | Current result | Required follow-up |
 |---|---|---|
-| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | `sigaltstack` support cleared the previous native execution fault, and instruction-aware syscall patching cleared the Go `newosproc` clone failure caused by rewriting the `0x50f00` clone-flags immediate. Host-step tracing shows the 30s timeout happens before runtime execution: eager rootfs materialization had reached `5120/7782` files at `27364ms` and had not emitted `run-rootfs rootfs-loaded`. | Replace or bypass eager rootfs materialization for large package fixtures before using guest-step diagnostics as the workload gate. |
-| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Host-step tracing shows the rootfs and interpreter startup complete, then native patching scans a `31363072` byte Node executable range and the timeout lands while applying `45171` FS-relative patches with `fs_base=0`. | Reduce or defer Windows FS-relative patch application for large executable ranges; avoid treating this as guest scheduler progress. |
-| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Host-step tracing shows repeated native patch cache work after startup: the Rust executable range is rescanned and FS-relative patches are reapplied, with the timeout landing while applying `1942` FS-relative patches after a fresh scan. | Stabilize native patch cache invalidation/reuse and reduce repeated FS-relative patch application for Rust-sized executable mappings. |
+| `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Host-backed package-rootfs loading cleared the eager materialization blocker and the latest recorded rerun entered native guest execution, but it still exceeded a 30s process timeout in a native/host-side window after repeated patch-cache work for `fs_base=0x700a6b28`. | Rerun with host-step and native-fault diagnostics after the perf-012 close to classify whether Go shares the high-address FS/TLS fallback boundary or has a different native-window blocker. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | No longer times out applying `45171` zero-base FS-relative patches. It now fails with a native null-address fault on the original `mov rax, fs:[0x28]` at RIP `0x700000751bd6` with FS base `0x700000277c90`; that high guest FS address cannot be represented by the current fixed-width absolute rewrite. | Define and implement the native execution or JIT fallback boundary for unrepresentable high-address FS-relative TLS loads. |
+| `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | No longer times out rescanning/reapplying Rust executable-range patches. It now fails with a native null-address fault on the original `mov rax, fs:[0]` at RIP `0x7006680a` with FS base `0x700010ba1140`; that high guest FS address cannot be represented by the current fixed-width absolute rewrite. | Define and implement the native execution or JIT fallback boundary for unrepresentable high-address FS-relative TLS loads. |
 
 ## Resolved Build Direction
 
