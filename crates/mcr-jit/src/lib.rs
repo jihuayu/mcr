@@ -342,6 +342,7 @@ pub struct GuestRegisters {
     pub r15: u64,
     pub rip: u64,
     pub rflags: u64,
+    pub fs_base: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1593,9 +1594,22 @@ fn effective_address(
     registers: &GuestRegisters,
     instruction: &Instruction,
 ) -> Result<u64, ExecutionError> {
+    let segment_base = match instruction.memory_segment() {
+        Register::FS => registers.fs_base,
+        Register::None | Register::DS | Register::ES | Register::SS => 0,
+        _ => {
+            return Err(ExecutionError::MissingSyscall {
+                terminator: BlockTerminator::Invalid {
+                    rip: instruction.ip(),
+                },
+            });
+        }
+    };
     let base = match instruction.memory_base() {
         Register::None => 0,
-        Register::RIP | Register::EIP => return Ok(instruction.ip_rel_memory_address()),
+        Register::RIP | Register::EIP => {
+            return Ok(segment_base.wrapping_add(instruction.ip_rel_memory_address()));
+        }
         base => read_reg64(registers, base)?,
     };
     let index = match instruction.memory_index() {
@@ -1604,7 +1618,8 @@ fn effective_address(
             read_reg64(registers, index)?.wrapping_mul(u64::from(instruction.memory_index_scale()))
         }
     };
-    Ok(base
+    Ok(segment_base
+        .wrapping_add(base)
         .wrapping_add(index)
         .wrapping_add(instruction.memory_displacement64()))
 }
@@ -2368,6 +2383,7 @@ mod tests {
             r14: 0x1414,
             r15: 0x1515,
             rip: site.rip,
+            fs_base: 0,
             rflags: 0x202,
         };
         let original = registers;
@@ -2841,6 +2857,33 @@ mod tests {
         assert_eq!(trap.registers().rax, 0x0708_091a_2b3c_4d5e);
         assert_eq!(memory.read_u64(0x700010), 0x0708_091a_2b3c_4d5e);
         assert_eq!(trap.site().rip, 0x461008);
+    }
+
+    #[test]
+    fn execution_core_applies_fs_base_to_memory_operands() {
+        let block = GuestBlock::new(
+            &[
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, // mov rax,fs:[0x28]
+                0x0f, 0x05, // syscall
+            ],
+            0x461080,
+        );
+        let registers = GuestRegisters {
+            fs_base: 0x7000_0020_0000,
+            rip: block.rip(),
+            ..GuestRegisters::default()
+        };
+        let mut memory = TestGuestMemory::with_bytes(
+            0x7000_0020_0028,
+            &Syscall::Getpid.number().raw().to_le_bytes(),
+        );
+
+        let trap = SameIsaExecutionCore::new()
+            .execute_to_syscall_trap_with_memory(block, registers, &mut memory)
+            .expect("execute fs-relative load before syscall");
+
+        assert_eq!(trap.registers().rax, Syscall::Getpid.number().raw());
+        assert_eq!(trap.site().rip, 0x461089);
     }
 
     #[test]

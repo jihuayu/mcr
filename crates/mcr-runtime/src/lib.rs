@@ -3281,6 +3281,13 @@ where
 {
     const MAX_GUEST_BLOCK_BYTES: usize = 4096;
 
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
     let trap = {
         let Some(memory) = dispatcher.subsystems().memory_for_process(pid) else {
             dispatcher
@@ -3293,7 +3300,7 @@ where
         let mut read_only_memory = ReadOnlyGuestMemory { memory };
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, before_rip),
-            registers_from_gpr(gpr),
+            registers_from_gpr_with_fs_base(gpr, fs_base),
             &mut read_only_memory,
         )
     };
@@ -3418,6 +3425,13 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
     };
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
     let trap = {
         let memory = dispatcher
             .subsystems_mut()
@@ -3425,7 +3439,7 @@ where
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, before_rip),
-            registers_from_gpr(gpr),
+            registers_from_gpr_with_fs_base(gpr, fs_base),
             memory,
         )?
     };
@@ -3463,6 +3477,82 @@ where
         .ok_or(GuestExecutionError::MissingInitialTask)?;
     let final_regs = if task.regs() == gpr {
         let updated_regs = gpr_from_registers(registers);
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    ))
+}
+
+fn dispatch_interpreted_guest_task_from_registers<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    expected_task_regs: GprState,
+    registers: GuestRegisters,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
+
+    let block = {
+        let memory = dispatcher
+            .subsystems()
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        read_guest_block(memory, registers.rip, MAX_GUEST_BLOCK_BYTES)?
+    };
+    let trap = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
+            GuestBlock::new(&block, registers.rip),
+            registers,
+            memory,
+        )?
+    };
+
+    let syscall_registers = trap.registers().syscall_registers();
+    let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+    if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
+        let trap_regs = gpr_from_registers(trap.registers());
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        if task.regs() == expected_task_regs {
+            task.set_regs(trap_regs);
+        }
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            task.regs().rip(),
+            dispatch_result.encoded_rax,
+            task.state(),
+        ));
+    }
+
+    let mut registers = trap.registers();
+    registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
+    let updated_regs = gpr_from_registers(registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == expected_task_regs {
         task.set_regs(updated_regs);
         updated_regs
     } else {
@@ -3551,6 +3641,29 @@ where
                 host_step_trace(format_args!(
                     "runtime native-fault pid={pid} tid={tid} {instruction}"
                 ));
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if matches!(&error, mcr_win::NativeExecutionError::GuestFault { .. })
+                && fault_instruction
+                    .as_ref()
+                    .is_some_and(native_fault_is_unrewritten_fs_relative)
+            {
+                host_step_trace(format_args!(
+                    "runtime native-fs-fallback pid={pid} tid={tid} rip=0x{:016x} fs_base=0x{fs_base:016x}",
+                    native_registers.rip
+                ));
+                dispatcher.subsystems_mut().set_native_fp(
+                    tid,
+                    mcr_win::HostFloatingPointState {
+                        xmm: native_registers.xmm,
+                        mxcsr: native_registers.mxcsr,
+                    },
+                );
+                let mut registers = guest_registers_from_host(native_registers);
+                registers.fs_base = fs_base;
+                return dispatch_interpreted_guest_task_from_registers(
+                    dispatcher, tid, pid, before_rip, gpr, registers,
+                );
             }
             return Err(native_execution_error(
                 error,
@@ -4062,6 +4175,11 @@ fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultSt
         .collect()
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn native_fault_is_unrewritten_fs_relative(instruction: &NativeFaultInstruction) -> bool {
+    fs_relative_original(&instruction.bytes).is_some()
+}
+
 fn read_guest_block(
     memory: &GuestMemory,
     rip: u64,
@@ -4101,6 +4219,14 @@ fn registers_from_gpr(value: GprState) -> GuestRegisters {
         r15: value.r15(),
         rip: value.rip(),
         rflags: value.rflags(),
+        fs_base: 0,
+    }
+}
+
+fn registers_from_gpr_with_fs_base(value: GprState, fs_base: u64) -> GuestRegisters {
+    GuestRegisters {
+        fs_base,
+        ..registers_from_gpr(value)
     }
 }
 
@@ -4169,6 +4295,7 @@ fn guest_registers_from_host(value: mcr_win::HostCpuRegisters) -> GuestRegisters
         r15: value.r15,
         rip: value.rip,
         rflags: value.rflags,
+        fs_base: 0,
     }
 }
 
@@ -11981,6 +12108,7 @@ mod tests {
             r14: 15,
             r15: 16,
             rip: 17,
+            fs_base: 0,
             rflags: 18,
         };
 
@@ -12124,6 +12252,47 @@ mod tests {
                 .exit_state(),
             ExitState::Exited { status: 77 }
         );
+    }
+
+    #[test]
+    fn guest_execution_dispatches_syscall_after_fs_relative_guest_memory_load() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, // mov rax,fs:[0x28]
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+        runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0x600000,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x600028, &Syscall::Getpid.number().raw().to_le_bytes())
+            .unwrap();
+        let arch = runtime.dispatch_syscall(context(
+            Syscall::ArchPrctl,
+            [ARCH_SET_FS, 0x600000, 0, 0, 0, 0],
+        ));
+        assert_eq!(arch.result, SyscallReturn::Success(0));
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("fs-relative load feeds guest syscall dispatch");
+
+        assert_eq!(step.before_rip(), 0x401000);
+        assert_eq!(step.after_rip(), 0x40100b);
+        assert_eq!(step.encoded_rax(), u64::from(INITIAL_GUEST_PID));
     }
 
     #[test]
@@ -13898,6 +14067,32 @@ mod tests {
             guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
             [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90]
         );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_keeps_high_fs_relative_original_for_fault_fallback() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(INITIAL_GUEST_PID, 0x7000_0020_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            fs_load
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("fs-relative fault instruction decodes");
+        assert!(native_fault_is_unrewritten_fs_relative(&instruction));
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
