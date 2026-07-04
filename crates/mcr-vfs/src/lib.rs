@@ -2964,9 +2964,9 @@ impl Default for FdTable {
 struct VfsCache {
     generation: u64,
     regular_file_generation: u64,
-    directory_listings: BTreeMap<VfsCacheKey, Vec<DirectoryEntry>>,
+    directory_listings: BTreeMap<VfsCacheKey, Arc<[DirectoryEntry]>>,
     metadata: BTreeMap<VfsCacheKey, LinuxFileAttr>,
-    small_reads: BTreeMap<VfsCacheKey, Vec<u8>>,
+    small_reads: BTreeMap<VfsCacheKey, Arc<[u8]>>,
 }
 
 impl VfsCache {
@@ -2985,11 +2985,11 @@ impl VfsCache {
         self.small_reads.clear();
     }
 
-    fn directory_listing(&self, inode: InodeId) -> Option<Vec<DirectoryEntry>> {
+    fn directory_listing(&self, inode: InodeId) -> Option<Arc<[DirectoryEntry]>> {
         self.directory_listings.get(&self.key(inode)).cloned()
     }
 
-    fn insert_directory_listing(&mut self, inode: InodeId, entries: Vec<DirectoryEntry>) {
+    fn insert_directory_listing(&mut self, inode: InodeId, entries: Arc<[DirectoryEntry]>) {
         self.directory_listings.insert(self.key(inode), entries);
     }
 
@@ -3001,11 +3001,11 @@ impl VfsCache {
         self.metadata.insert(self.key(inode), attr);
     }
 
-    fn small_read(&self, inode: InodeId) -> Option<Vec<u8>> {
+    fn small_read(&self, inode: InodeId) -> Option<Arc<[u8]>> {
         self.small_reads.get(&self.key(inode)).cloned()
     }
 
-    fn insert_small_read(&mut self, inode: InodeId, data: Vec<u8>) {
+    fn insert_small_read(&mut self, inode: InodeId, data: Arc<[u8]>) {
         self.small_reads.insert(self.key(inode), data);
     }
 
@@ -3616,7 +3616,7 @@ impl VirtualFileSystem {
         let entries = if source.cacheable {
             self.cached_directory_entries(source.inode, &source.path)?
         } else {
-            self.fds.directory_entries(&self.tree, &source.path)?
+            self.fds.directory_entries(&self.tree, &source.path)?.into()
         };
         self.fds.consume_directory_entries(fd, max_bytes, &entries)
     }
@@ -4167,24 +4167,25 @@ impl VirtualFileSystem {
         &self,
         inode_id: InodeId,
         path: &GuestPath,
-    ) -> VfsResult<Vec<DirectoryEntry>> {
+    ) -> VfsResult<Arc<[DirectoryEntry]>> {
         if let Some(entries) = self.cache.borrow().directory_listing(inode_id) {
             return Ok(entries);
         }
 
-        let entries = self.fds.static_directory_entries(&self.tree, path)?;
+        let entries: Arc<[DirectoryEntry]> =
+            self.fds.static_directory_entries(&self.tree, path)?.into();
         self.cache
             .borrow_mut()
             .insert_directory_listing(inode_id, entries.clone());
         Ok(entries)
     }
 
-    fn cached_small_read_data(&self, inode_id: InodeId, data: &[u8]) -> Vec<u8> {
+    fn cached_small_read_data(&self, inode_id: InodeId, data: &[u8]) -> Arc<[u8]> {
         if let Some(cached) = self.cache.borrow().small_read(inode_id) {
             return cached;
         }
 
-        let cached = data.to_vec();
+        let cached: Arc<[u8]> = data.into();
         self.cache
             .borrow_mut()
             .insert_small_read(inode_id, cached.clone());
