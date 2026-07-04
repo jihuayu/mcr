@@ -35,3 +35,7 @@ cargo test -p mcr-snapshot
 - File deletions from lower layers emit `.wh.<name>`.
 - Opaque directory behavior emits `.wh..wh..opq`.
 - Tests must cover rename-over-existing, deleted lower files, symlink entries, hardlink entries where supported, and repeated export determinism.
+- Initial checkpoint: added deterministic layer-entry planning in
+  `mcr-snapshot` for filesystem entries, deleted-lower whiteouts, and opaque
+  directory markers. Tar stream emission and content bytes remain follow-up
+  work.
