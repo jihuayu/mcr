@@ -8,6 +8,7 @@ pub mod run_rootfs;
 use std::{
     collections::BTreeMap,
     fmt,
+    io::{IoSlice, IoSliceMut},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -1387,42 +1388,18 @@ where
             message.msg_iov,
             usize::try_from(message.msg_iovlen).map_err(|_| LinuxErrno::EINVAL)?,
         )?;
-        if self.socket_is_udp_datagram(socket_id)? {
-            let buffer = self.read_iovec_bytes(&iovecs)?;
-            let count = if let Some(datagram_address) = address {
-                self.sockets
-                    .send_to(socket_id, &buffer, datagram_address)
-                    .map_err(net_errno)?
-            } else {
-                self.sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?
-            };
-            return Ok(count as u64);
-        }
-
-        let mut total = 0u64;
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            self.memory
-                .read_bytes(iovec.iov_base, &mut buffer)
-                .map_err(memory_errno)?;
-            let count = if let Some(address) = address {
-                self.sockets
-                    .send_to(socket_id, &buffer, address)
-                    .map_err(net_errno)?
-            } else {
-                self.sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?
-            };
-            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-            if count < len {
-                break;
-            }
-        }
-        Ok(total)
+        let buffers = self.read_iovec_buffers(&iovecs)?;
+        let slices = io_slices(&buffers);
+        let count = if let Some(address) = address {
+            self.sockets
+                .send_to_vectored(socket_id, &slices, address)
+                .map_err(net_errno)?
+        } else {
+            self.sockets
+                .send_connected_vectored(socket_id, &slices)
+                .map_err(net_errno)?
+        };
+        Ok(count as u64)
     }
 
     fn sys_recvmsg(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -1444,15 +1421,13 @@ where
         let total = if (message.msg_name != 0 || message.msg_namelen != 0)
             && self.socket_is_udp_datagram(socket_id)?
         {
-            let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
-                let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                total.checked_add(len).ok_or(LinuxErrno::EINVAL)
-            })?;
-            let mut buffer = vec![0; capacity];
-            let (count, address) = self
-                .sockets
-                .recv_from(socket_id, &mut buffer)
-                .map_err(net_errno)?;
+            let mut buffers = iovec_output_buffers(&iovecs)?;
+            let (count, address) = {
+                let mut slices = io_slices_mut(&mut buffers);
+                self.sockets
+                    .recv_from_vectored(socket_id, &mut slices)
+                    .map_err(net_errno)?
+            };
             write_socket_address_to_msghdr_name(
                 &mut self.memory,
                 args.msg,
@@ -1460,7 +1435,7 @@ where
                 message.msg_namelen,
                 address,
             )?;
-            self.write_iovec_bytes(&iovecs, &buffer[..count])?;
+            self.write_iovec_buffers(&iovecs, &buffers, count)?;
             count as u64
         } else {
             if message.msg_name != 0 {
@@ -1716,23 +1691,13 @@ where
         let fd = arg_i32(request, 0);
         let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
         if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
-            let mut total = 0u64;
-            for item in iov {
-                let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-                let mut buffer = vec![0; len];
-                self.memory
-                    .read_bytes(item.iov_base, &mut buffer)
-                    .map_err(memory_errno)?;
-                let count = self
-                    .sockets
-                    .send_connected(socket_id, &buffer)
-                    .map_err(net_errno)?;
-                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-                if count < len {
-                    break;
-                }
-            }
-            return Ok(total);
+            let buffers = self.read_iovec_buffers(&iov)?;
+            let slices = io_slices(&buffers);
+            let count = self
+                .sockets
+                .send_connected_vectored(socket_id, &slices)
+                .map_err(net_errno)?;
+            return Ok(count as u64);
         }
 
         let mut total = 0u64;
@@ -2253,36 +2218,37 @@ where
         Ok(iovecs)
     }
 
-    fn read_iovec_bytes(&self, iovecs: &[LinuxIovec]) -> Result<Vec<u8>, LinuxErrno> {
-        let capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            total.checked_add(len).ok_or(LinuxErrno::EINVAL)
-        })?;
-        let mut buffer = Vec::with_capacity(capacity);
+    fn read_iovec_buffers(&self, iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+        let mut buffers = Vec::with_capacity(iovecs.len());
         for iovec in iovecs {
             let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let start = buffer.len();
-            buffer.resize(start + len, 0);
+            let mut buffer = vec![0; len];
             self.memory
-                .read_bytes(iovec.iov_base, &mut buffer[start..])
+                .read_bytes(iovec.iov_base, &mut buffer)
                 .map_err(memory_errno)?;
+            buffers.push(buffer);
         }
-        Ok(buffer)
+        Ok(buffers)
     }
 
-    fn write_iovec_bytes(&mut self, iovecs: &[LinuxIovec], bytes: &[u8]) -> Result<(), LinuxErrno> {
+    fn write_iovec_buffers(
+        &mut self,
+        iovecs: &[LinuxIovec],
+        buffers: &[Vec<u8>],
+        bytes_written: usize,
+    ) -> Result<(), LinuxErrno> {
         let mut consumed = 0usize;
-        for iovec in iovecs {
+        for (iovec, buffer) in iovecs.iter().zip(buffers) {
             let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let remaining = bytes.len().saturating_sub(consumed);
+            let remaining = bytes_written.saturating_sub(consumed);
             let write_len = len.min(remaining);
             if write_len > 0 {
                 self.memory
-                    .write_bytes(iovec.iov_base, &bytes[consumed..consumed + write_len])
+                    .write_bytes(iovec.iov_base, &buffer[..write_len])
                     .map_err(memory_errno)?;
             }
             consumed += write_len;
-            if consumed >= bytes.len() {
+            if consumed >= bytes_written {
                 break;
             }
         }
@@ -2294,23 +2260,15 @@ where
         socket_id: SocketId,
         iovecs: &[LinuxIovec],
     ) -> Result<u64, LinuxErrno> {
-        let mut total = 0u64;
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            let count = self
-                .sockets
-                .recv_connected(socket_id, &mut buffer)
-                .map_err(net_errno)?;
-            self.memory
-                .write_bytes(iovec.iov_base, &buffer[..count])
-                .map_err(memory_errno)?;
-            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
-            if count < len {
-                break;
-            }
-        }
-        Ok(total)
+        let mut buffers = iovec_output_buffers(iovecs)?;
+        let count = {
+            let mut slices = io_slices_mut(&mut buffers);
+            self.sockets
+                .recv_connected_vectored(socket_id, &mut slices)
+                .map_err(net_errno)?
+        };
+        self.write_iovec_buffers(iovecs, &buffers, count)?;
+        Ok(count as u64)
     }
 
     fn socket_is_udp_datagram(&self, id: SocketId) -> Result<bool, LinuxErrno> {
@@ -2336,6 +2294,28 @@ where
             .write_bytes(addr, &encode_linux_statfs(statfs))
             .map_err(memory_errno)
     }
+}
+
+fn io_slices(buffers: &[Vec<u8>]) -> Vec<IoSlice<'_>> {
+    buffers.iter().map(|buffer| IoSlice::new(buffer)).collect()
+}
+
+fn io_slices_mut(buffers: &mut [Vec<u8>]) -> Vec<IoSliceMut<'_>> {
+    buffers
+        .iter_mut()
+        .map(|buffer| IoSliceMut::new(buffer))
+        .collect()
+}
+
+fn iovec_output_buffers(iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+    iovecs
+        .iter()
+        .map(|iovec| {
+            usize::try_from(iovec.iov_len)
+                .map(|len| vec![0; len])
+                .map_err(|_| LinuxErrno::EINVAL)
+        })
+        .collect()
 }
 
 fn outcome(result: Result<u64, LinuxErrno>) -> SyscallOutcome {
@@ -9953,6 +9933,7 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(transport.sent_bytes(), b"abcd");
+        assert_eq!(transport.sent_calls(), vec![b"abcd".to_vec()]);
 
         assert_eq!(
             dispatch(&mut runtime, Syscall::Readv, [3, 0x5000, 2, 0, 0, 0]),
@@ -9960,6 +9941,7 @@ mod tests {
         );
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(transport.recv_calls(), 1);
     }
 
     #[test]
@@ -10010,12 +9992,14 @@ mod tests {
             SyscallReturn::Success(4)
         );
         assert_eq!(transport.sent_bytes(), b"abcd");
+        assert_eq!(transport.sent_calls(), vec![b"abcd".to_vec()]);
         assert_eq!(
             dispatch_network(&mut runtime, Syscall::Recvmsg, [3, 0x5100, 0, 0, 0, 0],),
             SyscallReturn::Success(6)
         );
         assert_eq!(runtime.memory().read(0x6000, 3), b"abc");
         assert_eq!(runtime.memory().read(0x6010, 3), b"def");
+        assert_eq!(transport.recv_calls(), 1);
         assert_eq!(u32_at(runtime.memory(), 0x5100 + 48), 0);
     }
 
@@ -11482,6 +11466,10 @@ mod tests {
             self.state.borrow().sent_calls.clone()
         }
 
+        fn recv_calls(&self) -> usize {
+            self.state.borrow().recv_calls
+        }
+
         fn push_incoming(&self, bytes: &[u8]) {
             self.state.borrow_mut().incoming.extend_from_slice(bytes);
         }
@@ -11514,6 +11502,7 @@ mod tests {
     struct TestSocketState {
         sent: Vec<u8>,
         sent_calls: Vec<Vec<u8>>,
+        recv_calls: usize,
         incoming: Vec<u8>,
         connected: Option<SocketAddress>,
         connect_would_block_once: bool,
@@ -11633,6 +11622,7 @@ mod tests {
 
         fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, mcr_net::HostIoError> {
             let mut state = self.state.borrow_mut();
+            state.recv_calls += 1;
             let count = buffer.len().min(state.incoming.len());
             buffer[..count].copy_from_slice(&state.incoming[..count]);
             state.incoming.drain(..count);
