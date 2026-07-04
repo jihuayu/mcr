@@ -28,7 +28,7 @@ DEFAULT_ARCH = "x86_64"
 DEFAULT_FIXTURE_ROOT = "tests/fixtures"
 DEFAULT_MIRROR = "https://dl-cdn.alpinelinux.org/alpine"
 DEFAULT_PACKAGES = ("curl", "git", "ca-certificates", "ca-certificates-bundle")
-ROOTFS_NAME = "alpine-rootfs"
+DEFAULT_ROOTFS_NAME = "alpine-rootfs"
 ROOTFS_MANIFEST = "rootfs/manifest.mcr"
 REPOSITORIES = ("main", "community")
 
@@ -95,6 +95,11 @@ def main() -> int:
         help=f"Alpine architecture (default: {DEFAULT_ARCH})",
     )
     parser.add_argument(
+        "--rootfs-name",
+        default=DEFAULT_ROOTFS_NAME,
+        help=f"rootfs manifest entry to materialize (default: {DEFAULT_ROOTFS_NAME})",
+    )
+    parser.add_argument(
         "--package",
         dest="packages",
         action="append",
@@ -108,7 +113,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="replace an existing alpine-rootfs fixture",
+        help="replace an existing rootfs fixture",
     )
     parser.add_argument(
         "--check-only",
@@ -126,7 +131,8 @@ def main() -> int:
         script_root = Path(__file__).resolve().parents[1]
         repo_root = discover_repo_root(script_root)
         fixtures_dir = absolutize(repo_root, args.fixtures_dir)
-        record = read_rootfs_record(fixtures_dir, ROOTFS_NAME)
+        rootfs_name = args.rootfs_name
+        record = read_rootfs_record(fixtures_dir, rootfs_name)
         rootfs_dir = fixtures_dir / record.path
         archive_path = fixtures_dir / record.archive_path
         cache = None
@@ -135,11 +141,12 @@ def main() -> int:
 
         if args.check_only:
             validate_rootfs(rootfs_dir, require_network_packages=not args.no_network_packages)
-            print(f"{ROOTFS_NAME} is ready at {rootfs_dir}")
+            print(f"{rootfs_name} is ready at {rootfs_dir}")
             return 0
 
         if cache is not None:
             ensure_cached_worktree_rootfs(
+                rootfs_name=rootfs_name,
                 cache=cache,
                 mirror=args.mirror.rstrip("/"),
                 arch=args.arch,
@@ -149,20 +156,22 @@ def main() -> int:
                 else package_list(args.packages),
             )
             link_worktree_rootfs(
+                rootfs_name=rootfs_name,
                 rootfs_dir=rootfs_dir,
                 cached_rootfs_dir=cache.rootfs_dir,
                 force=args.force,
             )
             validate_rootfs(rootfs_dir, require_network_packages=not args.no_network_packages)
-            print(f"{ROOTFS_NAME} is ready at {rootfs_dir}")
+            print(f"{rootfs_name} is ready at {rootfs_dir}")
             return 0
 
         if rootfs_dir.exists() and not args.force:
             validate_rootfs(rootfs_dir, require_network_packages=not args.no_network_packages)
-            print(f"{ROOTFS_NAME} already exists at {rootfs_dir}; use --force to rebuild")
+            print(f"{rootfs_name} already exists at {rootfs_dir}; use --force to rebuild")
             return 0
 
         materialize_rootfs(
+            rootfs_name=rootfs_name,
             mirror=args.mirror.rstrip("/"),
             arch=args.arch,
             fixtures_dir=fixtures_dir,
@@ -180,6 +189,7 @@ def main() -> int:
 
 def materialize_rootfs(
     *,
+    rootfs_name: str,
     mirror: str,
     arch: str,
     fixtures_dir: Path,
@@ -222,7 +232,7 @@ def materialize_rootfs(
             remove_tree(tmp_dir)
         raise
 
-    print(f"materialized {ROOTFS_NAME} at {rootfs_dir}")
+    print(f"materialized {rootfs_name} at {rootfs_dir}")
     print(f"Alpine {release.version} ({release.branch}) archive: {archive_path}")
     if package_names:
         print("installed packages: " + ", ".join(package_names))
@@ -280,6 +290,7 @@ def git_capture(cwd: Path, *args: str) -> str | None:
 
 def ensure_cached_worktree_rootfs(
     *,
+    rootfs_name: str,
     cache: WorktreeCache,
     mirror: str,
     arch: str,
@@ -296,22 +307,23 @@ def ensure_cached_worktree_rootfs(
         except MaterializeError as error:
             if not force:
                 raise MaterializeError(
-                    f"cached {ROOTFS_NAME} at {cache.rootfs_dir} is invalid: {error}; "
+                    f"cached {rootfs_name} at {cache.rootfs_dir} is invalid: {error}; "
                     "rerun with --force to rebuild it"
                 ) from error
         else:
-            print(f"using cached {ROOTFS_NAME} from main worktree {cache.rootfs_dir}")
+            print(f"using cached {rootfs_name} from main worktree {cache.rootfs_dir}")
             return
     elif os.path.lexists(cache.rootfs_dir):
         if not force:
             raise MaterializeError(
-                f"cached {ROOTFS_NAME} path is a broken symlink: {cache.rootfs_dir}; "
+                f"cached {rootfs_name} path is a broken symlink: {cache.rootfs_dir}; "
                 "rerun with --force to rebuild it"
             )
         cache.rootfs_dir.unlink()
 
-    print(f"materializing cached {ROOTFS_NAME} in main worktree {cache.main_repo_root}")
+    print(f"materializing cached {rootfs_name} in main worktree {cache.main_repo_root}")
     materialize_rootfs(
+        rootfs_name=rootfs_name,
         mirror=mirror,
         arch=arch,
         fixtures_dir=cache.fixtures_dir,
@@ -323,13 +335,13 @@ def ensure_cached_worktree_rootfs(
 
 
 def link_worktree_rootfs(
-    *, rootfs_dir: Path, cached_rootfs_dir: Path, force: bool
+    *, rootfs_name: str, rootfs_dir: Path, cached_rootfs_dir: Path, force: bool
 ) -> None:
     rootfs_dir.parent.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(rootfs_dir):
         if rootfs_dir.is_symlink():
             if rootfs_dir.exists() and same_path(rootfs_dir.resolve(), cached_rootfs_dir):
-                print(f"{ROOTFS_NAME} already links to {cached_rootfs_dir}")
+                print(f"{rootfs_name} already links to {cached_rootfs_dir}")
                 return
             if not force:
                 raise MaterializeError(
