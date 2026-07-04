@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 pub const HOST_WORKER_POOL_MAX_WORKERS: usize = 64;
 pub const HOST_WORKER_POOL_MAX_QUEUED_JOBS: usize = 4096;
@@ -299,6 +301,51 @@ impl fmt::Display for HostWorkerPoolCompletionError {
 
 impl std::error::Error for HostWorkerPoolCompletionError {}
 
+#[derive(Debug)]
+pub struct HostWorkerPoolJob<T> {
+    submission: HostWorkerPoolSubmission,
+    receiver: Receiver<T>,
+}
+
+impl<T> HostWorkerPoolJob<T> {
+    #[must_use]
+    pub const fn submission(&self) -> HostWorkerPoolSubmission {
+        self.submission
+    }
+
+    pub fn recv(self) -> Result<T, HostWorkerPoolJobError> {
+        self.receiver
+            .recv()
+            .map_err(|_| HostWorkerPoolJobError::Panicked)
+    }
+
+    pub fn recv_timeout(self, timeout: Duration) -> Result<T, HostWorkerPoolJobError> {
+        self.receiver
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => HostWorkerPoolJobError::TimedOut,
+                RecvTimeoutError::Disconnected => HostWorkerPoolJobError::Panicked,
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostWorkerPoolJobError {
+    Panicked,
+    TimedOut,
+}
+
+impl fmt::Display for HostWorkerPoolJobError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Panicked => formatter.write_str("host worker job panicked or was cancelled"),
+            Self::TimedOut => formatter.write_str("host worker job timed out"),
+        }
+    }
+}
+
+impl std::error::Error for HostWorkerPoolJobError {}
+
 type HostWorkerJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Bounded host worker pool that can execute runtime and I/O completion jobs.
@@ -369,6 +416,23 @@ impl HostWorkerPoolExecutor {
         drop(inner);
         self.state.available.notify_one();
         Ok(HostWorkerPoolSubmission::Queued)
+    }
+
+    pub fn submit_result<T>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<HostWorkerPoolJob<T>, HostWorkerPoolSubmitError>
+    where
+        T: Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let submission = self.submit(move || {
+            let _ = sender.send(job());
+        })?;
+        Ok(HostWorkerPoolJob {
+            submission,
+            receiver,
+        })
     }
 
     #[must_use]
@@ -842,6 +906,44 @@ mod tests {
         assert_eq!(diagnostics.active_workers(), 0);
         assert_eq!(diagnostics.queued_jobs(), 0);
         assert_eq!(diagnostics.completed_jobs(), 3);
+        executor.shutdown();
+    }
+
+    #[test]
+    fn executor_returns_typed_job_results() {
+        let config =
+            HostWorkerPoolConfig::with_queue_capacity(HostWorkerPoolRole::IoCompletion, 1, 2)
+                .unwrap();
+        let executor = HostWorkerPoolExecutor::new(config).unwrap();
+
+        let job = executor.submit_result(|| 42usize).unwrap();
+
+        assert_eq!(job.submission(), HostWorkerPoolSubmission::Queued);
+        assert_eq!(job.recv_timeout(Duration::from_secs(2)), Ok(42));
+        let diagnostics = executor.diagnostics();
+        assert_eq!(diagnostics.submitted_jobs(), 1);
+        assert_eq!(diagnostics.completed_jobs(), 1);
+        executor.shutdown();
+    }
+
+    #[test]
+    fn executor_result_job_reports_panic_as_disconnected() {
+        let config =
+            HostWorkerPoolConfig::with_queue_capacity(HostWorkerPoolRole::IoCompletion, 1, 2)
+                .unwrap();
+        let executor = HostWorkerPoolExecutor::new(config).unwrap();
+
+        let job = executor
+            .submit_result(|| -> usize {
+                panic!("worker result failure");
+            })
+            .unwrap();
+
+        assert_eq!(
+            job.recv_timeout(Duration::from_secs(2)),
+            Err(HostWorkerPoolJobError::Panicked)
+        );
+        assert_eq!(executor.diagnostics().completed_jobs(), 1);
         executor.shutdown();
     }
 

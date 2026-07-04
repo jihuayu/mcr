@@ -9,7 +9,8 @@ pub use host_worker_pool::{
     HOST_WORKER_POOL_MAX_QUEUED_JOBS, HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPoolBoundary,
     HostWorkerPoolCompletion, HostWorkerPoolCompletionError, HostWorkerPoolConfig,
     HostWorkerPoolConfigError, HostWorkerPoolDiagnostics, HostWorkerPoolExecutor,
-    HostWorkerPoolRole, HostWorkerPoolSubmission, HostWorkerPoolSubmitError, HostWorkerPools,
+    HostWorkerPoolJob, HostWorkerPoolJobError, HostWorkerPoolRole, HostWorkerPoolSubmission,
+    HostWorkerPoolSubmitError, HostWorkerPools,
 };
 
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};

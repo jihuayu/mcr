@@ -54,3 +54,7 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   completed/rejected counts through `HostWorkerPoolDiagnostics`, catches job
   panics so counters are drained, and joins workers on explicit shutdown or
   drop.
+- Added typed worker-pool job results. `HostWorkerPoolExecutor::submit_result`
+  now returns a `HostWorkerPoolJob<T>` handle that preserves bounded submission
+  semantics while allowing runtime/network callers to wait for typed I/O or
+  guest-task results without creating ad hoc channels outside the pool boundary.
