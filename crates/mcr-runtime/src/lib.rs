@@ -78,6 +78,12 @@ const LINUX_PR_GET_THP_DISABLE: u64 = 42;
 const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
 const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+const LINUX_SS_DISABLE: u32 = 2;
+const LINUX_SS_AUTODISARM: u32 = 1 << 31;
+const LINUX_SS_SUPPORTED_FLAGS: u32 = LINUX_SS_DISABLE | LINUX_SS_AUTODISARM;
+const LINUX_MINSIGSTKSZ: u64 = 2048;
+const LINUX_STACK_T_FLAGS_OFFSET: u64 = 8;
+const LINUX_STACK_T_SIZE_OFFSET: u64 = 16;
 const LINUX_UTIME_NOW: i64 = 0x3fffffff;
 const LINUX_UTIME_OMIT: i64 = 0x3ffffffe;
 
@@ -315,6 +321,31 @@ impl EpollRegistry {
 
     fn instance_mut(&mut self, id: u64) -> Result<&mut EpollInstance, LinuxErrno> {
         self.instances.get_mut(&id).ok_or(LinuxErrno::EBADF)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestSignalAltStack {
+    sp: u64,
+    flags: u32,
+    size: u64,
+}
+
+impl GuestSignalAltStack {
+    const DISABLED: Self = Self {
+        sp: 0,
+        flags: LINUX_SS_DISABLE,
+        size: 0,
+    };
+
+    const fn disabled(self) -> bool {
+        self.flags & LINUX_SS_DISABLE != 0
+    }
+}
+
+impl Default for GuestSignalAltStack {
+    fn default() -> Self {
+        Self::DISABLED
     }
 }
 
@@ -3454,6 +3485,7 @@ pub struct RuntimeSubsystems {
     epolls: EpollRegistry,
     native_execution: bool,
     native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
+    signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
     native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
     pending_fork_child_regs: Option<GprState>,
 }
@@ -3487,6 +3519,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
@@ -3517,6 +3550,7 @@ impl RuntimeSubsystems {
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
+            signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
             pending_fork_child_regs: None,
         })
@@ -3811,6 +3845,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
+            mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
             mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
             mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
@@ -4664,6 +4699,47 @@ impl RuntimeSubsystems {
         }
     }
 
+    fn dispatch_sigaltstack(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.sigaltstack(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    fn sigaltstack(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let pid = request.context.pid;
+        let tid = request.context.tid;
+        self.select_memory_for_process(pid)?;
+        let ss = arg(request, 0);
+        let old_ss = arg(request, 1);
+        let current = self
+            .signal_alt_stacks
+            .get(&tid)
+            .copied()
+            .unwrap_or_default();
+        let requested = if ss == 0 {
+            None
+        } else {
+            let stack = read_guest_stack_t(self.files.memory(), ss)?;
+            validate_sigaltstack(stack)?;
+            Some(stack)
+        };
+
+        if old_ss != 0 {
+            write_guest_stack_t(self.files.memory_mut(), old_ss, current)?;
+        }
+
+        if let Some(requested) = requested {
+            if requested.disabled() {
+                self.signal_alt_stacks.remove(&tid);
+            } else {
+                self.signal_alt_stacks.insert(tid, requested);
+            }
+        }
+
+        self.store_selected_process_memory(pid)
+    }
+
     fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
         if let Err(errno) = self.select_process_context(pid) {
@@ -4944,6 +5020,7 @@ impl RuntimeSubsystems {
         }
         sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
         self.native_fp.remove(&request.context.tid);
+        self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
         self.invalidate_native_patch_cache(request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
@@ -5935,6 +6012,59 @@ fn wait_status_from_decoded(decoded: &[TraceField]) -> Option<u32> {
                 |hex| u32::from_str_radix(hex, 16).ok(),
             )
         })
+}
+
+fn read_guest_stack_t(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<GuestSignalAltStack, LinuxErrno> {
+    Ok(GuestSignalAltStack {
+        sp: read_guest_u64(memory, addr)?,
+        flags: read_guest_u32(
+            memory,
+            addr.checked_add(LINUX_STACK_T_FLAGS_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?,
+        size: read_guest_u64(
+            memory,
+            addr.checked_add(LINUX_STACK_T_SIZE_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?,
+    })
+}
+
+fn write_guest_stack_t(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    stack: GuestSignalAltStack,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &stack.sp.to_le_bytes())
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(LINUX_STACK_T_FLAGS_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+            &stack.flags.to_le_bytes(),
+        )
+        .map_err(memory_errno)?;
+    memory
+        .write_bytes(
+            addr.checked_add(LINUX_STACK_T_SIZE_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+            &stack.size.to_le_bytes(),
+        )
+        .map_err(memory_errno)
+}
+
+fn validate_sigaltstack(stack: GuestSignalAltStack) -> Result<(), LinuxErrno> {
+    if stack.flags & !LINUX_SS_SUPPORTED_FLAGS != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    if !stack.disabled() && stack.size < LINUX_MINSIGSTKSZ {
+        return Err(LinuxErrno::ENOMEM);
+    }
+    Ok(())
 }
 
 fn read_futex_timeout(
@@ -8037,6 +8167,60 @@ mod tests {
                 ))
                 .result,
             SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn sigaltstack_reports_disabled_stack_and_persists_enabled_stack() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 0, 8192);
+
+        let set = runtime.dispatch_syscall(context(
+            Syscall::Sigaltstack,
+            [0x402000, 0x402020, 0, 0, 0, 0],
+        ));
+        assert_eq!(set.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402020), 0);
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402020 + LINUX_STACK_T_FLAGS_OFFSET),
+            LINUX_SS_DISABLE
+        );
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402020 + LINUX_STACK_T_SIZE_OFFSET),
+            0
+        );
+
+        let query =
+            runtime.dispatch_syscall(context(Syscall::Sigaltstack, [0, 0x402040, 0, 0, 0, 0]));
+        assert_eq!(query.result, SyscallReturn::Success(0));
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402040), 0x7000_0000);
+        assert_eq!(
+            u32_from_guest(runtime.memory(), 0x402040 + LINUX_STACK_T_FLAGS_OFFSET),
+            0
+        );
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402040 + LINUX_STACK_T_SIZE_OFFSET),
+            8192
+        );
+    }
+
+    #[test]
+    fn sigaltstack_rejects_bad_flags_and_too_small_enabled_stack() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 4, 8192);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+
+        write_stack_t(runtime.memory_mut(), 0x402000, 0x7000_0000, 0, 1024);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ENOMEM)
         );
     }
 
@@ -10370,6 +10554,16 @@ mod tests {
         let mut bytes = [0; 2];
         memory.read(addr, &mut bytes).unwrap();
         u16::from_le_bytes(bytes)
+    }
+
+    fn write_stack_t(memory: &mut GuestMemory, addr: u64, sp: u64, flags: u32, size: u64) {
+        memory.write(addr, &sp.to_le_bytes()).unwrap();
+        memory
+            .write(addr + LINUX_STACK_T_FLAGS_OFFSET, &flags.to_le_bytes())
+            .unwrap();
+        memory
+            .write(addr + LINUX_STACK_T_SIZE_OFFSET, &size.to_le_bytes())
+            .unwrap();
     }
 
     fn write_pollfd(memory: &mut GuestMemory, addr: u64, fd: i32, events: i16) {

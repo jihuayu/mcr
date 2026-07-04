@@ -125,6 +125,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Setregid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getpgid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getsid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Sigaltstack, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Statfs, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Fstatfs, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Nanosleep, SyscallSubsystem::Time),
@@ -733,6 +734,9 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("oldset", arg(2)),
             decimal_field("sigsetsize", arg(3)),
         ],
+        Syscall::Sigaltstack => {
+            vec![hex_field("ss", arg(0)), hex_field("old_ss", arg(1))]
+        }
         Syscall::SetTidAddress => vec![hex_field("tidptr", arg(0))],
         Syscall::SetRobustList => {
             vec![hex_field("head", arg(0)), decimal_field("len", arg(1))]
