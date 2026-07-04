@@ -150,7 +150,9 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "curl --version"` | Phase 2 networking |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "curl -fsSL https://example.com >/dev/null"` | Phase 2 networking |
 | `mcr run-rootfs alpine-rootfs /bin/sh -c "git --version"` | Phase 2 networking |
-| `mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world"` | Phase 2 networking |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null"` | Phase 2 networking |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world-shallow"` | Phase 2 networking |
+| `mcr run-rootfs alpine-rootfs /bin/sh -c "git clone https://github.com/octocat/Hello-World.git /tmp/hello-world-full"` | Phase 2 networking |
 | `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Phase 2 workload matrix |
 | `mcr run-rootfs python-rootfs /bin/sh -c "python -V"` | Phase 2 workload matrix |
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Phase 2 workload matrix |
@@ -175,9 +177,11 @@ materialized-rootfs gate, and covers the guest shell path for `cat`, `mkdir`,
 MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored common_command_matrix_contract
 ```
 
-The ignored network tests use the same `MCR_BIN` and materialized-rootfs gate,
-plus public network access. They intentionally stay inside the Phase 2
-TCP-client and bounded-DNS subset. Run them explicitly with:
+The ignored network matrix tests use the same `MCR_BIN` and
+materialized-rootfs gate, plus public network access. The matrix covers `curl`
+version/HTTPS fetch and `git` version/remote query/shallow clone/full HTTPS
+clone. They intentionally stay inside the Phase 2 TCP-client and bounded-DNS
+subset. Run them explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored network_smoke_contract
