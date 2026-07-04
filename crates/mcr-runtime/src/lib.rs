@@ -6287,6 +6287,17 @@ impl RuntimeSubsystems {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, LinuxErrno> {
+        if let Some(mapping) = self
+            .files
+            .vfs()
+            .map_readonly_regular_file_at(fd, offset, len)
+            .map_err(vfs_errno)?
+        {
+            let mut bytes = mapping.as_slice().to_vec();
+            zero_elf_load_bss_tail(self.files.vfs(), fd, offset, &mut bytes);
+            return Ok(bytes);
+        }
+
         let mut bytes = vec![0; len];
         let count = self
             .files

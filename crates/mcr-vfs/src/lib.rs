@@ -3317,6 +3317,60 @@ impl VirtualFileSystem {
         }))
     }
 
+    pub fn map_readonly_regular_file_at(
+        &self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+    ) -> VfsResult<Option<mcr_win::HostFileMapping>> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Ok(None);
+        }
+        let Some(node) = self.tree.lookup_inode(entry.inode_id()) else {
+            return Ok(None);
+        };
+        if !matches!(node.kind(), PathNodeKind::File) {
+            return Ok(None);
+        }
+        let Some(path) = node.deferred_host_path() else {
+            return Ok(None);
+        };
+        let Some(available) = node.attr().size.checked_sub(offset) else {
+            return Ok(None);
+        };
+        let map_len = len.min(usize::try_from(available).unwrap_or(usize::MAX));
+        if map_len == 0 {
+            return Ok(None);
+        }
+        let file = mcr_win::HostFile::open(
+            path,
+            mcr_win::FileOptions::new(
+                mcr_win::FileAccess::Read,
+                mcr_win::FileCreation::OpenExisting,
+            ),
+        )
+        .map_err(vfs_error_from_host)?;
+        match file.map_readonly_at(offset, map_len) {
+            Ok(mapping) => Ok(Some(mapping)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    mcr_win::HostErrorKind::InvalidInput | mcr_win::HostErrorKind::Unsupported
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(vfs_error_from_host(error)),
+        }
+    }
+
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
         let regular_write = self
             .fds
@@ -5428,6 +5482,35 @@ mod tests {
                 .is_some()
         );
 
+        let _ = fs::remove_file(host_path);
+    }
+
+    #[test]
+    fn deferred_host_file_can_expose_readonly_host_mapping_without_materializing() {
+        let host_path =
+            std::env::temp_dir().join(format!("mcr-vfs-deferred-host-map-{}", std::process::id()));
+        fs::write(&host_path, b"abcdef").unwrap();
+
+        let rootfs = Rootfs::new("/host/root");
+        let mut tree = PathTree::new();
+        tree.create_dir("/tmp").unwrap();
+        tree.create_file_with_host_content("/tmp/deferred", &host_path, 6, 0o644)
+            .unwrap();
+        let mut vfs = VirtualFileSystem::from_parts(rootfs, tree, FdTable::with_stdio());
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/deferred", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        let mapping = vfs.map_readonly_regular_file_at(fd, 1, 3).unwrap().unwrap();
+        assert_eq!(mapping.as_slice(), b"bcd");
+        assert!(
+            vfs.tree()
+                .lookup_path(&guest_path("/tmp/deferred"))
+                .unwrap()
+                .deferred_host_path()
+                .is_some()
+        );
+
+        drop(mapping);
         let _ = fs::remove_file(host_path);
     }
 

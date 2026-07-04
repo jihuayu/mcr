@@ -55,3 +55,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   `CreateFileMappingW` / `MapViewOfFile` on Windows with allocation-granularity
   offset alignment and a non-Windows read-backed fallback. This is still a host
   adapter boundary; runtime VMA/COW integration remains in this task.
+- VFS now exposes deferred host-file read-only mappings without materializing
+  file contents into the in-memory tree, and runtime file-backed mmap population
+  tries that host mapping path before falling back to `pread`. The guest VMA is
+  still runtime-owned and copied into guest memory; page-level VMA/COW reuse is
+  the remaining integration step.
