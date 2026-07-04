@@ -7,6 +7,7 @@
 | Dockerfile builder | Phase 3 | Runtime must first support shell, process, network, and filesystem behavior used by `RUN`. |
 | OCI/Docker image output | Phase 3 | Requires reliable snapshot diff and overlay semantics, which build on VFS after Phase 2. |
 | Registry pull/push | Phase 3 | Not needed to prove runtime execution; rootfs fixtures are enough for MVP and Phase 2. |
+| Build RUN snapshot mutation and cancellation gate | build-003 | `buildrun-001` closed only the `mcr-runtime` executor API boundary. Follow-up must mount snapshot rootfs views, route `RUN` writes into snapshot mutation and layer diffing, and wire build cancellation before claiming end-to-end Dockerfile `RUN` mutation. |
 | BuildKit worker/executor | Phase 4 | Needs a stable runtime executor contract, snapshot diff boundary, and native builder proof first. |
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
 | Full overlay lower/upper layer implementation | Phase 3 | VFS must remain compatible with it, but export semantics belong to builder work. |
