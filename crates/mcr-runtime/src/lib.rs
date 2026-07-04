@@ -2352,6 +2352,63 @@ fn clone_args_from_request(request: &SyscallRequest) -> CloneSyscallArgs {
     )
 }
 
+fn clone3_args_from_memory(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+    size: u64,
+) -> Result<CloneSyscallArgs, LinuxErrno> {
+    const CLONE_ARGS_MIN_SIZE: u64 = 64;
+    const CLONE_ARGS_FULL_SIZE: u64 = 88;
+    if addr == 0 {
+        return Err(LinuxErrno::EFAULT);
+    }
+    if !(CLONE_ARGS_MIN_SIZE..=CLONE_ARGS_FULL_SIZE).contains(&size) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let flags = read_guest_u64(memory, clone3_field_addr(addr, 0)?)?;
+    let pidfd = read_guest_u64(memory, clone3_field_addr(addr, 8)?)?;
+    let child_tid = read_guest_u64(memory, clone3_field_addr(addr, 16)?)?;
+    let parent_tid = read_guest_u64(memory, clone3_field_addr(addr, 24)?)?;
+    let exit_signal = read_guest_u64(memory, clone3_field_addr(addr, 32)?)?;
+    let stack = read_guest_u64(memory, clone3_field_addr(addr, 40)?)?;
+    let stack_size = read_guest_u64(memory, clone3_field_addr(addr, 48)?)?;
+    let tls = read_guest_u64(memory, clone3_field_addr(addr, 56)?)?;
+    let set_tid = if size >= 72 {
+        read_guest_u64(memory, clone3_field_addr(addr, 64)?)?
+    } else {
+        0
+    };
+    let set_tid_size = if size >= 80 {
+        read_guest_u64(memory, clone3_field_addr(addr, 72)?)?
+    } else {
+        0
+    };
+    let cgroup = if size >= CLONE_ARGS_FULL_SIZE {
+        read_guest_u64(memory, clone3_field_addr(addr, 80)?)?
+    } else {
+        0
+    };
+    if pidfd != 0 || set_tid != 0 || set_tid_size != 0 || cgroup != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let child_stack = if stack == 0 || stack_size == 0 {
+        stack
+    } else {
+        stack.checked_add(stack_size).ok_or(LinuxErrno::EINVAL)?
+    };
+    Ok(CloneSyscallArgs::new(
+        flags | exit_signal,
+        child_stack,
+        parent_tid,
+        child_tid,
+        tls,
+    ))
+}
+
+fn clone3_field_addr(addr: u64, offset: u64) -> Result<u64, LinuxErrno> {
+    addr.checked_add(offset).ok_or(LinuxErrno::EFAULT)
+}
+
 fn optional_linux_id(value: u32) -> Option<u32> {
     (value != u32::MAX).then_some(value)
 }
@@ -4778,6 +4835,7 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
     number == mcr_sys::Syscall::Fork.number().raw()
         || number == mcr_sys::Syscall::Vfork.number().raw()
         || number == mcr_sys::Syscall::Clone.number().raw()
+        || number == mcr_sys::Syscall::Clone3.number().raw()
 }
 
 #[cfg(any(
@@ -5968,12 +6026,11 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Prlimit64 => self.dispatch_prlimit64(request),
             mcr_sys::Syscall::Getcpu => self.dispatch_getcpu(request),
             mcr_sys::Syscall::Membarrier => self.dispatch_membarrier(request),
-            mcr_sys::Syscall::Rseq | mcr_sys::Syscall::Clone3 => {
-                SyscallOutcome::errno(LinuxErrno::ENOSYS)
-            }
-            mcr_sys::Syscall::Fork | mcr_sys::Syscall::Vfork | mcr_sys::Syscall::Clone => {
-                self.dispatch_fork_like(request)
-            }
+            mcr_sys::Syscall::Rseq => SyscallOutcome::errno(LinuxErrno::ENOSYS),
+            mcr_sys::Syscall::Fork
+            | mcr_sys::Syscall::Vfork
+            | mcr_sys::Syscall::Clone
+            | mcr_sys::Syscall::Clone3 => self.dispatch_fork_like(request),
             _ => self.dispatch_kernel_task(request),
         }
     }
@@ -7247,15 +7304,35 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let clone_args =
-            (request.syscall == mcr_sys::Syscall::Clone).then(|| clone_args_from_request(request));
+        let clone_args = match request.syscall {
+            mcr_sys::Syscall::Clone => Some(clone_args_from_request(request)),
+            mcr_sys::Syscall::Clone3 => {
+                match clone3_args_from_memory(self.files.memory(), arg(request, 0), arg(request, 1))
+                {
+                    Ok(args) => Some(args),
+                    Err(errno) => return SyscallOutcome::errno(errno),
+                }
+            }
+            _ => None,
+        };
         self.perf_record_fork_like(request.syscall, clone_args);
         let pending_child_regs = self.pending_fork_child_regs.take();
         let outcome = if self.native_execution {
             match pending_child_regs {
-                Some(child_regs) => self.dispatch_native_fork_like_task(request, child_regs),
+                Some(child_regs) => {
+                    self.dispatch_native_fork_like_task(request, clone_args, child_regs)
+                }
+                None if request.syscall == mcr_sys::Syscall::Clone3 => self.tasks.clone_current(
+                    request.context.tid,
+                    clone_args.expect("clone3 args decoded"),
+                ),
                 None => self.tasks.dispatch_for_current_task(request),
             }
+        } else if request.syscall == mcr_sys::Syscall::Clone3 {
+            self.tasks.clone_current(
+                request.context.tid,
+                clone_args.expect("clone3 args decoded"),
+            )
         } else {
             self.tasks.dispatch_for_current_task(request)
         };
@@ -7290,6 +7367,7 @@ impl RuntimeSubsystems {
     fn dispatch_native_fork_like_task(
         &mut self,
         request: &SyscallRequest,
+        clone_args: Option<CloneSyscallArgs>,
         child_regs: GprState,
     ) -> SyscallOutcome {
         match request.syscall {
@@ -7299,17 +7377,13 @@ impl RuntimeSubsystems {
             mcr_sys::Syscall::Vfork => self
                 .tasks
                 .vfork_current_with_child_regs(request.context.tid, child_regs),
-            mcr_sys::Syscall::Clone => self.tasks.clone_current_with_child_regs(
-                request.context.tid,
-                mcr_sys::CloneSyscallArgs::new(
-                    arg(request, 0),
-                    arg(request, 1),
-                    arg(request, 2),
-                    arg(request, 3),
-                    arg(request, 4),
-                ),
-                child_regs,
-            ),
+            mcr_sys::Syscall::Clone | mcr_sys::Syscall::Clone3 => {
+                self.tasks.clone_current_with_child_regs(
+                    request.context.tid,
+                    clone_args.expect("clone args decoded"),
+                    child_regs,
+                )
+            }
             _ => SyscallOutcome::unsupported(),
         }
     }
@@ -9024,17 +9098,17 @@ mod tests {
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6,
         LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
         LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
-        LINUX_CLONE_THREAD, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLET,
-        LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT, LINUX_EPOLLOUT,
-        LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
+        LINUX_CLONE_THREAD, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC,
+        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
+        LINUX_EPOLLET, LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT,
+        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
         LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
         LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
-        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
-        LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
-        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallArgs,
-        SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent, TraceContext,
-        Wait4SyscallArgs,
+        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SIGCHLD, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE,
+        LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM,
+        LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall,
+        SyscallArgs, SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
+        TraceContext, Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -13639,6 +13713,24 @@ mod tests {
         memory.write(addr + 8, &usec.to_le_bytes()).unwrap();
     }
 
+    fn write_clone3_args(
+        memory: &mut GuestMemory,
+        addr: u64,
+        flags: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+    ) {
+        for (index, value) in [flags, 0, 0, 0, exit_signal, stack, stack_size, 0, 0, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            memory
+                .write(addr + (index * 8) as u64, &value.to_le_bytes())
+                .unwrap();
+        }
+    }
+
     fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {
         memory.write(addr, &sec.to_le_bytes()).unwrap();
         memory.write(addr + 8, &nsec.to_le_bytes()).unwrap();
@@ -14675,6 +14767,83 @@ mod tests {
     }
 
     #[test]
+    fn clone3_vfork_defers_memory_clone_until_child_execve() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/new",
+            test_program_bytes_with_marker(0x501000, 0x5a),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+        write_clone3_args(
+            runtime.memory_mut(),
+            0x402200,
+            LINUX_CLONE_VM | LINUX_CLONE_VFORK,
+            LINUX_SIGCHLD,
+            0x7000_0000,
+            0x1000,
+        );
+
+        let clone3 = runtime.dispatch_syscall(context(Syscall::Clone3, [0x402200, 88, 0, 0, 0, 0]));
+
+        assert_eq!(clone3.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForVfork { child_pid: 2 }
+        );
+        assert_eq!(runtime.kernel().task(2).unwrap().regs().rsp(), 0x7000_1000);
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/new"
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+    }
+
+    #[test]
     fn parent_memory_mutation_materializes_deferred_fork_child_first() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime.memory_mut().write(0x402000, b"parent").unwrap();
@@ -15399,12 +15568,6 @@ mod tests {
                 .result,
             SyscallReturn::Errno(LinuxErrno::ENOSYS)
         );
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(Syscall::Clone3, [0x402000, 88, 0, 0, 0, 0]))
-                .result,
-            SyscallReturn::Errno(LinuxErrno::ENOSYS)
-        );
     }
 
     #[test]
@@ -15507,18 +15670,11 @@ mod tests {
 
     #[test]
     fn runtime_unimplemented_fake_syscalls_return_enosys_and_trace_args() {
-        for (syscall, args, decoded_field) in [
-            (
-                Syscall::Rseq,
-                [0x402000, 32, 0, 0x53053053, 0, 0],
-                ("rseq", "0x402000"),
-            ),
-            (
-                Syscall::Clone3,
-                [0x402000, 88, 0, 0, 0, 0],
-                ("cl_args", "0x402000"),
-            ),
-        ] {
+        for (syscall, args, decoded_field) in [(
+            Syscall::Rseq,
+            [0x402000, 32, 0, 0x53053053, 0, 0],
+            ("rseq", "0x402000"),
+        )] {
             let mut runtime = Runtime::with_tracer(
                 test_program("/bin/app", 0x401000),
                 InMemorySyscallTracer::new(),
