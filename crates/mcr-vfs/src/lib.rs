@@ -2891,12 +2891,20 @@ impl Default for FdTable {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct VfsCache {
     generation: u64,
+    regular_file_generation: u64,
     metadata: BTreeMap<VfsCacheKey, LinuxFileAttr>,
     small_reads: BTreeMap<VfsCacheKey, Vec<u8>>,
 }
 
 impl VfsCache {
     fn invalidate_all(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.regular_file_generation = self.regular_file_generation.wrapping_add(1);
+        self.metadata.clear();
+        self.small_reads.clear();
+    }
+
+    fn invalidate_proc_views(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.metadata.clear();
         self.small_reads.clear();
@@ -2939,6 +2947,24 @@ impl VfsCache {
 struct VfsCacheKey {
     inode: InodeId,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RegularFileCacheKey {
+    inode: InodeId,
+    generation: u64,
+}
+
+impl RegularFileCacheKey {
+    #[must_use]
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
 }
 
 #[cfg(test)]
@@ -3032,7 +3058,7 @@ impl VirtualFileSystem {
 
     pub fn set_proc_self(&mut self, proc_self: ProcSelfData) {
         self.proc_self = proc_self;
-        self.invalidate_vfs_caches();
+        self.invalidate_proc_caches();
     }
 
     pub fn mount_minimal_devfs(&mut self) -> VfsResult<()> {
@@ -3184,6 +3210,27 @@ impl VirtualFileSystem {
         }
         self.fds
             .pread(&self.tree, &self.proc_self, fd, offset, buffer)
+    }
+
+    pub fn regular_file_cache_key(&self, fd: Fd) -> VfsResult<Option<RegularFileCacheKey>> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Ok(None);
+        }
+        let inode = entry.inode_id();
+        let Some(node) = self.tree.lookup_inode(inode) else {
+            return Ok(None);
+        };
+        if !matches!(node.kind(), PathNodeKind::File) {
+            return Ok(None);
+        }
+        Ok(Some(RegularFileCacheKey {
+            inode,
+            generation: self.cache.borrow().regular_file_generation,
+        }))
     }
 
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
@@ -4026,6 +4073,10 @@ impl VirtualFileSystem {
 
     fn invalidate_vfs_caches(&self) {
         self.cache.borrow_mut().invalidate_all();
+    }
+
+    fn invalidate_proc_caches(&self) {
+        self.cache.borrow_mut().invalidate_proc_views();
     }
 
     #[cfg(test)]

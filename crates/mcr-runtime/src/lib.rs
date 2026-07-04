@@ -50,7 +50,7 @@ use mcr_task::{
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
     FdReadiness, FdTable, FileKind, FileRef, FileTimes, LinuxFileAttr, LinuxFsKind, LinuxStatfs,
-    OpenFlags, ProcSelfData, SeekWhence, VfsError, VirtualFileSystem,
+    OpenFlags, ProcSelfData, RegularFileCacheKey, SeekWhence, VfsError, VirtualFileSystem,
 };
 use mcr_win::SocketEvents;
 
@@ -3992,10 +3992,62 @@ fn guest_registers_from_host(value: mcr_win::HostCpuRegisters) -> GuestRegisters
     }
 }
 
+#[derive(Debug, Default)]
+struct FileBackedMappingCache {
+    entries: BTreeMap<FileBackedMappingCacheKey, Arc<[u8]>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl FileBackedMappingCache {
+    fn lookup(&mut self, key: FileBackedMappingCacheKey) -> Option<Arc<[u8]>> {
+        let bytes = self.entries.get(&key)?;
+        self.hits += 1;
+        Some(bytes.clone())
+    }
+
+    fn record_miss(&mut self) {
+        self.misses += 1;
+    }
+
+    fn insert(&mut self, key: FileBackedMappingCacheKey, bytes: Vec<u8>) -> Arc<[u8]> {
+        self.entries
+            .retain(|cached, _| cached.file.generation() == key.file.generation());
+        let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+        self.entries.insert(key, bytes.clone());
+        bytes
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> FileBackedMappingCacheSnapshot {
+        FileBackedMappingCacheSnapshot {
+            entries: self.entries.len(),
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileBackedMappingCacheKey {
+    file: RegularFileCacheKey,
+    offset: u64,
+    length: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileBackedMappingCacheSnapshot {
+    entries: usize,
+    hits: usize,
+    misses: usize,
+}
+
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
     files: RuntimeFileSystem<GuestMemory>,
+    file_backed_mapping_cache: FileBackedMappingCache,
     process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
     pending_fork_exec: BTreeMap<mcr_sys::GuestPid, PendingForkExec>,
     selected_memory_pid: mcr_sys::GuestPid,
@@ -4036,6 +4088,7 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
+            file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
             pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
@@ -4068,6 +4121,7 @@ impl RuntimeSubsystems {
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
+            file_backed_mapping_cache: FileBackedMappingCache::default(),
             process_memory: BTreeMap::new(),
             pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
@@ -4097,6 +4151,11 @@ impl RuntimeSubsystems {
             }
         }
         self.native_execution = true;
+    }
+
+    #[cfg(test)]
+    fn file_backed_mapping_cache_snapshot(&self) -> FileBackedMappingCacheSnapshot {
+        self.file_backed_mapping_cache.snapshot()
     }
 
     fn native_fp(&self, tid: mcr_sys::GuestTid) -> Option<&mcr_win::HostFloatingPointState> {
@@ -4566,7 +4625,7 @@ impl RuntimeSubsystems {
             .mmap(args)
             .map_err(|error| error.errno())?;
         if !args.is_anonymous() {
-            self.populate_file_backed_mmap(mapped, length, prot, fd, offset)?;
+            self.populate_file_backed_mmap(mapped, length, prot, flags, fd, offset)?;
         }
         Ok(mapped)
     }
@@ -4576,6 +4635,7 @@ impl RuntimeSubsystems {
         mapped: u64,
         length: u64,
         prot: u32,
+        flags: u32,
         fd: Fd,
         offset: i64,
     ) -> Result<(), LinuxErrno> {
@@ -4583,13 +4643,7 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
         let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
-        let mut bytes = vec![0; len];
-        let count = self
-            .files
-            .vfs()
-            .pread(fd, offset as u64, &mut bytes)
-            .map_err(vfs_errno)?;
-        zero_elf_load_bss_tail(self.files.vfs(), fd, offset as u64, &mut bytes[..count]);
+        let bytes = self.file_backed_mmap_bytes(fd, offset as u64, len, prot, flags)?;
         let writable = mcr_sys::MprotectSyscallArgs {
             addr: mapped,
             length,
@@ -4599,7 +4653,7 @@ impl RuntimeSubsystems {
             .memory_mut()
             .mprotect(writable)
             .map_err(|error| error.errno())?;
-        let write_result = self.files.memory_mut().write(mapped, &bytes[..count]);
+        let write_result = self.files.memory_mut().write(mapped, bytes.as_ref());
         let restore_result = self
             .files
             .memory_mut()
@@ -4611,6 +4665,73 @@ impl RuntimeSubsystems {
         write_result.map_err(|error| error.errno())?;
         restore_result.map_err(|error| error.errno())?;
         Ok(())
+    }
+
+    fn file_backed_mmap_bytes(
+        &mut self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<Arc<[u8]>, LinuxErrno> {
+        let cache_key = self.file_backed_mmap_cache_key(fd, offset, len, prot, flags)?;
+        if let Some(key) = cache_key {
+            if let Some(bytes) = self.file_backed_mapping_cache.lookup(key) {
+                return Ok(bytes);
+            }
+            self.file_backed_mapping_cache.record_miss();
+            let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
+            return Ok(self.file_backed_mapping_cache.insert(key, bytes));
+        }
+
+        let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
+        Ok(Arc::from(bytes.into_boxed_slice()))
+    }
+
+    fn file_backed_mmap_cache_key(
+        &self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<Option<FileBackedMappingCacheKey>, LinuxErrno> {
+        if prot & mcr_sys::LINUX_PROT_WRITE != 0 || flags & mcr_sys::LINUX_MAP_PRIVATE == 0 {
+            return Ok(None);
+        }
+
+        let Some(file) = self
+            .files
+            .vfs()
+            .regular_file_cache_key(fd)
+            .map_err(vfs_errno)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(FileBackedMappingCacheKey {
+            file,
+            offset,
+            length: len,
+        }))
+    }
+
+    fn read_file_backed_mmap_bytes(
+        &self,
+        fd: Fd,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        let mut bytes = vec![0; len];
+        let count = self
+            .files
+            .vfs()
+            .pread(fd, offset, &mut bytes)
+            .map_err(vfs_errno)?;
+        zero_elf_load_bss_tail(self.files.vfs(), fd, offset, &mut bytes[..count]);
+        bytes.truncate(count);
+        Ok(bytes)
     }
 
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -7529,6 +7650,172 @@ mod tests {
         runtime.memory().read(0x7000_0100, &mut bytes).unwrap();
         assert_eq!(&bytes[..8], b"LOADDATA");
         assert_eq!(&bytes[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn runtime_file_backed_mmap_reuses_read_only_cache_and_keeps_private_vmas() {
+        let page_size = usize::try_from(GUEST_PAGE_SIZE).unwrap();
+        let data = (0u16..5000)
+            .map(|index| u8::try_from(index % 251 + 1).unwrap())
+            .collect::<Vec<_>>();
+        let mut tree = PathTree::new();
+        tree.create_dir("/tmp").unwrap();
+        tree.create_file_with_content("/tmp/large", data.clone(), 0o644)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/app", 0x401000), tree);
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/large\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+
+        let first_addr = 0x7000_0000;
+        let first = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                first_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(first.result, SyscallReturn::Success(first_addr));
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .file_backed_mapping_cache_snapshot(),
+            FileBackedMappingCacheSnapshot {
+                entries: 1,
+                hits: 0,
+                misses: 1
+            }
+        );
+        let first_vma = runtime.memory().vma_containing(first_addr).unwrap();
+        assert_eq!(
+            first_vma.protection(),
+            GuestMemoryProtection::new(true, false, false)
+        );
+        assert!(matches!(
+            first_vma.kind(),
+            GuestVmaKind::FileBacked {
+                fd: 3,
+                offset: 4096,
+                shared: false
+            }
+        ));
+
+        let mapped_file_bytes = data.len() - page_size;
+        let tail_probe = mapped_file_bytes - 4;
+        let mut tail = [0xff; 8];
+        runtime
+            .memory()
+            .read(first_addr + tail_probe as u64, &mut tail)
+            .unwrap();
+        assert_eq!(&tail[..4], &data[data.len() - 4..]);
+        assert_eq!(&tail[4..], &[0; 4]);
+
+        let second_addr = first_addr + GUEST_PAGE_SIZE;
+        let second = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                second_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(second.result, SyscallReturn::Success(second_addr));
+        let after_read_only = runtime
+            .dispatcher
+            .subsystems()
+            .file_backed_mapping_cache_snapshot();
+        assert_eq!(
+            after_read_only,
+            FileBackedMappingCacheSnapshot {
+                entries: 1,
+                hits: 1,
+                misses: 1
+            }
+        );
+
+        runtime
+            .memory_mut()
+            .mprotect(mcr_sys::MprotectSyscallArgs {
+                addr: first_addr,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+            })
+            .unwrap();
+        runtime.memory_mut().write(first_addr, b"Q").unwrap();
+        let mut second_byte = [0];
+        runtime
+            .memory()
+            .read(second_addr, &mut second_byte)
+            .unwrap();
+        assert_eq!(second_byte, [data[page_size]]);
+
+        let writable_first_addr = first_addr + GUEST_PAGE_SIZE * 2;
+        let writable_first = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                writable_first_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(
+            writable_first.result,
+            SyscallReturn::Success(writable_first_addr)
+        );
+        let writable_second_addr = first_addr + GUEST_PAGE_SIZE * 3;
+        let writable_second = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                writable_second_addr,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                GUEST_PAGE_SIZE,
+            ],
+        ));
+        assert_eq!(
+            writable_second.result,
+            SyscallReturn::Success(writable_second_addr)
+        );
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .file_backed_mapping_cache_snapshot(),
+            after_read_only
+        );
+        runtime
+            .memory_mut()
+            .write(writable_first_addr, b"W")
+            .unwrap();
+        let mut writable_second_byte = [0];
+        runtime
+            .memory()
+            .read(writable_second_addr, &mut writable_second_byte)
+            .unwrap();
+        assert_eq!(writable_second_byte, [data[page_size]]);
     }
 
     #[test]

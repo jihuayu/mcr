@@ -113,6 +113,13 @@ file mappings where that preserves MCR's guest VMA model. The runtime should use
 lazy population and copy-on-write for private writable mappings so repeated
 `execve` and supported `fork+exec` paths avoid unnecessary copies.
 
+The first reusable boundary caches immutable private file-mapping payloads by
+regular-file inode, VFS generation, file offset, and requested mapping length.
+The cache lives above the VFS and below guest memory materialization: it never
+exposes host paths or handles, writes cached bytes into each guest VMA with the
+requested permissions restored afterward, and bypasses reuse for initially
+writable private mappings until a real copy-on-write page backend exists.
+
 ## Network Optimization
 
 ### IOCP Backend
