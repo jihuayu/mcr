@@ -160,6 +160,49 @@ pub enum GuestMemoryError {
     Host(HostError),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GuestLibcIntrinsic {
+    Memcpy,
+    Memmove,
+    Memset,
+    Memchr,
+    Memcmp,
+    Strlen { max_len: usize },
+}
+
+pub const DEFAULT_LIBC_STRLEN_MAX: usize = 1024 * 1024;
+
+impl GuestLibcIntrinsic {
+    #[must_use]
+    pub fn from_symbol_name(symbol: &str) -> Option<Self> {
+        let name = symbol.split_once('@').map_or(symbol, |(name, _)| name);
+        match name {
+            "memcpy" => Some(Self::Memcpy),
+            "memmove" => Some(Self::Memmove),
+            "memset" => Some(Self::Memset),
+            "memchr" => Some(Self::Memchr),
+            "memcmp" => Some(Self::Memcmp),
+            "strlen" => Some(Self::Strlen {
+                max_len: DEFAULT_LIBC_STRLEN_MAX,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum GuestLibcIntrinsicError {
+    Memory(GuestMemoryError),
+    UnsupportedOverlap,
+    UnterminatedString,
+}
+
+impl From<GuestMemoryError> for GuestLibcIntrinsicError {
+    fn from(value: GuestMemoryError) -> Self {
+        Self::Memory(value)
+    }
+}
+
 impl GuestMemoryError {
     #[must_use]
     pub const fn errno(&self) -> LinuxErrno {
@@ -491,6 +534,25 @@ impl GuestMemory {
         self.write_guest(destination, &bytes)
     }
 
+    pub fn intrinsic_memcmp(
+        &self,
+        lhs: u64,
+        rhs: u64,
+        len: usize,
+    ) -> Result<i32, GuestMemoryError> {
+        let mut lhs_bytes = vec![0; len];
+        let mut rhs_bytes = vec![0; len];
+        self.copy_guest(lhs, &mut lhs_bytes, AccessKind::Read)?;
+        self.copy_guest(rhs, &mut rhs_bytes, AccessKind::Read)?;
+        Ok(lhs_bytes
+            .iter()
+            .zip(rhs_bytes.iter())
+            .find_map(|(left, right)| {
+                (left != right).then_some(i32::from(*left) - i32::from(*right))
+            })
+            .unwrap_or(0))
+    }
+
     pub fn intrinsic_memchr(
         &self,
         address: u64,
@@ -513,6 +575,48 @@ impl GuestMemory {
         let mut bytes = vec![0; max_len];
         self.copy_guest(address, &mut bytes, AccessKind::Read)?;
         Ok(bytes.iter().position(|byte| *byte == 0))
+    }
+
+    pub fn dispatch_libc_intrinsic(
+        &mut self,
+        intrinsic: GuestLibcIntrinsic,
+        rdi: u64,
+        rsi: u64,
+        rdx: u64,
+    ) -> Result<u64, GuestLibcIntrinsicError> {
+        match intrinsic {
+            GuestLibcIntrinsic::Memcpy => {
+                let len = usize::try_from(rdx).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                if raw_ranges_overlap(rdi, rsi, len)? {
+                    return Err(GuestLibcIntrinsicError::UnsupportedOverlap);
+                }
+                self.intrinsic_memmove(rdi, rsi, len)?;
+                Ok(rdi)
+            }
+            GuestLibcIntrinsic::Memmove => {
+                let len = usize::try_from(rdx).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                self.intrinsic_memmove(rdi, rsi, len)?;
+                Ok(rdi)
+            }
+            GuestLibcIntrinsic::Memset => {
+                let len = usize::try_from(rdx).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                self.intrinsic_memset(rdi, rsi as u8, len)?;
+                Ok(rdi)
+            }
+            GuestLibcIntrinsic::Memchr => {
+                let len = usize::try_from(rdx).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                Ok(self.intrinsic_memchr(rdi, rsi as u8, len)?.unwrap_or(0))
+            }
+            GuestLibcIntrinsic::Memcmp => {
+                let len = usize::try_from(rdx).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                let result = self.intrinsic_memcmp(rdi, rsi, len)?;
+                Ok((result as i64) as u64)
+            }
+            GuestLibcIntrinsic::Strlen { max_len } => self
+                .intrinsic_strlen(rdi, max_len)?
+                .map(|len| len as u64)
+                .ok_or(GuestLibcIntrinsicError::UnterminatedString),
+        }
     }
 
     pub fn patch_code(&mut self, address: u64, bytes: &[u8]) -> Result<Vec<u8>, GuestMemoryError> {
@@ -1503,6 +1607,16 @@ fn checked_raw_range(start: u64, length: u64) -> Result<u64, GuestMemoryError> {
         .ok_or(GuestMemoryError::InvalidLength)
 }
 
+fn raw_ranges_overlap(lhs: u64, rhs: u64, len: usize) -> Result<bool, GuestMemoryError> {
+    if len == 0 {
+        return Ok(false);
+    }
+    let length = u64::try_from(len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+    let lhs_end = checked_raw_range(lhs, length)?;
+    let rhs_end = checked_raw_range(rhs, length)?;
+    Ok(lhs < rhs_end && rhs < lhs_end)
+}
+
 fn checked_mapping_end(
     start: u64,
     length: u64,
@@ -1574,7 +1688,8 @@ mod tests {
     };
 
     use super::{
-        GUEST_PAGE_SIZE, GuestMemory, GuestMemoryError, GuestMemoryProtection, GuestVmaKind,
+        GUEST_PAGE_SIZE, GuestLibcIntrinsic, GuestLibcIntrinsicError, GuestMemory,
+        GuestMemoryError, GuestMemoryProtection, GuestVmaKind,
     };
 
     const BRK_BASE: u64 = 0x0100_0000;
@@ -1663,6 +1778,8 @@ mod tests {
         let mut moved = [0; 8];
         memory.read(addr, &mut moved).unwrap();
         assert_eq!(&moved, b"ababcdef");
+        assert_eq!(memory.intrinsic_memcmp(addr + 2, addr + 2, 3).unwrap(), 0);
+        assert!(memory.intrinsic_memcmp(addr, addr + 5, 3).unwrap() < 0);
         assert_eq!(memory.intrinsic_strlen(addr, 12).unwrap(), Some(11));
 
         memory
@@ -1676,6 +1793,87 @@ mod tests {
             memory.intrinsic_memset(addr, 0, 1),
             Err(GuestMemoryError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn libc_intrinsic_dispatch_uses_sysv_register_arguments_and_abi_returns() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+            ))
+            .unwrap();
+        let src = addr;
+        let dst = addr + 32;
+        let other = addr + 64;
+        memory.write(src, b"abc\0tail").unwrap();
+        memory.write(other, b"abd\0tail").unwrap();
+
+        assert_eq!(
+            memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memcpy, dst, src, 3)
+                .unwrap(),
+            dst
+        );
+        let mut copied = [0; 3];
+        memory.read(dst, &mut copied).unwrap();
+        assert_eq!(&copied, b"abc");
+
+        assert_eq!(
+            memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memset, dst + 3, b'x'.into(), 2)
+                .unwrap(),
+            dst + 3
+        );
+        assert_eq!(
+            memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memchr, src, b'b'.into(), 4)
+                .unwrap(),
+            src + 1
+        );
+        assert_eq!(
+            memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Strlen { max_len: 16 }, src, 0, 0)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            memory
+                .dispatch_libc_intrinsic(GuestLibcIntrinsic::Memcmp, src, other, 3)
+                .unwrap() as i64,
+            -1
+        );
+
+        assert_eq!(
+            memory.dispatch_libc_intrinsic(GuestLibcIntrinsic::Memcpy, src + 1, src, 3),
+            Err(GuestLibcIntrinsicError::UnsupportedOverlap)
+        );
+        assert_eq!(
+            memory.dispatch_libc_intrinsic(GuestLibcIntrinsic::Strlen { max_len: 2 }, src, 0, 0),
+            Err(GuestLibcIntrinsicError::UnterminatedString)
+        );
+    }
+
+    #[test]
+    fn libc_intrinsic_symbol_classifier_accepts_versioned_libc_names() {
+        assert_eq!(
+            GuestLibcIntrinsic::from_symbol_name("memcpy"),
+            Some(GuestLibcIntrinsic::Memcpy)
+        );
+        assert_eq!(
+            GuestLibcIntrinsic::from_symbol_name("memset@@GLIBC_2.2.5"),
+            Some(GuestLibcIntrinsic::Memset)
+        );
+        assert_eq!(
+            GuestLibcIntrinsic::from_symbol_name("strlen@GLIBC_2.2.5"),
+            Some(GuestLibcIntrinsic::Strlen {
+                max_len: super::DEFAULT_LIBC_STRLEN_MAX
+            })
+        );
+        assert_eq!(GuestLibcIntrinsic::from_symbol_name("strcpy"), None);
     }
 
     #[test]

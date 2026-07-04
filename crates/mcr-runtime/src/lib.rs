@@ -24,8 +24,9 @@ pub use build_run::{
     BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
 };
 pub use memory::{
-    DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE, GuestBrkOutcome, GuestMemory,
-    GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
+    DEFAULT_LIBC_STRLEN_MAX, DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE,
+    GuestBrkOutcome, GuestLibcIntrinsic, GuestLibcIntrinsicError, GuestMemory, GuestMemoryError,
+    GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
 };
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 

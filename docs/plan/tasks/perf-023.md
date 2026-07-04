@@ -52,3 +52,14 @@ cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
   guest memory access checks, so unmapped ranges and read/write permissions keep
   returning the same Linux-facing memory errors. Native symbol/patch dispatch is
   still the remaining replacement step.
+- Added the runtime intrinsic dispatch contract for already-identified libc
+  targets. `GuestLibcIntrinsic` executes SysV register-shaped arguments for
+  `memcpy`, `memmove`, `memset`, `memchr`, `memcmp`, and bounded `strlen`,
+  preserves guest memory checks, returns ABI-shaped values, and rejects
+  overlapping `memcpy` instead of silently applying `memmove` semantics. Loader
+  dynsym/PLT target discovery remains separate from this safe execution
+  boundary.
+- Added a libc symbol-name classifier for unversioned and glibc-versioned names
+  (`name`, `name@VERSION`, and `name@@VERSION`) so future native patch or loader
+  discovery can map resolved targets to the safe dispatch contract without
+  duplicating string matching.
