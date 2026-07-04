@@ -1,7 +1,7 @@
 ---
 id: perf-009
 scope: network-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, net-001]
 ---
 

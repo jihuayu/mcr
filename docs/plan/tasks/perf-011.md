@@ -1,7 +1,7 @@
 ---
 id: perf-011
 scope: task-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, task-003, net-002]
 ---
 

@@ -1,7 +1,7 @@
 ---
 id: perf-002
 scope: vfs-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, vfs-004]
 ---
 
