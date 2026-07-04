@@ -1,7 +1,7 @@
 ---
 id: perf-013
 scope: syscall-performance
-status: in-progress
+status: done
 depends-on: [perf-001, sys-001]
 ---
 
@@ -30,7 +30,7 @@ diagnostics, and Linux ABI return behavior.
 ```powershell
 cargo test -p mcr-sys
 cargo test -p mcr-runtime getpid gettid clock -- --nocapture
-cargo test -p mcr-testkit perf_syscall_fast_path -- --ignored --nocapture
+cargo test -p mcr-runtime perf_baseline_runtime_syscall_and_process_paths -- --ignored --nocapture
 ```
 
 ## Notes
@@ -47,3 +47,8 @@ cargo test -p mcr-testkit perf_syscall_fast_path -- --ignored --nocapture
 - Remaining candidates such as `uname` and clock queries that copy structures
   into guest memory stay on the regular dispatcher path until their memory
   semantics have focused coverage.
+- Completed 2026-07-04: the committed fast path remains intentionally narrow to
+  `getpid`/`gettid`, with runtime coverage proving trace and return-value
+  parity. Clock and structure-copying candidates stay on the regular dispatcher
+  until their guest-memory semantics have focused coverage; the committed
+  ignored runtime baseline covers synthetic getpid dispatch timing.
