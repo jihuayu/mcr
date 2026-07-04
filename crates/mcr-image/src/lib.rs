@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{self, Write as _},
     fs, io,
@@ -757,6 +757,105 @@ impl RegistryPullPlan {
     #[must_use]
     pub fn layers(&self) -> &[OciDescriptor] {
         &self.layers
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryPushUploadKind {
+    Blob,
+    Manifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryPushUpload {
+    kind: RegistryPushUploadKind,
+    descriptor: OciDescriptor,
+}
+
+impl RegistryPushUpload {
+    #[must_use]
+    pub const fn new(kind: RegistryPushUploadKind, descriptor: OciDescriptor) -> Self {
+        Self { kind, descriptor }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RegistryPushUploadKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &OciDescriptor {
+        &self.descriptor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryPushPlan {
+    reference: OciReference,
+    manifest_descriptor: OciDescriptor,
+    uploads: Vec<RegistryPushUpload>,
+}
+
+impl RegistryPushPlan {
+    pub fn from_manifest(
+        reference: OciReference,
+        manifest_descriptor: OciDescriptor,
+        manifest: OciImageManifest,
+        remote_blobs: impl IntoIterator<Item = OciDigest>,
+    ) -> Result<Self, ImageError> {
+        if manifest_descriptor.media_type() != MEDIA_TYPE_OCI_MANIFEST {
+            return Err(ImageError::UnsupportedManifestMediaType(
+                manifest_descriptor.media_type().to_owned(),
+            ));
+        }
+        if manifest.config().media_type() != MEDIA_TYPE_OCI_CONFIG {
+            return Err(ImageError::UnsupportedManifestMediaType(
+                manifest.config().media_type().to_owned(),
+            ));
+        }
+        for layer in manifest.layers() {
+            validate_layer_media_type(layer.media_type())?;
+        }
+
+        let remote_blobs = remote_blobs.into_iter().collect::<BTreeSet<_>>();
+        let mut planned_blobs = BTreeSet::new();
+        let mut uploads = Vec::with_capacity(1 + manifest.layers().len() + 1);
+        for descriptor in std::iter::once(manifest.config()).chain(manifest.layers()) {
+            if remote_blobs.contains(descriptor.digest()) {
+                continue;
+            }
+            if planned_blobs.insert(descriptor.digest().clone()) {
+                uploads.push(RegistryPushUpload::new(
+                    RegistryPushUploadKind::Blob,
+                    descriptor.clone(),
+                ));
+            }
+        }
+        uploads.push(RegistryPushUpload::new(
+            RegistryPushUploadKind::Manifest,
+            manifest_descriptor.clone(),
+        ));
+
+        Ok(Self {
+            reference,
+            manifest_descriptor,
+            uploads,
+        })
+    }
+
+    #[must_use]
+    pub const fn reference(&self) -> &OciReference {
+        &self.reference
+    }
+
+    #[must_use]
+    pub const fn manifest_descriptor(&self) -> &OciDescriptor {
+        &self.manifest_descriptor
+    }
+
+    #[must_use]
+    pub fn uploads(&self) -> &[RegistryPushUpload] {
+        &self.uploads
     }
 }
 
@@ -1579,6 +1678,96 @@ mod tests {
             vec![MEDIA_TYPE_OCI_LAYER, MEDIA_TYPE_OCI_LAYER_GZIP]
         );
         assert_eq!(plan.layers()[0], layer_one);
+    }
+
+    #[test]
+    fn registry_push_plan_uploads_missing_blobs_before_manifest() {
+        let config = descriptor_for(MEDIA_TYPE_OCI_CONFIG, br#"{"architecture":"amd64"}"#);
+        let layer_one = descriptor_for(MEDIA_TYPE_OCI_LAYER, b"layer-one");
+        let layer_two = descriptor_for(MEDIA_TYPE_OCI_LAYER_GZIP, b"layer-two");
+        let manifest =
+            OciImageManifest::new(config.clone(), vec![layer_one.clone(), layer_two.clone()]);
+        let manifest_descriptor =
+            descriptor_for(MEDIA_TYPE_OCI_MANIFEST, &manifest.to_json_bytes());
+
+        let plan = RegistryPushPlan::from_manifest(
+            OciReference::parse("localhost:5000/team/app:test").unwrap(),
+            manifest_descriptor.clone(),
+            manifest,
+            vec![layer_one.digest().clone()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.reference().registry(), "localhost:5000");
+        assert_eq!(plan.manifest_descriptor(), &manifest_descriptor);
+        assert_eq!(
+            plan.uploads()
+                .iter()
+                .map(RegistryPushUpload::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                RegistryPushUploadKind::Blob,
+                RegistryPushUploadKind::Blob,
+                RegistryPushUploadKind::Manifest
+            ]
+        );
+        assert_eq!(plan.uploads()[0].descriptor(), &config);
+        assert_eq!(plan.uploads()[1].descriptor(), &layer_two);
+        assert_eq!(plan.uploads()[2].descriptor(), &manifest_descriptor);
+    }
+
+    #[test]
+    fn registry_push_plan_deduplicates_blob_uploads() {
+        let config = descriptor_for(MEDIA_TYPE_OCI_CONFIG, br#"{"architecture":"amd64"}"#);
+        let layer = descriptor_for(MEDIA_TYPE_OCI_LAYER, b"same-layer");
+        let manifest = OciImageManifest::new(config, vec![layer.clone(), layer.clone()]);
+        let manifest_descriptor =
+            descriptor_for(MEDIA_TYPE_OCI_MANIFEST, &manifest.to_json_bytes());
+
+        let plan = RegistryPushPlan::from_manifest(
+            OciReference::parse("example.com/team/app:test").unwrap(),
+            manifest_descriptor.clone(),
+            manifest,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.uploads().len(), 3);
+        assert_eq!(plan.uploads()[1].descriptor(), &layer);
+        assert_eq!(plan.uploads()[2].kind(), RegistryPushUploadKind::Manifest);
+    }
+
+    #[test]
+    fn registry_push_plan_rejects_invalid_media_types() {
+        let config = descriptor_for(MEDIA_TYPE_OCI_CONFIG, br#"{"architecture":"amd64"}"#);
+        let layer = descriptor_for(MEDIA_TYPE_OCI_LAYER, b"layer");
+        let manifest = OciImageManifest::new(config.clone(), vec![layer]);
+        let config_descriptor = descriptor_for(MEDIA_TYPE_OCI_CONFIG, b"not-a-manifest");
+
+        assert!(matches!(
+            RegistryPushPlan::from_manifest(
+                OciReference::parse("team/app:test").unwrap(),
+                config_descriptor,
+                manifest,
+                Vec::new(),
+            ),
+            Err(ImageError::UnsupportedManifestMediaType(_))
+        ));
+
+        let bad_config = descriptor_for(MEDIA_TYPE_OCI_LAYER, b"bad-config");
+        let manifest = OciImageManifest::new(bad_config, vec![config]);
+        let manifest_descriptor =
+            descriptor_for(MEDIA_TYPE_OCI_MANIFEST, &manifest.to_json_bytes());
+
+        assert!(matches!(
+            RegistryPushPlan::from_manifest(
+                OciReference::parse("team/app:test").unwrap(),
+                manifest_descriptor,
+                manifest,
+                Vec::new(),
+            ),
+            Err(ImageError::UnsupportedManifestMediaType(_))
+        ));
     }
 
     #[test]

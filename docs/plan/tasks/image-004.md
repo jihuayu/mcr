@@ -1,7 +1,7 @@
 ---
 id: image-004
 scope: phase3-image
-status: pending
+status: in-progress
 depends-on: [image-003]
 ---
 
@@ -34,3 +34,7 @@ cargo test -p mcr-image
 - Tests should prefer a local registry fixture or deterministic fake registry.
 - Full credential helper support is deferred.
 - Manifest push must happen after required blobs are present.
+- Checkpoint 2026-07-04: `mcr-image` now has a registry push planner that validates
+  config/layer media types, skips remote-present blobs, deduplicates repeated
+  layer descriptors, and always orders the manifest upload after required blobs.
+  A deterministic fake registry transport remains before marking this task done.
