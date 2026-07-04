@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::{HostError, HostOperation, HostResult};
+use crate::memory::HostFileMapping;
 use crate::overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
     HostIoSubmission,
@@ -164,10 +165,41 @@ impl HostFile {
         submit_overlapped_at_platform(self, HostIoDirection::Write, offset, buffer)
     }
 
+    /// Maps a read-only view of file bytes when the host supports it.
+    pub fn map_readonly_at(&self, offset: u64, len: usize) -> HostResult<HostFileMapping> {
+        map_readonly_at_platform(self, offset, len)
+    }
+
     /// Flushes host file buffers.
     pub fn flush(&self) -> HostResult<()> {
         flush_platform(self)
     }
+}
+
+#[cfg(not(windows))]
+fn map_readonly_at_platform(
+    file: &HostFile,
+    offset: u64,
+    len: usize,
+) -> HostResult<HostFileMapping> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if len == 0 {
+        return Err(HostError::invalid_input(HostOperation::MapFile));
+    }
+    let mut cloned = file
+        .file
+        .try_clone()
+        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
+    cloned
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
+    let mut bytes = vec![0; len];
+    let count = cloned
+        .read(&mut bytes)
+        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
+    bytes.truncate(count);
+    Ok(HostFileMapping::from_bytes(bytes))
 }
 
 #[cfg(not(windows))]
@@ -223,6 +255,15 @@ fn submit_overlapped_at_platform(
             )),
         },
     }
+}
+
+#[cfg(windows)]
+fn map_readonly_at_platform(
+    file: &HostFile,
+    offset: u64,
+    len: usize,
+) -> HostResult<HostFileMapping> {
+    HostFileMapping::map_readonly_handle(file.handle, offset, len)
 }
 
 #[cfg(windows)]
@@ -820,6 +861,29 @@ mod tests {
         let _ = std::fs::remove_file(path);
 
         assert_eq!(&buf, b"abc");
+    }
+
+    #[test]
+    fn host_file_readonly_mapping_exposes_requested_range() {
+        let path =
+            std::env::temp_dir().join(format!("mcr-win-file-mapping-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let file = HostFile::open(
+            &path,
+            FileOptions::new(FileAccess::ReadWrite, FileCreation::CreateNew),
+        )
+        .unwrap();
+        file.write(b"abcdef").unwrap();
+        file.flush().unwrap();
+
+        let mapping = file.map_readonly_at(1, 3).unwrap();
+        assert_eq!(mapping.len(), 3);
+        assert_eq!(mapping.as_slice(), b"bcd");
+
+        drop(mapping);
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(windows)]

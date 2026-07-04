@@ -47,3 +47,11 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   fault isolation between parent and child processes.
 - Cache invalidation must include VFS generation changes, truncation, writes,
   metadata changes, and exec rematerialization.
+
+## Checkpoints
+
+- Added the first host-backed read-only file mapping primitive in `mcr-win`.
+  `HostFile::map_readonly_at` returns `HostFileMapping`, which uses
+  `CreateFileMappingW` / `MapViewOfFile` on Windows with allocation-granularity
+  offset alignment and a non-Windows read-backed fallback. This is still a host
+  adapter boundary; runtime VMA/COW integration remains in this task.

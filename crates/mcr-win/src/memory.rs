@@ -22,6 +22,132 @@ pub struct HostMemory {
     len: usize,
 }
 
+/// Read-only host-backed view of file contents.
+#[derive(Debug)]
+pub struct HostFileMapping {
+    #[cfg(windows)]
+    mapping: crate::windows::Handle,
+    #[cfg(windows)]
+    view: std::ptr::NonNull<u8>,
+    #[cfg(windows)]
+    slice_offset: usize,
+    #[cfg(not(windows))]
+    storage: Box<[u8]>,
+    len: usize,
+}
+
+impl HostFileMapping {
+    /// Returns the requested mapped bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        #[cfg(windows)]
+        {
+            // SAFETY: `view` owns at least `slice_offset + len` mapped bytes until Drop.
+            unsafe {
+                std::slice::from_raw_parts(self.view.as_ptr().add(self.slice_offset), self.len)
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            &self.storage
+        }
+    }
+
+    /// Mapping size visible to the caller.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether this view contains no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self {
+            storage: bytes.into_boxed_slice(),
+            len,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn map_readonly_handle(
+        handle: crate::windows::Handle,
+        offset: u64,
+        len: usize,
+    ) -> HostResult<Self> {
+        if len == 0 {
+            return Err(HostError::invalid_input(HostOperation::MapFile));
+        }
+
+        let granularity = allocation_granularity();
+        let aligned_offset = offset / granularity * granularity;
+        let slice_offset = usize::try_from(offset - aligned_offset)
+            .map_err(|_| HostError::invalid_input(HostOperation::MapFile))?;
+        let view_len = slice_offset
+            .checked_add(len)
+            .ok_or_else(|| HostError::invalid_input(HostOperation::MapFile))?;
+
+        let mapping = unsafe {
+            // SAFETY: The file handle is supplied by HostFile; security attributes and name are null.
+            CreateFileMappingW(
+                handle,
+                std::ptr::null_mut(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if mapping.is_null() {
+            return Err(crate::error::last_windows_error(HostOperation::MapFile));
+        }
+
+        let view = unsafe {
+            // SAFETY: `mapping` is a read-only file mapping and offset is allocation-granularity aligned.
+            MapViewOfFile(
+                mapping,
+                FILE_MAP_READ,
+                (aligned_offset >> 32) as u32,
+                aligned_offset as u32,
+                view_len,
+            )
+        };
+        let Some(view) = std::ptr::NonNull::new(view.cast::<u8>()) else {
+            crate::windows::close_handle(mapping);
+            return Err(crate::error::last_windows_error(HostOperation::MapFile));
+        };
+
+        Ok(Self {
+            mapping,
+            view,
+            slice_offset,
+            len,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostFileMapping {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: `view` was returned by MapViewOfFile for this mapping.
+            let _ = UnmapViewOfFile(self.view.as_ptr().cast());
+        }
+        crate::windows::close_handle(self.mapping);
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for HostFileMapping {}
+
+#[cfg(windows)]
+unsafe impl Sync for HostFileMapping {}
+
 impl HostMemory {
     /// Reserves and commits a host allocation with the requested protection.
     pub fn allocate(size: usize, protection: MemoryProtection) -> HostResult<Self> {
@@ -205,6 +331,16 @@ fn protect_platform(
     Ok(())
 }
 
+#[cfg(windows)]
+fn allocation_granularity() -> u64 {
+    let mut info = std::mem::MaybeUninit::<SystemInfo>::uninit();
+    unsafe {
+        // SAFETY: `info` points to writable storage for GetSystemInfo.
+        GetSystemInfo(info.as_mut_ptr());
+        u64::from(info.assume_init().allocation_granularity)
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn allocate_platform(size: usize, protection: MemoryProtection) -> HostResult<HostMemory> {
     mmap_allocate(
@@ -381,10 +517,45 @@ const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 #[cfg(windows)]
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+#[cfg(windows)]
+const FILE_MAP_READ: u32 = 0x0004;
+
+#[cfg(windows)]
+#[repr(C)]
+struct SystemInfo {
+    processor_architecture: u16,
+    reserved: u16,
+    page_size: u32,
+    minimum_application_address: *mut std::ffi::c_void,
+    maximum_application_address: *mut std::ffi::c_void,
+    active_processor_mask: usize,
+    number_of_processors: u32,
+    processor_type: u32,
+    allocation_granularity: u32,
+    processor_level: u16,
+    processor_revision: u16,
+}
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn GetSystemInfo(system_info: *mut SystemInfo);
+    fn CreateFileMappingW(
+        file: crate::windows::Handle,
+        file_mapping_attributes: *mut std::ffi::c_void,
+        protect: u32,
+        maximum_size_high: u32,
+        maximum_size_low: u32,
+        name: *const u16,
+    ) -> crate::windows::Handle;
+    fn MapViewOfFile(
+        file_mapping_object: crate::windows::Handle,
+        desired_access: u32,
+        file_offset_high: u32,
+        file_offset_low: u32,
+        number_of_bytes_to_map: usize,
+    ) -> *mut std::ffi::c_void;
+    fn UnmapViewOfFile(base_address: *const std::ffi::c_void) -> crate::windows::Bool;
     fn VirtualAlloc(
         address: *mut std::ffi::c_void,
         size: usize,

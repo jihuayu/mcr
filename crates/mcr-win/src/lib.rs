@@ -25,7 +25,7 @@ pub use files::{
     create_symlink_file, delete_file, rename_file, replace_file,
 };
 pub use iocp::{HostIoCompletionPacket, HostIoCompletionPort};
-pub use memory::{HostMemory, MemoryProtection};
+pub use memory::{HostFileMapping, HostMemory, MemoryProtection};
 pub use native_exec::{
     DEFAULT_MXCSR, HostCpuRegisters, HostFloatingPointState, HostXmmRegisters,
     NativeExecutionError, execute_x86_64_until_trap,
