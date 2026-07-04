@@ -325,6 +325,13 @@ fault behavior, and overlap semantics match the Linux-visible contract.
 
 This is optional and should follow native execution and syscall fast paths.
 
+The native-mode implementation uses the same trap shape as syscall patching.
+For executable file-backed mappings, runtime scans ELF64 `.dynsym` metadata,
+maps recognized libc symbols through the `PT_LOAD` load bias, and registers
+process-local intrinsic traps only when the target address falls inside the
+new executable mapping. The trap handler validates guest memory through the
+normal runtime paths and preserves routine-specific overlap behavior.
+
 ### Fast Syscalls
 
 Small, frequent syscalls with no guest memory side effects should gain a fast

@@ -4007,6 +4007,16 @@ fn guest_libc_intrinsic_execution_error(error: GuestLibcIntrinsicError) -> Guest
     }
 }
 
+fn guest_execution_errno(error: GuestExecutionError) -> LinuxErrno {
+    match error {
+        GuestExecutionError::Memory(error) => error.errno(),
+        GuestExecutionError::MissingInitialTask
+        | GuestExecutionError::MissingTask(_)
+        | GuestExecutionError::TaskExited { .. }
+        | GuestExecutionError::Execution(_) => LinuxErrno::EINVAL,
+    }
+}
+
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -5336,6 +5346,215 @@ struct FileBackedMappingCacheSnapshot {
     misses: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileBackedLibcIntrinsicSymbol {
+    value: u64,
+    intrinsic: GuestLibcIntrinsic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ElfSectionHeader {
+    section_type: u32,
+    offset: u64,
+    size: u64,
+    link: u32,
+    entry_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ElfLoadHeader {
+    file_offset: u64,
+    virtual_address: u64,
+    file_size: u64,
+    memory_size: u64,
+}
+
+const ELF64_MAGIC: &[u8; 4] = b"\x7fELF";
+const ELF64_CLASS_64: u8 = 2;
+const ELF64_DATA_LITTLE_ENDIAN: u8 = 1;
+const ELF64_MACHINE_X86_64: u16 = 62;
+const ELF64_PT_LOAD: u32 = 1;
+const ELF64_SHT_DYNSYM: u32 = 11;
+const ELF64_STT_FUNC: u8 = 2;
+const ELF64_STT_GNU_IFUNC: u8 = 10;
+const ELF64_SYMBOL_SIZE: usize = 24;
+
+fn parse_file_backed_libc_intrinsic_symbols(bytes: &[u8]) -> Vec<FileBackedLibcIntrinsicSymbol> {
+    let Some(sections) = elf_section_headers(bytes) else {
+        return Vec::new();
+    };
+    let mut symbols = Vec::new();
+    for section in sections
+        .iter()
+        .filter(|section| section.section_type == ELF64_SHT_DYNSYM)
+    {
+        let Some(strtab) = usize::try_from(section.link)
+            .ok()
+            .and_then(|index| sections.get(index))
+            .and_then(|section| elf_range(bytes, section.offset, section.size))
+        else {
+            continue;
+        };
+        let entry_size = usize::try_from(section.entry_size)
+            .ok()
+            .filter(|size| *size >= ELF64_SYMBOL_SIZE)
+            .unwrap_or(ELF64_SYMBOL_SIZE);
+        let Some(dynsym) = elf_range(bytes, section.offset, section.size) else {
+            continue;
+        };
+        for entry in dynsym.chunks_exact(entry_size) {
+            let Some(symbol) = parse_file_backed_libc_intrinsic_symbol(entry, strtab) else {
+                continue;
+            };
+            symbols.push(symbol);
+        }
+    }
+    symbols
+}
+
+fn parse_file_backed_libc_intrinsic_symbol(
+    entry: &[u8],
+    strtab: &[u8],
+) -> Option<FileBackedLibcIntrinsicSymbol> {
+    let name_offset = elf_u32(entry, 0)? as usize;
+    let symbol_type = *entry.get(4)? & 0x0f;
+    if !matches!(symbol_type, ELF64_STT_FUNC | ELF64_STT_GNU_IFUNC) {
+        return None;
+    }
+    let value = elf_u64(entry, 8)?;
+    if value == 0 {
+        return None;
+    }
+    let name = elf_cstr(strtab, name_offset)?;
+    let intrinsic = GuestLibcIntrinsic::from_symbol_name(name)?;
+    Some(FileBackedLibcIntrinsicSymbol { value, intrinsic })
+}
+
+fn elf_load_bias_for_mapping(bytes: &[u8], file_offset: u64, mapped: u64) -> Option<u64> {
+    let page_size = GUEST_PAGE_SIZE;
+    for load in elf_load_headers(bytes)? {
+        let segment_file_start = elf_align_down(load.file_offset, page_size);
+        let segment_file_end = align_up_checked(
+            load.file_offset
+                .checked_add(load.file_size.max(load.memory_size))?,
+            page_size,
+        )?;
+        if file_offset < segment_file_start || file_offset >= segment_file_end {
+            continue;
+        }
+        let segment_vaddr_start = elf_align_down(load.virtual_address, page_size);
+        let mapped_image_address =
+            segment_vaddr_start.checked_add(file_offset.checked_sub(segment_file_start)?)?;
+        return mapped.checked_sub(mapped_image_address);
+    }
+    None
+}
+
+fn elf_section_headers(bytes: &[u8]) -> Option<Vec<ElfSectionHeader>> {
+    validate_elf64_header(bytes)?;
+    let section_offset = elf_u64(bytes, 40)?;
+    let section_entry_size = usize::from(elf_u16(bytes, 58)?);
+    let section_count = usize::from(elf_u16(bytes, 60)?);
+    if section_entry_size < 64 {
+        return None;
+    }
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        let offset = usize::try_from(section_offset)
+            .ok()?
+            .checked_add(index.checked_mul(section_entry_size)?)?;
+        let section = bytes.get(offset..offset.checked_add(section_entry_size)?)?;
+        sections.push(ElfSectionHeader {
+            section_type: elf_u32(section, 4)?,
+            offset: elf_u64(section, 24)?,
+            size: elf_u64(section, 32)?,
+            link: elf_u32(section, 40)?,
+            entry_size: elf_u64(section, 56)?,
+        });
+    }
+    Some(sections)
+}
+
+fn elf_load_headers(bytes: &[u8]) -> Option<Vec<ElfLoadHeader>> {
+    validate_elf64_header(bytes)?;
+    let program_offset = elf_u64(bytes, 32)?;
+    let program_entry_size = usize::from(elf_u16(bytes, 54)?);
+    let program_count = usize::from(elf_u16(bytes, 56)?);
+    if program_entry_size < 56 {
+        return None;
+    }
+    let mut loads = Vec::new();
+    for index in 0..program_count {
+        let offset = usize::try_from(program_offset)
+            .ok()?
+            .checked_add(index.checked_mul(program_entry_size)?)?;
+        let header = bytes.get(offset..offset.checked_add(program_entry_size)?)?;
+        if elf_u32(header, 0)? != ELF64_PT_LOAD {
+            continue;
+        }
+        loads.push(ElfLoadHeader {
+            file_offset: elf_u64(header, 8)?,
+            virtual_address: elf_u64(header, 16)?,
+            file_size: elf_u64(header, 32)?,
+            memory_size: elf_u64(header, 40)?,
+        });
+    }
+    Some(loads)
+}
+
+fn validate_elf64_header(bytes: &[u8]) -> Option<()> {
+    if bytes.get(0..4)? != ELF64_MAGIC
+        || *bytes.get(4)? != ELF64_CLASS_64
+        || *bytes.get(5)? != ELF64_DATA_LITTLE_ENDIAN
+        || elf_u16(bytes, 18)? != ELF64_MACHINE_X86_64
+    {
+        return None;
+    }
+    Some(())
+}
+
+fn elf_range(bytes: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let len = usize::try_from(len).ok()?;
+    bytes.get(offset..offset.checked_add(len)?)
+}
+
+fn elf_cstr(bytes: &[u8], offset: usize) -> Option<&str> {
+    let tail = bytes.get(offset..)?;
+    let end = tail.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&tail[..end]).ok()
+}
+
+fn elf_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn elf_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn elf_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+const fn elf_align_down(value: u64, alignment: u64) -> u64 {
+    value / alignment * alignment
+}
+
+fn align_up_checked(value: u64, alignment: u64) -> Option<u64> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        return Some(value);
+    }
+    value.checked_add(alignment - remainder)
+}
+
 #[derive(Debug, Default)]
 struct RuntimePerfSummary {
     enabled: bool,
@@ -5602,6 +5821,8 @@ pub struct RuntimeSubsystems {
     guest_task_worker_pool: Option<Arc<HostWorkerPoolExecutor>>,
     files: RuntimeFileSystem<GuestMemory>,
     file_backed_mapping_cache: FileBackedMappingCache,
+    libc_intrinsic_symbol_cache:
+        BTreeMap<RegularFileCacheKey, Arc<[FileBackedLibcIntrinsicSymbol]>>,
     process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
     pending_fork_exec: BTreeMap<mcr_sys::GuestPid, PendingForkExec>,
     selected_memory_pid: mcr_sys::GuestPid,
@@ -5676,6 +5897,7 @@ impl RuntimeSubsystems {
             guest_task_worker_pool: start_guest_task_worker_pool(),
             files: RuntimeFileSystem::new(vfs, memory),
             file_backed_mapping_cache: FileBackedMappingCache::default(),
+            libc_intrinsic_symbol_cache: BTreeMap::new(),
             process_memory: BTreeMap::new(),
             pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
@@ -5717,6 +5939,7 @@ impl RuntimeSubsystems {
             guest_task_worker_pool: start_guest_task_worker_pool(),
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
             file_backed_mapping_cache: FileBackedMappingCache::default(),
+            libc_intrinsic_symbol_cache: BTreeMap::new(),
             process_memory: BTreeMap::new(),
             pending_fork_exec: BTreeMap::new(),
             selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
@@ -6149,12 +6372,15 @@ impl MemorySyscalls for RuntimeSubsystems {
         }
         let outcome = if matches!(request.syscall, mcr_sys::Syscall::Mmap) {
             outcome(self.mmap(
-                arg(request, 0),
-                arg(request, 1),
-                arg_u32(request, 2),
-                arg_u32(request, 3),
-                arg_i32(request, 4),
-                arg(request, 5) as i64,
+                pid,
+                mcr_sys::MmapSyscallArgs {
+                    addr: arg(request, 0),
+                    length: arg(request, 1),
+                    prot: arg_u32(request, 2),
+                    flags: arg_u32(request, 3),
+                    fd: arg_i32(request, 4),
+                    offset: arg(request, 5) as i64,
+                },
             ))
         } else {
             self.files.memory_mut().dispatch_memory(request)
@@ -6408,28 +6634,31 @@ impl RuntimeSubsystems {
 
     fn mmap(
         &mut self,
-        addr: u64,
-        length: u64,
-        prot: u32,
-        flags: u32,
-        fd: Fd,
-        offset: i64,
+        pid: mcr_sys::GuestPid,
+        args: mcr_sys::MmapSyscallArgs,
     ) -> Result<u64, LinuxErrno> {
-        let args = mcr_sys::MmapSyscallArgs {
-            addr,
-            length,
-            prot,
-            flags,
-            fd,
-            offset,
-        };
         let mapped = self
             .files
             .memory_mut()
             .mmap(args)
             .map_err(|error| error.errno())?;
         if !args.is_anonymous() {
-            self.populate_file_backed_mmap(mapped, length, prot, flags, fd, offset)?;
+            self.populate_file_backed_mmap(
+                mapped,
+                args.length,
+                args.prot,
+                args.flags,
+                args.fd,
+                args.offset,
+            )?;
+            self.register_file_backed_libc_intrinsic_patches(
+                pid,
+                mapped,
+                args.length,
+                args.prot,
+                args.fd,
+                args.offset,
+            )?;
         }
         Ok(mapped)
     }
@@ -6469,6 +6698,87 @@ impl RuntimeSubsystems {
         write_result.map_err(|error| error.errno())?;
         restore_result.map_err(|error| error.errno())?;
         Ok(())
+    }
+
+    fn register_file_backed_libc_intrinsic_patches(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        mapped: u64,
+        length: u64,
+        prot: u32,
+        fd: Fd,
+        offset: i64,
+    ) -> Result<(), LinuxErrno> {
+        if !self.native_execution || prot & mcr_sys::LINUX_PROT_EXEC == 0 || offset < 0 {
+            return Ok(());
+        }
+        let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
+        let offset = offset as u64;
+        let Ok(bytes) = self.read_regular_file_for_symbol_scan(fd) else {
+            return Ok(());
+        };
+        let Some(load_bias) = elf_load_bias_for_mapping(&bytes, offset, mapped) else {
+            return Ok(());
+        };
+        let mapped_end = mapped.checked_add(length).ok_or(LinuxErrno::ENOMEM)?;
+        for symbol in self
+            .file_backed_libc_intrinsic_symbols(fd, &bytes)?
+            .iter()
+            .copied()
+        {
+            let Some(address) = load_bias.checked_add(symbol.value) else {
+                continue;
+            };
+            let patch_end = address.saturating_add(2);
+            if address < mapped || patch_end > mapped_end || (address - mapped) as usize >= len {
+                continue;
+            }
+            self.register_libc_intrinsic_patch(pid, address, symbol.intrinsic)
+                .map_err(guest_execution_errno)?;
+        }
+        Ok(())
+    }
+
+    fn file_backed_libc_intrinsic_symbols(
+        &mut self,
+        fd: Fd,
+        bytes: &[u8],
+    ) -> Result<Arc<[FileBackedLibcIntrinsicSymbol]>, LinuxErrno> {
+        let Some(key) = self
+            .files
+            .vfs()
+            .regular_file_cache_key(fd)
+            .map_err(vfs_errno)?
+        else {
+            return Ok(Arc::from([]));
+        };
+        if let Some(symbols) = self.libc_intrinsic_symbol_cache.get(&key) {
+            return Ok(Arc::clone(symbols));
+        }
+        let symbols: Arc<[FileBackedLibcIntrinsicSymbol]> =
+            Arc::from(parse_file_backed_libc_intrinsic_symbols(bytes).into_boxed_slice());
+        self.libc_intrinsic_symbol_cache
+            .retain(|cached, _| cached.generation() == key.generation());
+        self.libc_intrinsic_symbol_cache
+            .insert(key, Arc::clone(&symbols));
+        Ok(symbols)
+    }
+
+    fn read_regular_file_for_symbol_scan(&self, fd: Fd) -> Result<Vec<u8>, LinuxErrno> {
+        const MAX_SYMBOL_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+        let attr = self.files.vfs().fstat(fd).map_err(vfs_errno)?;
+        if attr.size > MAX_SYMBOL_SCAN_BYTES {
+            return Err(LinuxErrno::EFBIG);
+        }
+        let len = usize::try_from(attr.size).map_err(|_| LinuxErrno::ENOMEM)?;
+        let mut bytes = vec![0; len];
+        let count = self
+            .files
+            .vfs()
+            .pread(fd, 0, &mut bytes)
+            .map_err(vfs_errno)?;
+        bytes.truncate(count);
+        Ok(bytes)
     }
 
     fn file_backed_mmap_bytes(
@@ -13986,6 +14296,71 @@ mod tests {
         bytes
     }
 
+    fn elf_with_dynsym_memcpy() -> Vec<u8> {
+        const PH_OFFSET: usize = 64;
+        const LOAD_OFFSET: usize = 0x1000;
+        const DYNSYM_OFFSET: usize = 0x2800;
+        const STRTAB_OFFSET: usize = 0x2900;
+        const SH_OFFSET: usize = 0x3000;
+        const MEMCPY_VADDR: u64 = 0x2010;
+        let mut bytes = vec![0; SH_OFFSET + 64 * 3];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        write_test_u16(&mut bytes, 16, 3);
+        write_test_u16(&mut bytes, 18, 0x3e);
+        write_test_u32(&mut bytes, 20, 1);
+        write_test_u64(&mut bytes, 32, PH_OFFSET as u64);
+        write_test_u64(&mut bytes, 40, SH_OFFSET as u64);
+        write_test_u16(&mut bytes, 52, 64);
+        write_test_u16(&mut bytes, 54, 56);
+        write_test_u16(&mut bytes, 56, 1);
+        write_test_u16(&mut bytes, 58, 64);
+        write_test_u16(&mut bytes, 60, 3);
+
+        write_test_u32(&mut bytes, PH_OFFSET, 1);
+        write_test_u32(&mut bytes, PH_OFFSET + 4, PF_R | PF_X);
+        write_test_u64(&mut bytes, PH_OFFSET + 8, LOAD_OFFSET as u64);
+        write_test_u64(&mut bytes, PH_OFFSET + 16, 0x2000);
+        write_test_u64(&mut bytes, PH_OFFSET + 24, 0x2000);
+        write_test_u64(&mut bytes, PH_OFFSET + 32, GUEST_PAGE_SIZE);
+        write_test_u64(&mut bytes, PH_OFFSET + 40, GUEST_PAGE_SIZE);
+        write_test_u64(&mut bytes, PH_OFFSET + 48, GUEST_PAGE_SIZE);
+
+        bytes[LOAD_OFFSET + 0x10..LOAD_OFFSET + 0x13].copy_from_slice(&[0x90, 0x90, 0xc3]);
+        bytes[STRTAB_OFFSET..STRTAB_OFFSET + 8].copy_from_slice(b"\0memcpy\0");
+        write_test_u32(&mut bytes, DYNSYM_OFFSET + 24, 1);
+        bytes[DYNSYM_OFFSET + 28] = 0x12;
+        write_test_u64(&mut bytes, DYNSYM_OFFSET + 32, MEMCPY_VADDR);
+        write_test_u64(&mut bytes, DYNSYM_OFFSET + 40, 3);
+
+        let dynsym = SH_OFFSET + 64;
+        write_test_u32(&mut bytes, dynsym + 4, 11);
+        write_test_u64(&mut bytes, dynsym + 24, DYNSYM_OFFSET as u64);
+        write_test_u64(&mut bytes, dynsym + 32, 48);
+        write_test_u32(&mut bytes, dynsym + 40, 2);
+        write_test_u64(&mut bytes, dynsym + 56, 24);
+
+        let strtab = SH_OFFSET + 64 * 2;
+        write_test_u32(&mut bytes, strtab + 4, 3);
+        write_test_u64(&mut bytes, strtab + 24, STRTAB_OFFSET as u64);
+        write_test_u64(&mut bytes, strtab + 32, 8);
+        bytes
+    }
+
+    fn write_test_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_test_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_test_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn ipv4_sockaddr(port: u16) -> Vec<u8> {
         ipv4_sockaddr_for([127, 0, 0, 1], port)
     }
@@ -16346,6 +16721,75 @@ mod tests {
             mcr_task::HostWorkerPoolRole::GuestTaskExecution
         );
         assert!(pool.diagnostics().submitted_jobs() >= 1);
+    }
+
+    #[test]
+    fn file_backed_libc_intrinsic_symbols_parse_dynsym() {
+        let symbols = parse_file_backed_libc_intrinsic_symbols(&elf_with_dynsym_memcpy());
+
+        assert_eq!(
+            symbols,
+            vec![FileBackedLibcIntrinsicSymbol {
+                value: 0x2010,
+                intrinsic: GuestLibcIntrinsic::Memcpy
+            }]
+        );
+    }
+
+    #[test]
+    fn executable_file_mmap_registers_libc_intrinsic_patch_from_dynsym() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/lib").unwrap();
+        tree.create_file_with_content("/lib/libc.so", elf_with_dynsym_memcpy(), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/app", 0x401000), tree);
+        runtime.enable_native_execution();
+        runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0x600000,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x600000, b"/lib/libc.so\0")
+            .unwrap();
+
+        let fd = runtime
+            .dispatch_syscall(context(
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x600000, u64::from(O_RDONLY), 0, 0, 0],
+            ))
+            .result;
+        assert_eq!(fd, SyscallReturn::Success(3));
+        let mapped = 0x700000;
+        let mmap = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                mapped,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_EXEC),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                0x1000,
+            ],
+        ));
+
+        assert_eq!(mmap.result, SyscallReturn::Success(mapped));
+        let target = mapped + 0x10;
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .libc_intrinsic_patch(INITIAL_GUEST_PID, target),
+            Some(GuestLibcIntrinsic::Memcpy)
+        );
+        assert_eq!(guest_bytes(runtime.memory(), target, 3), [0xcc, 0x90, 0xc3]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 id: perf-023
 scope: jit-performance
-status: ready
+status: done
 depends-on: [perf-012, perf-014, perf-015]
 ---
 
@@ -69,3 +69,10 @@ cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
   `GuestLibcIntrinsic` contract from SysV argument registers, pop the guest
   return address, and resume the caller with ABI-shaped `rax`. Automatic dynsym
   / PLT discovery is still the remaining target-identification step.
+- Closed 2026-07-04: executable file-backed `mmap` in native mode now scans
+  ELF64 `.dynsym` entries, classifies hot libc memory/string symbols, computes
+  the mapped object load bias from `PT_LOAD`, and registers process-local trap
+  patches when the symbol lands inside the executable mapping. Invalid,
+  unsupported, or oversized ELF files skip replacement and keep normal mmap
+  semantics. Targeted verification covers symbol parsing, automatic mmap patch
+  registration, native trap dispatch, and the ignored intrinsic baseline.
