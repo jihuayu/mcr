@@ -52,3 +52,8 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   the `mcr-testkit perf_worker_pool` filter so the active perf gate captures
   diagnostics snapshot overhead before real submissions are routed through the
   boundary.
+- Added a bounded submission/execution boundary in `mcr-task`: host worker pool
+  records now accept work while worker slots are available, queue accepted work
+  up to a bounded capacity, reject overflow submissions, promote queued work on
+  completion, and expose submission/completion/rejection counters. Guest
+  scheduling is still not routed through the boundary.

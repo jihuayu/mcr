@@ -242,12 +242,17 @@ high-concurrency workloads do not repeatedly call `CreateThread`. Worker pools
 need cancellation, teardown, and priority rules compatible with guest wait and
 exit behavior.
 
-The first checkpoint adds the diagnostics-visible boundary without changing
-guest scheduling. `mcr-task` now owns bounded pool configuration records for
-guest task execution and I/O completion work. Runtime diagnostics capture each
-pool's role, maximum workers, active workers, and queued jobs, while active and
-queued counts remain zero until a later checkpoint routes real submissions
-through the boundary.
+The first checkpoints add the diagnostics-visible boundary without changing
+guest scheduling. `mcr-task` owns bounded pool configuration records for guest
+task execution and I/O completion work. Runtime diagnostics capture each pool's
+role, maximum workers, queue capacity, active workers, queued jobs, and
+submission/completion/rejection counters.
+
+`mcr-task` also owns a bounded submission boundary that starts work while a role
+has idle worker slots, queues accepted work up to the configured capacity, and
+rejects later submissions with observable counters. This is still a synchronous
+host-side boundary; guest scheduling and I/O are not routed through the pool
+until a later checkpoint wires cancellation, teardown, and wait semantics.
 
 Prestarted process workers are a speculative later optimization. They must not
 break the current one-host-process-per-container boundary unless a separate

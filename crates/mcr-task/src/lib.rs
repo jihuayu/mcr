@@ -4,9 +4,12 @@ use std::fmt;
 mod host_worker_pool;
 
 pub use host_worker_pool::{
-    DEFAULT_GUEST_TASK_WORKERS, DEFAULT_IO_COMPLETION_WORKERS, HOST_WORKER_POOL_MAX_WORKERS,
-    HostWorkerPoolBoundary, HostWorkerPoolConfig, HostWorkerPoolConfigError,
-    HostWorkerPoolDiagnostics, HostWorkerPoolRole, HostWorkerPools,
+    DEFAULT_GUEST_TASK_QUEUE_CAPACITY, DEFAULT_GUEST_TASK_WORKERS,
+    DEFAULT_IO_COMPLETION_QUEUE_CAPACITY, DEFAULT_IO_COMPLETION_WORKERS,
+    HOST_WORKER_POOL_MAX_QUEUED_JOBS, HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPoolBoundary,
+    HostWorkerPoolCompletion, HostWorkerPoolCompletionError, HostWorkerPoolConfig,
+    HostWorkerPoolConfigError, HostWorkerPoolDiagnostics, HostWorkerPoolRole,
+    HostWorkerPoolSubmission, HostWorkerPoolSubmitError, HostWorkerPools,
 };
 
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};
@@ -2029,9 +2032,9 @@ mod tests {
 
         assert_eq!(before[0].role(), HostWorkerPoolRole::GuestTaskExecution);
         assert_eq!(before[1].role(), HostWorkerPoolRole::IoCompletion);
-        assert!(before.iter().all(
-            |pool| pool.max_workers() > 0 && pool.max_workers() <= HOST_WORKER_POOL_MAX_WORKERS
-        ));
+        assert!(before.iter().all(|pool| pool.max_workers() > 0
+            && pool.max_workers() <= HOST_WORKER_POOL_MAX_WORKERS
+            && pool.max_queued_jobs() > 0));
 
         assert_eq!(kernel.fork_child(INITIAL_GUEST_TID).unwrap(), 2);
         assert_eq!(kernel.host_worker_pool_diagnostics(), before);
