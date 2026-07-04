@@ -21,6 +21,7 @@ pub const MEDIA_TYPE_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1
 pub const MEDIA_TYPE_OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_IMAGE_LAYOUT_VERSION: &str = "1.0.0";
 pub const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
+const TAR_BLOCK_SIZE: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OciDescriptor {
@@ -918,6 +919,81 @@ impl LocalContentStore {
         Ok(manifest_descriptor)
     }
 
+    pub fn docker_tar_bytes(
+        &self,
+        manifest: &OciImageManifest,
+        repository_tag: Option<&str>,
+    ) -> Result<Vec<u8>, ImageError> {
+        if manifest.config().media_type() != MEDIA_TYPE_OCI_CONFIG {
+            return Err(ImageError::UnsupportedManifestMediaType(
+                manifest.config().media_type().to_owned(),
+            ));
+        }
+
+        let config_bytes = self.read_blob(manifest.config())?;
+        let config_file = docker_config_filename(manifest.config());
+        let mut layer_entries = Vec::with_capacity(manifest.layers().len());
+        for layer in manifest.layers() {
+            if layer.media_type() != MEDIA_TYPE_OCI_LAYER {
+                return Err(ImageError::UnsupportedLayerMediaType(
+                    layer.media_type().to_owned(),
+                ));
+            }
+            let layer_bytes = self.read_blob(layer)?;
+            layer_entries.push(DockerLayerArchiveEntry {
+                path: docker_layer_filename(layer),
+                bytes: layer_bytes,
+            });
+        }
+
+        if let Some(repository_tag) = repository_tag {
+            validate_docker_repository_tag(repository_tag)?;
+        }
+
+        let layer_paths = layer_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        let manifest_bytes = docker_manifest_json_bytes(&config_file, &layer_paths, repository_tag);
+        let repositories_bytes = if let Some(repository_tag) = repository_tag {
+            let image_id = layer_entries
+                .last()
+                .and_then(|entry| entry.path.split_once('/').map(|(directory, _)| directory))
+                .unwrap_or_else(|| manifest.config().digest().encoded());
+            Some(docker_repositories_json_bytes(repository_tag, image_id)?)
+        } else {
+            None
+        };
+
+        let mut archive = Vec::new();
+        append_tar_file(&mut archive, "manifest.json", &manifest_bytes)?;
+        append_tar_file(&mut archive, &config_file, &config_bytes)?;
+        for entry in &layer_entries {
+            append_tar_file(&mut archive, &entry.path, &entry.bytes)?;
+        }
+        if let Some(repositories_bytes) = repositories_bytes {
+            append_tar_file(&mut archive, "repositories", &repositories_bytes)?;
+        }
+        archive.extend(std::iter::repeat_n(0, TAR_BLOCK_SIZE * 2));
+        Ok(archive)
+    }
+
+    pub fn write_docker_tar(
+        &self,
+        manifest: &OciImageManifest,
+        repository_tag: Option<&str>,
+        output_path: impl AsRef<Path>,
+    ) -> Result<(), ImageError> {
+        let archive = self.docker_tar_bytes(manifest, repository_tag)?;
+        if let Some(parent) = output_path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(output_path, archive)?;
+        Ok(())
+    }
+
     fn verify_blob_bytes(&self, expected: &OciDigest, bytes: &[u8]) -> Result<(), ImageError> {
         let actual = OciDigest::sha256(bytes);
         if &actual != expected {
@@ -928,6 +1004,11 @@ impl LocalContentStore {
         }
         Ok(())
     }
+}
+
+struct DockerLayerArchiveEntry {
+    path: String,
+    bytes: Vec<u8>,
 }
 
 fn oci_layout_json_bytes() -> Vec<u8> {
@@ -944,6 +1025,191 @@ fn oci_index_json_bytes(manifest_descriptor: &OciDescriptor) -> Vec<u8> {
     push_descriptor_json(&mut output, manifest_descriptor);
     output.push_str("]}");
     output.into_bytes()
+}
+
+fn docker_config_filename(config: &OciDescriptor) -> String {
+    format!("{}.json", config.digest().encoded())
+}
+
+fn docker_layer_filename(layer: &OciDescriptor) -> String {
+    format!("{}/layer.tar", layer.digest().encoded())
+}
+
+fn docker_manifest_json_bytes(
+    config_file: &str,
+    layer_paths: &[&str],
+    repository_tag: Option<&str>,
+) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("[{\"Config\":");
+    push_json_string(&mut output, config_file);
+    output.push_str(",\"RepoTags\":");
+    if let Some(repository_tag) = repository_tag {
+        output.push('[');
+        push_json_string(&mut output, repository_tag);
+        output.push(']');
+    } else {
+        output.push_str("[]");
+    }
+    output.push_str(",\"Layers\":[");
+    for (index, layer_path) in layer_paths.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(&mut output, layer_path);
+    }
+    output.push_str("]}]");
+    output.into_bytes()
+}
+
+fn docker_repositories_json_bytes(
+    repository_tag: &str,
+    image_id: &str,
+) -> Result<Vec<u8>, ImageError> {
+    let (repository, tag) = split_docker_repository_tag(repository_tag)?;
+    let mut output = String::new();
+    output.push('{');
+    push_json_string(&mut output, &repository);
+    output.push_str(":{");
+    push_json_string(&mut output, &tag);
+    output.push(':');
+    push_json_string(&mut output, image_id);
+    output.push_str("}}");
+    Ok(output.into_bytes())
+}
+
+fn validate_docker_repository_tag(repository_tag: &str) -> Result<(), ImageError> {
+    split_docker_repository_tag(repository_tag).map(|_| ())
+}
+
+fn split_docker_repository_tag(repository_tag: &str) -> Result<(String, String), ImageError> {
+    if repository_tag.is_empty()
+        || repository_tag.trim() != repository_tag
+        || repository_tag
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(ImageError::InvalidReference(repository_tag.to_owned()));
+    }
+    let (repository, tag) = split_tag(repository_tag)?;
+    let Some(tag) = tag else {
+        return Err(ImageError::InvalidReference(repository_tag.to_owned()));
+    };
+    validate_tag(&tag)?;
+    Ok((repository.to_owned(), tag))
+}
+
+fn append_tar_file(archive: &mut Vec<u8>, path: &str, bytes: &[u8]) -> Result<(), ImageError> {
+    let mut header = [0u8; TAR_BLOCK_SIZE];
+    write_tar_path(&mut header, path)?;
+    write_tar_octal(&mut header[100..108], 0o644, "mode")?;
+    write_tar_octal(&mut header[108..116], 0, "uid")?;
+    write_tar_octal(&mut header[116..124], 0, "gid")?;
+    write_tar_octal(
+        &mut header[124..136],
+        u64::try_from(bytes.len()).expect("usize fits in u64"),
+        "size",
+    )?;
+    write_tar_octal(&mut header[136..148], 0, "mtime")?;
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    write_tar_string(&mut header[257..263], "ustar")?;
+    write_tar_string(&mut header[263..265], "00")?;
+
+    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+    write_tar_checksum(&mut header[148..156], checksum)?;
+
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(bytes);
+    let padding = (TAR_BLOCK_SIZE - (bytes.len() % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+    archive.extend(std::iter::repeat_n(0, padding));
+    Ok(())
+}
+
+fn write_tar_path(header: &mut [u8; TAR_BLOCK_SIZE], path: &str) -> Result<(), ImageError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ImageError::InvalidTarEntryPath(path.to_owned()));
+    }
+
+    if path.len() <= 100 {
+        write_tar_string(&mut header[0..100], path)?;
+        return Ok(());
+    }
+
+    if let Some((prefix, name)) = split_tar_prefix_name(path)
+        && name.len() <= 100
+        && prefix.len() <= 155
+    {
+        write_tar_string(&mut header[0..100], name)?;
+        write_tar_string(&mut header[345..500], prefix)?;
+        return Ok(());
+    }
+
+    Err(ImageError::TarEntryPathTooLong(path.to_owned()))
+}
+
+fn split_tar_prefix_name(path: &str) -> Option<(&str, &str)> {
+    let mut split_indices = path
+        .match_indices('/')
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    split_indices.reverse();
+    for index in split_indices {
+        let prefix = &path[..index];
+        let name = &path[index + 1..];
+        if !name.is_empty() {
+            return Some((prefix, name));
+        }
+    }
+    None
+}
+
+fn write_tar_string(field: &mut [u8], value: &str) -> Result<(), ImageError> {
+    if value.len() > field.len() {
+        return Err(ImageError::TarEntryPathTooLong(value.to_owned()));
+    }
+    field[..value.len()].copy_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_tar_octal(
+    field: &mut [u8],
+    value: u64,
+    field_name: &'static str,
+) -> Result<(), ImageError> {
+    let max_digits = field.len() - 1;
+    let encoded = format!("{value:o}");
+    if encoded.len() > max_digits {
+        return Err(ImageError::TarFieldOverflow {
+            field: field_name,
+            value,
+        });
+    }
+    let padding = max_digits - encoded.len();
+    field[..padding].fill(b'0');
+    field[padding..padding + encoded.len()].copy_from_slice(encoded.as_bytes());
+    field[field.len() - 1] = 0;
+    Ok(())
+}
+
+fn write_tar_checksum(field: &mut [u8], checksum: u64) -> Result<(), ImageError> {
+    let encoded = format!("{checksum:06o}");
+    if encoded.len() > 6 {
+        return Err(ImageError::TarFieldOverflow {
+            field: "checksum",
+            value: checksum,
+        });
+    }
+    field[..encoded.len()].copy_from_slice(encoded.as_bytes());
+    field[6] = 0;
+    field[7] = b' ';
+    Ok(())
 }
 
 fn verify_descriptor_bytes(descriptor: &OciDescriptor, bytes: &[u8]) -> Result<(), ImageError> {
@@ -985,6 +1251,12 @@ pub enum ImageError {
     SizeMismatch {
         expected: u64,
         actual: u64,
+    },
+    InvalidTarEntryPath(String),
+    TarEntryPathTooLong(String),
+    TarFieldOverflow {
+        field: &'static str,
+        value: u64,
     },
     Snapshot(SnapshotError),
     LayerUnpack(LayerUnpackError),
@@ -1029,6 +1301,15 @@ impl fmt::Display for ImageError {
                     "blob size mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::InvalidTarEntryPath(value) => {
+                write!(formatter, "invalid tar entry path: {value}")
+            }
+            Self::TarEntryPathTooLong(value) => {
+                write!(formatter, "tar entry path is too long: {value}")
+            }
+            Self::TarFieldOverflow { field, value } => {
+                write!(formatter, "tar {field} value is too large: {value}")
+            }
             Self::Snapshot(error) => error.fmt(formatter),
             Self::LayerUnpack(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
@@ -1072,7 +1353,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::BTreeMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
@@ -1402,6 +1686,101 @@ mod tests {
     }
 
     #[test]
+    fn local_content_store_writes_deterministic_docker_tar() {
+        let root = temp_root("docker-tar");
+        let store = LocalContentStore::new(&root);
+        let config = OciImageConfig::new(
+            OciPlatform::linux_amd64(),
+            OciContainerConfig::new()
+                .with_env(["PATH=/usr/bin"])
+                .with_working_dir("/srv/app")
+                .with_command(["/bin/app"]),
+            vec![OciHistoryEntry::new("FROM scratch").with_empty_layer(true)],
+            vec![OciDigest::sha256(b"layer")],
+        );
+        let config_bytes = config.to_json_bytes();
+        let config_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_CONFIG, &config_bytes)
+            .unwrap();
+        let layer_bytes = single_file_tar("srv/app/hello.txt", b"hello\n");
+        let layer_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_LAYER, &layer_bytes)
+            .unwrap();
+        let manifest =
+            OciImageManifest::new(config_descriptor.clone(), vec![layer_descriptor.clone()]);
+
+        let first = store
+            .docker_tar_bytes(&manifest, Some("mcr/example:test"))
+            .unwrap();
+        let second = store
+            .docker_tar_bytes(&manifest, Some("mcr/example:test"))
+            .unwrap();
+        let archive_path = root.join("exports").join("image.tar");
+        store
+            .write_docker_tar(&manifest, Some("mcr/example:test"), &archive_path)
+            .unwrap();
+        let entries = tar_entries(&first);
+        let entry_names = entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>();
+        let config_file = docker_config_filename(&config_descriptor);
+        let layer_file = docker_layer_filename(&layer_descriptor);
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(archive_path).unwrap(), first);
+        assert_eq!(
+            entry_names,
+            vec![
+                "manifest.json",
+                config_file.as_str(),
+                layer_file.as_str(),
+                "repositories"
+            ]
+        );
+
+        let entry_map = entries.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            String::from_utf8(entry_map["manifest.json"].clone()).unwrap(),
+            format!(
+                "[{{\"Config\":\"{}\",\"RepoTags\":[\"mcr/example:test\"],\"Layers\":[\"{}\"]}}]",
+                config_file, layer_file
+            )
+        );
+        assert_eq!(entry_map[&config_file], config_bytes);
+        assert_eq!(entry_map[&layer_file], layer_bytes);
+        assert_eq!(
+            String::from_utf8(entry_map["repositories"].clone()).unwrap(),
+            format!(
+                "{{\"mcr/example\":{{\"test\":\"{}\"}}}}",
+                layer_descriptor.digest().encoded()
+            )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_tar_rejects_compressed_layer_blob() {
+        let root = temp_root("docker-tar-gzip");
+        let store = LocalContentStore::new(&root);
+        let config_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_CONFIG, br#"{"architecture":"amd64"}"#)
+            .unwrap();
+        let layer_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_LAYER_GZIP, b"gzip")
+            .unwrap();
+        let manifest = OciImageManifest::new(config_descriptor, vec![layer_descriptor]);
+
+        assert!(matches!(
+            store.docker_tar_bytes(&manifest, Some("mcr:test")),
+            Err(ImageError::UnsupportedLayerMediaType(_))
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn local_content_store_rejects_tampered_content_and_size_mismatch() {
         let root = temp_root("content-store-tampered");
         let store = LocalContentStore::new(&root);
@@ -1436,6 +1815,62 @@ mod tests {
 
     fn descriptor_for(media_type: &str, bytes: &[u8]) -> OciDescriptor {
         OciDescriptor::new(media_type, OciDigest::sha256(bytes), bytes.len() as u64)
+    }
+
+    fn tar_entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            assert!(offset + TAR_BLOCK_SIZE <= archive.len());
+            let header = &archive[offset..offset + TAR_BLOCK_SIZE];
+            if header.iter().all(|byte| *byte == 0) {
+                assert!(
+                    archive[offset..offset + (TAR_BLOCK_SIZE * 2)]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+                return entries;
+            }
+
+            let mut checksum_header = header.to_vec();
+            checksum_header[148..156].fill(b' ');
+            let expected_checksum = read_tar_octal(&header[148..156]);
+            let actual_checksum = checksum_header
+                .iter()
+                .map(|byte| usize::from(*byte))
+                .sum::<usize>();
+            assert_eq!(expected_checksum, actual_checksum);
+
+            let name = read_tar_string(&header[0..100]);
+            let prefix = read_tar_string(&header[345..500]);
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let size = read_tar_octal(&header[124..136]);
+            offset += TAR_BLOCK_SIZE;
+            let data_end = offset + size;
+            entries.push((path, archive[offset..data_end].to_vec()));
+            offset = data_end + ((TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE);
+        }
+    }
+
+    fn read_tar_string(field: &[u8]) -> String {
+        let end = field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len());
+        String::from_utf8(field[..end].to_vec()).unwrap()
+    }
+
+    fn read_tar_octal(field: &[u8]) -> usize {
+        let end = field
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b' ')
+            .unwrap_or(field.len());
+        let value = std::str::from_utf8(&field[..end]).unwrap();
+        usize::from_str_radix(value, 8).unwrap()
     }
 
     fn single_file_tar(path: &str, data: &[u8]) -> Vec<u8> {

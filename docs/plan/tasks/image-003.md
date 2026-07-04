@@ -1,7 +1,7 @@
 ---
 id: image-003
 scope: phase3-image
-status: in-progress
+status: done
 depends-on: [image-001, snapshot-002]
 ---
 
@@ -43,5 +43,9 @@ cargo test -p mcr-snapshot
   Docker-compatible tar writers remain follow-up work.
 - 2026-07-04 checkpoint: `LocalContentStore::write_oci_layout` now writes
   deterministic `oci-layout`, `index.json`, and manifest blobs after verifying
-  referenced config and layer blobs. Docker-compatible tar output remains
-  follow-up work.
+  referenced config and layer blobs.
+- 2026-07-04 checkpoint: `LocalContentStore::docker_tar_bytes` and
+  `write_docker_tar` now write deterministic Docker-compatible archives with
+  `manifest.json`, the config JSON file, layer `layer.tar` entries in manifest
+  order, and optional `repositories` tag metadata. External `docker load`
+  validation remains covered by `integ-004`.
