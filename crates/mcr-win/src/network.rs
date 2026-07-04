@@ -1,3 +1,4 @@
+use std::io::{IoSlice, IoSliceMut};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -300,9 +301,23 @@ impl HostSocket {
         send_platform(self, buffer)
     }
 
+    /// Sends scattered bytes on this socket.
+    pub fn send_vectored(&self, buffers: &[IoSlice<'_>]) -> HostResult<usize> {
+        send_vectored_platform(self, buffers)
+    }
+
     /// Sends bytes to a remote datagram address.
     pub fn send_to(&self, buffer: &[u8], address: SocketAddr) -> HostResult<usize> {
         send_to_platform(self, buffer, address)
+    }
+
+    /// Sends scattered bytes to a remote datagram address.
+    pub fn send_to_vectored(
+        &self,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddr,
+    ) -> HostResult<usize> {
+        send_to_vectored_platform(self, buffers, address)
     }
 
     /// Receives bytes from this socket.
@@ -310,9 +325,22 @@ impl HostSocket {
         recv_platform(self, buffer)
     }
 
+    /// Receives bytes into scattered buffers.
+    pub fn recv_vectored(&self, buffers: &mut [IoSliceMut<'_>]) -> HostResult<usize> {
+        recv_vectored_platform(self, buffers)
+    }
+
     /// Receives bytes and the remote datagram address.
     pub fn recv_from(&self, buffer: &mut [u8]) -> HostResult<(usize, SocketAddr)> {
         recv_from_platform(self, buffer)
+    }
+
+    /// Receives bytes into scattered buffers and reports the remote datagram address.
+    pub fn recv_from_vectored(
+        &self,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> HostResult<(usize, SocketAddr)> {
+        recv_from_vectored_platform(self, buffers)
     }
 
     /// Polls this socket for readiness.
@@ -425,9 +453,23 @@ fn send_platform(_socket: &HostSocket, _buffer: &[u8]) -> HostResult<usize> {
 }
 
 #[cfg(not(windows))]
+fn send_vectored_platform(_socket: &HostSocket, _buffers: &[IoSlice<'_>]) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::SendSocket))
+}
+
+#[cfg(not(windows))]
 fn send_to_platform(
     _socket: &HostSocket,
     _buffer: &[u8],
+    _address: SocketAddr,
+) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::SendSocket))
+}
+
+#[cfg(not(windows))]
+fn send_to_vectored_platform(
+    _socket: &HostSocket,
+    _buffers: &[IoSlice<'_>],
     _address: SocketAddr,
 ) -> HostResult<usize> {
     Err(HostError::unsupported(HostOperation::SendSocket))
@@ -439,7 +481,23 @@ fn recv_platform(_socket: &HostSocket, _buffer: &mut [u8]) -> HostResult<usize> 
 }
 
 #[cfg(not(windows))]
+fn recv_vectored_platform(
+    _socket: &HostSocket,
+    _buffers: &mut [IoSliceMut<'_>],
+) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
 fn recv_from_platform(_socket: &HostSocket, _buffer: &mut [u8]) -> HostResult<(usize, SocketAddr)> {
+    Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
+fn recv_from_vectored_platform(
+    _socket: &HostSocket,
+    _buffers: &mut [IoSliceMut<'_>],
+) -> HostResult<(usize, SocketAddr)> {
     Err(HostError::unsupported(HostOperation::RecvSocket))
 }
 
@@ -619,6 +677,32 @@ fn send_platform(socket: &HostSocket, buffer: &[u8]) -> HostResult<usize> {
 }
 
 #[cfg(windows)]
+fn send_vectored_platform(socket: &HostSocket, buffers: &[IoSlice<'_>]) -> HostResult<usize> {
+    if buffers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut wsa_buffers = wsa_send_buffers(buffers)?;
+    let mut sent = 0u32;
+    // SAFETY: Each `WSABUF` points to readable slice storage for this synchronous call.
+    let status = unsafe {
+        WSASend(
+            socket.raw,
+            wsa_buffers.as_mut_ptr(),
+            wsa_buffer_count(wsa_buffers.len(), HostOperation::SendSocket)?,
+            &mut sent,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::SendSocket));
+    }
+    Ok(sent as usize)
+}
+
+#[cfg(windows)]
 fn send_to_platform(socket: &HostSocket, buffer: &[u8], address: SocketAddr) -> HostResult<usize> {
     let len = i32::try_from(buffer.len())
         .map_err(|_| HostError::invalid_input(HostOperation::SendSocket))?;
@@ -641,12 +725,75 @@ fn send_to_platform(socket: &HostSocket, buffer: &[u8], address: SocketAddr) -> 
 }
 
 #[cfg(windows)]
+fn send_to_vectored_platform(
+    socket: &HostSocket,
+    buffers: &[IoSlice<'_>],
+    address: SocketAddr,
+) -> HostResult<usize> {
+    if buffers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut wsa_buffers = wsa_send_buffers(buffers)?;
+    let storage = SocketAddressStorage::from_socket_addr(address);
+    let mut sent = 0u32;
+    // SAFETY: `WSABUF` entries and `storage` remain valid for this synchronous call.
+    let status = unsafe {
+        WSASendTo(
+            socket.raw,
+            wsa_buffers.as_mut_ptr(),
+            wsa_buffer_count(wsa_buffers.len(), HostOperation::SendSocket)?,
+            &mut sent,
+            0,
+            storage.as_sockaddr(),
+            storage.len(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::SendSocket));
+    }
+    Ok(sent as usize)
+}
+
+#[cfg(windows)]
 fn recv_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<usize> {
     let len = i32::try_from(buffer.len())
         .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
     // SAFETY: `buffer` points to `len` writable bytes for the duration of the call.
     let received = unsafe { recv(socket.raw, buffer.as_mut_ptr().cast(), len, 0) };
     if received == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
+    }
+    Ok(received as usize)
+}
+
+#[cfg(windows)]
+fn recv_vectored_platform(
+    socket: &HostSocket,
+    buffers: &mut [IoSliceMut<'_>],
+) -> HostResult<usize> {
+    if buffers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut wsa_buffers = wsa_recv_buffers(buffers)?;
+    let mut received = 0u32;
+    let mut flags = 0u32;
+    // SAFETY: Each `WSABUF` points to writable slice storage for this synchronous call.
+    let status = unsafe {
+        WSARecv(
+            socket.raw,
+            wsa_buffers.as_mut_ptr(),
+            wsa_buffer_count(wsa_buffers.len(), HostOperation::RecvSocket)?,
+            &mut received,
+            &mut flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
         return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
     }
     Ok(received as usize)
@@ -673,6 +820,75 @@ fn recv_from_platform(socket: &HostSocket, buffer: &mut [u8]) -> HostResult<(usi
         return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
     }
     Ok((received as usize, socket_addr_from_storage(&storage)?))
+}
+
+#[cfg(windows)]
+fn recv_from_vectored_platform(
+    socket: &HostSocket,
+    buffers: &mut [IoSliceMut<'_>],
+) -> HostResult<(usize, SocketAddr)> {
+    if buffers.is_empty() {
+        return Ok((0, socket_addr_platform(socket, SocketAddressKind::Peer)?));
+    }
+
+    let mut wsa_buffers = wsa_recv_buffers(buffers)?;
+    let mut storage = SockaddrStorage::default();
+    let mut address_len = size_of_i32::<SockaddrStorage>()?;
+    let mut received = 0u32;
+    let mut flags = 0u32;
+    // SAFETY: `WSABUF`, `storage`, and length pointers remain valid for this synchronous call.
+    let status = unsafe {
+        WSARecvFrom(
+            socket.raw,
+            wsa_buffers.as_mut_ptr(),
+            wsa_buffer_count(wsa_buffers.len(), HostOperation::RecvSocket)?,
+            &mut received,
+            &mut flags,
+            storage.as_mut_sockaddr(),
+            &mut address_len,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(HostOperation::RecvSocket));
+    }
+    Ok((received as usize, socket_addr_from_storage(&storage)?))
+}
+
+#[cfg(windows)]
+fn wsa_send_buffers(buffers: &[IoSlice<'_>]) -> HostResult<Vec<WsaBuf>> {
+    buffers
+        .iter()
+        .map(|buffer| {
+            let len = u32::try_from(buffer.len())
+                .map_err(|_| HostError::invalid_input(HostOperation::SendSocket))?;
+            Ok(WsaBuf {
+                len,
+                buf: buffer.as_ptr().cast_mut().cast(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn wsa_recv_buffers(buffers: &mut [IoSliceMut<'_>]) -> HostResult<Vec<WsaBuf>> {
+    buffers
+        .iter_mut()
+        .map(|buffer| {
+            let len = u32::try_from(buffer.len())
+                .map_err(|_| HostError::invalid_input(HostOperation::RecvSocket))?;
+            Ok(WsaBuf {
+                len,
+                buf: buffer.as_mut_ptr().cast(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn wsa_buffer_count(count: usize, operation: HostOperation) -> HostResult<u32> {
+    u32::try_from(count).map_err(|_| HostError::invalid_input(operation))
 }
 
 #[cfg(windows)]
@@ -968,6 +1184,13 @@ struct WsaPollFd {
 
 #[cfg(windows)]
 #[repr(C)]
+struct WsaBuf {
+    len: u32,
+    buf: *mut std::ffi::c_char,
+}
+
+#[cfg(windows)]
+#[repr(C)]
 struct Sockaddr {
     family: u16,
     data: [u8; 14],
@@ -1191,6 +1414,15 @@ unsafe extern "system" {
         len: i32,
         flags: i32,
     ) -> i32;
+    fn WSASend(
+        socket: crate::windows::Socket,
+        buffers: *mut WsaBuf,
+        buffer_count: u32,
+        bytes_sent: *mut u32,
+        flags: u32,
+        overlapped: *mut std::ffi::c_void,
+        completion_routine: *mut std::ffi::c_void,
+    ) -> i32;
     fn sendto(
         socket: crate::windows::Socket,
         buffer: *const std::ffi::c_char,
@@ -1199,11 +1431,31 @@ unsafe extern "system" {
         to: *const Sockaddr,
         tolen: i32,
     ) -> i32;
+    fn WSASendTo(
+        socket: crate::windows::Socket,
+        buffers: *mut WsaBuf,
+        buffer_count: u32,
+        bytes_sent: *mut u32,
+        flags: u32,
+        to: *const Sockaddr,
+        tolen: i32,
+        overlapped: *mut std::ffi::c_void,
+        completion_routine: *mut std::ffi::c_void,
+    ) -> i32;
     fn recv(
         socket: crate::windows::Socket,
         buffer: *mut std::ffi::c_char,
         len: i32,
         flags: i32,
+    ) -> i32;
+    fn WSARecv(
+        socket: crate::windows::Socket,
+        buffers: *mut WsaBuf,
+        buffer_count: u32,
+        bytes_received: *mut u32,
+        flags: *mut u32,
+        overlapped: *mut std::ffi::c_void,
+        completion_routine: *mut std::ffi::c_void,
     ) -> i32;
     fn recvfrom(
         socket: crate::windows::Socket,
@@ -1212,6 +1464,17 @@ unsafe extern "system" {
         flags: i32,
         from: *mut Sockaddr,
         fromlen: *mut i32,
+    ) -> i32;
+    fn WSARecvFrom(
+        socket: crate::windows::Socket,
+        buffers: *mut WsaBuf,
+        buffer_count: u32,
+        bytes_received: *mut u32,
+        flags: *mut u32,
+        from: *mut Sockaddr,
+        fromlen: *mut i32,
+        overlapped: *mut std::ffi::c_void,
+        completion_routine: *mut std::ffi::c_void,
     ) -> i32;
     fn ioctlsocket(socket: crate::windows::Socket, cmd: i32, argp: *mut u32) -> i32;
     fn setsockopt(
@@ -1236,6 +1499,9 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{NetworkStack, SocketCompletionKind, SocketEvents};
+
+    #[cfg(windows)]
+    use std::io::{IoSlice, IoSliceMut};
 
     #[cfg(windows)]
     use super::{
@@ -1374,6 +1640,15 @@ mod tests {
         let mut buffer = [0; 4];
         assert_eq!(server.recv(&mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"ping");
+
+        let chunks = [IoSlice::new(b"ve"), IoSlice::new(b"c!")];
+        assert_eq!(client.send_vectored(&chunks).unwrap(), 4);
+        let mut first = [0; 2];
+        let mut second = [0; 2];
+        let mut buffers = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+        assert_eq!(server.recv_vectored(&mut buffers).unwrap(), 4);
+        assert_eq!(&first, b"ve");
+        assert_eq!(&second, b"c!");
 
         server.shutdown(HostShutdown::Both).unwrap();
     }

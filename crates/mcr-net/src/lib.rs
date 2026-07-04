@@ -794,9 +794,25 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket.send(buffer).map_err(HostIoError::from)
     }
 
+    fn send_vectored(&mut self, buffers: &[IoSlice<'_>]) -> Result<usize, HostIoError> {
+        self.socket
+            .send_vectored(buffers)
+            .map_err(HostIoError::from)
+    }
+
     fn send_to(&mut self, buffer: &[u8], address: SocketAddress) -> Result<usize, HostIoError> {
         self.socket
             .send_to(buffer, SocketAddr::from(address))
+            .map_err(HostIoError::from)
+    }
+
+    fn send_to_vectored(
+        &mut self,
+        buffers: &[IoSlice<'_>],
+        address: SocketAddress,
+    ) -> Result<usize, HostIoError> {
+        self.socket
+            .send_to_vectored(buffers, SocketAddr::from(address))
             .map_err(HostIoError::from)
     }
 
@@ -804,9 +820,25 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket.recv(buffer).map_err(HostIoError::from)
     }
 
+    fn recv_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> Result<usize, HostIoError> {
+        self.socket
+            .recv_vectored(buffers)
+            .map_err(HostIoError::from)
+    }
+
     fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddress), HostIoError> {
         self.socket
             .recv_from(buffer)
+            .map(|(count, address)| (count, SocketAddress::from(address)))
+            .map_err(HostIoError::from)
+    }
+
+    fn recv_from_vectored(
+        &mut self,
+        buffers: &mut [IoSliceMut<'_>],
+    ) -> Result<(usize, SocketAddress), HostIoError> {
+        self.socket
+            .recv_from_vectored(buffers)
             .map(|(count, address)| (count, SocketAddress::from(address)))
             .map_err(HostIoError::from)
     }
