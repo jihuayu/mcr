@@ -19,6 +19,7 @@
 | Process-shared futex | Later compatibility | Current model intentionally keeps one host process per container. |
 | Strong sandboxing | Later product line | Current product trust model is trusted development workloads. |
 | Cross-architecture guest execution | Later product line | Same-ISA x86-64 is required to keep MVP feasible. |
+| Libc intrinsic replacement | Measurement gate | `perf-014` closed as a decision checkpoint without implementation. Reopen only after `perf-012` stabilizes native block caching, ignored perf benchmarks prove libc string or memory routines are a material hotspot, and fault/overlap semantics can be proven. |
 
 ## Phase 2 Workload Blockers
 

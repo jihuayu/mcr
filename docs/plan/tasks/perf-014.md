@@ -1,7 +1,7 @@
 ---
 id: perf-014
 scope: jit-performance
-status: blocked
+status: done
 depends-on: [perf-012]
 ---
 
@@ -28,15 +28,28 @@ identify the target and preserve guest memory, overlap, and fault semantics.
 ## Verification
 
 ```powershell
-cargo test -p mcr-jit libc_intrinsic -- --nocapture
-cargo test -p mcr-runtime guest_memory_fault -- --nocapture
-cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
+git diff --check
 ```
 
 ## Notes
 
-- This remains blocked until native block caching is stable and measurements show
-  string or memory routines are a material hotspot.
-- Replacement must preserve overlap behavior and guest memory fault reporting.
-- If symbol identification is fragile for static or stripped binaries, document
-  the limitation and leave the optimization disabled by default.
+- 2026-07-04 decision checkpoint: do not implement libc intrinsic replacement
+  now. `perf-012` is still in progress, native block caching is not yet a
+  stable foundation, and current package-rootfs diagnostics point at native
+  execution faults and block-cache or patch-application behavior rather than
+  measured libc string or memory routine hotspots.
+- Keep this optimization in the backlog behind a measurement gate. Reopen only
+  after `perf-012` stabilizes native block caching, an ignored perf benchmark
+  shows `memcpy`, `memset`, `memchr`, `memcmp`, `strlen`, or adjacent libc
+  string/memory routines are a material hotspot, and the implementation can
+  prove Linux-visible guest memory fault reporting and overlap semantics.
+- The risk remains high until target identification is robust for static and
+  stripped binaries and replacement paths can preserve guest memory checks
+  without hiding native faults.
+- Future implementation validation should include:
+
+```powershell
+cargo test -p mcr-jit libc_intrinsic -- --nocapture
+cargo test -p mcr-runtime guest_memory_fault -- --nocapture
+cargo test -p mcr-testkit perf_libc_intrinsic -- --ignored --nocapture
+```
