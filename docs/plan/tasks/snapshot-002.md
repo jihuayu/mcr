@@ -1,7 +1,7 @@
 ---
 id: snapshot-002
 scope: phase3-snapshot
-status: pending
+status: in-progress
 depends-on: [snapshot-001]
 ---
 
@@ -39,3 +39,7 @@ cargo test -p mcr-snapshot
   `mcr-snapshot` for filesystem entries, deleted-lower whiteouts, and opaque
   directory markers. Tar stream emission and content bytes remain follow-up
   work.
+- 2026-07-04 checkpoint: added deterministic uncompressed tar export for the
+  layer plan, including regular file content validation, Linux metadata,
+  hardlinks, symlinks, devices, FIFOs, whiteouts, and opaque directory markers.
+  Full upper-root diff walking remains follow-up work.

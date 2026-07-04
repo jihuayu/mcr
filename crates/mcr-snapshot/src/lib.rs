@@ -351,6 +351,18 @@ impl SnapshotLayerPlan {
     pub fn entries(&self) -> &[LayerEntry] {
         &self.entries
     }
+
+    pub fn to_uncompressed_tar(
+        &self,
+        regular_contents: &BTreeMap<SnapshotPath, Vec<u8>>,
+    ) -> Result<Vec<u8>, LayerExportError> {
+        let mut archive = Vec::new();
+        for entry in &self.entries {
+            append_layer_tar_entry(&mut archive, entry, regular_contents)?;
+        }
+        archive.extend(std::iter::repeat_n(0, TAR_BLOCK_SIZE * 2));
+        Ok(archive)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -381,6 +393,257 @@ pub enum LayerEntryKind {
     Filesystem { metadata: LinuxMetadata },
     Whiteout { deleted_path: SnapshotPath },
     OpaqueDirectory { directory_path: SnapshotPath },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LayerExportError {
+    CannotExportRootEntry,
+    MissingRegularContent(SnapshotPath),
+    RegularContentSizeMismatch {
+        path: SnapshotPath,
+        expected: u64,
+        actual: u64,
+    },
+    NegativeMtime(SnapshotPath),
+    HeaderFieldTooLarge(&'static str),
+    PathTooLong(String),
+    LinkNameTooLong(String),
+}
+
+impl fmt::Display for LayerExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CannotExportRootEntry => formatter.write_str("cannot export snapshot root entry"),
+            Self::MissingRegularContent(path) => {
+                write!(
+                    formatter,
+                    "missing regular file content for layer path: {path}"
+                )
+            }
+            Self::RegularContentSizeMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "regular file content size mismatch for {path}: expected {expected}, got {actual}"
+            ),
+            Self::NegativeMtime(path) => {
+                write!(
+                    formatter,
+                    "negative mtime cannot be encoded in tar for: {path}"
+                )
+            }
+            Self::HeaderFieldTooLarge(field) => {
+                write!(formatter, "tar header field is too large: {field}")
+            }
+            Self::PathTooLong(path) => write!(formatter, "tar path is too long: {path}"),
+            Self::LinkNameTooLong(path) => write!(formatter, "tar link name is too long: {path}"),
+        }
+    }
+}
+
+impl Error for LayerExportError {}
+
+fn append_layer_tar_entry(
+    archive: &mut Vec<u8>,
+    entry: &LayerEntry,
+    regular_contents: &BTreeMap<SnapshotPath, Vec<u8>>,
+) -> Result<(), LayerExportError> {
+    match entry.kind() {
+        LayerEntryKind::Filesystem { metadata } => {
+            let content = regular_content_for(entry.path(), metadata, regular_contents)?;
+            append_tar_header(archive, entry.path(), metadata)?;
+            append_tar_content(archive, content);
+        }
+        LayerEntryKind::Whiteout { .. } | LayerEntryKind::OpaqueDirectory { .. } => {
+            let metadata = LinuxMetadata::new(SnapshotFileKind::Regular { size: 0 }, 0, 0, 0, 0);
+            append_tar_header(archive, entry.path(), &metadata)?;
+        }
+    }
+    Ok(())
+}
+
+fn regular_content_for<'a>(
+    path: &SnapshotPath,
+    metadata: &LinuxMetadata,
+    regular_contents: &'a BTreeMap<SnapshotPath, Vec<u8>>,
+) -> Result<&'a [u8], LayerExportError> {
+    let SnapshotFileKind::Regular { size } = metadata.kind() else {
+        return Ok(&[]);
+    };
+    let Some(content) = regular_contents.get(path) else {
+        if *size == 0 {
+            return Ok(&[]);
+        }
+        return Err(LayerExportError::MissingRegularContent(path.clone()));
+    };
+    let actual = u64::try_from(content.len()).expect("usize fits in u64");
+    if actual != *size {
+        return Err(LayerExportError::RegularContentSizeMismatch {
+            path: path.clone(),
+            expected: *size,
+            actual,
+        });
+    }
+    Ok(content)
+}
+
+fn append_tar_header(
+    archive: &mut Vec<u8>,
+    path: &SnapshotPath,
+    metadata: &LinuxMetadata,
+) -> Result<(), LayerExportError> {
+    let mut header = [0u8; TAR_BLOCK_SIZE];
+    let tar_path = layer_tar_path(path)?;
+    let path_parts = split_tar_path(&tar_path)?;
+    write_tar_field_string(&mut header[0..100], path_parts.name, "name")?;
+    if let Some(prefix) = path_parts.prefix {
+        write_tar_field_string(&mut header[345..500], prefix, "prefix")?;
+    }
+    write_tar_field_octal(&mut header[100..108], u64::from(metadata.mode()), "mode")?;
+    write_tar_field_octal(&mut header[108..116], u64::from(metadata.uid()), "uid")?;
+    write_tar_field_octal(&mut header[116..124], u64::from(metadata.gid()), "gid")?;
+    write_tar_field_octal(&mut header[124..136], tar_size(metadata), "size")?;
+    write_tar_field_octal(
+        &mut header[136..148],
+        tar_mtime_seconds(path, metadata)?,
+        "mtime",
+    )?;
+    header[148..156].fill(b' ');
+    header[156] = tar_typeflag(metadata);
+    match metadata.kind() {
+        SnapshotFileKind::Symlink { target } => {
+            write_tar_link_name(&mut header[157..257], target)?;
+        }
+        SnapshotFileKind::Hardlink { target } => {
+            let target = layer_tar_path(target)?;
+            write_tar_link_name(&mut header[157..257], &target)?;
+        }
+        SnapshotFileKind::CharacterDevice { major, minor }
+        | SnapshotFileKind::BlockDevice { major, minor } => {
+            write_tar_field_octal(&mut header[329..337], u64::from(*major), "devmajor")?;
+            write_tar_field_octal(&mut header[337..345], u64::from(*minor), "devminor")?;
+        }
+        SnapshotFileKind::Directory | SnapshotFileKind::Regular { .. } | SnapshotFileKind::Fifo => {
+        }
+    }
+    write_tar_field_string(&mut header[257..263], "ustar", "magic")?;
+    write_tar_field_string(&mut header[263..265], "00", "version")?;
+    write_tar_checksum(&mut header);
+    archive.extend_from_slice(&header);
+    Ok(())
+}
+
+fn append_tar_content(archive: &mut Vec<u8>, content: &[u8]) {
+    if content.is_empty() {
+        return;
+    }
+    archive.extend_from_slice(content);
+    let padding = (TAR_BLOCK_SIZE - (content.len() % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+    archive.extend(std::iter::repeat_n(0, padding));
+}
+
+fn tar_size(metadata: &LinuxMetadata) -> u64 {
+    match metadata.kind() {
+        SnapshotFileKind::Regular { size } => *size,
+        _ => 0,
+    }
+}
+
+fn tar_typeflag(metadata: &LinuxMetadata) -> u8 {
+    match metadata.kind() {
+        SnapshotFileKind::Regular { .. } => b'0',
+        SnapshotFileKind::Hardlink { .. } => b'1',
+        SnapshotFileKind::Symlink { .. } => b'2',
+        SnapshotFileKind::CharacterDevice { .. } => b'3',
+        SnapshotFileKind::BlockDevice { .. } => b'4',
+        SnapshotFileKind::Directory => b'5',
+        SnapshotFileKind::Fifo => b'6',
+    }
+}
+
+fn tar_mtime_seconds(
+    path: &SnapshotPath,
+    metadata: &LinuxMetadata,
+) -> Result<u64, LayerExportError> {
+    let nanos = metadata.mtime_unix_nanos();
+    if nanos < 0 {
+        return Err(LayerExportError::NegativeMtime(path.clone()));
+    }
+    u64::try_from(nanos / 1_000_000_000).map_err(|_| LayerExportError::HeaderFieldTooLarge("mtime"))
+}
+
+fn layer_tar_path(path: &SnapshotPath) -> Result<String, LayerExportError> {
+    let path = path.as_str();
+    if path == "/" {
+        return Err(LayerExportError::CannotExportRootEntry);
+    }
+    Ok(path.trim_start_matches('/').to_owned())
+}
+
+struct TarPathParts<'a> {
+    prefix: Option<&'a str>,
+    name: &'a str,
+}
+
+fn split_tar_path(path: &str) -> Result<TarPathParts<'_>, LayerExportError> {
+    if path.len() <= 100 {
+        return Ok(TarPathParts {
+            prefix: None,
+            name: path,
+        });
+    }
+    for index in path.match_indices('/').map(|(index, _)| index).rev() {
+        let prefix = &path[..index];
+        let name = &path[index + 1..];
+        if !prefix.is_empty() && !name.is_empty() && prefix.len() <= 155 && name.len() <= 100 {
+            return Ok(TarPathParts {
+                prefix: Some(prefix),
+                name,
+            });
+        }
+    }
+    Err(LayerExportError::PathTooLong(path.to_owned()))
+}
+
+fn write_tar_link_name(field: &mut [u8], value: &str) -> Result<(), LayerExportError> {
+    if value.len() > field.len() {
+        return Err(LayerExportError::LinkNameTooLong(value.to_owned()));
+    }
+    field[..value.len()].copy_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_tar_field_string(
+    field: &mut [u8],
+    value: &str,
+    field_name: &'static str,
+) -> Result<(), LayerExportError> {
+    if value.len() > field.len() {
+        return Err(LayerExportError::HeaderFieldTooLarge(field_name));
+    }
+    field[..value.len()].copy_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_tar_field_octal(
+    field: &mut [u8],
+    value: u64,
+    field_name: &'static str,
+) -> Result<(), LayerExportError> {
+    let encoded = format!("{value:0width$o}", width = field.len() - 1);
+    if encoded.len() >= field.len() {
+        return Err(LayerExportError::HeaderFieldTooLarge(field_name));
+    }
+    field[..encoded.len()].copy_from_slice(encoded.as_bytes());
+    Ok(())
+}
+
+fn write_tar_checksum(header: &mut [u8; TAR_BLOCK_SIZE]) {
+    let checksum = header.iter().map(|byte| u32::from(*byte)).sum::<u32>();
+    let encoded = format!("{checksum:06o}\0 ");
+    header[148..156].copy_from_slice(encoded.as_bytes());
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -695,6 +958,7 @@ fn join_snapshot_child(parent: &str, child: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn package_name_is_stable() {
@@ -1042,6 +1306,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layer_plan_exports_deterministic_uncompressed_tar() {
+        let mut spec = SnapshotSpec::new(
+            SnapshotId::new("tar-step").unwrap(),
+            WritableUpperRoot::new("upper").unwrap(),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/etc").unwrap(),
+            LinuxMetadata::new(SnapshotFileKind::Directory, 0o755, 0, 0, 1_000_000_000),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/etc/config").unwrap(),
+            LinuxMetadata::new(
+                SnapshotFileKind::Regular { size: 9 },
+                0o640,
+                100,
+                200,
+                2_000_000_000,
+            ),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/bin/sh").unwrap(),
+            LinuxMetadata::new(
+                SnapshotFileKind::Symlink {
+                    target: "../busybox".to_owned(),
+                },
+                0o777,
+                0,
+                0,
+                3_000_000_000,
+            ),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/bin/tool-copy").unwrap(),
+            LinuxMetadata::new(
+                SnapshotFileKind::Hardlink {
+                    target: SnapshotPath::new("/bin/tool").unwrap(),
+                },
+                0o755,
+                0,
+                0,
+                4_000_000_000,
+            ),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/var/cache").unwrap(),
+            LinuxMetadata::new(SnapshotFileKind::Directory, 0o755, 0, 0, 5_000_000_000),
+        );
+        spec.delete_lower_path(SnapshotPath::new("/etc/old").unwrap())
+            .unwrap();
+        spec.mark_opaque_directory(SnapshotPath::new("/var/cache").unwrap());
+
+        let plan = spec.deterministic_layer_plan().unwrap();
+        let mut content = BTreeMap::new();
+        content.insert(
+            SnapshotPath::new("/etc/config").unwrap(),
+            b"name=mcr\n".to_vec(),
+        );
+
+        let first = plan.to_uncompressed_tar(&content).unwrap();
+        let second = plan.to_uncompressed_tar(&content).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            tar_entry_names(&first),
+            vec![
+                "bin/sh",
+                "bin/tool-copy",
+                "etc",
+                "etc/.wh.old",
+                "etc/config",
+                "var/cache",
+                "var/cache/.wh..wh..opq"
+            ]
+        );
+        assert_eq!(
+            tar_entry_payload(&first, "etc/config"),
+            Some(b"name=mcr\n".as_slice())
+        );
+
+        let layer = BaseLayerSnapshot::from_uncompressed_tar(
+            LayerRef::new(SnapshotId::new("exported").unwrap()),
+            &first,
+        )
+        .unwrap();
+        assert_eq!(
+            layer
+                .entries()
+                .iter()
+                .map(|entry| entry.path().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/bin/sh",
+                "/bin/tool-copy",
+                "/etc",
+                "/etc/.wh.old",
+                "/etc/config",
+                "/var/cache",
+                "/var/cache/.wh..wh..opq"
+            ]
+        );
+        assert_eq!(
+            layer
+                .get(&SnapshotPath::new("/etc/.wh.old").unwrap())
+                .unwrap()
+                .metadata()
+                .kind(),
+            &SnapshotFileKind::Regular { size: 0 }
+        );
+        assert_eq!(
+            layer
+                .get(&SnapshotPath::new("/bin/tool-copy").unwrap())
+                .unwrap()
+                .metadata()
+                .kind(),
+            &SnapshotFileKind::Hardlink {
+                target: SnapshotPath::new("/bin/tool").unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn layer_plan_export_rejects_missing_or_mismatched_regular_content() {
+        let plan = SnapshotLayerPlan::from_parts(
+            [SnapshotEntry::new(
+                SnapshotPath::new("/payload").unwrap(),
+                LinuxMetadata::new(SnapshotFileKind::Regular { size: 4 }, 0o644, 0, 0, 0),
+            )],
+            [],
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.to_uncompressed_tar(&BTreeMap::new()),
+            Err(LayerExportError::MissingRegularContent(
+                SnapshotPath::new("/payload").unwrap()
+            ))
+        );
+
+        let mut content = BTreeMap::new();
+        content.insert(SnapshotPath::new("/payload").unwrap(), b"too long".to_vec());
+        assert_eq!(
+            plan.to_uncompressed_tar(&content),
+            Err(LayerExportError::RegularContentSizeMismatch {
+                path: SnapshotPath::new("/payload").unwrap(),
+                expected: 4,
+                actual: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn layer_plan_export_rejects_root_tar_entry() {
+        let plan = SnapshotLayerPlan::from_parts(
+            [SnapshotEntry::new(
+                SnapshotPath::new("/").unwrap(),
+                LinuxMetadata::new(SnapshotFileKind::Directory, 0o755, 0, 0, 0),
+            )],
+            [],
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.to_uncompressed_tar(&BTreeMap::new()),
+            Err(LayerExportError::CannotExportRootEntry)
+        );
+    }
+
     fn layer_paths(plan: &SnapshotLayerPlan) -> Vec<&str> {
         plan.entries()
             .iter()
@@ -1236,5 +1670,53 @@ mod tests {
     fn write_tar_octal(field: &mut [u8], value: u64) {
         let encoded = format!("{value:0width$o}", width = field.len() - 1);
         field[..encoded.len()].copy_from_slice(encoded.as_bytes());
+    }
+
+    fn tar_entry_names(archive: &[u8]) -> Vec<String> {
+        tar_entries(archive)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    fn tar_entry_payload<'a>(archive: &'a [u8], name: &str) -> Option<&'a [u8]> {
+        tar_entries(archive)
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.payload)
+    }
+
+    fn tar_entries(archive: &[u8]) -> Vec<TarEntryView<'_>> {
+        let mut offset = 0usize;
+        let mut entries = Vec::new();
+        while offset < archive.len() {
+            let header_end = offset + TAR_BLOCK_SIZE;
+            let header = &archive[offset..header_end];
+            if header.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let name = tar_string(&header[0..100], "name").unwrap();
+            let prefix = tar_string(&header[345..500], "prefix").unwrap();
+            let name = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let size = tar_octal(&header[124..136], "size").unwrap();
+            let data_start = header_end;
+            let data_len = usize::try_from(size).unwrap();
+            let data_end = data_start + data_len;
+            entries.push(TarEntryView {
+                name,
+                payload: &archive[data_start..data_end],
+            });
+            offset = data_start + padded_tar_len(size).unwrap();
+        }
+        entries
+    }
+
+    struct TarEntryView<'a> {
+        name: String,
+        payload: &'a [u8],
     }
 }
