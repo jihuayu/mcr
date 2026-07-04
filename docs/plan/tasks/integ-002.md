@@ -1,7 +1,7 @@
 ---
 id: integ-002
 scope: phase2-integration
-status: blocked
+status: done
 depends-on: [task-002, task-003, vfs-004]
 ---
 
@@ -42,3 +42,6 @@ mcr run-rootfs alpine-rootfs /bin/sh -c "cat /proc/self/cmdline >/dev/null && he
 
 - No task/process/VFS mock may remain on this path.
 - This task does not require outbound network.
+- Local Windows validation used the materialized Alpine rootfs and
+  `target\debug\mcr.exe`; the shell echo, pipe, and procfs/devfs commands all
+  passed through `mcr run-rootfs`.
