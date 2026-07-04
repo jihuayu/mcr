@@ -1,7 +1,7 @@
 ---
 id: perf-020
 scope: network-performance
-status: pending
+status: done
 depends-on: [perf-006, perf-019]
 ---
 
@@ -72,3 +72,10 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   polling, consume matching IOCP packets into an MCR-owned receive cache, report
   `Receive` / `PeerClosed` / `Error` readiness, and let guest `recv` consume the
   cached bytes before falling back to the synchronous socket path.
+- Wired blocking TCP stream sends through the host-owned `WSASend` submission
+  path. The Windows transport waits for the matching IOCP packet before
+  reporting bytes sent, while nonblocking sends stay on the synchronous fallback
+  so Linux `EAGAIN` semantics cannot race with a background send.
+- Closed as implemented for the current backend scope. Targeted verification
+  covered `mcr-win` IOCP boundaries, `mcr-net` IOCP/readiness tests, and
+  runtime socket/poll/epoll tests.

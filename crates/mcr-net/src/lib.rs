@@ -786,6 +786,13 @@ impl WinHostSocketHandle {
             && self.spec.effective_protocol() == SocketProtocol::Tcp
     }
 
+    fn can_use_iocp_send(&self) -> bool {
+        self.completion_port.is_some()
+            && !self.spec.flags.nonblocking
+            && self.spec.socket_type == SocketType::Stream
+            && self.spec.effective_protocol() == SocketProtocol::Tcp
+    }
+
     fn has_recv_readiness(&self) -> bool {
         !self.recv_ready.is_empty() || self.recv_eof
     }
@@ -873,6 +880,63 @@ impl WinHostSocketHandle {
             SocketCompletionKind::PeerClosed
         } else {
             SocketCompletionKind::Receive
+        }
+    }
+
+    fn submit_send_fast_path(&mut self, buffer: &[u8]) -> Result<Option<usize>, HostIoError> {
+        if !self.can_use_iocp_send() || buffer.is_empty() {
+            return Ok(None);
+        }
+        let submission = self.socket.submit_overlapped_send(buffer.to_vec());
+        self.finish_send_submission(submission).map(Some)
+    }
+
+    fn finish_send_submission(
+        &mut self,
+        submission: HostSocketIoSubmission,
+    ) -> Result<usize, HostIoError> {
+        match submission {
+            HostSocketIoSubmission::Completed(completion) => {
+                if completion.direction() != HostSocketIoDirection::Send {
+                    return Err(HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped socket completion direction mismatch",
+                    ));
+                }
+                Ok(completion.bytes_transferred())
+            }
+            HostSocketIoSubmission::Failed(failure) => {
+                if failure.direction() != HostSocketIoDirection::Send {
+                    return Err(HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped socket failure direction mismatch",
+                    ));
+                }
+                let (error, _) = failure.into_parts();
+                Err(HostIoError::from(error))
+            }
+            HostSocketIoSubmission::Pending(pending) => self.wait_send_completion(pending),
+        }
+    }
+
+    fn wait_send_completion(&mut self, pending: PendingHostSocketIo) -> Result<usize, HostIoError> {
+        loop {
+            let packet = {
+                let port = self.completion_port.as_ref().ok_or_else(|| {
+                    HostIoError::new(
+                        LinuxErrno::InvalidArgument,
+                        "overlapped send requires an IOCP",
+                    )
+                })?;
+                port.get(None).map_err(HostIoError::from)?
+            };
+            let Some(packet) = packet else {
+                continue;
+            };
+            if pending.matches_completion(packet) {
+                return self.finish_send_submission(pending.complete_from_packet(packet));
+            }
+            self.complete_recv_packet(packet)?;
         }
     }
 }
@@ -970,7 +1034,9 @@ impl HostSocketHandle for WinHostSocketHandle {
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), HostIoError> {
         self.socket
             .set_nonblocking(nonblocking)
-            .map_err(HostIoError::from)
+            .map_err(HostIoError::from)?;
+        self.spec.flags.nonblocking = nonblocking;
+        Ok(())
     }
 
     fn connect_fast_path(
@@ -1052,6 +1118,9 @@ impl HostSocketHandle for WinHostSocketHandle {
     }
 
     fn send(&mut self, buffer: &[u8]) -> Result<usize, HostIoError> {
+        if let Some(count) = self.submit_send_fast_path(buffer)? {
+            return Ok(count);
+        }
         self.socket.send(buffer).map_err(HostIoError::from)
     }
 
@@ -4874,6 +4943,82 @@ mod tests {
 
         assert_eq!(count, 9);
         assert_eq!(&buffer[..count], b"iocp-data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_host_transport_iocp_send_moves_stream_bytes() {
+        let stack = NetworkStack::start().expect("network stack");
+        let listener = stack
+            .open_socket(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                HostSocketProtocol::Tcp,
+            )
+            .expect("listener socket");
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let server_addr = SocketAddress::from(listener.local_addr().unwrap());
+
+        let mut table = GuestSocketTable::with_transport(
+            WinHostSocketTransport::new().expect("host transport"),
+        );
+        let client = table
+            .create_socket_from_spec(
+                SocketSpec::with_flags(
+                    SocketDomain::Inet,
+                    SocketType::Stream,
+                    SocketProtocol::Tcp,
+                    SocketCreationFlags {
+                        nonblocking: true,
+                        cloexec: false,
+                    },
+                )
+                .expect("tcp spec"),
+            )
+            .expect("client socket");
+
+        assert_eq!(
+            table
+                .connect(client, server_addr)
+                .expect_err("ConnectEx should be pending")
+                .linux_errno(),
+            LinuxErrno::OperationInProgress
+        );
+        for _ in 0..10 {
+            let _ = table.poll(
+                client,
+                SocketEvents::write(),
+                Some(Duration::from_millis(50)),
+            );
+            if matches!(
+                table.socket(client).expect("client state").state(),
+                SocketState::Connected { .. }
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            table.socket(client).expect("client state").state(),
+            SocketState::Connected { .. }
+        ));
+        table
+            .set_nonblocking(client, false)
+            .expect("blocking send mode");
+
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(table.send_connected(client, b"iocp-send").unwrap(), 9);
+
+        let mut buffer = [0; 16];
+        let count = server.recv(&mut buffer).unwrap();
+        assert_eq!(count, 9);
+        assert_eq!(&buffer[..count], b"iocp-send");
     }
 
     #[cfg(windows)]
