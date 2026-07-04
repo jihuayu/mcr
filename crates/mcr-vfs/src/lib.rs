@@ -1567,6 +1567,10 @@ impl PipeNode {
     fn notify_writable(&self) {
         self.inner.writable.notify_all();
     }
+
+    fn host_pair(&self) -> Option<&mcr_win::HostPipePair> {
+        self.inner.host_pair.as_ref()
+    }
 }
 
 impl Drop for PipeNode {
@@ -1581,6 +1585,7 @@ struct PipeInner {
     state: Mutex<PipeState>,
     readable: Condvar,
     writable: Condvar,
+    host_pair: Option<mcr_win::HostPipePair>,
 }
 
 impl PipeInner {
@@ -1589,6 +1594,7 @@ impl PipeInner {
             state: Mutex::new(PipeState::new(capacity)),
             readable: Condvar::new(),
             writable: Condvar::new(),
+            host_pair: mcr_win::HostPipePair::create_overlapped().ok(),
         }
     }
 }
@@ -1626,6 +1632,14 @@ impl PipeState {
         count
     }
 
+    fn discard_readable(&mut self, count: usize) {
+        for _ in 0..count.min(self.buffer.len()) {
+            self.buffer
+                .pop_front()
+                .expect("pipe buffer length was checked");
+        }
+    }
+
     fn set_capacity(&mut self, capacity: usize) -> VfsResult<usize> {
         let capacity = capacity.max(MIN_PIPE_CAPACITY);
         if capacity < self.buffer.len() {
@@ -1643,6 +1657,15 @@ impl PipeState {
 
         let count = available.min(buffer.len());
         self.buffer.extend(buffer[..count].iter().copied());
+        Ok(count)
+    }
+
+    fn record_written(&mut self, count: usize) -> VfsResult<usize> {
+        let available = self.capacity.saturating_sub(self.buffer.len());
+        if count > available {
+            return Err(VfsError::WouldBlock);
+        }
+        self.buffer.extend(std::iter::repeat_n(0, count));
         Ok(count)
     }
 
@@ -4537,6 +4560,13 @@ fn pipe_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
     if state.available() == 0 && !buffer.is_empty() && state.writers > 0 {
         return Err(VfsError::WouldBlock);
     }
+    if let Some(host_pair) = pipe.host_pair() {
+        let count = pipe_host_read(host_pair.reader(), &mut state, buffer)?;
+        if count > 0 {
+            pipe.notify_writable();
+        }
+        return Ok(count);
+    }
     let count = state.read(buffer);
     if count > 0 {
         pipe.notify_writable();
@@ -4553,11 +4583,56 @@ fn pipe_write(entry: &FdEntry, buffer: &[u8]) -> VfsResult<usize> {
     if state.capacity == state.available() && !buffer.is_empty() && state.readers > 0 {
         return Err(VfsError::WouldBlock);
     }
+    if let Some(host_pair) = pipe.host_pair() {
+        let count = pipe_host_write(host_pair.writer(), &mut state, buffer)?;
+        if count > 0 {
+            pipe.notify_readable();
+        }
+        return Ok(count);
+    }
     let count = state.write(buffer)?;
     if count > 0 {
         pipe.notify_readable();
     }
     Ok(count)
+}
+
+fn pipe_host_read(
+    reader: &mcr_win::HostFile,
+    state: &mut PipeState,
+    buffer: &mut [u8],
+) -> VfsResult<usize> {
+    let count = state.available().min(buffer.len());
+    if count == 0 {
+        return Ok(0);
+    }
+    let completion = reader
+        .submit_overlapped_read_at(0, vec![0; count])
+        .complete_or_fallback(reader)
+        .map_err(|failure| vfs_error_from_host(failure.error().clone()))?;
+    let count = completion.bytes_transferred().min(buffer.len());
+    buffer[..count].copy_from_slice(&completion.buffer()[..count]);
+    state.discard_readable(count);
+    Ok(count)
+}
+
+fn pipe_host_write(
+    writer: &mcr_win::HostFile,
+    state: &mut PipeState,
+    buffer: &[u8],
+) -> VfsResult<usize> {
+    let count = state
+        .capacity
+        .saturating_sub(state.available())
+        .min(buffer.len());
+    if count == 0 {
+        return Ok(0);
+    }
+    let completion = writer
+        .submit_overlapped_write_at(0, buffer[..count].to_vec())
+        .complete_or_fallback(writer)
+        .map_err(|failure| vfs_error_from_host(failure.error().clone()))?;
+    state.record_written(completion.bytes_transferred().min(count))
 }
 
 fn eventfd_read(entry: &FdEntry, buffer: &mut [u8]) -> VfsResult<usize> {
@@ -4905,6 +4980,13 @@ mod tests {
         let [read_fd, write_fd] = vfs.pipe(OpenFlags::new(O_CLOEXEC | O_NONBLOCK)).unwrap();
         let mut buffer = [0; 5];
 
+        #[cfg(windows)]
+        assert!(
+            pipe_node(vfs.fds().get(read_fd).unwrap().file())
+                .unwrap()
+                .host_pair()
+                .is_some()
+        );
         assert!(vfs.fds().cloexec(read_fd).unwrap());
         assert!(vfs.fds().cloexec(write_fd).unwrap());
         assert_eq!(

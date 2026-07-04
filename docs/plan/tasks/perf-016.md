@@ -81,3 +81,9 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   pending/completion/cancellation model for pipe read/write. VFS/runtime pipes
   remain MCR-owned for now; wiring guest pipe descriptors to host-backed pipes
   and readiness completion dispatch remains in this task.
+- VFS pipes now attach a host overlapped pipe pair when the Windows adapter can
+  create one. Guest readiness, capacity, endpoint counting, and errno behavior
+  stay in MCR state, while the byte data path uses `HostFile`
+  `submit_overlapped_read_at` / `submit_overlapped_write_at` and updates the
+  MCR readiness counters only after host completion. Unsupported hosts keep the
+  in-memory pipe fallback.

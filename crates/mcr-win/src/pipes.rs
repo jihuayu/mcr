@@ -8,6 +8,18 @@ pub struct HostPipePair {
     writer: HostFile,
 }
 
+#[cfg(windows)]
+// SAFETY: The pipe pair owns two Windows handles. VFS serializes guest pipe
+// operations through its pipe mutex, and Windows overlapped handle ownership can
+// move across host threads without invalidating the handles.
+unsafe impl Send for HostPipePair {}
+
+#[cfg(windows)]
+// SAFETY: Shared references only expose handle operations; VFS keeps mutable
+// pipe state synchronized, and the underlying Windows handles remain valid
+// until the pair is dropped.
+unsafe impl Sync for HostPipePair {}
+
 impl HostPipePair {
     /// Creates a byte pipe pair whose handles support overlapped I/O.
     pub fn create_overlapped() -> HostResult<Self> {
