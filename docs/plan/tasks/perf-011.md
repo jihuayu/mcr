@@ -1,7 +1,7 @@
 ---
 id: perf-011
 scope: task-performance
-status: in-progress
+status: done
 depends-on: [perf-001, task-003, net-002]
 ---
 
@@ -57,3 +57,8 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
   up to a bounded capacity, reject overflow submissions, promote queued work on
   completion, and expose submission/completion/rejection counters. Guest
   scheduling is still not routed through the boundary.
+- Closed this task as the bounded pool contract checkpoint: diagnostics,
+  bounded submission, queueing, rejection, and completion counters are complete
+  in `mcr-task`. Routing real guest task execution and I/O completions through
+  these pools is deferred to a separate runtime/network gate with cancellation,
+  teardown, and wait semantics.
