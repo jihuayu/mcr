@@ -95,3 +95,12 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   `node -v` and `cargo --version` both return guest runtime errors from native
   null-address faults instead (`node`: RIP `0x700357c6`; `cargo`: RIP
   `0x7006680a`).
+- 2026-07-04 diagnostic checkpoint: native null-address faults now render the
+  faulting instruction bytes, decoded instruction, and guest FS base. Fresh
+  package-rootfs reruns show both Node and Cargo are faulting on original
+  FS-relative TLS loads after the guest FS base has moved above the current
+  absolute rewrite range (`node`: `mov rax, fs:[0x28]` at RIP
+  `0x700000751bd6`, FS base `0x700000277c90`; `cargo`: `mov rax, fs:[0]` at
+  RIP `0x7006680a`, FS base `0x700010ba1140`). The remaining blocker is
+  therefore the native execution/JIT fallback boundary for high-address
+  FS-relative TLS accesses, not patch-cache throughput.

@@ -221,9 +221,13 @@ fn write_native_fault_details(
     formatter: &mut fmt::Formatter<'_>,
     error: &crate::GuestRunError,
 ) -> fmt::Result {
-    let Some((registers, stack_words)) = native_fault_details(error) else {
+    let Some((registers, fs_base, instruction, stack_words)) = native_fault_details(error) else {
         return Ok(());
     };
+    if let Some(instruction) = instruction {
+        write!(formatter, "\nfault instruction: {instruction}")?;
+    }
+    write!(formatter, "\nfault tls: fs_base=0x{fs_base:016x}")?;
     write!(
         formatter,
         "\nfault registers: rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x} rsi=0x{:016x} rdi=0x{:016x} rbp=0x{:016x} rsp=0x{:016x}",
@@ -265,15 +269,22 @@ fn write_native_fault_details(
 
 fn native_fault_details(
     error: &crate::GuestRunError,
-) -> Option<(mcr_jit::GuestRegisters, &[mcr_jit::NativeFaultStackWord])> {
+) -> Option<(
+    mcr_jit::GuestRegisters,
+    u64,
+    Option<&mcr_jit::NativeFaultInstruction>,
+    &[mcr_jit::NativeFaultStackWord],
+)> {
     match error {
         crate::GuestRunError::GuestExecution(crate::GuestExecutionError::Execution(
             ExecutionError::NativeFault {
                 registers,
+                fs_base,
+                instruction,
                 stack_words,
                 ..
             },
-        )) => Some((*registers, stack_words)),
+        )) => Some((*registers, *fs_base, instruction.as_deref(), stack_words)),
         _ => None,
     }
 }
@@ -1237,6 +1248,7 @@ mod tests {
                 signal: -1073741819,
                 rip: 0x7000_004d_5305,
                 address: 0x9139b,
+                fs_base: 0x7000_0000,
                 registers: mcr_jit::GuestRegisters {
                     rax: u64::MAX,
                     rcx: 1,
@@ -1245,6 +1257,12 @@ mod tests {
                     rsp: 0x1001_ffb58,
                     ..mcr_jit::GuestRegisters::default()
                 },
+                instruction: Some(Box::new(mcr_jit::NativeFaultInstruction {
+                    rip: 0x7000_004d_5305,
+                    bytes: vec![0x48, 0x8b, 0x40, 0x28],
+                    decoded: "code=Mov_r64_rm64 mnemonic=Mov len=4 operands=[reg=RAX,mem(seg=DS,base=RAX,index=None,scale=1,disp=0x28)]"
+                        .to_string(),
+                })),
                 stack_words: vec![mcr_jit::NativeFaultStackWord {
                     address: 0x1001_ffb58,
                     value: 0x7000_004d_1234,
@@ -1254,6 +1272,10 @@ mod tests {
         let rendered = error.to_string();
 
         assert!(rendered.contains("fault registers:"));
+        assert!(rendered.contains("fault instruction:"));
+        assert!(rendered.contains("fault tls: fs_base=0x0000000070000000"));
+        assert!(rendered.contains("bytes=48 8b 40 28"));
+        assert!(rendered.contains("code=Mov_r64_rm64"));
         assert!(rendered.contains("rax=0xffffffffffffffff"));
         assert!(rendered.contains("rdi=0x000000000009139b"));
         assert!(rendered.contains("rsp=0x00000001001ffb58"));

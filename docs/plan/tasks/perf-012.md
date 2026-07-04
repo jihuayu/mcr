@@ -59,3 +59,12 @@ cargo test -p mcr-testkit perf_native_execution -- --ignored --nocapture
   faults at null address instead (`node`: RIP `0x700357c6`; `cargo`: RIP
   `0x7006680a`), so follow-up work should diagnose the faulting native
   instruction/register state rather than patch-cache throughput.
+- 2026-07-04 checkpoint: native fault reporting now includes the faulting
+  instruction bytes, a decoded instruction summary, and the guest FS base beside
+  the existing register and stack snapshot. Rerunning package rootfs checks
+  shows the next blocker is unmaterialized FS-relative TLS loads whose guest
+  FS bases are above the current fixed-width absolute rewrite range: `node -v`
+  faulted on `64 48 8b 04 25 28 00 00 00` (`mov rax, fs:[0x28]`) at RIP
+  `0x700000751bd6` with FS base `0x700000277c90`; `cargo --version` faulted on
+  `64 48 8b 04 25 00 00 00 00` (`mov rax, fs:[0]`) at RIP `0x7006680a` with
+  FS base `0x700010ba1140`.

@@ -326,6 +326,13 @@ code patching groups fixed-width rewrites by host allocation so large syscall or
 TLS patch sets do not repeatedly toggle the same executable mapping's
 protection for each candidate.
 
+Native fault diagnostics include the faulting instruction bytes, a decoded
+instruction summary, the guest FS base, registers, and stack words. These
+diagnostics are part of the performance boundary because they distinguish
+patch-cache throughput regressions from same-ISA execution correctness blockers,
+such as FS-relative TLS instructions whose guest FS base cannot be encoded by
+the current fixed-width absolute rewrite.
+
 ## Measurement Gates
 
 Each performance task must add or update an observable benchmark or smoke gate.

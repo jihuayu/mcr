@@ -220,6 +220,83 @@ fn last_syscall_byte_pair(bytes: &[u8]) -> Option<usize> {
         .rposition(|window| matches!(window, [0x0f, 0x05]))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeFaultInstruction {
+    pub rip: u64,
+    pub bytes: Vec<u8>,
+    pub decoded: String,
+}
+
+impl fmt::Display for NativeFaultInstruction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "rip=0x{:016x} bytes={} decoded={}",
+            self.rip,
+            format_bytes(&self.bytes),
+            self.decoded
+        )
+    }
+}
+
+pub fn decode_native_fault_instruction(bytes: &[u8], rip: u64) -> Option<NativeFaultInstruction> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut decoder = Decoder::with_ip(X86_64_BITNESS, bytes, rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return None;
+    }
+    let len = instruction.len().min(bytes.len());
+    Some(NativeFaultInstruction {
+        rip,
+        bytes: bytes[..len].to_vec(),
+        decoded: describe_instruction(&instruction),
+    })
+}
+
+fn describe_instruction(instruction: &Instruction) -> String {
+    let operands = (0..instruction.op_count())
+        .map(|operand| describe_operand(instruction, operand))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "code={:?} mnemonic={:?} len={} operands=[{}]",
+        instruction.code(),
+        instruction.mnemonic(),
+        instruction.len(),
+        operands
+    )
+}
+
+fn describe_operand(instruction: &Instruction, operand: u32) -> String {
+    match instruction.op_kind(operand) {
+        OpKind::Register => format!("reg={:?}", instruction.op_register(operand)),
+        OpKind::Memory => format!(
+            "mem(seg={:?},base={:?},index={:?},scale={},disp=0x{:x})",
+            instruction.memory_segment(),
+            instruction.memory_base(),
+            instruction.memory_index(),
+            instruction.memory_index_scale(),
+            instruction.memory_displacement64()
+        ),
+        kind => format!("{kind:?}"),
+    }
+}
+
+fn format_bytes(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn decoded_mnemonic(instruction: &Instruction) -> DecodedMnemonic {
     if instruction.mnemonic() == Mnemonic::Syscall {
         DecodedMnemonic::Syscall
@@ -515,7 +592,9 @@ pub enum ExecutionError {
         signal: i32,
         rip: u64,
         address: u64,
+        fs_base: u64,
         registers: GuestRegisters,
+        instruction: Option<Box<NativeFaultInstruction>>,
         stack_words: Vec<NativeFaultStackWord>,
     },
 }
@@ -557,12 +636,20 @@ impl fmt::Display for ExecutionError {
                 signal,
                 rip,
                 address,
+                fs_base,
                 registers: _,
+                instruction,
                 stack_words: _,
-            } => write!(
-                f,
-                "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}"
-            ),
+            } => {
+                write!(
+                    f,
+                    "guest native execution faulted with signal {signal} at rip 0x{rip:016x}, address 0x{address:016x}, fs_base 0x{fs_base:016x}"
+                )?;
+                if let Some(instruction) = instruction {
+                    write!(f, ", instruction {instruction}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -2056,7 +2143,8 @@ mod tests {
     use super::{
         BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError,
         GuestBlock, GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters,
-        SameIsaExecutionCore, SyscallSite, TrampolineCore, syscall_instruction_sites,
+        SameIsaExecutionCore, SyscallSite, TrampolineCore, decode_native_fault_instruction,
+        syscall_instruction_sites,
     };
     use std::collections::BTreeMap;
 
@@ -2181,6 +2269,28 @@ mod tests {
         let sites = syscall_instruction_sites(&[0x90; 1024], 0x401000);
 
         assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn native_fault_instruction_decodes_memory_operand() {
+        let instruction =
+            decode_native_fault_instruction(&[0x48, 0x8b, 0x40, 0x28, 0x90], 0x7000_0075_1bd6)
+                .expect("fault instruction should decode");
+
+        assert_eq!(instruction.rip, 0x7000_0075_1bd6);
+        assert_eq!(instruction.bytes, [0x48, 0x8b, 0x40, 0x28]);
+        assert!(
+            instruction.decoded.contains("code=Mov_r64_rm64"),
+            "{}",
+            instruction.decoded
+        );
+        assert!(
+            instruction
+                .decoded
+                .contains("mem(seg=DS,base=RAX,index=None,scale=1,disp=0x28)"),
+            "{}",
+            instruction.decoded
+        );
     }
 
     #[test]

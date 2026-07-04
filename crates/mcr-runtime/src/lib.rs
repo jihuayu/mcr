@@ -25,7 +25,8 @@ pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootf
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
 use mcr_jit::{
-    ExecutionError, GuestBlock, GuestRegisters, NativeFaultStackWord, SameIsaExecutionCore,
+    ExecutionError, GuestBlock, GuestRegisters, NativeFaultInstruction, NativeFaultStackWord,
+    SameIsaExecutionCore,
 };
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,
@@ -3552,9 +3553,22 @@ where
             native_registers.rip,
             host_step_elapsed_ms(native_start)
         ));
+        let fault_instruction = native_fault_instruction(memory, native_registers.rip);
         let stack_words = native_fault_stack_words(memory, native_registers.rsp);
-        native_result
-            .map_err(|error| native_execution_error(error, native_registers, stack_words))?;
+        if let Err(error) = native_result {
+            if let Some(instruction) = fault_instruction.as_ref() {
+                host_step_trace(format_args!(
+                    "runtime native-fault pid={pid} tid={tid} {instruction}"
+                ));
+            }
+            return Err(native_execution_error(
+                error,
+                native_registers,
+                fs_base,
+                fault_instruction,
+                stack_words,
+            ));
+        }
         dispatcher.subsystems_mut().set_native_fp(
             tid,
             mcr_win::HostFloatingPointState {
@@ -4000,6 +4014,8 @@ fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> Option<(Fd, 
 fn native_execution_error(
     error: mcr_win::NativeExecutionError,
     registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: Option<NativeFaultInstruction>,
     stack_words: Vec<NativeFaultStackWord>,
 ) -> GuestExecutionError {
     match error {
@@ -4011,7 +4027,9 @@ fn native_execution_error(
             signal,
             rip,
             address,
+            fs_base,
             registers: guest_registers_from_host(registers),
+            instruction: instruction.map(Box::new),
             stack_words,
         }),
         mcr_win::NativeExecutionError::UnsupportedHost
@@ -4021,11 +4039,20 @@ fn native_execution_error(
                 signal: 0,
                 rip: 0,
                 address: 0,
+                fs_base,
                 registers: GuestRegisters::default(),
+                instruction: None,
                 stack_words: Vec::new(),
             })
         }
     }
+}
+
+fn native_fault_instruction(memory: &GuestMemory, rip: u64) -> Option<NativeFaultInstruction> {
+    const MAX_INSTRUCTION_BYTES: usize = 15;
+
+    let bytes = read_guest_block(memory, rip, MAX_INSTRUCTION_BYTES).ok()?;
+    mcr_jit::decode_native_fault_instruction(&bytes, rip)
 }
 
 fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultStackWord> {
