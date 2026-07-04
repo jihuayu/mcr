@@ -83,6 +83,12 @@ path strings alone. Mutating syscalls such as `openat` with write intent,
 `unlinkat`, `renameat2`, `ftruncate`, chmod/chown-like changes, and metadata
 sidecar writes must invalidate affected entries.
 
+The first VFS cache checkpoint keeps this boundary narrow: `mcr-vfs` maintains
+an inode-and-generation keyed metadata cache plus a small regular-file read
+cache. Any successful VFS mutation that can affect attributes, links, paths, or
+file contents advances the generation and drops cached entries. Directory
+iteration batching remains a later `perf-002` step.
+
 ### File Mapping
 
 Executable files, shared libraries, and read-only data should prefer host-backed

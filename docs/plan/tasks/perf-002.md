@@ -40,3 +40,7 @@ cargo test -p mcr-testkit perf_vfs_cache -- --ignored --nocapture
 - Invalidate affected entries on write-open, unlink, rename, truncate,
   metadata-sidecar updates, and any syscall that can change visible attributes.
 - Preserve Linux delete-while-open and directory iteration behavior.
+- Initial checkpoint: `mcr-vfs` now has an inode-and-generation keyed metadata
+  cache and small regular-file read cache with generation invalidation on
+  successful write opens, writes, truncates, link/path mutations, mount changes,
+  and metadata updates. Directory iteration batching is still pending.
