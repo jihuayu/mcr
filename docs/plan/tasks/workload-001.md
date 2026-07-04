@@ -63,7 +63,9 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   readiness, scheduling, native execution, or unknown, without changing normal
   unbounded runtime behavior. Focused runtime tests cover futex, fd readiness,
   wait4 scheduling, native execution, and step-limit timeout reporting.
-- Remaining blocker: rerun `node -v`, `go version`, and `cargo --version` with
-  materialized language rootfs payloads and record the concrete stall category.
-  The isolated workload diagnostics worktree does not contain those package
-  rootfs payloads.
+- Follow-up package-rootfs validation with `mcr run-rootfs --guest-step-limit`
+  confirmed that `python -V` completes, while `go version`, `node -v`, and
+  `cargo --version` each exceeded a 30s process timeout without returning a
+  guest step-limit diagnostic. That means the remaining blocker is likely inside
+  a single native/host-side execution window, patch/materialization path, or
+  equivalent long operation rather than repeated guest-step progress.
