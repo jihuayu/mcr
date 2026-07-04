@@ -25,15 +25,15 @@ const SHELL_STARTUP: GuestPerfWorkload = GuestPerfWorkload {
 };
 const SMALL_FILE_IO: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_small_file_io",
-    script: "i=0; while [ $i -lt 64 ]; do p=/tmp/mcr-perf-small-$$-$i; printf 'payload\n' > \"$p\" && cat \"$p\" >/dev/null && rm \"$p\"; i=$((i+1)); done",
-    operations: 64,
+    script: "i=0; while [ $i -lt 16 ]; do p=/tmp/mcr-perf-small-$$-$i; printf 'payload\n' > \"$p\" && cat \"$p\" >/dev/null && rm \"$p\"; i=$((i+1)); done",
+    operations: 16,
     category: "small_file_io",
     requires_public_network: false,
 };
 const DIRECTORY_METADATA_WALK: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_directory_metadata_walk",
-    script: "d=/tmp/mcr-perf-dir-$$; mkdir -p \"$d\"; i=0; while [ $i -lt 128 ]; do touch \"$d/f$i\"; i=$((i+1)); done; ls -l \"$d\" >/dev/null; rm -rf \"$d\"",
-    operations: 128,
+    script: "d=/tmp/mcr-perf-dir-$$; i=0; while [ $i -lt 32 ]; do rm -f \"$d/f$i\"; i=$((i+1)); done; rmdir \"$d\" 2>/dev/null || true; mkdir -p \"$d\"; i=0; while [ $i -lt 32 ]; do touch \"$d/f$i\"; i=$((i+1)); done; ls -l \"$d\" >/dev/null; i=0; while [ $i -lt 32 ]; do rm \"$d/f$i\"; i=$((i+1)); done; rmdir \"$d\"",
+    operations: 32,
     category: "directory_metadata_walk",
     requires_public_network: false,
 };
@@ -161,8 +161,17 @@ fn perf_baseline_guest_smoke_workloads() -> Result<()> {
         return Ok(());
     };
     let mut report = PerfBaselineReport::new("mcr-testkit guest workload performance baseline");
+    let run_public_network = env::var_os("MCR_PERF_PUBLIC_NETWORK").is_some();
 
     for workload in GUEST_PERF_WORKLOADS {
+        if workload.requires_public_network && !run_public_network {
+            eprintln!(
+                "skipping guest perf workload `{}`: set MCR_PERF_PUBLIC_NETWORK=1",
+                workload.name
+            );
+            continue;
+        }
+
         let command = context.command(*workload);
         let (output_result, wall_time) = measure_wall_time(|| command.run());
         let output = output_result?;

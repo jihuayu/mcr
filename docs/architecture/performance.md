@@ -252,8 +252,9 @@ The first baseline suites are intentionally split by subsystem boundary:
 - `mcr-net` measures high-concurrency loopback accept/recv/send behavior through
   `WinHostSocketTransport`;
 - `mcr-testkit` measures guest shell startup, small-file I/O, directory
-  metadata walks, `curl`, and `git ls-remote` through the materialized Alpine
-  rootfs and `MCR_BIN`.
+  metadata walks through the materialized Alpine rootfs and `MCR_BIN`; the
+  public-network `curl` and `git ls-remote` measurements are opt-in with
+  `MCR_PERF_PUBLIC_NETWORK=1`.
 
 These suites are baselines, not performance assertions. They should fail only
 when the measured workload itself fails. Thresholds, trend storage, and

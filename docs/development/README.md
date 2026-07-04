@@ -198,11 +198,13 @@ cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
 cargo test -p mcr-net perf_baseline -- --ignored --nocapture
 ```
 
-The guest workload baseline additionally requires `MCR_BIN`, a materialized
-`alpine-rootfs`, and public network access for `curl` and `git ls-remote`:
+The guest workload baseline additionally requires `MCR_BIN` and a materialized
+`alpine-rootfs`. Public-network `curl` and `git ls-remote` measurements run only
+when `MCR_PERF_PUBLIC_NETWORK=1` is set:
 
 ```powershell
 MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
+MCR_BIN=target/debug/mcr MCR_PERF_PUBLIC_NETWORK=1 cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
 ```
 
 Linux x86-64 guest smokes must be treated as x86_64-host validation. Do not
