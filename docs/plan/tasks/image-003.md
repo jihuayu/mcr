@@ -41,3 +41,7 @@ cargo test -p mcr-snapshot
   environment, working directory, entrypoint, command, history, rootfs diff IDs,
   descriptor ordering, and annotation key ordering. OCI layout and
   Docker-compatible tar writers remain follow-up work.
+- 2026-07-04 checkpoint: `LocalContentStore::write_oci_layout` now writes
+  deterministic `oci-layout`, `index.json`, and manifest blobs after verifying
+  referenced config and layer blobs. Docker-compatible tar output remains
+  follow-up work.

@@ -19,6 +19,8 @@ pub const MEDIA_TYPE_OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.
 pub const MEDIA_TYPE_OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 pub const MEDIA_TYPE_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const MEDIA_TYPE_OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+pub const OCI_IMAGE_LAYOUT_VERSION: &str = "1.0.0";
+pub const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OciDescriptor {
@@ -885,6 +887,37 @@ impl LocalContentStore {
             .join(digest.encoded()))
     }
 
+    pub fn write_oci_layout(
+        &self,
+        manifest: &OciImageManifest,
+        reference_name: Option<&str>,
+    ) -> Result<OciDescriptor, ImageError> {
+        if manifest.config().media_type() != MEDIA_TYPE_OCI_CONFIG {
+            return Err(ImageError::UnsupportedManifestMediaType(
+                manifest.config().media_type().to_owned(),
+            ));
+        }
+        self.read_blob(manifest.config())?;
+        for layer in manifest.layers() {
+            validate_layer_media_type(layer.media_type())?;
+            self.read_blob(layer)?;
+        }
+
+        fs::create_dir_all(self.root())?;
+        let manifest_bytes = manifest.to_json_bytes();
+        let mut manifest_descriptor = self.write_blob(MEDIA_TYPE_OCI_MANIFEST, &manifest_bytes)?;
+        if let Some(reference_name) = reference_name {
+            manifest_descriptor.insert_annotation(ANNOTATION_REF_NAME, reference_name);
+        }
+
+        fs::write(self.root.join("oci-layout"), oci_layout_json_bytes())?;
+        fs::write(
+            self.root.join("index.json"),
+            oci_index_json_bytes(&manifest_descriptor),
+        )?;
+        Ok(manifest_descriptor)
+    }
+
     fn verify_blob_bytes(&self, expected: &OciDigest, bytes: &[u8]) -> Result<(), ImageError> {
         let actual = OciDigest::sha256(bytes);
         if &actual != expected {
@@ -895,6 +928,22 @@ impl LocalContentStore {
         }
         Ok(())
     }
+}
+
+fn oci_layout_json_bytes() -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("{\"imageLayoutVersion\":");
+    push_json_string(&mut output, OCI_IMAGE_LAYOUT_VERSION);
+    output.push('}');
+    output.into_bytes()
+}
+
+fn oci_index_json_bytes(manifest_descriptor: &OciDescriptor) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("{\"schemaVersion\":2,\"manifests\":[");
+    push_descriptor_json(&mut output, manifest_descriptor);
+    output.push_str("]}");
+    output.into_bytes()
 }
 
 fn verify_descriptor_bytes(descriptor: &OciDescriptor, bytes: &[u8]) -> Result<(), ImageError> {
@@ -1301,6 +1350,53 @@ mod tests {
         );
         assert_eq!(descriptor.size(), bytes.len() as u64);
         assert_eq!(store.read_blob(&descriptor).unwrap(), bytes);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_content_store_writes_deterministic_oci_layout() {
+        let root = temp_root("oci-layout");
+        let store = LocalContentStore::new(&root);
+        let config = OciImageConfig::new(
+            OciPlatform::linux_amd64(),
+            OciContainerConfig::new()
+                .with_env(["PATH=/usr/bin"])
+                .with_command(["/bin/app"]),
+            vec![OciHistoryEntry::new("FROM scratch").with_empty_layer(true)],
+            vec![OciDigest::sha256(b"layer")],
+        );
+        let config_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_CONFIG, &config.to_json_bytes())
+            .unwrap();
+        let layer_descriptor = store.write_blob(MEDIA_TYPE_OCI_LAYER, b"layer").unwrap();
+        let manifest = OciImageManifest::new(config_descriptor, vec![layer_descriptor]);
+
+        let manifest_descriptor = store.write_oci_layout(&manifest, Some("mcr:test")).unwrap();
+        let first_index = fs::read_to_string(root.join("index.json")).unwrap();
+        let second_descriptor = store.write_oci_layout(&manifest, Some("mcr:test")).unwrap();
+        let second_index = fs::read_to_string(root.join("index.json")).unwrap();
+
+        assert_eq!(manifest_descriptor, second_descriptor);
+        assert_eq!(first_index, second_index);
+        assert_eq!(
+            fs::read_to_string(root.join("oci-layout")).unwrap(),
+            "{\"imageLayoutVersion\":\"1.0.0\"}"
+        );
+        assert_eq!(
+            first_index,
+            format!(
+                "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{}\",\"digest\":\"{}\",\"size\":{},\"annotations\":{{\"{}\":\"mcr:test\"}}}}]}}",
+                MEDIA_TYPE_OCI_MANIFEST,
+                manifest_descriptor.digest(),
+                manifest_descriptor.size(),
+                ANNOTATION_REF_NAME
+            )
+        );
+        assert_eq!(
+            store.read_blob(&manifest_descriptor).unwrap(),
+            manifest.to_json_bytes()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
