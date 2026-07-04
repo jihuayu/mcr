@@ -5,6 +5,8 @@ use crate::overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
     HostIoSubmission,
 };
+#[cfg(windows)]
+use crate::overlapped_io::{PendingHostIo, WindowsOverlapped, WindowsPendingHostIo};
 
 /// Host file access requested from the file adapter.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -408,6 +410,31 @@ fn submit_overlapped_at_platform(
         ));
     }
 
+    let mut duplicate = std::ptr::null_mut();
+    let current_process = unsafe {
+        // SAFETY: `GetCurrentProcess` has no preconditions and returns a pseudo handle.
+        GetCurrentProcess()
+    };
+    let duplicated = unsafe {
+        // SAFETY: The source handle is owned by HostFile and `duplicate` is a valid out pointer.
+        DuplicateHandle(
+            current_process,
+            file.handle,
+            current_process,
+            &mut duplicate,
+            0,
+            crate::windows::FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duplicated == crate::windows::FALSE {
+        return HostIoSubmission::Failed(HostIoFailure::new(
+            direction,
+            crate::error::last_windows_error(direction.operation()),
+            buffer,
+        ));
+    }
+
     let event = unsafe {
         // SAFETY: Security attributes and name are intentionally null. The returned handle is owned.
         CreateEventW(
@@ -418,6 +445,7 @@ fn submit_overlapped_at_platform(
         )
     };
     if event.is_null() {
+        crate::windows::close_handle(duplicate);
         return HostIoSubmission::Failed(HostIoFailure::new(
             direction,
             crate::error::last_windows_error(direction.operation()),
@@ -425,31 +453,26 @@ fn submit_overlapped_at_platform(
         ));
     }
 
-    let mut overlapped = WindowsOverlapped {
-        internal: 0,
-        internal_high: 0,
-        offset: offset as u32,
-        offset_high: (offset >> 32) as u32,
-        event,
-    };
+    let overlapped = WindowsOverlapped::new(offset, event);
+    let mut pending_state = WindowsPendingHostIo::new(duplicate, overlapped);
 
     let len = buffer.len().min(u32::MAX as usize) as u32;
     let ok = unsafe {
-        // SAFETY: The file handle is owned by HostFile; the buffer and OVERLAPPED live until completion.
+        // SAFETY: The duplicated handle, buffer, and OVERLAPPED record live until completion.
         match direction {
             HostIoDirection::Read => ReadFile(
-                file.handle,
+                pending_state.handle(),
                 buffer.as_mut_ptr().cast(),
                 len,
                 std::ptr::null_mut(),
-                (&mut overlapped as *mut WindowsOverlapped).cast(),
+                pending_state.overlapped_mut_ptr(),
             ),
             HostIoDirection::Write => WriteFile(
-                file.handle,
+                pending_state.handle(),
                 buffer.as_ptr().cast(),
                 len,
                 std::ptr::null_mut(),
-                (&mut overlapped as *mut WindowsOverlapped).cast(),
+                pending_state.overlapped_mut_ptr(),
             ),
         }
     };
@@ -457,11 +480,9 @@ fn submit_overlapped_at_platform(
     if ok == crate::windows::FALSE {
         let error = crate::windows::last_error();
         if direction == HostIoDirection::Read && error == ERROR_HANDLE_EOF {
-            crate::windows::close_handle(event);
             return HostIoSubmission::Completed(HostIoCompletion::new(direction, 0, buffer));
         }
         if error != ERROR_IO_PENDING {
-            crate::windows::close_handle(event);
             return HostIoSubmission::Failed(HostIoFailure::new(
                 direction,
                 crate::error::windows_error(direction.operation(), error),
@@ -470,34 +491,11 @@ fn submit_overlapped_at_platform(
         }
     }
 
-    let mut bytes_transferred = 0;
-    let completed = unsafe {
-        // SAFETY: The pending operation uses this OVERLAPPED, and TRUE waits until the event completes.
-        GetOverlappedResult(
-            file.handle,
-            (&mut overlapped as *mut WindowsOverlapped).cast(),
-            &mut bytes_transferred,
-            TRUE,
-        )
-    };
-    crate::windows::close_handle(event);
-
-    if completed == crate::windows::FALSE {
-        let error = crate::windows::last_error();
-        if direction == HostIoDirection::Read && error == ERROR_HANDLE_EOF {
-            return HostIoSubmission::Completed(HostIoCompletion::new(direction, 0, buffer));
-        }
-        HostIoSubmission::Failed(HostIoFailure::new(
-            direction,
-            crate::error::windows_error(direction.operation(), error),
-            buffer,
-        ))
+    let pending = PendingHostIo::from_windows_pending(direction, pending_state, buffer);
+    if ok == crate::windows::FALSE {
+        HostIoSubmission::Pending(pending)
     } else {
-        HostIoSubmission::Completed(HostIoCompletion::new(
-            direction,
-            bytes_transferred as usize,
-            buffer,
-        ))
+        pending.wait_complete().into()
     }
 }
 
@@ -721,16 +719,8 @@ const ERROR_IO_PENDING: u32 = 997;
 const ERROR_HANDLE_EOF: u32 = 38;
 #[cfg(windows)]
 const TRUE: crate::windows::Bool = 1;
-
 #[cfg(windows)]
-#[repr(C)]
-struct WindowsOverlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    event: crate::windows::Handle,
-}
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -764,11 +754,15 @@ unsafe extern "system" {
         initial_state: crate::windows::Bool,
         name: *const u16,
     ) -> crate::windows::Handle;
-    fn GetOverlappedResult(
-        file: crate::windows::Handle,
-        overlapped: *mut std::ffi::c_void,
-        number_of_bytes_transferred: *mut u32,
-        wait: crate::windows::Bool,
+    fn GetCurrentProcess() -> crate::windows::Handle;
+    fn DuplicateHandle(
+        source_process_handle: crate::windows::Handle,
+        source_handle: crate::windows::Handle,
+        target_process_handle: crate::windows::Handle,
+        target_handle: *mut crate::windows::Handle,
+        desired_access: u32,
+        inherit_handle: crate::windows::Bool,
+        options: u32,
     ) -> crate::windows::Bool;
     fn FlushFileBuffers(file: crate::windows::Handle) -> crate::windows::Bool;
     fn DeleteFileW(file_name: *const u16) -> crate::windows::Bool;
@@ -830,7 +824,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn host_file_overlapped_read_write_at_complete_without_fallback() {
+    fn host_file_overlapped_read_write_at_uses_real_completion_source() {
         let path = std::env::temp_dir().join(format!(
             "mcr-win-overlapped-file-test-{}",
             std::process::id()
@@ -843,27 +837,34 @@ mod tests {
         )
         .unwrap();
 
-        let write = file
-            .submit_overlapped_write_at(0, b"abcdef".to_vec())
-            .complete_or_fallback(&file)
-            .unwrap();
+        let write = complete_real_overlapped(
+            &file,
+            file.submit_overlapped_write_at(0, b"abcdef".to_vec()),
+        );
         assert_eq!(write.bytes_transferred(), 6);
         assert_eq!(write.buffer(), b"abcdef");
         file.flush().unwrap();
 
-        let read = match file.submit_overlapped_read_at(1, vec![0; 3]) {
-            HostIoSubmission::Completed(completion) => completion,
-            other => panic!("expected completed overlapped read, got {other:?}"),
-        };
+        let read = complete_real_overlapped(&file, file.submit_overlapped_read_at(1, vec![0; 3]));
         assert_eq!(read.bytes_transferred(), 3);
         assert_eq!(read.buffer(), b"bcd");
 
-        let eof = match file.submit_overlapped_read_at(64, vec![0; 3]) {
-            HostIoSubmission::Completed(completion) => completion,
-            other => panic!("expected completed EOF read, got {other:?}"),
-        };
+        let eof = complete_real_overlapped(&file, file.submit_overlapped_read_at(64, vec![0; 3]));
         assert_eq!(eof.bytes_transferred(), 0);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    fn complete_real_overlapped(
+        file: &HostFile,
+        submission: HostIoSubmission,
+    ) -> crate::HostIoCompletion {
+        match submission {
+            HostIoSubmission::Fallback(fallback) => {
+                panic!("expected real overlapped completion, got fallback {fallback:?}")
+            }
+            other => other.complete_or_fallback(file).unwrap(),
+        }
     }
 }

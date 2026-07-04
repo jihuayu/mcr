@@ -68,3 +68,10 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
 - The read path treats overlapped EOF as a zero-byte Linux read, so ELF segment
   tail probes and other offset reads past the host file end do not surface as
   guest `EINVAL`.
+- Windows regular-file offset I/O now returns a real
+  `HostIoSubmission::Pending` when the host reports `ERROR_IO_PENDING` instead
+  of waiting inside the submit path. `PendingHostIo` owns a duplicated file
+  handle, event, `OVERLAPPED` record, and buffer until `poll_complete`,
+  `wait_complete`, cancellation, or drop-drain finishes the host operation.
+  Immediate completions and synchronous errors still return `Completed` or
+  `Failed`, and unsupported non-offset operations still use the fallback.

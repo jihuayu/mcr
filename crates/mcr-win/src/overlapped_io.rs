@@ -109,7 +109,7 @@ impl HostIoFailure {
 }
 
 /// Submission returned by the host file-like I/O adapter.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum HostIoSubmission {
     Completed(HostIoCompletion),
     Failed(HostIoFailure),
@@ -119,14 +119,12 @@ pub enum HostIoSubmission {
 
 impl HostIoSubmission {
     /// Completes an immediate operation or runs the synchronous fallback.
-    ///
-    /// Pending operations must be completed by the future overlapped backend.
     pub fn complete_or_fallback(self, file: &HostFile) -> HostIoResult {
         match self {
             Self::Completed(completion) => Ok(completion),
             Self::Failed(failure) => Err(failure),
             Self::Fallback(fallback) => fallback.complete(file),
-            Self::Pending(pending) => pending.unsupported_completion(),
+            Self::Pending(pending) => pending.wait_complete(),
         }
     }
 }
@@ -193,11 +191,12 @@ impl HostIoFallback {
 }
 
 /// Pending host file-like I/O operation.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct PendingHostIo {
     direction: HostIoDirection,
     cancel_requested: bool,
-    buffer: Vec<u8>,
+    buffer: Option<Vec<u8>>,
+    platform: Option<PendingHostIoPlatform>,
 }
 
 impl PendingHostIo {
@@ -206,7 +205,22 @@ impl PendingHostIo {
         Self {
             direction,
             cancel_requested: false,
-            buffer,
+            buffer: Some(buffer),
+            platform: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_windows_pending(
+        direction: HostIoDirection,
+        platform: WindowsPendingHostIo,
+        buffer: Vec<u8>,
+    ) -> Self {
+        Self {
+            direction,
+            cancel_requested: false,
+            buffer: Some(buffer),
+            platform: Some(platform),
         }
     }
 
@@ -222,7 +236,7 @@ impl PendingHostIo {
 
     /// Returns the pending operation buffer.
     pub fn buffer(&self) -> &[u8] {
-        &self.buffer
+        self.buffer.as_deref().unwrap_or(&[])
     }
 
     /// Requests cancellation without releasing the completion record or buffer.
@@ -231,41 +245,276 @@ impl PendingHostIo {
             return false;
         }
         self.cancel_requested = true;
+        self.request_cancel_platform();
         true
+    }
+
+    /// Polls the host completion source without blocking.
+    pub fn poll_complete(mut self) -> HostIoSubmission {
+        match self.try_complete_platform() {
+            PendingPoll::Pending => HostIoSubmission::Pending(self),
+            PendingPoll::Ready(result) => result.into(),
+        }
+    }
+
+    /// Waits for the host completion source and returns the owned buffer.
+    pub fn wait_complete(mut self) -> HostIoResult {
+        match self.wait_complete_platform() {
+            PendingPoll::Ready(result) => result,
+            PendingPoll::Pending => self.unsupported_completion(),
+        }
     }
 
     /// Drains a host-aborted operation after cancellation or close.
     pub fn drain_cancelled(self) -> HostIoResult {
+        #[cfg(windows)]
+        if self.platform.is_some() {
+            return self.wait_complete();
+        }
+
         Err(HostIoFailure::new(
             self.direction,
             HostError::new(self.direction.operation(), HostErrorKind::Interrupted),
-            self.buffer,
+            self.into_buffer(),
         ))
     }
 
-    fn unsupported_completion(self) -> HostIoResult {
+    fn unsupported_completion(mut self) -> HostIoResult {
         Err(HostIoFailure::new(
             self.direction,
             HostError::unsupported(self.direction.operation()),
-            self.buffer,
+            self.buffer.take().unwrap_or_default(),
         ))
     }
 
     #[cfg(test)]
-    fn complete(self, bytes_transferred: usize) -> HostIoResult {
-        if bytes_transferred > self.buffer.len() {
+    fn complete(mut self, bytes_transferred: usize) -> HostIoResult {
+        let buffer = self.buffer.take().unwrap_or_default();
+        if bytes_transferred > buffer.len() {
             return Err(HostIoFailure::new(
                 self.direction,
                 HostError::invalid_input(self.direction.operation()),
-                self.buffer,
+                buffer,
             ));
         }
         Ok(HostIoCompletion::new(
             self.direction,
             bytes_transferred,
-            self.buffer,
+            buffer,
         ))
     }
+
+    fn into_buffer(mut self) -> Vec<u8> {
+        self.buffer.take().unwrap_or_default()
+    }
+
+    #[cfg(not(windows))]
+    fn request_cancel_platform(&self) {}
+
+    #[cfg(windows)]
+    fn request_cancel_platform(&self) {
+        if let Some(platform) = self.platform.as_ref() {
+            platform.request_cancel();
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn try_complete_platform(&mut self) -> PendingPoll {
+        PendingPoll::Ready(self.take_unsupported_completion())
+    }
+
+    #[cfg(windows)]
+    fn try_complete_platform(&mut self) -> PendingPoll {
+        self.complete_platform(crate::windows::FALSE)
+    }
+
+    #[cfg(not(windows))]
+    fn wait_complete_platform(&mut self) -> PendingPoll {
+        PendingPoll::Ready(self.take_unsupported_completion())
+    }
+
+    #[cfg(windows)]
+    fn wait_complete_platform(&mut self) -> PendingPoll {
+        self.complete_platform(TRUE)
+    }
+
+    fn take_unsupported_completion(&mut self) -> HostIoResult {
+        Err(HostIoFailure::new(
+            self.direction,
+            HostError::unsupported(self.direction.operation()),
+            self.buffer.take().unwrap_or_default(),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn complete_platform(&mut self, wait: crate::windows::Bool) -> PendingPoll {
+        let Some(platform) = self.platform.as_mut() else {
+            return PendingPoll::Ready(self.take_unsupported_completion());
+        };
+
+        let mut bytes_transferred = 0;
+        let completed = unsafe {
+            // SAFETY: `platform` owns both the duplicated handle and the OVERLAPPED record.
+            GetOverlappedResult(
+                platform.handle(),
+                platform.overlapped_mut_ptr(),
+                &mut bytes_transferred,
+                wait,
+            )
+        };
+
+        if completed == crate::windows::FALSE {
+            let error = crate::windows::last_error();
+            if error == ERROR_IO_INCOMPLETE {
+                return PendingPoll::Pending;
+            }
+            let buffer = self.buffer.take().unwrap_or_default();
+            self.platform.take();
+            if self.direction == HostIoDirection::Read && error == ERROR_HANDLE_EOF {
+                return PendingPoll::Ready(Ok(HostIoCompletion::new(self.direction, 0, buffer)));
+            }
+            return PendingPoll::Ready(Err(HostIoFailure::new(
+                self.direction,
+                crate::error::windows_error(self.direction.operation(), error),
+                buffer,
+            )));
+        }
+
+        let buffer = self.buffer.take().unwrap_or_default();
+        self.platform.take();
+        PendingPoll::Ready(Ok(HostIoCompletion::new(
+            self.direction,
+            bytes_transferred as usize,
+            buffer,
+        )))
+    }
+}
+
+impl From<HostIoResult> for HostIoSubmission {
+    fn from(value: HostIoResult) -> Self {
+        match value {
+            Ok(completion) => Self::Completed(completion),
+            Err(failure) => Self::Failed(failure),
+        }
+    }
+}
+
+impl Drop for PendingHostIo {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(mut platform) = self.platform.take() {
+            platform.request_cancel();
+            let mut bytes_transferred = 0;
+            let _ = unsafe {
+                // SAFETY: `platform` is still alive and owns the completion record.
+                GetOverlappedResult(
+                    platform.handle(),
+                    platform.overlapped_mut_ptr(),
+                    &mut bytes_transferred,
+                    TRUE,
+                )
+            };
+        }
+    }
+}
+
+enum PendingPoll {
+    Pending,
+    Ready(HostIoResult),
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct PendingHostIoPlatform;
+
+#[cfg(windows)]
+type PendingHostIoPlatform = WindowsPendingHostIo;
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct WindowsPendingHostIo {
+    handle: crate::windows::Handle,
+    overlapped: Box<WindowsOverlapped>,
+}
+
+#[cfg(windows)]
+impl WindowsPendingHostIo {
+    pub(crate) fn new(handle: crate::windows::Handle, overlapped: WindowsOverlapped) -> Self {
+        Self {
+            handle,
+            overlapped: Box::new(overlapped),
+        }
+    }
+
+    pub(crate) const fn handle(&self) -> crate::windows::Handle {
+        self.handle
+    }
+
+    pub(crate) fn overlapped_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        (&mut *self.overlapped as *mut WindowsOverlapped).cast()
+    }
+
+    fn request_cancel(&self) {
+        let overlapped = (&*self.overlapped as *const WindowsOverlapped).cast_mut();
+        unsafe {
+            // SAFETY: The duplicated handle and OVERLAPPED record are owned by this pending op.
+            let _ = CancelIoEx(self.handle, overlapped.cast());
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPendingHostIo {
+    fn drop(&mut self) {
+        crate::windows::close_handle(self.overlapped.event);
+        crate::windows::close_handle(self.handle);
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct WindowsOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: crate::windows::Handle,
+}
+
+#[cfg(windows)]
+impl WindowsOverlapped {
+    pub(crate) const fn new(offset: u64, event: crate::windows::Handle) -> Self {
+        Self {
+            internal: 0,
+            internal_high: 0,
+            offset: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            event,
+        }
+    }
+}
+
+#[cfg(windows)]
+const TRUE: crate::windows::Bool = 1;
+#[cfg(windows)]
+const ERROR_IO_INCOMPLETE: u32 = 996;
+#[cfg(windows)]
+const ERROR_HANDLE_EOF: u32 = 38;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetOverlappedResult(
+        file: crate::windows::Handle,
+        overlapped: *mut std::ffi::c_void,
+        number_of_bytes_transferred: *mut u32,
+        wait: crate::windows::Bool,
+    ) -> crate::windows::Bool;
+    fn CancelIoEx(
+        file: crate::windows::Handle,
+        overlapped: *mut std::ffi::c_void,
+    ) -> crate::windows::Bool;
 }
 
 #[cfg(test)]
