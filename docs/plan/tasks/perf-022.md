@@ -52,3 +52,6 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   RIO function-table shape or an explicit unsupported fallback. No RIO data path
   is enabled yet; future work must still provide opt-in measurement evidence,
   registered-buffer lifetime proofs, and comparison against the IOCP backend.
+- Exposed the RIO capability gate through `mcr-net::HostSocketHandle` and
+  `GuestSocketTable`. Non-RIO handles default to an explicit unsupported
+  capability, while the Windows host handle delegates to `mcr-win`.

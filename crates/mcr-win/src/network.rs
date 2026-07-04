@@ -454,7 +454,7 @@ impl HostRioCapability {
         }
     }
 
-    const fn unsupported(error_code: Option<i32>) -> Self {
+    pub const fn unsupported(error_code: Option<i32>) -> Self {
         Self {
             supported: false,
             error_code,

@@ -7,9 +7,9 @@ use std::{
 };
 
 use mcr_win::{
-    AddressFamily, HostError, HostErrorKind, HostShutdown, HostSocket, HostSocketOptionName,
-    HostSocketOptionValue, NetworkStack, SocketCompletionKind, SocketEvents, SocketKind,
-    SocketProtocol as HostSocketProtocol,
+    AddressFamily, HostError, HostErrorKind, HostRioCapability, HostShutdown, HostSocket,
+    HostSocketOptionName, HostSocketOptionValue, NetworkStack, SocketCompletionKind, SocketEvents,
+    SocketKind, SocketProtocol as HostSocketProtocol,
 };
 
 mod dns_cache;
@@ -599,6 +599,9 @@ pub trait HostSocketHandle: fmt::Debug {
     ) -> Result<SocketConnectFastPathCompletion, HostIoError> {
         Ok(SocketConnectFastPathCompletion::Inactive)
     }
+    fn rio_capability(&mut self) -> Result<HostRioCapability, HostIoError> {
+        Ok(HostRioCapability::unsupported(None))
+    }
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError>;
     fn local_addr(&self) -> Result<SocketAddress, HostIoError>;
     fn peer_addr(&self) -> Result<SocketAddress, HostIoError>;
@@ -767,6 +770,10 @@ impl HostSocketHandle for WinHostSocketHandle {
         self.socket
             .connect(SocketAddr::from(address))
             .map_err(HostIoError::from)
+    }
+
+    fn rio_capability(&mut self) -> Result<HostRioCapability, HostIoError> {
+        self.socket.rio_capability().map_err(HostIoError::from)
     }
 
     fn take_error(&mut self) -> Result<Option<HostIoError>, HostIoError> {
@@ -1727,6 +1734,14 @@ impl GuestSocketTable {
     pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {
         let socket = self.socket(id)?;
         validate_connected_stream_io(socket, SocketOperation::Send)
+    }
+
+    pub fn rio_capability(&mut self, id: SocketId) -> Result<HostRioCapability, SocketError> {
+        let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
+        entry
+            .handle
+            .rio_capability()
+            .map_err(SocketError::from_host)
     }
 
     pub fn unsupported_socket_io(operation: SocketOperation) -> SocketError {
@@ -4196,6 +4211,24 @@ mod tests {
             5
         );
         assert_eq!(&buffer, b"serve");
+    }
+
+    #[test]
+    fn rio_capability_defaults_to_explicit_fallback() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(FakeHostSocketHandle::default()),
+            )
+            .expect("socket with handle");
+
+        let capability = table.rio_capability(stream).expect("RIO capability");
+
+        assert!(!capability.is_supported());
+        assert_eq!(capability.error_code(), None);
+        assert_eq!(capability.function_count(), 0);
     }
 
     #[cfg(windows)]
