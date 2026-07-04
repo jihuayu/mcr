@@ -63,3 +63,5 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   `memcmp`, `memset`, and `strlen`, emits normal `mcr_perf_baseline` output, and
   participates in `MCR_PERF_ENFORCE_GATES=1` through
   `MCR_PERF_MAX_WALL_MS_LIBC_INTRINSIC_DISPATCH`.
+- Promoted the worker-pool diagnostics baseline into the same opt-in gate
+  mechanism with `MCR_PERF_MAX_WALL_MS_WORKER_POOL_DIAGNOSTICS_SNAPSHOT`.

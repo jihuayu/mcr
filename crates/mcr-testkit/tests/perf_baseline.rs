@@ -481,6 +481,7 @@ fn worker_pool_diagnostics_baseline_report(suite: &str) -> PerfBaselineReport {
         .with_field("guest_task_max_workers", diagnostics[0].max_workers())
         .with_field("io_completion_max_workers", diagnostics[1].max_workers()),
     );
+    enforce_wall_time_gate("worker_pool_diagnostics_snapshot", wall_time, 1_000);
 
     report
 }
