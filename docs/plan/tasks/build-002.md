@@ -1,7 +1,7 @@
 ---
 id: build-002
 scope: phase3-build
-status: pending
+status: in-progress
 depends-on: [build-001, snapshot-001]
 ---
 
@@ -36,3 +36,8 @@ cargo test -p mcr-snapshot
 - `COPY` and `ADD` must not escape the build context.
 - Preserve deterministic file ordering and metadata sidecar behavior.
 - Remote URL `ADD` and tar auto-extract remain unsupported.
+- Initial context checkpoint: added build context loading with deterministic
+  path ordering, basic `.dockerignore` filtering, metadata-only `ARG`, `ENV`,
+  and `WORKDIR` planning, and safe local `COPY`/`ADD` planning into
+  `mcr-snapshot` sidecar metadata. `RUN`, remote `ADD`, tar auto-extract, and
+  image execution remain outside this checkpoint.
