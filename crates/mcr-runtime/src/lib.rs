@@ -3153,6 +3153,13 @@ impl NativePatchCache {
     }
 
     fn invalidate_range(&mut self, start: u64, end: u64) {
+        if !self
+            .scanned_ranges
+            .iter()
+            .any(|(range_start, range_end)| ranges_overlap(start, end, *range_start, *range_end))
+        {
+            return;
+        }
         self.image_metadata_eligible = false;
         self.scanned_ranges.retain(|(range_start, range_end)| {
             !ranges_overlap(start, end, *range_start, *range_end)
@@ -4482,14 +4489,16 @@ impl MemorySyscalls for RuntimeSubsystems {
         }
         if let SyscallReturn::Success(result) = outcome.result {
             match request.syscall {
-                mcr_sys::Syscall::Mmap => {
+                mcr_sys::Syscall::Mmap if arg_u32(request, 2) & mcr_sys::LINUX_PROT_EXEC != 0 => {
                     self.invalidate_native_patch_cache_range(pid, result, arg(request, 1));
                 }
-                mcr_sys::Syscall::Munmap | mcr_sys::Syscall::Mprotect => {
+                mcr_sys::Syscall::Munmap => {
                     self.invalidate_native_patch_cache_range(pid, arg(request, 0), arg(request, 1));
                 }
-                mcr_sys::Syscall::Brk => {
-                    self.invalidate_native_patch_cache(pid);
+                mcr_sys::Syscall::Mprotect
+                    if arg_u32(request, 2) & mcr_sys::LINUX_PROT_EXEC != 0 =>
+                {
+                    self.invalidate_native_patch_cache_range(pid, arg(request, 0), arg(request, 1));
                 }
                 _ => {}
             }
@@ -12921,6 +12930,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+    }
+
+    #[test]
+    fn native_patch_cache_survives_guest_brk_changes() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[0x0f, 0x05, 0x90],
+        ))
+        .unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+        let scanned_ranges = runtime
+            .dispatcher
+            .subsystems()
+            .native_patch_caches
+            .get(&pid)
+            .unwrap()
+            .scanned_ranges
+            .clone();
+        let current_brk = runtime.memory().current_brk();
+        let request =
+            SyscallRequest::from_guest_context(context(Syscall::Brk, [current_brk, 0, 0, 0, 0, 0]));
+
+        let outcome = runtime
+            .dispatcher
+            .subsystems_mut()
+            .dispatch_memory(&request);
+
+        assert_eq!(outcome.result, SyscallReturn::Success(current_brk));
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .scanned_ranges,
+            scanned_ranges
+        );
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
