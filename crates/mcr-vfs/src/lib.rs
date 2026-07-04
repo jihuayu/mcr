@@ -5418,6 +5418,8 @@ mod tests {
         let mut buffer = [0; 3];
         assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 3);
         assert_eq!(&buffer, b"cde");
+        assert_eq!(vfs.lseek(fd, 64, SeekWhence::Set).unwrap(), 64);
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 0);
         assert!(
             vfs.tree()
                 .lookup_path(&guest_path)

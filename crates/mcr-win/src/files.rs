@@ -456,6 +456,10 @@ fn submit_overlapped_at_platform(
 
     if ok == crate::windows::FALSE {
         let error = crate::windows::last_error();
+        if direction == HostIoDirection::Read && error == ERROR_HANDLE_EOF {
+            crate::windows::close_handle(event);
+            return HostIoSubmission::Completed(HostIoCompletion::new(direction, 0, buffer));
+        }
         if error != ERROR_IO_PENDING {
             crate::windows::close_handle(event);
             return HostIoSubmission::Failed(HostIoFailure::new(
@@ -479,9 +483,13 @@ fn submit_overlapped_at_platform(
     crate::windows::close_handle(event);
 
     if completed == crate::windows::FALSE {
+        let error = crate::windows::last_error();
+        if direction == HostIoDirection::Read && error == ERROR_HANDLE_EOF {
+            return HostIoSubmission::Completed(HostIoCompletion::new(direction, 0, buffer));
+        }
         HostIoSubmission::Failed(HostIoFailure::new(
             direction,
-            crate::error::last_windows_error(direction.operation()),
+            crate::error::windows_error(direction.operation(), error),
             buffer,
         ))
     } else {
@@ -710,6 +718,8 @@ const SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: u32 = 0x2;
 #[cfg(windows)]
 const ERROR_IO_PENDING: u32 = 997;
 #[cfg(windows)]
+const ERROR_HANDLE_EOF: u32 = 38;
+#[cfg(windows)]
 const TRUE: crate::windows::Bool = 1;
 
 #[cfg(windows)]
@@ -847,6 +857,12 @@ mod tests {
         };
         assert_eq!(read.bytes_transferred(), 3);
         assert_eq!(read.buffer(), b"bcd");
+
+        let eof = match file.submit_overlapped_read_at(64, vec![0; 3]) {
+            HostIoSubmission::Completed(completion) => completion,
+            other => panic!("expected completed EOF read, got {other:?}"),
+        };
+        assert_eq!(eof.bytes_transferred(), 0);
 
         let _ = std::fs::remove_file(path);
     }

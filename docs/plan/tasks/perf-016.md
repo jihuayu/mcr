@@ -65,3 +65,6 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   unmaterialized on open and read through the host adapter's offset-based
   overlapped boundary. Writes, truncation, and other mutations still
   materialize the file into VFS-owned memory before changing contents.
+- The read path treats overlapped EOF as a zero-byte Linux read, so ELF segment
+  tail probes and other offset reads past the host file end do not surface as
+  guest `EINVAL`.
