@@ -41,3 +41,9 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 - Do not introduce prestarted process workers in this task; that requires a
   separate design if MCR changes the one-host-process-per-container boundary.
 - Pool sizing must be bounded and observable in diagnostics.
+
+## Checkpoints
+
+- Added the first diagnostics-visible boundary in `mcr-task`: bounded pool
+  records for guest task execution and I/O completions, exposed through runtime
+  diagnostics without changing guest scheduling or process semantics.

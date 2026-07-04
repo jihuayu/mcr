@@ -1,6 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod host_worker_pool;
+
+pub use host_worker_pool::{
+    DEFAULT_GUEST_TASK_WORKERS, DEFAULT_IO_COMPLETION_WORKERS, HOST_WORKER_POOL_MAX_WORKERS,
+    HostWorkerPoolBoundary, HostWorkerPoolConfig, HostWorkerPoolConfigError,
+    HostWorkerPoolDiagnostics, HostWorkerPoolRole, HostWorkerPools,
+};
+
 use mcr_elf::{GuestImageError, GuestMemoryImage, InitialStackConfig, parse_load_plan};
 use mcr_sys::{
     CloneSyscallArgs, GuestAddress, GuestPid, GuestTid, KillSyscallArgs,
@@ -788,6 +796,7 @@ pub struct GuestKernel {
     next_tid: GuestTid,
     processes: BTreeMap<GuestPid, GuestProcess>,
     tasks: BTreeMap<GuestTid, GuestTask>,
+    host_worker_pools: HostWorkerPools,
 }
 
 impl GuestKernel {
@@ -797,6 +806,7 @@ impl GuestKernel {
             next_tid: INITIAL_GUEST_TID,
             processes: BTreeMap::new(),
             tasks: BTreeMap::new(),
+            host_worker_pools: HostWorkerPools::default_bounded(),
         };
         kernel.create_initial_process(program)?;
         Ok(kernel)
@@ -834,6 +844,16 @@ impl GuestKernel {
 
     pub fn tasks(&self) -> impl Iterator<Item = &GuestTask> {
         self.tasks.values()
+    }
+
+    #[must_use]
+    pub const fn host_worker_pools(&self) -> &HostWorkerPools {
+        &self.host_worker_pools
+    }
+
+    #[must_use]
+    pub const fn host_worker_pool_diagnostics(&self) -> [HostWorkerPoolDiagnostics; 2] {
+        self.host_worker_pools.diagnostics()
     }
 
     pub fn dispatch_for_current_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -2000,6 +2020,23 @@ mod tests {
         assert!(process.files().contains(0));
         assert!(process.files().contains(1));
         assert!(process.files().contains(2));
+    }
+
+    #[test]
+    fn host_worker_pool_diagnostics_are_bounded_without_scheduling_side_effects() {
+        let mut kernel = GuestKernel::new(test_program("/bin/init", 0x401000)).unwrap();
+        let before = kernel.host_worker_pool_diagnostics();
+
+        assert_eq!(before[0].role(), HostWorkerPoolRole::GuestTaskExecution);
+        assert_eq!(before[1].role(), HostWorkerPoolRole::IoCompletion);
+        assert!(before.iter().all(
+            |pool| pool.max_workers() > 0 && pool.max_workers() <= HOST_WORKER_POOL_MAX_WORKERS
+        ));
+
+        assert_eq!(kernel.fork_child(INITIAL_GUEST_TID).unwrap(), 2);
+        assert_eq!(kernel.host_worker_pool_diagnostics(), before);
+        assert_eq!(kernel.next_pid(), 3);
+        assert_eq!(kernel.next_tid(), 3);
     }
 
     #[test]

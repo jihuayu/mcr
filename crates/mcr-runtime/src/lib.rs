@@ -45,7 +45,8 @@ use mcr_sys::{
 };
 use mcr_task::{
     CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProcess, GuestProgram,
-    GuestTask, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
+    GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError,
+    TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -364,6 +365,7 @@ pub struct RuntimeDiagnostics {
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
     tasks: Vec<DiagnosticTask>,
+    worker_pools: Vec<HostWorkerPoolDiagnostics>,
     last_syscall: Option<DiagnosticSyscall>,
     in_flight_syscall: Option<DiagnosticSyscall>,
     native_execution_enabled: bool,
@@ -405,6 +407,7 @@ impl RuntimeDiagnostics {
                 .tasks()
                 .map(DiagnosticTask::from_guest_task)
                 .collect(),
+            worker_pools: kernel.host_worker_pool_diagnostics().to_vec(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
             in_flight_syscall: in_flight_syscall(events),
             native_execution_enabled,
@@ -444,6 +447,11 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub fn tasks(&self) -> &[DiagnosticTask] {
         &self.tasks
+    }
+
+    #[must_use]
+    pub fn worker_pools(&self) -> &[HostWorkerPoolDiagnostics] {
+        &self.worker_pools
     }
 
     #[must_use]
@@ -13703,6 +13711,13 @@ mod tests {
             &[b"/bin/app".to_vec(), b"--flag".to_vec()]
         );
         assert_eq!(diagnostics.envp(), &[b"A=B".to_vec()]);
+        assert_eq!(diagnostics.worker_pools().len(), 2);
+        assert!(
+            diagnostics
+                .worker_pools()
+                .iter()
+                .all(|pool| pool.max_workers() > 0 && pool.active_workers() == 0)
+        );
         assert!(diagnostics.vmas().iter().any(|vma| {
             vma.start() <= 0x401000
                 && 0x401000 < vma.end()
