@@ -352,6 +352,96 @@ pub enum HostConnectExSubmission {
     Pending(PendingHostConnectEx),
 }
 
+/// Submission returned by the host `AcceptEx` adapter.
+#[derive(Debug)]
+pub enum HostAcceptExSubmission {
+    Failed(HostError),
+    Pending(PendingHostAcceptEx),
+}
+
+/// Pending `AcceptEx` operation.
+#[derive(Debug)]
+pub struct PendingHostAcceptEx {
+    #[cfg(windows)]
+    platform: Option<WindowsPendingAcceptEx>,
+}
+
+impl PendingHostAcceptEx {
+    #[cfg(windows)]
+    fn from_windows_pending(platform: WindowsPendingAcceptEx) -> Self {
+        Self {
+            platform: Some(platform),
+        }
+    }
+
+    #[must_use]
+    pub fn overlapped_token(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(platform) = self.platform.as_ref() {
+            return platform.overlapped_token();
+        }
+        0
+    }
+
+    #[must_use]
+    pub fn matches_completion(&self, packet: HostIoCompletionPacket) -> bool {
+        self.overlapped_token() == packet.overlapped()
+    }
+
+    pub fn complete_from_packet(
+        mut self,
+        packet: HostIoCompletionPacket,
+    ) -> Result<(HostSocket, SocketAddr), HostError> {
+        if !self.matches_completion(packet) {
+            return Err(HostError::invalid_input(HostOperation::AcceptSocket));
+        }
+        if let Some(error) = packet.error_code() {
+            self.mark_completed_without_context_update();
+            return Err(crate::error::windows_error(
+                HostOperation::AcceptSocket,
+                error,
+            ));
+        }
+        self.mark_completed_platform()
+    }
+
+    #[cfg(windows)]
+    fn mark_completed_platform(&mut self) -> Result<(HostSocket, SocketAddr), HostError> {
+        let Some(platform) = self.platform.as_mut() else {
+            return Err(HostError::invalid_input(HostOperation::AcceptSocket));
+        };
+        platform.completed = true;
+        let accepted_ref = platform
+            .accepted
+            .as_ref()
+            .ok_or_else(|| HostError::invalid_input(HostOperation::AcceptSocket))?;
+        update_accept_context(accepted_ref.raw(), platform.listener.raw)?;
+        let peer = accepted_ref.peer_addr()?;
+        let accepted = platform
+            .accepted
+            .take()
+            .ok_or_else(|| HostError::invalid_input(HostOperation::AcceptSocket))?;
+        self.platform.take();
+        Ok((accepted, peer))
+    }
+
+    #[cfg(not(windows))]
+    fn mark_completed_platform(&mut self) -> Result<(HostSocket, SocketAddr), HostError> {
+        Err(HostError::unsupported(HostOperation::AcceptSocket))
+    }
+
+    #[cfg(windows)]
+    fn mark_completed_without_context_update(&mut self) {
+        if let Some(platform) = self.platform.as_mut() {
+            platform.completed = true;
+        }
+        self.platform.take();
+    }
+
+    #[cfg(not(windows))]
+    fn mark_completed_without_context_update(&mut self) {}
+}
+
 /// Pending `ConnectEx` operation.
 #[derive(Debug)]
 pub struct PendingHostConnectEx {
@@ -713,6 +803,11 @@ impl HostSocket {
         submit_connect_ex_platform(self, address)
     }
 
+    /// Submits an `AcceptEx` operation. The listener must be associated with an IOCP.
+    pub fn submit_accept_ex(&self) -> HostAcceptExSubmission {
+        submit_accept_ex_platform(self)
+    }
+
     /// Submits an overlapped receive. The socket must be associated with an IOCP.
     pub fn submit_overlapped_recv(&self, buffer: Vec<u8>) -> HostSocketIoSubmission {
         submit_overlapped_socket_io_platform(self, HostSocketIoDirection::Receive, buffer)
@@ -924,6 +1019,11 @@ fn submit_connect_ex_platform(
     _address: SocketAddr,
 ) -> HostConnectExSubmission {
     HostConnectExSubmission::Failed(HostError::unsupported(HostOperation::ConnectSocket))
+}
+
+#[cfg(not(windows))]
+fn submit_accept_ex_platform(_socket: &HostSocket) -> HostAcceptExSubmission {
+    HostAcceptExSubmission::Failed(HostError::unsupported(HostOperation::AcceptSocket))
 }
 
 #[cfg(not(windows))]
@@ -1457,6 +1557,78 @@ fn submit_connect_ex_platform(socket: &HostSocket, address: SocketAddr) -> HostC
 }
 
 #[cfg(windows)]
+fn submit_accept_ex_platform(listener: &HostSocket) -> HostAcceptExSubmission {
+    let function = match listener.extension_function(SocketFastPathKind::AcceptEx) {
+        Ok(function) => function,
+        Err(error) => return HostAcceptExSubmission::Failed(error),
+    };
+    let listener_addr = match listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => return HostAcceptExSubmission::Failed(error),
+    };
+    let family = if listener_addr.is_ipv4() {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    };
+    let accepted =
+        match open_socket_raw_platform(family, SocketKind::Stream, SocketProtocol::Tcp, true) {
+            Ok(socket) => socket,
+            Err(error) => return HostAcceptExSubmission::Failed(error),
+        };
+    let event = unsafe {
+        // SAFETY: Creating an unnamed manual-reset event with no security descriptor.
+        CreateEventW(
+            std::ptr::null_mut(),
+            TRUE,
+            crate::windows::FALSE,
+            std::ptr::null(),
+        )
+    };
+    if event.is_null() {
+        return HostAcceptExSubmission::Failed(crate::error::last_windows_error(
+            HostOperation::AcceptSocket,
+        ));
+    }
+
+    let overlapped = WsaOverlapped::new(event);
+    let mut platform = WindowsPendingAcceptEx::new(listener.clone_inner(), accepted, overlapped);
+    let accept_ex = unsafe {
+        // SAFETY: The pointer was returned by WSAIoctl for WSAID_ACCEPTEX on this socket.
+        std::mem::transmute::<usize, AcceptExFn>(function)
+    };
+    let mut bytes_received = 0u32;
+    let output_buffer = platform.output_buffer.as_mut_ptr().cast();
+    let overlapped = platform.overlapped_mut_ptr();
+    let ok = unsafe {
+        // SAFETY: Listener, accepted socket, output buffer, and OVERLAPPED outlive the operation.
+        accept_ex(
+            listener.raw(),
+            platform.accepted_raw(),
+            output_buffer,
+            0,
+            ACCEPTEX_ADDRESS_BUFFER_LEN,
+            ACCEPTEX_ADDRESS_BUFFER_LEN,
+            &mut bytes_received,
+            overlapped,
+        )
+    };
+    if ok == crate::windows::FALSE {
+        let error = crate::windows::wsa_last_error();
+        if error != WSA_IO_PENDING {
+            return HostAcceptExSubmission::Failed(HostError::with_code(
+                HostOperation::AcceptSocket,
+                crate::error::winsock_kind(error),
+                HostErrorCode::Winsock(error),
+            ));
+        }
+    }
+
+    platform.submitted = true;
+    HostAcceptExSubmission::Pending(PendingHostAcceptEx::from_windows_pending(platform))
+}
+
+#[cfg(windows)]
 fn submit_overlapped_socket_io_platform(
     socket: &HostSocket,
     direction: HostSocketIoDirection,
@@ -1710,6 +1882,29 @@ fn update_connect_context(socket: crate::windows::Socket) -> HostResult<()> {
 }
 
 #[cfg(windows)]
+fn update_accept_context(
+    accepted: crate::windows::Socket,
+    listener: crate::windows::Socket,
+) -> HostResult<()> {
+    let status = unsafe {
+        // SAFETY: `listener` is the listening socket that produced `accepted` through AcceptEx.
+        setsockopt(
+            accepted,
+            SOL_SOCKET,
+            SO_UPDATE_ACCEPT_CONTEXT,
+            std::ptr::from_ref(&listener).cast(),
+            std::mem::size_of::<crate::windows::Socket>() as i32,
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::AcceptSocket,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn duration_to_poll_timeout(duration: Duration) -> i32 {
     if duration.is_zero() {
         return 0;
@@ -1852,6 +2047,8 @@ const SO_ERROR: i32 = 0x1007;
 #[cfg(windows)]
 const SO_TYPE: i32 = 0x1008;
 #[cfg(windows)]
+const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700b;
+#[cfg(windows)]
 const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 #[cfg(windows)]
 const TCP_NODELAY: i32 = 0x0001;
@@ -1962,6 +2159,18 @@ impl Default for RioExtensionFunctionTable {
 const RIO_FUNCTION_COUNT: usize = 13;
 
 #[cfg(windows)]
+type AcceptExFn = unsafe extern "system" fn(
+    listen_socket: crate::windows::Socket,
+    accept_socket: crate::windows::Socket,
+    output_buffer: *mut std::ffi::c_void,
+    receive_data_len: u32,
+    local_address_len: u32,
+    remote_address_len: u32,
+    bytes_received: *mut u32,
+    overlapped: *mut std::ffi::c_void,
+) -> crate::windows::Bool;
+
+#[cfg(windows)]
 type ConnectExFn = unsafe extern "system" fn(
     socket: crate::windows::Socket,
     name: *const Sockaddr,
@@ -1971,6 +2180,76 @@ type ConnectExFn = unsafe extern "system" fn(
     bytes_sent: *mut u32,
     overlapped: *mut std::ffi::c_void,
 ) -> crate::windows::Bool;
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsPendingAcceptEx {
+    listener: Arc<HostSocketInner>,
+    accepted: Option<HostSocket>,
+    overlapped: Box<WsaOverlapped>,
+    output_buffer: Vec<u8>,
+    submitted: bool,
+    completed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsPendingAcceptEx {
+    fn new(
+        listener: Arc<HostSocketInner>,
+        accepted: HostSocket,
+        overlapped: WsaOverlapped,
+    ) -> Self {
+        Self {
+            listener,
+            accepted: Some(accepted),
+            overlapped: Box::new(overlapped),
+            output_buffer: vec![0; (ACCEPTEX_ADDRESS_BUFFER_LEN * 2) as usize],
+            submitted: false,
+            completed: false,
+        }
+    }
+
+    fn accepted_raw(&self) -> crate::windows::Socket {
+        self.accepted
+            .as_ref()
+            .expect("accepted socket present while AcceptEx is pending")
+            .raw()
+    }
+
+    fn overlapped_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        (&mut *self.overlapped as *mut WsaOverlapped).cast()
+    }
+
+    fn overlapped_token(&self) -> usize {
+        (&*self.overlapped as *const WsaOverlapped) as usize
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPendingAcceptEx {
+    fn drop(&mut self) {
+        if self.submitted && !self.completed {
+            let overlapped = self.overlapped_mut_ptr();
+            unsafe {
+                // SAFETY: The listener and OVERLAPPED are owned by this pending operation.
+                let _ = CancelIoEx(self.listener.raw as crate::windows::Handle, overlapped);
+                let mut bytes_transferred = 0u32;
+                let mut flags = 0u32;
+                let _ = WSAGetOverlappedResult(
+                    self.listener.raw,
+                    overlapped,
+                    &mut bytes_transferred,
+                    TRUE,
+                    &mut flags,
+                );
+            }
+        }
+        crate::windows::close_handle(self.overlapped.event);
+    }
+}
+
+#[cfg(windows)]
+const ACCEPTEX_ADDRESS_BUFFER_LEN: u32 = std::mem::size_of::<SockaddrStorage>() as u32 + 16;
 
 #[cfg(windows)]
 #[derive(Debug)]
@@ -2451,8 +2730,8 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostConnectExSubmission, HostSocketIoDirection, HostSocketIoSubmission, NetworkStack,
-        SocketCompletionKind, SocketEvents,
+        HostAcceptExSubmission, HostConnectExSubmission, HostSocketIoDirection,
+        HostSocketIoSubmission, NetworkStack, SocketCompletionKind, SocketEvents,
     };
 
     #[cfg(windows)]
@@ -2752,6 +3031,49 @@ mod tests {
 
         assert_eq!(client.peer_addr().unwrap(), server.local_addr().unwrap());
         assert_eq!(peer.ip(), client.local_addr().unwrap().ip());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acceptex_completion_updates_socket_context() {
+        let stack = NetworkStack::start().unwrap();
+        let port = HostIoCompletionPort::new().unwrap();
+        let listener = stack
+            .open_socket_with_iocp(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                SocketProtocol::Tcp,
+                &port,
+                37,
+            )
+            .unwrap();
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let local = listener.local_addr().unwrap();
+        let pending = match listener.submit_accept_ex() {
+            HostAcceptExSubmission::Pending(pending) => pending,
+            other => panic!("expected pending AcceptEx, got {other:?}"),
+        };
+        let client = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        client.connect(local).unwrap();
+        let packet = port
+            .get(Some(std::time::Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.completion_key(), 37);
+        assert!(pending.matches_completion(packet));
+        let (server, peer) = pending.complete_from_packet(packet).unwrap();
+
+        assert_eq!(peer.ip(), client.local_addr().unwrap().ip());
+        assert_eq!(client.peer_addr().unwrap(), server.local_addr().unwrap());
     }
 
     #[cfg(windows)]

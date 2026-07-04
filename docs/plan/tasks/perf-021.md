@@ -64,3 +64,9 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   `ConnectEx`, readiness draining consumes the matching IOCP packet, and the
   existing Linux `Connecting` -> `Connected` state machine completes through the
   `Connect` readiness class. Plain connect remains the fallback.
+- Added the real `AcceptEx` host submission boundary. `HostSocket` can submit
+  an IOCP-associated listener through the resolved `AcceptEx` function pointer,
+  keep the accepted socket, address buffer, and `OVERLAPPED` state alive, cancel
+  unfinished accepts on drop, complete from a matching IOCP packet, and apply
+  `SO_UPDATE_ACCEPT_CONTEXT`. Wiring this into `mcr-net` accept readiness
+  remains in this task.
