@@ -4977,11 +4977,36 @@ impl RuntimeSubsystems {
             .clone();
         if pid == self.selected_memory_pid {
             self.drop_selected_memory_allocations();
-            let memory = GuestMemory::from_image(&image).map_err(|error| error.errno())?;
+            let memory = self.memory_from_process_image(&image)?;
             *self.files.memory_mut() = memory;
         } else {
-            let memory = GuestMemory::from_image(&image).map_err(|error| error.errno())?;
+            let memory = self.memory_from_process_image(&image)?;
             *self.memory_for_process_mut(pid).ok_or(LinuxErrno::ESRCH)? = memory;
+        }
+        Ok(())
+    }
+
+    fn memory_from_process_image(
+        &self,
+        image: &mcr_elf::GuestMemoryImage,
+    ) -> Result<GuestMemory, LinuxErrno> {
+        let mut memory = GuestMemory::from_image(image).map_err(|error| error.errno())?;
+        self.configure_new_process_memory(&mut memory)?;
+        Ok(memory)
+    }
+
+    fn configure_new_process_memory(&self, memory: &mut GuestMemory) -> Result<(), LinuxErrno> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            if self.native_execution {
+                memory
+                    .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
+                    .map_err(|error| error.errno())?;
+            }
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            let _ = memory;
         }
         Ok(())
     }
@@ -11325,6 +11350,52 @@ mod tests {
             SyscallReturn::Success(WINDOWS_NATIVE_MMAP_BASE)
         );
         assert!(WINDOWS_NATIVE_MMAP_BASE <= i32::MAX as u64);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_execve_preserves_patchable_low_mmap_base() {
+        let _guard = crate::test_support::native_execution_test_guard();
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content("/bin/new", test_program_bytes(0x501000), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.enable_native_execution();
+
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+        runtime.memory_mut().write(0x402120, b"/bin/new\0").unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0x402120u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402008, &0u64.to_le_bytes())
+            .unwrap();
+
+        let exec =
+            runtime.dispatch_syscall(context(Syscall::Execve, [0x402100, 0x402000, 0, 0, 0, 0]));
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+
+        let mapped = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                0,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS),
+                u64::MAX,
+                0,
+            ],
+        ));
+
+        assert_eq!(
+            mapped.result,
+            SyscallReturn::Success(WINDOWS_NATIVE_MMAP_BASE)
+        );
     }
 
     #[test]
