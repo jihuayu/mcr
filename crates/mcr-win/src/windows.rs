@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::ffi::c_void;
 
 pub(crate) type Bool = i32;

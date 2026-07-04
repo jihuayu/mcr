@@ -1876,7 +1876,7 @@ mod tests {
             Err(GuestMemoryError::InvalidFlags)
         );
         assert_eq!(
-            memory.madvise(u64::MAX & !(GUEST_PAGE_SIZE - 1), GUEST_PAGE_SIZE * 2, 0),
+            memory.madvise(!(GUEST_PAGE_SIZE - 1), GUEST_PAGE_SIZE * 2, 0),
             Err(GuestMemoryError::InvalidLength)
         );
     }

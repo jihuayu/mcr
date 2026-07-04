@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use core::fmt;
 
 use iced_x86::{

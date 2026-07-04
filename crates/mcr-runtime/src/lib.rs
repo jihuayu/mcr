@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 pub mod memory;
 pub mod run_rootfs;
 
@@ -3026,13 +3028,13 @@ where
         } else {
             task.regs()
         };
-        return Ok(GuestExecutionStep::new(
+        Ok(GuestExecutionStep::new(
             tid,
             before_rip,
             final_regs.rip(),
             final_regs.rax(),
             task.state(),
-        ));
+        ))
     }
 }
 
@@ -5445,8 +5447,7 @@ fn read_elf64_program_headers(
     let ph_offset = le_u64(&elf_header[32..40]);
     let ph_entry_size = usize::from(le_u16(&elf_header[54..56]));
     let ph_count = usize::from(le_u16(&elf_header[56..58]));
-    if ph_entry_size < ELF_PROGRAM_HEADER_MIN_LEN
-        || ph_entry_size > MAX_ELF_PROGRAM_HEADER_LEN
+    if !(ELF_PROGRAM_HEADER_MIN_LEN..=MAX_ELF_PROGRAM_HEADER_LEN).contains(&ph_entry_size)
         || ph_count > MAX_ELF_PROGRAM_HEADERS
     {
         return None;
