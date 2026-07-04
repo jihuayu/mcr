@@ -60,3 +60,7 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   passed. Current local baseline: shell startup `355.664ms`, guest small-file
   loop `9737.243ms`, directory metadata walk `30309.548ms`, `curl
   https://example.com` `1947.129ms`, and `git ls-remote` `114131.414ms`.
+- 2026-07-04 planning update: the `git ls-remote` baseline is large enough to
+  threaten product viability. `perf-015` reopens shell/network metadata
+  performance as a front-loaded gate instead of leaving threshold storage and
+  trend dashboards as the only follow-up.

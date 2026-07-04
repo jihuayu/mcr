@@ -2,7 +2,7 @@
 
 ## Objective
 
-This analysis decomposes the runtime plan into independently reviewable implementation tasks ending at Phase 2 completion: BusyBox/Alpine MVP, shell `fork+exec`, TCP-client networking with bounded DNS, and minimal `/proc`/`/dev`.
+This analysis decomposes the runtime plan into independently reviewable implementation tasks ending at Phase 2 completion: BusyBox/Alpine MVP, shell `fork+exec`, TCP-client networking with bounded DNS, minimal `/proc`/`/dev`, and front-loaded performance viability for high-value development commands.
 
 Dockerfile builder, OCI output, BuildKit, and Docker Engine API are outside this task graph.
 
@@ -38,6 +38,7 @@ Each integration task must connect real modules instead of leaving stubs.
 | Proc/dev path | Shell and language runtimes read `/proc/self/*` and `/dev/*` through VFS. | `vfs-004`, `integ-002`, `workload-001` |
 | Network path | Guest TCP socket syscalls reach the host through `mcr-net`/`mcr-win`, and DNS works through `/etc/hosts` plus the documented resolver/proxy path. | `net-001`, `integ-003` |
 | Event path | Guest `poll`/`epoll` consumes level-trigger socket, pipe, stdio, proc/dev, and internal readiness. | `net-002`, `integ-003` |
+| Performance viability path | Shell/network metadata workloads report where wall time is spent and avoid pathological scheduler, remap, clone/exec, and pipe handoff overhead. | `perf-001`, `perf-010`, `perf-013`, `perf-015` |
 | Workload matrix | Runtime executes fixed Node/Python/Go/Rust discovery commands. | `workload-001` |
 | Guest TLS path | `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` updates per-task FS-base state observed by guest execution. | `task-001`, `jit-001`, `elf-003`, `workload-001` |
 
@@ -65,10 +66,16 @@ boot-001
       -> net-001 -> net-002
       -> integ-002
       -> integ-003
+      -> perf-001 -> perf-015
       -> workload-001
 ```
 
 Some module tasks can run in parallel after `boot-001` if separate worktrees are available and their paths do not overlap. Integration tasks are serial gates.
+
+`perf-015` is intentionally before the final workload-matrix claim. It may use
+the existing perf baselines plus focused runtime instrumentation to decide
+whether shell/network latency is close enough to host-order behavior to justify
+continuing with wider compatibility.
 
 ## Task Boundary Rules
 

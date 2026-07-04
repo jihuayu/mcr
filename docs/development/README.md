@@ -2,12 +2,15 @@
 
 ## Current Milestone Boundary
 
-Development is split into two required runtime stages. Build work starts only after Phase 2 exits.
+Development is split into two required runtime stages. Build work starts only
+after Phase 2 exits. Performance validation is not a post-Phase-2 activity: it
+is a front-loaded product gate for deciding whether the runtime path is worth
+expanding.
 
 | Stage | Goal | Exit criteria |
 |---|---|---|
-| MVP | Run static Linux x86-64 ELF and BusyBox/Alpine commands from a rootfs. | BusyBox smoke suite passes with P0 syscall coverage and deterministic crash diagnostics. |
-| Phase 2 | Run shell commands, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc`/`/dev`. | Alpine shell, curl/git networking, and language runtime smoke tests pass under the documented ABI subset. |
+| MVP | Run static Linux x86-64 ELF and BusyBox/Alpine commands from a rootfs. | BusyBox smoke suite passes with P0 syscall coverage, deterministic crash diagnostics, and no known startup-path performance cliff. |
+| Phase 2 | Run shell commands, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc`/`/dev`. | Alpine shell, curl/git networking, and language runtime smoke tests pass under the documented ABI subset, with shell/network metadata latency passing the active performance viability gate. |
 | Phase 3 | Build constrained Dockerfile images with native MCR builder and OCI/Docker output. | `mcr build` produces valid OCI layout and Docker tar for fixed Dockerfile fixtures. |
 | Phase 4 | Adapt stable build contracts to BuildKit worker/executor. | `buildctl` drives the supported Dockerfile subset through the MCR worker. |
 
@@ -79,6 +82,24 @@ Required capabilities:
 - level-trigger `poll` and `epoll` compatibility over a shared readiness queue;
 - per-task guest FS-base TLS through `ARCH_SET_FS` and `ARCH_GET_FS`;
 - smoke tests for shell, curl/git, and language runtimes.
+- performance proof for the high-risk user-visible paths before broadening the
+  workload matrix: shell startup, `curl`, `git ls-remote`, shallow `git clone`,
+  native execution patching, and cross-process pipe handoff.
+
+### Performance Viability Gate
+
+Performance work is allowed to move ahead of broader compatibility when a
+measured path threatens product value. Current `main` has a public-network
+baseline where `curl https://example.com` is about `1947ms`, while
+`git ls-remote https://github.com/octocat/Hello-World.git HEAD` is about
+`114131ms`. That gap is too large to treat as a late backend optimization.
+
+The immediate performance gate is `perf-015`. It must classify where wall time
+goes with an opt-in summary trace, reduce pathological scheduler/remap or IPC
+handoff costs, and rerun the public-network baseline before later workload or
+build milestones claim progress. If the gate cannot get `git ls-remote` near
+host-order latency, the project direction must be reconsidered before investing
+in wider compatibility.
 
 ## Validation Policy
 
@@ -193,8 +214,8 @@ through the host shell.
 
 Ignored performance baselines print `mcr_perf_baseline.version=1` reports with
 environment metadata, wall time, operation counts, and derived throughput. They
-are measurement gates, not tuning changes or pass/fail thresholds. Run local
-subsystem baselines with:
+started as measurement gates, but selected paths can be promoted to viability
+gates when they determine product value. Run local subsystem baselines with:
 
 ```powershell
 cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
@@ -218,6 +239,15 @@ when `MCR_PERF_PUBLIC_NETWORK=1` is set:
 ```powershell
 MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
 MCR_BIN=target/debug/mcr MCR_PERF_PUBLIC_NETWORK=1 cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
+```
+
+For active performance viability work, run the release binary as well as the
+ignored baseline harness so debug-build overhead does not hide the runtime
+shape:
+
+```powershell
+cargo build --release -p mcr-cli
+target\release\mcr.exe run-rootfs tests\fixtures\rootfs\alpine-rootfs /bin/sh -c "GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null"
 ```
 
 Linux x86-64 guest smokes must be treated as x86_64-host validation. Do not
@@ -270,7 +300,8 @@ The delivery order is:
 8. Phase 2 task/process/futex/signals;
 9. Phase 2 procfs/devfs;
 10. Phase 2 network/eventing;
-11. Phase 2 workload smoke matrix.
+11. performance viability for shell/network metadata paths;
+12. Phase 2 workload smoke matrix.
 
 Tasks with no path overlap may be parallelized in separate worktrees, but dependent integration tasks wait for predecessor tasks to land.
 
@@ -283,7 +314,7 @@ The following are intentionally outside MVP and Phase 2:
 - BuildKit worker/executor before Phase 4;
 - Docker Engine API facade;
 - overlay lower/upper layer implementation beyond VFS design compatibility;
-- IOCP performance rewrite;
+- broad IOCP performance rewrite after the current viability gate is solved;
 - general UDP socket semantics outside the DNS path;
 - AF_UNIX compatibility;
 - edge-triggered epoll and one-shot/exclusive epoll watches;

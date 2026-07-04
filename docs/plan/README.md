@@ -30,6 +30,10 @@ Every task file contains:
 - Stage only paths listed in the task.
 - If a task changes public behavior, update the relevant design doc listed in `context`.
 - Do not implement backlog items inside MVP/Phase 2 tasks.
+- Performance viability gates may be promoted ahead of compatibility or build
+  work when measured latency threatens product value. They must be represented
+  by an explicit task, record before/after measurements, and stay focused on
+  the diagnosed runtime bottleneck rather than reopening broad backend rewrites.
 
 ## Review Rules
 

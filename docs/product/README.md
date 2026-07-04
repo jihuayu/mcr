@@ -6,6 +6,13 @@ MCR is a Windows-native Linux userspace runtime for trusted development workload
 
 The first planned delivery is not a Docker Desktop replacement. It is the runtime foundation needed before any Dockerfile builder, OCI image writer, BuildKit worker, or Docker Engine API facade is worth building.
 
+Performance is part of that foundation, not a late polish pass. MCR only has
+product value if common Linux development commands start quickly enough on
+Windows to feel meaningfully lighter than a VM-style workflow. The runtime must
+therefore prove the highest-risk performance paths early, especially shell
+startup, cross-process pipe protocols, public-network metadata fetches, and
+language runtime startup.
+
 After Phase 2, the preferred build direction is:
 
 1. deliver a native MCR builder that can execute a constrained Dockerfile subset and export OCI/Docker images;
@@ -24,8 +31,8 @@ The current plan completes two stages:
 
 | Stage | Product result | Required user-visible proof |
 |---|---|---|
-| MVP | Static ELF and BusyBox/Alpine commands run from a Linux rootfs. | `mcr run-rootfs alpine-rootfs /bin/busybox echo hello`, `ls /`, and `cat /etc/os-release` succeed. |
-| Phase 2 | Shell, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc` make common development tools usable. | `alpine sh -c`, `curl`, `git clone`, `node -v`, `python -V`, `go version`, and `cargo --version` smoke tests succeed under the documented ABI subset. |
+| MVP | Static ELF and BusyBox/Alpine commands run from a Linux rootfs. | `mcr run-rootfs alpine-rootfs /bin/busybox echo hello`, `ls /`, and `cat /etc/os-release` succeed with no obvious startup-path performance pathology. |
+| Phase 2 | Shell, common `fork+exec`, TCP-client networking, bounded DNS, and minimal `/proc` make common development tools usable. | `alpine sh -c`, `curl`, `git clone`, `git ls-remote`, `node -v`, `python -V`, `go version`, and `cargo --version` smoke tests succeed under the documented ABI subset, and the highest-value network metadata paths pass the active performance viability gate. |
 
 ## Supported Workloads
 
@@ -75,7 +82,10 @@ Phase 2 is complete when:
 - outbound TCP, bounded DNS, and level-trigger `poll`/`epoll` compatibility cover `curl`, `git`, and package-manager fetch paths;
 - guest thread-local storage is supported through per-task `ARCH_SET_FS`/`ARCH_GET_FS` FS-base state, not host Rust TLS;
 - `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/environ`, `/proc/self/fd`, `/dev/null`, `/dev/zero`, and `/dev/urandom` exist;
-- fixed smoke tests for Alpine shell, network tools, and language runtimes pass.
+- fixed smoke tests for Alpine shell, network tools, and language runtimes pass;
+- selected high-value performance smokes, starting with shell startup and
+  `git ls-remote`, are close enough to host behavior that the runtime is worth
+  continuing before wider compatibility or build work proceeds.
 
 ## Product Decisions
 
@@ -84,6 +94,7 @@ Phase 2 is complete when:
 | Host and guest architecture | Windows x86-64 host, Linux x86-64 guest | Same-ISA execution avoids cross-architecture CPU emulation during the first runtime milestone. |
 | Trust model | Trusted development workloads | Strong sandboxing would dominate the design and block the runtime proof. |
 | Process model | One host process per guest container through Phase 2 | This keeps guest IDs, fd tables, futex keys, signals, and `/proc` under one runtime authority. |
+| Performance validation | Front-loaded product gate | Startup, IPC handoff, and network metadata latency determine whether the runtime has product value; pathological overhead must block milestone expansion instead of moving silently to backlog. |
 | gVisor reuse | Reference only | gVisor's syscall tables, tests, and architecture are useful, but its platform layer depends on Linux mechanisms. |
 | BuildKit reuse | Native builder first, BuildKit worker second | Runtime correctness, snapshot diff, and OCI output must exist before a BuildKit executor can be meaningful. |
 

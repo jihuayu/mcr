@@ -2,11 +2,15 @@
 
 ## Purpose And Boundary
 
-MCR's first performance goal is to reduce the overhead of the Windows userspace
-Linux ABI runtime without changing guest-visible Linux semantics. Performance
-backends are implementation details behind the same syscall, fd, task, memory,
-and readiness contracts documented in [Runtime design](runtime.md) and
-[Network ABI design](networking.md).
+MCR's first performance goal is to prove that the Windows userspace Linux ABI
+runtime can be valuable before the project broadens compatibility. This is not
+a late tuning phase. Startup latency, cross-process pipe protocols, public
+network metadata fetches, and native execution handoff costs must be measured
+and fixed early when they threaten product value.
+
+Performance backends remain implementation details behind the same syscall, fd,
+task, memory, and readiness contracts documented in [Runtime design](runtime.md)
+and [Network ABI design](networking.md).
 
 The design targets trusted development workloads that are syscall-heavy,
 I/O-heavy, or network-heavy, especially shell pipelines, `curl`, `git`, package
@@ -44,6 +48,31 @@ VFS and Windows file adapter.
    replacing a readiness implementation with IOCP-fed readiness state.
 5. Avoid optimizations that silently weaken fork, fd lifetime, close-on-exec,
    errno, path, or socket semantics.
+6. Treat product-critical latency cliffs as milestone blockers, not as generic
+   backlog items.
+
+## Performance-First Viability Gate
+
+Correctness remains mandatory, but a correct runtime that makes common
+development commands feel unusable is not a viable product. The plan therefore
+front-loads performance validation for the smallest workloads that expose the
+highest-risk overhead:
+
+- shell startup and short `sh -c` commands;
+- cross-process pipe protocols such as `git` talking to `git-remote-https`;
+- public-network metadata fetches with small payloads, especially `git
+  ls-remote`;
+- shallow clone and package-manager metadata paths;
+- native execution patch/cache behavior for language runtime startup.
+
+The current `main` baseline proves why this gate exists: `curl
+https://example.com` is about `1947ms`, while `git ls-remote
+https://github.com/octocat/Hello-World.git HEAD` is about `114131ms`. That
+shape points to runtime handoff overhead rather than network throughput alone.
+`perf-015` owns the first product-value proof: add an opt-in performance summary
+trace, classify scheduler sleep versus memory remap versus clone/exec versus
+pipe handoff, then optimize the dominant path before the wider workload matrix
+or build plane advances.
 
 ## File And I/O Optimization
 
@@ -383,7 +412,11 @@ The first baseline suites are intentionally split by subsystem boundary:
   `MCR_PERF_PUBLIC_NETWORK=1`, while the `perf_dns` and `perf_worker_pool`
   filters provide task-specific host-only reports for active perf checkpoints.
 
-These suites are baselines, not performance assertions. They should fail only
-when the measured workload itself fails. Thresholds, trend storage, and
-regression budgets belong in later performance tasks after `workload-001` makes
-the Phase 2 workload matrix stable.
+These suites started as baselines, not performance assertions. For
+product-critical paths, that is no longer enough. `perf-015` promotes selected
+shell/network metadata measurements into a viability gate: the benchmark must
+still report raw wall time and operation counts, but the task may block
+milestone progress when the runtime remains orders of magnitude slower than the
+host for small payloads. Long-term threshold storage and trend dashboards can
+remain later work; the immediate gate is local, repeatable, and tied to
+specific commands.
