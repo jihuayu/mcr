@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{HostError, HostErrorCode, HostOperation, HostResult};
-use crate::iocp::HostIoCompletionPort;
+use crate::iocp::{HostIoCompletionPacket, HostIoCompletionPort};
 
 /// Host address family for socket creation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -226,6 +226,201 @@ impl<'a> SocketPoll<'a> {
     }
 }
 
+/// Direction for an overlapped host socket buffer operation.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HostSocketIoDirection {
+    Receive,
+    Send,
+}
+
+impl HostSocketIoDirection {
+    const fn operation(self) -> HostOperation {
+        match self {
+            Self::Receive => HostOperation::RecvSocket,
+            Self::Send => HostOperation::SendSocket,
+        }
+    }
+}
+
+/// Completion of an overlapped host socket buffer operation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostSocketIoCompletion {
+    direction: HostSocketIoDirection,
+    bytes_transferred: usize,
+    buffer: Vec<u8>,
+}
+
+impl HostSocketIoCompletion {
+    fn new(direction: HostSocketIoDirection, bytes_transferred: usize, buffer: Vec<u8>) -> Self {
+        Self {
+            direction,
+            bytes_transferred,
+            buffer,
+        }
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> HostSocketIoDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn bytes_transferred(&self) -> usize {
+        self.bytes_transferred
+    }
+
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    #[must_use]
+    pub fn into_buffer(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
+/// Failed overlapped host socket buffer operation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostSocketIoFailure {
+    direction: HostSocketIoDirection,
+    error: HostError,
+    buffer: Vec<u8>,
+}
+
+impl HostSocketIoFailure {
+    fn new(direction: HostSocketIoDirection, error: HostError, buffer: Vec<u8>) -> Self {
+        Self {
+            direction,
+            error,
+            buffer,
+        }
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> HostSocketIoDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> &HostError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (HostError, Vec<u8>) {
+        (self.error, self.buffer)
+    }
+}
+
+pub type HostSocketIoResult = Result<HostSocketIoCompletion, HostSocketIoFailure>;
+
+/// Submission returned by the overlapped host socket adapter.
+#[derive(Debug)]
+pub enum HostSocketIoSubmission {
+    Completed(HostSocketIoCompletion),
+    Failed(HostSocketIoFailure),
+    Pending(PendingHostSocketIo),
+}
+
+impl From<HostSocketIoResult> for HostSocketIoSubmission {
+    fn from(value: HostSocketIoResult) -> Self {
+        match value {
+            Ok(completion) => Self::Completed(completion),
+            Err(failure) => Self::Failed(failure),
+        }
+    }
+}
+
+/// Pending overlapped host socket operation.
+#[derive(Debug)]
+pub struct PendingHostSocketIo {
+    direction: HostSocketIoDirection,
+    buffer: Option<Vec<u8>>,
+    #[cfg(windows)]
+    platform: Option<WindowsPendingSocketIo>,
+}
+
+impl PendingHostSocketIo {
+    #[cfg(windows)]
+    fn from_windows_pending(
+        direction: HostSocketIoDirection,
+        platform: WindowsPendingSocketIo,
+        buffer: Vec<u8>,
+    ) -> Self {
+        Self {
+            direction,
+            buffer: Some(buffer),
+            platform: Some(platform),
+        }
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> HostSocketIoDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        self.buffer.as_deref().unwrap_or(&[])
+    }
+
+    #[must_use]
+    pub fn overlapped_token(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(platform) = self.platform.as_ref() {
+            return platform.overlapped_token();
+        }
+        0
+    }
+
+    #[must_use]
+    pub fn matches_completion(&self, packet: HostIoCompletionPacket) -> bool {
+        self.overlapped_token() == packet.overlapped()
+    }
+
+    #[must_use]
+    pub fn complete_from_packet(
+        mut self,
+        packet: HostIoCompletionPacket,
+    ) -> HostSocketIoSubmission {
+        if !self.matches_completion(packet) {
+            return HostSocketIoSubmission::Pending(self);
+        }
+        let buffer = self.buffer.take().unwrap_or_default();
+        if packet.bytes_transferred() as usize > buffer.len() {
+            self.mark_completed_platform();
+            return HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
+                self.direction,
+                HostError::invalid_input(self.direction.operation()),
+                buffer,
+            ));
+        }
+        self.mark_completed_platform();
+        HostSocketIoSubmission::Completed(HostSocketIoCompletion::new(
+            self.direction,
+            packet.bytes_transferred() as usize,
+            buffer,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn mark_completed_platform(&mut self) {
+        if let Some(platform) = self.platform.as_mut() {
+            platform.completed = true;
+        }
+        self.platform.take();
+    }
+
+    #[cfg(not(windows))]
+    fn mark_completed_platform(&mut self) {}
+}
+
 /// Winsock runtime lifetime guard.
 #[derive(Debug)]
 pub struct NetworkStack {
@@ -309,6 +504,11 @@ impl HostSocket {
         self.inner.raw
     }
 
+    #[cfg(windows)]
+    fn clone_inner(&self) -> Arc<HostSocketInner> {
+        Arc::clone(&self.inner)
+    }
+
     /// Connects this socket to a remote address.
     pub fn connect(&self, address: SocketAddr) -> HostResult<()> {
         connect_platform(self, address)
@@ -361,6 +561,16 @@ impl HostSocket {
     /// Receives bytes into scattered buffers.
     pub fn recv_vectored(&self, buffers: &mut [IoSliceMut<'_>]) -> HostResult<usize> {
         recv_vectored_platform(self, buffers)
+    }
+
+    /// Submits an overlapped receive. The socket must be associated with an IOCP.
+    pub fn submit_overlapped_recv(&self, buffer: Vec<u8>) -> HostSocketIoSubmission {
+        submit_overlapped_socket_io_platform(self, HostSocketIoDirection::Receive, buffer)
+    }
+
+    /// Submits an overlapped send. The socket must be associated with an IOCP.
+    pub fn submit_overlapped_send(&self, buffer: Vec<u8>) -> HostSocketIoSubmission {
+        submit_overlapped_socket_io_platform(self, HostSocketIoDirection::Send, buffer)
     }
 
     /// Receives bytes and the remote datagram address.
@@ -543,6 +753,19 @@ fn recv_from_vectored_platform(
     _buffers: &mut [IoSliceMut<'_>],
 ) -> HostResult<(usize, SocketAddr)> {
     Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
+fn submit_overlapped_socket_io_platform(
+    _socket: &HostSocket,
+    direction: HostSocketIoDirection,
+    buffer: Vec<u8>,
+) -> HostSocketIoSubmission {
+    HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
+        direction,
+        HostError::unsupported(direction.operation()),
+        buffer,
+    ))
 }
 
 #[cfg(not(windows))]
@@ -942,6 +1165,93 @@ fn recv_from_vectored_platform(
 }
 
 #[cfg(windows)]
+fn submit_overlapped_socket_io_platform(
+    socket: &HostSocket,
+    direction: HostSocketIoDirection,
+    mut buffer: Vec<u8>,
+) -> HostSocketIoSubmission {
+    if buffer.is_empty() {
+        return HostSocketIoSubmission::Completed(HostSocketIoCompletion::new(
+            direction, 0, buffer,
+        ));
+    }
+
+    let event = unsafe {
+        // SAFETY: Creating an unnamed manual-reset event with no security descriptor.
+        CreateEventW(
+            std::ptr::null_mut(),
+            TRUE,
+            crate::windows::FALSE,
+            std::ptr::null(),
+        )
+    };
+    if event.is_null() {
+        return HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
+            direction,
+            crate::error::last_windows_error(direction.operation()),
+            buffer,
+        ));
+    }
+
+    let overlapped = WsaOverlapped::new(event);
+    let mut platform = WindowsPendingSocketIo::new(socket.clone_inner(), overlapped);
+    let mut bytes_transferred = 0u32;
+    let mut wsa_buffer = WsaBuf {
+        len: buffer.len().min(u32::MAX as usize) as u32,
+        buf: buffer.as_mut_ptr().cast(),
+    };
+    let status = match direction {
+        HostSocketIoDirection::Receive => {
+            let mut flags = 0u32;
+            unsafe {
+                // SAFETY: The socket, buffer, and OVERLAPPED are kept alive by the pending object.
+                WSARecv(
+                    socket.raw(),
+                    &mut wsa_buffer,
+                    1,
+                    &mut bytes_transferred,
+                    &mut flags,
+                    platform.overlapped_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            }
+        }
+        HostSocketIoDirection::Send => unsafe {
+            // SAFETY: The socket, buffer, and OVERLAPPED are kept alive by the pending object.
+            WSASend(
+                socket.raw(),
+                &mut wsa_buffer,
+                1,
+                &mut bytes_transferred,
+                0,
+                platform.overlapped_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
+    };
+
+    if status == crate::windows::SOCKET_ERROR {
+        let error = crate::windows::wsa_last_error();
+        if error != WSA_IO_PENDING {
+            return HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
+                direction,
+                HostError::with_code(
+                    direction.operation(),
+                    crate::error::winsock_kind(error),
+                    HostErrorCode::Winsock(error),
+                ),
+                buffer,
+            ));
+        }
+    }
+
+    platform.submitted = true;
+    HostSocketIoSubmission::Pending(PendingHostSocketIo::from_windows_pending(
+        direction, platform, buffer,
+    ))
+}
+
+#[cfg(windows)]
 fn wsa_send_buffers(buffers: &[IoSlice<'_>]) -> HostResult<Vec<WsaBuf>> {
     buffers
         .iter()
@@ -1210,6 +1520,10 @@ const POLLPRI: i16 = 0x0400;
 #[cfg(windows)]
 const WSA_FLAG_OVERLAPPED: u32 = 0x01;
 #[cfg(windows)]
+const WSA_IO_PENDING: i32 = 997;
+#[cfg(windows)]
+const TRUE: crate::windows::Bool = 1;
+#[cfg(windows)]
 const SOL_SOCKET: i32 = 0xffff;
 #[cfg(windows)]
 const SO_REUSEADDR: i32 = 0x0004;
@@ -1274,6 +1588,82 @@ struct WsaPollFd {
 struct WsaBuf {
     len: u32,
     buf: *mut std::ffi::c_char,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsPendingSocketIo {
+    socket: Arc<HostSocketInner>,
+    overlapped: Box<WsaOverlapped>,
+    submitted: bool,
+    completed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsPendingSocketIo {
+    fn new(socket: Arc<HostSocketInner>, overlapped: WsaOverlapped) -> Self {
+        Self {
+            socket,
+            overlapped: Box::new(overlapped),
+            submitted: false,
+            completed: false,
+        }
+    }
+
+    fn overlapped_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        (&mut *self.overlapped as *mut WsaOverlapped).cast()
+    }
+
+    fn overlapped_token(&self) -> usize {
+        (&*self.overlapped as *const WsaOverlapped) as usize
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPendingSocketIo {
+    fn drop(&mut self) {
+        if self.submitted && !self.completed {
+            let overlapped = self.overlapped_mut_ptr();
+            unsafe {
+                // SAFETY: The socket and OVERLAPPED are owned by this pending operation.
+                let _ = CancelIoEx(self.socket.raw as crate::windows::Handle, overlapped);
+                let mut bytes_transferred = 0u32;
+                let mut flags = 0u32;
+                let _ = WSAGetOverlappedResult(
+                    self.socket.raw,
+                    overlapped,
+                    &mut bytes_transferred,
+                    TRUE,
+                    &mut flags,
+                );
+            }
+        }
+        crate::windows::close_handle(self.overlapped.event);
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug)]
+struct WsaOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: crate::windows::Handle,
+}
+
+#[cfg(windows)]
+impl WsaOverlapped {
+    const fn new(event: crate::windows::Handle) -> Self {
+        Self {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1494,6 +1884,13 @@ unsafe extern "system" {
         flags: u32,
     ) -> crate::windows::Socket;
     fn closesocket(socket: crate::windows::Socket) -> i32;
+    fn WSAGetOverlappedResult(
+        socket: crate::windows::Socket,
+        overlapped: *mut std::ffi::c_void,
+        bytes_transferred: *mut u32,
+        wait: crate::windows::Bool,
+        flags: *mut u32,
+    ) -> crate::windows::Bool;
     fn WSAPoll(fd_array: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
     fn connect(socket: crate::windows::Socket, name: *const Sockaddr, name_len: i32) -> i32;
     fn bind(socket: crate::windows::Socket, name: *const Sockaddr, name_len: i32) -> i32;
@@ -1591,9 +1988,27 @@ unsafe extern "system" {
     fn getpeername(socket: crate::windows::Socket, name: *mut Sockaddr, name_len: *mut i32) -> i32;
 }
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        security_attributes: crate::windows::Handle,
+        manual_reset: crate::windows::Bool,
+        initial_state: crate::windows::Bool,
+        name: *const u16,
+    ) -> crate::windows::Handle;
+    fn CancelIoEx(
+        file: crate::windows::Handle,
+        overlapped: *mut std::ffi::c_void,
+    ) -> crate::windows::Bool;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NetworkStack, SocketCompletionKind, SocketEvents};
+    use super::{
+        HostSocketIoDirection, HostSocketIoSubmission, NetworkStack, SocketCompletionKind,
+        SocketEvents,
+    };
 
     #[cfg(windows)]
     use std::io::{IoSlice, IoSliceMut};
@@ -1704,6 +2119,110 @@ mod tests {
         assert_eq!(packet.bytes_transferred(), 4);
         assert_eq!(packet.completion_key(), 17);
         assert_eq!(packet.overlapped(), 0x55);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iocp_socket_recv_completion_returns_owned_buffer() {
+        let stack = NetworkStack::start().unwrap();
+        let port = HostIoCompletionPort::new().unwrap();
+        let listener = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let local = listener.local_addr().unwrap();
+        let client = stack
+            .open_socket_with_iocp(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                SocketProtocol::Tcp,
+                &port,
+                23,
+            )
+            .unwrap();
+        client.connect(local).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let pending = match client.submit_overlapped_recv(vec![0; 4]) {
+            HostSocketIoSubmission::Pending(pending) => pending,
+            other => panic!("expected pending recv, got {other:?}"),
+        };
+        assert_eq!(pending.direction(), HostSocketIoDirection::Receive);
+        assert_eq!(server.send(b"pong").unwrap(), 4);
+        let packet = port
+            .get(Some(std::time::Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.completion_key(), 23);
+        assert!(pending.matches_completion(packet));
+        let completion = match pending.complete_from_packet(packet) {
+            HostSocketIoSubmission::Completed(completion) => completion,
+            other => panic!("expected completed recv, got {other:?}"),
+        };
+
+        assert_eq!(completion.direction(), HostSocketIoDirection::Receive);
+        assert_eq!(completion.bytes_transferred(), 4);
+        assert_eq!(completion.buffer(), b"pong");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iocp_socket_send_completion_returns_owned_buffer() {
+        let stack = NetworkStack::start().unwrap();
+        let port = HostIoCompletionPort::new().unwrap();
+        let listener = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+        listener
+            .set_option(
+                HostSocketOptionName::ReuseAddress,
+                HostSocketOptionValue::Bool(true),
+            )
+            .unwrap();
+        listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        let local = listener.local_addr().unwrap();
+        let client = stack
+            .open_socket_with_iocp(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                SocketProtocol::Tcp,
+                &port,
+                29,
+            )
+            .unwrap();
+        client.connect(local).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let pending = match client.submit_overlapped_send(b"ping".to_vec()) {
+            HostSocketIoSubmission::Pending(pending) => pending,
+            other => panic!("expected pending send, got {other:?}"),
+        };
+        assert_eq!(pending.direction(), HostSocketIoDirection::Send);
+        let packet = port
+            .get(Some(std::time::Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.completion_key(), 29);
+        assert!(pending.matches_completion(packet));
+        let completion = match pending.complete_from_packet(packet) {
+            HostSocketIoSubmission::Completed(completion) => completion,
+            other => panic!("expected completed send, got {other:?}"),
+        };
+        let mut buffer = [0; 4];
+        assert_eq!(server.recv(&mut buffer).unwrap(), 4);
+
+        assert_eq!(completion.direction(), HostSocketIoDirection::Send);
+        assert_eq!(completion.bytes_transferred(), 4);
+        assert_eq!(completion.buffer(), b"ping");
+        assert_eq!(&buffer, b"ping");
     }
 
     #[cfg(windows)]

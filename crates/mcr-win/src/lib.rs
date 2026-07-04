@@ -31,9 +31,10 @@ pub use native_exec::{
     NativeExecutionError, execute_x86_64_until_trap,
 };
 pub use network::{
-    AddressFamily, HostShutdown, HostSocket, HostSocketOptionName, HostSocketOptionValue,
-    NetworkStack, SocketCompletionKind, SocketEvents, SocketFastPathKind, SocketKind, SocketPoll,
-    SocketProtocol,
+    AddressFamily, HostShutdown, HostSocket, HostSocketIoCompletion, HostSocketIoDirection,
+    HostSocketIoFailure, HostSocketIoResult, HostSocketIoSubmission, HostSocketOptionName,
+    HostSocketOptionValue, NetworkStack, PendingHostSocketIo, SocketCompletionKind, SocketEvents,
+    SocketFastPathKind, SocketKind, SocketPoll, SocketProtocol,
 };
 pub use overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,

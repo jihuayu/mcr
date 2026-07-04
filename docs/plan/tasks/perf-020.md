@@ -59,3 +59,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   and associates it with a host completion port under an MCR-owned completion
   key. The existing `open_socket`/`WSAPoll` path remains the fallback until
   overlapped `WSARecv`/`WSASend` ownership and readiness-drain integration land.
+- Added host-owned overlapped socket receive/send submissions in `mcr-win`.
+  `submit_overlapped_recv` and `submit_overlapped_send` keep the socket,
+  `WSAOVERLAPPED`, event, and transfer buffer alive until a matching IOCP packet
+  completes the pending operation and returns the owned buffer. Dropped pending
+  operations cancel and drain before freeing host state.
