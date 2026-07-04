@@ -12,6 +12,10 @@ use mcr_win::{
     SocketProtocol as HostSocketProtocol,
 };
 
+mod dns_cache;
+
+pub use dns_cache::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub const LINUX_AF_UNIX: u32 = 1;

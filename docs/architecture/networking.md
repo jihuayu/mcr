@@ -195,6 +195,15 @@ Winsock backend still falls back to `WSAPoll` when no completion-backed
 readiness is cached, so IOCP remains an implementation backend rather than a new
 guest-visible wait model.
 
+## MCR-Owned DNS Resolution
+
+Guest-created UDP/TCP sockets keep their normal ownership even when the payload
+looks like DNS. MCR may cache DNS results only for an MCR-owned resolver helper
+or DNS proxy that performs resolution on behalf of the runtime. That cache lives
+behind `mcr-net::DnsCache`, respects response TTLs, normalizes the DNS query
+name for cache lookup, and clears entries when the guest-visible resolver
+configuration snapshot changes.
+
 ## Socket Options
 
 Socket options are a whitelist, not a passthrough. Initial support should focus

@@ -32,6 +32,15 @@ cargo test -p mcr-runtime dns_ -- --nocapture
 cargo test -p mcr-testkit perf_dns -- --ignored --nocapture
 ```
 
+## Checkpoint
+
+- Added `mcr-net::DnsCache` as the boundary for MCR-owned resolver helpers and
+  DNS proxies. It caches positive address answers by normalized query name and
+  record type, expires them at the TTL boundary, skips zero-TTL answers, and
+  clears entries when the guest-visible resolver configuration snapshot changes.
+- This checkpoint does not intercept guest DNS datagrams, does not add TCP/TLS
+  pooling, and does not change guest socket ownership.
+
 ## Notes
 
 - Respect TTLs and scope entries to the guest network configuration represented
