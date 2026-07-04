@@ -54,3 +54,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   owning socket. The actual overlapped `AcceptEx`/`ConnectEx` submission,
   context update, cancellation, and `mcr-net` readiness integration remain in
   this task.
+- Added the first real `ConnectEx` host submission boundary. `HostSocket`
+  can submit a bound, IOCP-associated socket through the resolved `ConnectEx`
+  function pointer, keep the `OVERLAPPED` state alive, complete from a matching
+  IOCP packet, and apply `SO_UPDATE_CONNECT_CONTEXT`. Wiring this into
+  `mcr-net::HostSocketHandle::connect_fast_path` remains in this task.
