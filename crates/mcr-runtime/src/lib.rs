@@ -3697,7 +3697,11 @@ impl FileSyscalls for RuntimeSubsystems {
 impl MemorySyscalls for RuntimeSubsystems {
     fn dispatch_memory(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
-        if let Err(errno) = self.select_memory_for_process(pid) {
+        if matches!(request.syscall, mcr_sys::Syscall::Mmap) {
+            if let Err(errno) = self.select_process_context(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+        } else if let Err(errno) = self.select_memory_for_process(pid) {
             return SyscallOutcome::errno(errno);
         }
         let outcome = if matches!(request.syscall, mcr_sys::Syscall::Mmap) {
@@ -6509,6 +6513,62 @@ mod tests {
             runtime.memory_mut().write(0x7000_0000, b"x"),
             Err(GuestMemoryError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn runtime_file_backed_mmap_uses_calling_process_fd_table() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Fork, [0; 6]))
+                .result,
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context_for(
+                    2,
+                    2,
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Close, [99, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EBADF)
+        );
+
+        let mapped = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Mmap,
+            [
+                0x7000_0000,
+                GUEST_PAGE_SIZE,
+                u64::from(mcr_sys::LINUX_PROT_READ),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                0,
+            ],
+        ));
+
+        assert_eq!(mapped.result, SyscallReturn::Success(0x7000_0000));
+        let mut bytes = [0; 5];
+        runtime
+            .memory_for_process(2)
+            .unwrap()
+            .read(0x7000_0000, &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"hello");
     }
 
     #[test]
