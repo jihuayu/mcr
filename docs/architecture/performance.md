@@ -178,6 +178,10 @@ It should not be mixed into the first IOCP pass. A future RIO task must prove
 that registered buffer ownership, cancellation, and completion semantics can be
 hidden behind MCR's socket object and Linux errno model.
 
+The 2026-07-04 `perf-008` decision closes RIO as backlog-only until IOCP
+measurements show a small-message datagram bottleneck and a RIO prototype proves
+enough benefit to justify Windows-only buffer and lifetime complexity.
+
 ### DNS And Connection Reuse
 
 DNS caching is allowed only where MCR owns the resolution path, such as a
