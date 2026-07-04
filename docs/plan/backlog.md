@@ -7,6 +7,7 @@
 | Dockerfile builder | Phase 3 | Runtime must first support shell, process, network, and filesystem behavior used by `RUN`. |
 | Native builder execution gate | Phase 3 | `build-003` is closed only as the single-stage planning and contract boundary. Reopen for real `mcr build` execution after snapshot-rootfs mutation, `BuildRunSpec` execution, layer diffing, image output selection, and build diagnostics can be wired end to end. |
 | Multi-stage builder wiring | Phase 3 | `build-004` is closed as a deferred integration boundary. Reopen after native single-stage execution exists, then add named/numeric stage state, immutable prior-stage snapshot references, `COPY --from=<stage>` path resolution, and fixture smoke output comparison. |
+| Native builder smoke matrix | Phase 3 | `integ-004` is closed as a deferred external-validation gate. Reopen after real `mcr build` execution exists, then run single-stage and multi-stage fixtures, OCI layout validation, and `docker load` when Docker is available. |
 | OCI/Docker image output | Phase 3 | Requires reliable snapshot diff and overlay semantics, which build on VFS after Phase 2. |
 | Registry pull/push | Phase 3 | Not needed to prove runtime execution; rootfs fixtures are enough for MVP and Phase 2. |
 | Registry transport/auth/gzip gate | Phase 3 | `image-002` closed only the pull/unpack contract boundary. Reopen for real OCI registry HTTP transport, auth/token handling, remote manifest/blob fetch, gzip layer decompression, and local-registry integration proof before claiming remote image pull support. |
