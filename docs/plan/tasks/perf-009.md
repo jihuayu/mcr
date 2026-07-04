@@ -28,6 +28,7 @@ latency without changing guest socket ownership or TLS behavior.
 
 ```powershell
 cargo test -p mcr-net dns_cache -- --nocapture
+cargo test -p mcr-net perf_baseline_dns -- --ignored --nocapture
 cargo test -p mcr-runtime dns_ -- --nocapture
 cargo test -p mcr-testkit perf_dns -- --ignored --nocapture
 ```
@@ -40,6 +41,10 @@ cargo test -p mcr-testkit perf_dns -- --ignored --nocapture
   clears entries when the guest-visible resolver configuration snapshot changes.
 - This checkpoint does not intercept guest DNS datagrams, does not add TCP/TLS
   pooling, and does not change guest socket ownership.
+- Added ignored DNS cache baseline reports under `mcr-net` and the
+  `mcr-testkit perf_dns` filter so the active DNS cache perf gate captures
+  insert, lookup-hit, and expiry-purge costs without requiring guest network
+  execution.
 
 ## Notes
 

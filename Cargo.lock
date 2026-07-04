@@ -164,6 +164,10 @@ dependencies = [
 [[package]]
 name = "mcr-testkit"
 version = "0.1.0"
+dependencies = [
+ "mcr-net",
+ "mcr-task",
+]
 
 [[package]]
 name = "mcr-vfs"

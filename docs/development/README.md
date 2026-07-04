@@ -196,6 +196,15 @@ subsystem baselines with:
 cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
 cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
 cargo test -p mcr-net perf_baseline -- --ignored --nocapture
+cargo test -p mcr-task perf_worker_pool -- --ignored --nocapture
+```
+
+The task-specific DNS cache and worker-pool gates are host-only reports that
+keep the active perf task filters non-empty:
+
+```powershell
+cargo test -p mcr-testkit perf_dns -- --ignored --nocapture
+cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 ```
 
 The guest workload baseline additionally requires `MCR_BIN` and a materialized

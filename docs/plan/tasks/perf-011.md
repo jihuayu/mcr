@@ -29,6 +29,7 @@ high-concurrency workloads do not repeatedly create and destroy Windows threads.
 
 ```powershell
 cargo test -p mcr-task
+cargo test -p mcr-task perf_worker_pool -- --ignored --nocapture
 cargo test -p mcr-runtime task_ wait_ -- --nocapture
 cargo test -p mcr-net readiness -- --nocapture
 cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
@@ -47,3 +48,7 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 - Added the first diagnostics-visible boundary in `mcr-task`: bounded pool
   records for guest task execution and I/O completions, exposed through runtime
   diagnostics without changing guest scheduling or process semantics.
+- Added ignored worker-pool diagnostics baseline reports under `mcr-task` and
+  the `mcr-testkit perf_worker_pool` filter so the active perf gate captures
+  diagnostics snapshot overhead before real submissions are routed through the
+  boundary.

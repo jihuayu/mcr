@@ -1,7 +1,11 @@
 use std::env;
 use std::ffi::OsString;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use mcr_net::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
+use mcr_task::{HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPools};
 use mcr_testkit::perf::{PerfBaselineReport, PerfMeasurement, measure_wall_time};
 use mcr_testkit::{FixtureRoot, Result, SmokeCommand};
 
@@ -195,4 +199,151 @@ fn perf_baseline_guest_smoke_workloads() -> Result<()> {
 
     println!("{report}");
     Ok(())
+}
+
+#[test]
+#[ignore = "captures DNS cache performance baseline output without guest network access"]
+fn perf_dns_cache_baseline() {
+    let report = dns_cache_baseline_report("mcr-testkit DNS cache performance baseline");
+
+    println!("{report}");
+}
+
+#[test]
+#[ignore = "captures worker-pool diagnostics performance baseline output"]
+fn perf_worker_pool_diagnostics_baseline() {
+    let report =
+        worker_pool_diagnostics_baseline_report("mcr-testkit worker-pool diagnostics baseline");
+
+    println!("{report}");
+}
+
+fn dns_cache_baseline_report(suite: &str) -> PerfBaselineReport {
+    let entries = env_usize("MCR_PERF_DNS_CACHE_ENTRIES", 256);
+    let lookup_passes = env_usize("MCR_PERF_DNS_CACHE_LOOKUP_PASSES", 8);
+    let queries = dns_cache_queries(entries);
+    let mut cache = DnsCache::new(dns_config(b"nameserver 1.1.1.1\n"));
+    let mut report = PerfBaselineReport::new(suite);
+
+    let (inserted, insert_wall_time) = measure_wall_time(|| {
+        for (index, query) in queries.iter().enumerate() {
+            assert!(cache.insert_addresses(
+                query.clone(),
+                vec![sample_dns_address(index)],
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+            ));
+        }
+        cache.len()
+    });
+    assert_eq!(inserted, entries);
+    report.push(
+        PerfMeasurement::new("dns_cache_insert", entries as u64, insert_wall_time)
+            .with_field("entries", entries)
+            .with_field("record_type", "A")
+            .with_field("ttl_seconds", 60),
+    );
+
+    let (hits, lookup_wall_time) = measure_wall_time(|| {
+        let mut hits = 0usize;
+        for _ in 0..lookup_passes {
+            for query in &queries {
+                let addresses = cache
+                    .lookup_addresses(query, Duration::from_secs(20))
+                    .expect("seeded DNS cache entry should be live");
+                assert_eq!(addresses.len(), 1);
+                hits += 1;
+            }
+        }
+        hits
+    });
+    assert_eq!(hits, entries * lookup_passes);
+    report.push(
+        PerfMeasurement::new("dns_cache_lookup_hit", hits as u64, lookup_wall_time)
+            .with_field("entries", entries)
+            .with_field("lookup_passes", lookup_passes)
+            .with_field("resolver_config", "stable"),
+    );
+
+    let (purged, purge_wall_time) =
+        measure_wall_time(|| cache.purge_expired(Duration::from_secs(71)));
+    assert_eq!(purged, entries);
+    assert!(cache.is_empty());
+    report.push(
+        PerfMeasurement::new("dns_cache_purge_expired", entries as u64, purge_wall_time)
+            .with_field("entries", entries)
+            .with_field("expired_at_seconds", 71),
+    );
+
+    report
+}
+
+fn worker_pool_diagnostics_baseline_report(suite: &str) -> PerfBaselineReport {
+    let snapshots = env_usize("MCR_PERF_WORKER_POOL_DIAGNOSTIC_SNAPSHOTS", 4_096);
+    let pools = HostWorkerPools::default_bounded();
+    let diagnostics = pools.diagnostics();
+
+    assert_eq!(diagnostics.len(), 2);
+    assert!(diagnostics.iter().all(|pool| {
+        pool.max_workers() > 0
+            && pool.max_workers() <= HOST_WORKER_POOL_MAX_WORKERS
+            && pool.active_workers() == 0
+            && pool.queued_jobs() == 0
+    }));
+
+    let (checksum, wall_time) = measure_wall_time(|| {
+        let mut checksum = 0usize;
+        for _ in 0..snapshots {
+            for pool in pools.diagnostics() {
+                checksum = checksum
+                    .wrapping_add(pool.max_workers())
+                    .wrapping_add(pool.active_workers())
+                    .wrapping_add(pool.queued_jobs());
+            }
+        }
+        checksum
+    });
+    assert!(checksum > 0);
+
+    let mut report = PerfBaselineReport::new(suite);
+    report.push(
+        PerfMeasurement::new(
+            "worker_pool_diagnostics_snapshot",
+            (snapshots * diagnostics.len()) as u64,
+            wall_time,
+        )
+        .with_field("snapshots", snapshots)
+        .with_field("diagnostic_records_per_snapshot", diagnostics.len())
+        .with_field("max_worker_limit", HOST_WORKER_POOL_MAX_WORKERS)
+        .with_field("guest_task_max_workers", diagnostics[0].max_workers())
+        .with_field("io_completion_max_workers", diagnostics[1].max_workers()),
+    );
+
+    report
+}
+
+fn dns_config(resolv_conf: &[u8]) -> GuestDnsConfig {
+    GuestDnsConfig::from_guest_file_contents(
+        b"127.0.0.1 localhost\n",
+        resolv_conf,
+        b"hosts: files dns\n",
+    )
+}
+
+fn dns_cache_queries(entries: usize) -> Vec<DnsCacheQuery> {
+    (0..entries)
+        .map(|index| DnsCacheQuery::new(format!("perf-{index}.example.com"), DnsRecordType::A))
+        .collect()
+}
+
+fn sample_dns_address(index: usize) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(203, 0, 113, (index % 250 + 1) as u8))
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }

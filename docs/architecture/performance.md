@@ -320,11 +320,15 @@ The first baseline suites are intentionally split by subsystem boundary:
 - `mcr-vfs` measures local small-file create/write/read/close loops and
   directory `getdents64` plus per-entry `statx` walks;
 - `mcr-net` measures high-concurrency loopback accept/recv/send behavior through
-  `WinHostSocketTransport`;
+  `WinHostSocketTransport` plus DNS cache insert, lookup-hit, and expiry-purge
+  costs for the MCR-owned resolver boundary;
+- `mcr-task` measures bounded worker-pool diagnostics snapshots without routing
+  real guest scheduling or I/O submissions through the pool boundary;
 - `mcr-testkit` measures guest shell startup, small-file I/O, directory
   metadata walks through the materialized Alpine rootfs and `MCR_BIN`; the
   public-network `curl` and `git ls-remote` measurements are opt-in with
-  `MCR_PERF_PUBLIC_NETWORK=1`.
+  `MCR_PERF_PUBLIC_NETWORK=1`, while the `perf_dns` and `perf_worker_pool`
+  filters provide task-specific host-only reports for active perf checkpoints.
 
 These suites are baselines, not performance assertions. They should fail only
 when the measured workload itself fails. Thresholds, trend storage, and

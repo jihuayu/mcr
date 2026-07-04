@@ -1,15 +1,20 @@
-#![cfg(windows)]
-
+#[cfg(windows)]
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr};
+#[cfg(windows)]
 use std::net::{SocketAddr, TcpStream};
+#[cfg(windows)]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mcr_net::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
+#[cfg(windows)]
 use mcr_net::{
     GuestSocketTable, SocketAddress, SocketDomain, SocketProtocol, SocketSpec, SocketType,
     WinHostSocketTransport,
 };
 
+#[cfg(windows)]
 #[test]
 #[ignore = "captures high-concurrency loopback socket performance baseline output"]
 fn perf_baseline_high_concurrency_loopback_sockets() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,6 +50,67 @@ fn perf_baseline_high_concurrency_loopback_sockets() -> Result<(), Box<dyn std::
     .with_field("transport", "WinHostSocketTransport")];
     print_perf_report("mcr-net loopback performance baseline", &measurements);
     Ok(())
+}
+
+#[test]
+#[ignore = "captures DNS cache performance baseline output"]
+fn perf_baseline_dns_cache_lookup_and_purge() {
+    let entries = env_usize("MCR_PERF_DNS_CACHE_ENTRIES", 256);
+    let lookup_passes = env_usize("MCR_PERF_DNS_CACHE_LOOKUP_PASSES", 8);
+    let queries = dns_cache_queries(entries);
+    let mut cache = DnsCache::new(dns_config(b"nameserver 1.1.1.1\n"));
+
+    let (inserted, insert_wall_time) = measure_wall_time(|| {
+        for (index, query) in queries.iter().enumerate() {
+            assert!(cache.insert_addresses(
+                query.clone(),
+                vec![sample_dns_address(index)],
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+            ));
+        }
+        cache.len()
+    });
+    assert_eq!(inserted, entries);
+
+    let (hits, lookup_wall_time) = measure_wall_time(|| {
+        let mut hits = 0usize;
+        for _ in 0..lookup_passes {
+            for query in &queries {
+                let addresses = cache
+                    .lookup_addresses(query, Duration::from_secs(20))
+                    .expect("seeded DNS cache entry should be live");
+                assert_eq!(addresses.len(), 1);
+                hits += 1;
+            }
+        }
+        hits
+    });
+    assert_eq!(hits, entries * lookup_passes);
+
+    let (purged, purge_wall_time) =
+        measure_wall_time(|| cache.purge_expired(Duration::from_secs(71)));
+    assert_eq!(purged, entries);
+    assert!(cache.is_empty());
+
+    let measurements = [
+        PerfMeasurement::new("net_dns_cache_insert", entries as u64, insert_wall_time)
+            .with_field("entries", entries)
+            .with_field("record_type", "A")
+            .with_field("ttl_seconds", 60),
+        PerfMeasurement::new("net_dns_cache_lookup_hit", hits as u64, lookup_wall_time)
+            .with_field("entries", entries)
+            .with_field("lookup_passes", lookup_passes)
+            .with_field("resolver_config", "stable"),
+        PerfMeasurement::new(
+            "net_dns_cache_purge_expired",
+            entries as u64,
+            purge_wall_time,
+        )
+        .with_field("entries", entries)
+        .with_field("expired_at_seconds", 71),
+    ];
+    print_perf_report("mcr-net DNS cache performance baseline", &measurements);
 }
 
 struct PerfMeasurement {
@@ -104,6 +170,33 @@ fn unix_timestamp_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+fn dns_config(resolv_conf: &[u8]) -> GuestDnsConfig {
+    GuestDnsConfig::from_guest_file_contents(
+        b"127.0.0.1 localhost\n",
+        resolv_conf,
+        b"hosts: files dns\n",
+    )
+}
+
+fn dns_cache_queries(entries: usize) -> Vec<DnsCacheQuery> {
+    (0..entries)
+        .map(|index| DnsCacheQuery::new(format!("perf-{index}.example.com"), DnsRecordType::A))
+        .collect()
+}
+
+fn sample_dns_address(index: usize) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(203, 0, 113, (index % 250 + 1) as u8))
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[cfg(windows)]
 fn tcp_stream_spec() -> Result<SocketSpec, Box<dyn std::error::Error>> {
     Ok(SocketSpec::new(
         SocketDomain::Inet,
@@ -112,6 +205,7 @@ fn tcp_stream_spec() -> Result<SocketSpec, Box<dyn std::error::Error>> {
     )?)
 }
 
+#[cfg(windows)]
 fn spawn_loopback_clients(
     local: SocketAddr,
     connections: usize,
@@ -131,6 +225,7 @@ fn spawn_loopback_clients(
         .collect()
 }
 
+#[cfg(windows)]
 fn serve_loopback_clients(
     table: &mut GuestSocketTable,
     listener: mcr_net::SocketId,
