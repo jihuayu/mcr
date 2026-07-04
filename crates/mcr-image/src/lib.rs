@@ -859,6 +859,19 @@ impl RegistryPushPlan {
     }
 }
 
+pub trait RegistryPushTarget {
+    fn blob_exists(&self, digest: &OciDigest) -> Result<bool, ImageError>;
+
+    fn upload_blob(&mut self, descriptor: &OciDescriptor, bytes: &[u8]) -> Result<(), ImageError>;
+
+    fn upload_manifest(
+        &mut self,
+        reference: &OciReference,
+        descriptor: &OciDescriptor,
+        bytes: &[u8],
+    ) -> Result<(), ImageError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedLayerBlob {
     descriptor: OciDescriptor,
@@ -1016,6 +1029,75 @@ impl LocalContentStore {
             oci_index_json_bytes(&manifest_descriptor),
         )?;
         Ok(manifest_descriptor)
+    }
+
+    pub fn push_to_registry<T>(
+        &self,
+        reference: OciReference,
+        manifest: &OciImageManifest,
+        target: &mut T,
+    ) -> Result<RegistryPushPlan, ImageError>
+    where
+        T: RegistryPushTarget,
+    {
+        if manifest.config().media_type() != MEDIA_TYPE_OCI_CONFIG {
+            return Err(ImageError::UnsupportedManifestMediaType(
+                manifest.config().media_type().to_owned(),
+            ));
+        }
+
+        let mut local_blobs = BTreeMap::new();
+        let mut remote_blobs = Vec::new();
+        let config = manifest.config();
+        let config_bytes = self.read_blob(config)?;
+        if target.blob_exists(config.digest())? {
+            remote_blobs.push(config.digest().clone());
+        }
+        local_blobs.insert(config.digest().clone(), (config.clone(), config_bytes));
+
+        for layer in manifest.layers() {
+            validate_layer_media_type(layer.media_type())?;
+            let bytes = self.read_blob(layer)?;
+            if target.blob_exists(layer.digest())? {
+                remote_blobs.push(layer.digest().clone());
+            }
+            local_blobs
+                .entry(layer.digest().clone())
+                .or_insert_with(|| (layer.clone(), bytes));
+        }
+
+        let manifest_bytes = manifest.to_json_bytes();
+        let manifest_descriptor = OciDescriptor::new(
+            MEDIA_TYPE_OCI_MANIFEST,
+            OciDigest::sha256(&manifest_bytes),
+            u64::try_from(manifest_bytes.len()).expect("usize fits in u64"),
+        );
+        let plan = RegistryPushPlan::from_manifest(
+            reference,
+            manifest_descriptor,
+            manifest.clone(),
+            remote_blobs,
+        )?;
+
+        for upload in plan.uploads() {
+            match upload.kind() {
+                RegistryPushUploadKind::Blob => {
+                    let (_, bytes) = local_blobs
+                        .get(upload.descriptor().digest())
+                        .expect("registry push plan only contains verified local blobs");
+                    target.upload_blob(upload.descriptor(), bytes)?;
+                }
+                RegistryPushUploadKind::Manifest => {
+                    target.upload_manifest(
+                        plan.reference(),
+                        upload.descriptor(),
+                        &manifest_bytes,
+                    )?;
+                }
+            }
+        }
+
+        Ok(plan)
     }
 
     pub fn docker_tar_bytes(
@@ -1771,6 +1853,78 @@ mod tests {
     }
 
     #[test]
+    fn local_content_store_pushes_to_fake_registry_and_round_trips_pull_plan() {
+        let root = temp_root("registry-push");
+        let store = LocalContentStore::new(&root);
+        let config = OciImageConfig::new(
+            OciPlatform::linux_amd64(),
+            OciContainerConfig::new()
+                .with_env(["PATH=/usr/bin"])
+                .with_command(["/bin/app"]),
+            vec![OciHistoryEntry::new("FROM scratch")],
+            vec![OciDigest::sha256(b"layer")],
+        );
+        let config_bytes = config.to_json_bytes();
+        let config_descriptor = store
+            .write_blob(MEDIA_TYPE_OCI_CONFIG, &config_bytes)
+            .unwrap();
+        let layer_bytes = b"layer";
+        let layer_descriptor = store.write_blob(MEDIA_TYPE_OCI_LAYER, layer_bytes).unwrap();
+        let manifest =
+            OciImageManifest::new(config_descriptor.clone(), vec![layer_descriptor.clone()]);
+        let reference = OciReference::parse("localhost:5000/team/app:test").unwrap();
+        let mut registry = FakeRegistry::default();
+        registry.seed_blob(&layer_descriptor, layer_bytes).unwrap();
+
+        let plan = store
+            .push_to_registry(reference.clone(), &manifest, &mut registry)
+            .unwrap();
+
+        assert_eq!(
+            plan.uploads()
+                .iter()
+                .map(RegistryPushUpload::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                RegistryPushUploadKind::Blob,
+                RegistryPushUploadKind::Manifest
+            ]
+        );
+        assert_eq!(plan.uploads()[0].descriptor(), &config_descriptor);
+        assert_eq!(
+            registry.uploads,
+            vec![
+                RegistryPushUploadKind::Blob,
+                RegistryPushUploadKind::Manifest
+            ]
+        );
+
+        let (pushed_manifest_descriptor, pushed_manifest_bytes) =
+            registry.manifest(&reference).unwrap();
+        assert_eq!(pushed_manifest_descriptor, plan.manifest_descriptor());
+        assert_eq!(pushed_manifest_bytes, manifest.to_json_bytes());
+
+        let pull_plan = RegistryPullPlan::from_manifest(
+            reference,
+            OciPlatform::linux_amd64(),
+            pushed_manifest_descriptor.clone(),
+            manifest,
+        )
+        .unwrap();
+        assert_eq!(pull_plan.manifest_descriptor(), pushed_manifest_descriptor);
+        assert_eq!(
+            registry.blob_bytes(pull_plan.config()).unwrap(),
+            config_bytes
+        );
+        assert_eq!(
+            registry.blob_bytes(&pull_plan.layers()[0]).unwrap(),
+            layer_bytes
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn verified_layer_blob_checks_digest_before_snapshot_unpack() {
         let archive = single_file_tar("etc/os-release", b"ID=mcr\n");
         let descriptor = descriptor_for(MEDIA_TYPE_OCI_LAYER, &archive);
@@ -1992,6 +2146,71 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Default)]
+    struct FakeRegistry {
+        blobs: BTreeMap<OciDigest, (OciDescriptor, Vec<u8>)>,
+        manifests: BTreeMap<String, (OciDescriptor, Vec<u8>)>,
+        uploads: Vec<RegistryPushUploadKind>,
+    }
+
+    impl FakeRegistry {
+        fn seed_blob(
+            &mut self,
+            descriptor: &OciDescriptor,
+            bytes: &[u8],
+        ) -> Result<(), ImageError> {
+            verify_descriptor_bytes(descriptor, bytes)?;
+            self.blobs.insert(
+                descriptor.digest().clone(),
+                (descriptor.clone(), bytes.to_vec()),
+            );
+            Ok(())
+        }
+
+        fn blob_bytes(&self, descriptor: &OciDescriptor) -> Option<Vec<u8>> {
+            let (_, bytes) = self.blobs.get(descriptor.digest())?;
+            Some(bytes.clone())
+        }
+
+        fn manifest(&self, reference: &OciReference) -> Option<(&OciDescriptor, Vec<u8>)> {
+            let (descriptor, bytes) = self.manifests.get(&reference.to_string())?;
+            Some((descriptor, bytes.clone()))
+        }
+    }
+
+    impl RegistryPushTarget for FakeRegistry {
+        fn blob_exists(&self, digest: &OciDigest) -> Result<bool, ImageError> {
+            Ok(self.blobs.contains_key(digest))
+        }
+
+        fn upload_blob(
+            &mut self,
+            descriptor: &OciDescriptor,
+            bytes: &[u8],
+        ) -> Result<(), ImageError> {
+            verify_descriptor_bytes(descriptor, bytes)?;
+            self.uploads.push(RegistryPushUploadKind::Blob);
+            self.blobs.insert(
+                descriptor.digest().clone(),
+                (descriptor.clone(), bytes.to_vec()),
+            );
+            Ok(())
+        }
+
+        fn upload_manifest(
+            &mut self,
+            reference: &OciReference,
+            descriptor: &OciDescriptor,
+            bytes: &[u8],
+        ) -> Result<(), ImageError> {
+            verify_descriptor_bytes(descriptor, bytes)?;
+            self.uploads.push(RegistryPushUploadKind::Manifest);
+            self.manifests
+                .insert(reference.to_string(), (descriptor.clone(), bytes.to_vec()));
+            Ok(())
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {

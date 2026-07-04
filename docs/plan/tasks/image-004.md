@@ -1,7 +1,7 @@
 ---
 id: image-004
 scope: phase3-image
-status: in-progress
+status: done
 depends-on: [image-003]
 ---
 
@@ -38,3 +38,7 @@ cargo test -p mcr-image
   config/layer media types, skips remote-present blobs, deduplicates repeated
   layer descriptors, and always orders the manifest upload after required blobs.
   A deterministic fake registry transport remains before marking this task done.
+- Completed 2026-07-04: `LocalContentStore::push_to_registry` now queries a
+  `RegistryPushTarget`, uploads only missing verified local blobs, and writes the
+  manifest last. The deterministic fake registry test covers push ordering plus
+  a pull-plan round trip over the pushed manifest and blobs.
