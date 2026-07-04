@@ -1,7 +1,7 @@
 ---
 id: perf-003
 scope: io-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, fd-001, win-001]
 ---
 
@@ -41,3 +41,22 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
 - The backend must map host completion and cancellation results into Linux errno
   above the Windows adapter.
 - Keep a synchronous fallback for unsupported host handles or Windows versions.
+
+## Checkpoint 2026-07-04
+
+- Added the `mcr-win` host I/O submission boundary for file-like reads and
+  writes without replacing the synchronous backend.
+- `HostFile::submit_overlapped_read` and `HostFile::submit_overlapped_write`
+  currently return explicit synchronous fallback submissions that own the
+  operation buffer and preserve the existing host error shape.
+- Added focused `mcr-win` tests covering fallback round trips, fallback error
+  buffer retention, pending cancellation drain mapping to interrupted host
+  errors, and the completion-after-cancel race shape that real overlapped I/O
+  must preserve.
+
+## Remaining Blocker
+
+Opening Windows file and pipe handles with overlapped-compatible flags, binding
+them to an event/thread-pool/IOCP completion source, and wiring completion
+readiness into the runtime wait model remain pending. The VFS/runtime
+synchronous paths are intentionally unchanged in this checkpoint.

@@ -59,6 +59,16 @@ The immediate objective is to avoid parking host worker threads inside blocking
 Windows I/O calls when the guest operation can be represented as a pending MCR
 waitable operation.
 
+The first checkpoint keeps the synchronous backend in place and introduces the
+`mcr-win` host submission boundary. `HostFile::submit_overlapped_read` and
+`HostFile::submit_overlapped_write` return an owned submission that is either
+completed, pending, or explicitly routed through a synchronous fallback. Pending
+records own their buffer until completion or cancellation drain, and fallback
+failures return the same host adapter error shape that the existing synchronous
+file adapter uses. A later checkpoint can open compatible Windows handles with
+overlapped flags and attach events, thread-pool I/O, or IOCP without changing
+the VFS/runtime errno boundary.
+
 ### Vector And Scatter/Gather I/O
 
 Linux `readv`, `writev`, `sendmsg`, and `recvmsg` should avoid per-buffer host
