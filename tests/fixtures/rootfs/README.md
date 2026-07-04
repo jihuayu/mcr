@@ -25,3 +25,16 @@ creates a symlink from the current worktree to the cached rootfs. Use
 
 Phase 2 network smokes use `alpine-rootfs` and expect the extracted payload to
 provide `/bin/sh`, `curl`, `git`, CA certificates, and a writable `/tmp`.
+
+Extended support smokes use named Alpine package rootfs fixtures. Materialize
+only the payloads you need:
+
+```sh
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name gcc-rootfs --package build-base --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name node-rootfs --package nodejs --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name jdk-rootfs --package openjdk21-jdk --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name mysql-rootfs --package mariadb --package mariadb-client --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name redis-rootfs --package redis --force
+```
+
+These fixture payloads remain local and ignored by git.

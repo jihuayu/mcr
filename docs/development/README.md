@@ -155,6 +155,17 @@ that payload. If not, the script materializes the payload in the main workspace
 first and then links to it. Use `--no-worktree-cache` to keep the payload local
 to the current checkout.
 
+Named package rootfs fixtures use the same materializer and manifest. Build
+only the extended-support payloads you need:
+
+```powershell
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name gcc-rootfs --package build-base --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name node-rootfs --package nodejs --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name jdk-rootfs --package openjdk21-jdk --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name mysql-rootfs --package mariadb --package mariadb-client --force
+python3 scripts/materialize-alpine-rootfs.py --rootfs-name redis-rootfs --package redis --force
+```
+
 Smoke tests use `SmokeCommand` plus `GoldenOutput` assertions. A smoke remains
 `#[ignore]` until the owning runtime integration task enables the corresponding
 command from the table below.
@@ -178,6 +189,11 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs python-rootfs /bin/sh -c "python -V"` | Phase 2 workload matrix |
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Phase 2 workload matrix |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Phase 2 workload matrix |
+| `mcr run-rootfs gcc-rootfs /bin/sh -c "<write C source, gcc, run binary>"` | Extended support matrix |
+| `mcr run-rootfs node-rootfs /bin/sh -c "node -e \"console.log('node-ok')\""` | Extended support matrix |
+| `mcr run-rootfs jdk-rootfs /bin/sh -c "<javac then java>"` | Extended support matrix |
+| `mcr run-rootfs mysql-rootfs /bin/sh -c "<start mysqld and query over Unix socket>"` | Extended support matrix |
+| `mcr run-rootfs redis-rootfs /bin/sh -c "<start redis-server and query over Unix socket>"` | Extended support matrix |
 
 Phase 2 shell and network contracts are opt-in. Normal `cargo test -p
 mcr-testkit` must not require network access, GitHub access, CA certificates, or
@@ -211,6 +227,15 @@ MCR_BIN=mcr cargo test -p mcr-testkit -- --ignored network_smoke_contract
 Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
 `/bin/sh`, `-c`, and the guest command. They do not execute the command string
 through the host shell.
+
+The ignored extended support matrix uses `MCR_BIN` plus the matching
+materialized package rootfs fixture. It covers gcc compile-and-run, Node.js
+script execution, JDK compile-and-run, local MySQL/MariaDB server startup and
+query, and local Redis startup and query. Run it explicitly with:
+
+```powershell
+MCR_BIN=mcr cargo test -p mcr-testkit --test extended_support_smoke_contract -- --ignored --nocapture
+```
 
 Ignored performance baselines print `mcr_perf_baseline.version=1` reports with
 environment metadata, wall time, operation counts, and derived throughput.
