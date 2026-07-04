@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    fmt, fs, io,
+    fmt::{self, Write as _},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -399,6 +400,296 @@ impl OciImageManifest {
     pub fn layers(&self) -> &[OciDescriptor] {
         &self.layers
     }
+
+    #[must_use]
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        let mut output = String::new();
+        output.push_str("{\"schemaVersion\":2,\"mediaType\":");
+        push_json_string(&mut output, MEDIA_TYPE_OCI_MANIFEST);
+        output.push_str(",\"config\":");
+        push_descriptor_json(&mut output, &self.config);
+        output.push_str(",\"layers\":[");
+        for (index, layer) in self.layers.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            push_descriptor_json(&mut output, layer);
+        }
+        output.push_str("]}");
+        output.into_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OciContainerConfig {
+    env: Vec<String>,
+    working_dir: Option<String>,
+    entrypoint: Vec<String>,
+    command: Vec<String>,
+}
+
+impl OciContainerConfig {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_env<I, S>(mut self, env: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env = env.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_entrypoint<I, S>(mut self, entrypoint: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.entrypoint = entrypoint.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_command<I, S>(mut self, command: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.command = command.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn env(&self) -> &[String] {
+        &self.env
+    }
+
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+
+    #[must_use]
+    pub fn entrypoint(&self) -> &[String] {
+        &self.entrypoint
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OciHistoryEntry {
+    created_by: String,
+    comment: Option<String>,
+    empty_layer: bool,
+}
+
+impl OciHistoryEntry {
+    #[must_use]
+    pub fn new(created_by: impl Into<String>) -> Self {
+        Self {
+            created_by: created_by.into(),
+            comment: None,
+            empty_layer: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
+        self.comment = Some(comment.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_empty_layer(mut self, empty_layer: bool) -> Self {
+        self.empty_layer = empty_layer;
+        self
+    }
+
+    #[must_use]
+    pub fn created_by(&self) -> &str {
+        &self.created_by
+    }
+
+    #[must_use]
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
+
+    #[must_use]
+    pub const fn empty_layer(&self) -> bool {
+        self.empty_layer
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OciImageConfig {
+    platform: OciPlatform,
+    config: OciContainerConfig,
+    history: Vec<OciHistoryEntry>,
+    rootfs_diff_ids: Vec<OciDigest>,
+}
+
+impl OciImageConfig {
+    #[must_use]
+    pub const fn new(
+        platform: OciPlatform,
+        config: OciContainerConfig,
+        history: Vec<OciHistoryEntry>,
+        rootfs_diff_ids: Vec<OciDigest>,
+    ) -> Self {
+        Self {
+            platform,
+            config,
+            history,
+            rootfs_diff_ids,
+        }
+    }
+
+    #[must_use]
+    pub const fn platform(&self) -> &OciPlatform {
+        &self.platform
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &OciContainerConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn history(&self) -> &[OciHistoryEntry] {
+        &self.history
+    }
+
+    #[must_use]
+    pub fn rootfs_diff_ids(&self) -> &[OciDigest] {
+        &self.rootfs_diff_ids
+    }
+
+    #[must_use]
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        let mut output = String::new();
+        output.push_str("{\"architecture\":");
+        push_json_string(&mut output, self.platform.architecture());
+        output.push_str(",\"config\":");
+        push_container_config_json(&mut output, &self.config);
+        output.push_str(",\"history\":[");
+        for (index, entry) in self.history.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            push_history_entry_json(&mut output, entry);
+        }
+        output.push_str("],\"os\":");
+        push_json_string(&mut output, self.platform.os());
+        if let Some(variant) = self.platform.variant() {
+            output.push_str(",\"variant\":");
+            push_json_string(&mut output, variant);
+        }
+        output.push_str(",\"rootfs\":{\"diff_ids\":[");
+        for (index, diff_id) in self.rootfs_diff_ids.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            push_json_string(&mut output, &diff_id.to_string());
+        }
+        output.push_str("],\"type\":\"layers\"}}");
+        output.into_bytes()
+    }
+}
+
+fn push_container_config_json(output: &mut String, config: &OciContainerConfig) {
+    output.push_str("{\"Cmd\":");
+    push_json_string_array(output, config.command());
+    output.push_str(",\"Entrypoint\":");
+    push_json_string_array(output, config.entrypoint());
+    output.push_str(",\"Env\":");
+    push_json_string_array(output, config.env());
+    if let Some(working_dir) = config.working_dir() {
+        output.push_str(",\"WorkingDir\":");
+        push_json_string(output, working_dir);
+    }
+    output.push('}');
+}
+
+fn push_history_entry_json(output: &mut String, entry: &OciHistoryEntry) {
+    output.push_str("{\"created_by\":");
+    push_json_string(output, entry.created_by());
+    if let Some(comment) = entry.comment() {
+        output.push_str(",\"comment\":");
+        push_json_string(output, comment);
+    }
+    if entry.empty_layer() {
+        output.push_str(",\"empty_layer\":true");
+    }
+    output.push('}');
+}
+
+fn push_descriptor_json(output: &mut String, descriptor: &OciDescriptor) {
+    output.push_str("{\"mediaType\":");
+    push_json_string(output, descriptor.media_type());
+    output.push_str(",\"digest\":");
+    push_json_string(output, &descriptor.digest().to_string());
+    output.push_str(",\"size\":");
+    write!(output, "{}", descriptor.size()).expect("writing to String cannot fail");
+    if !descriptor.annotations().is_empty() {
+        output.push_str(",\"annotations\":{");
+        for (index, (key, value)) in descriptor.annotations().iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            push_json_string(output, key);
+            output.push(':');
+            push_json_string(output, value);
+        }
+        output.push('}');
+    }
+    output.push('}');
+}
+
+fn push_json_string_array(output: &mut String, values: &[String]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(output, value);
+    }
+    output.push(']');
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{00}'..='\u{1f}' => {
+                write!(output, "\\u{:04x}", u32::from(ch)).expect("writing to String cannot fail");
+            }
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -850,6 +1141,81 @@ mod tests {
             index.select_manifest(&OciPlatform::linux_amd64()),
             Err(ImageError::NoCompatibleManifest { .. })
         ));
+    }
+
+    #[test]
+    fn image_config_serializes_deterministic_json() {
+        let diff_ids = vec![
+            OciDigest::parse(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            OciDigest::parse(
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
+        ];
+        let config = OciContainerConfig::new()
+            .with_env(["PATH=/usr/bin", "APP_ENV=prod"])
+            .with_working_dir("/srv/app")
+            .with_entrypoint(["/entrypoint"])
+            .with_command(["serve", "--message=hello \"mcr\"\n"]);
+        let image = OciImageConfig::new(
+            OciPlatform::linux_amd64(),
+            config,
+            vec![
+                OciHistoryEntry::new("FROM scratch").with_empty_layer(true),
+                OciHistoryEntry::new("COPY app /srv/app").with_comment("build context"),
+            ],
+            diff_ids,
+        );
+
+        let first = image.to_json_bytes();
+        let second = image.to_json_bytes();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            concat!(
+                "{\"architecture\":\"amd64\",\"config\":{\"Cmd\":[\"serve\",",
+                "\"--message=hello \\\"mcr\\\"\\n\"],\"Entrypoint\":[\"/entrypoint\"],",
+                "\"Env\":[\"PATH=/usr/bin\",\"APP_ENV=prod\"],",
+                "\"WorkingDir\":\"/srv/app\"},\"history\":[",
+                "{\"created_by\":\"FROM scratch\",\"empty_layer\":true},",
+                "{\"created_by\":\"COPY app /srv/app\",\"comment\":\"build context\"}],",
+                "\"os\":\"linux\",\"rootfs\":{\"diff_ids\":[",
+                "\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",",
+                "\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"",
+                "],\"type\":\"layers\"}}"
+            )
+        );
+    }
+
+    #[test]
+    fn image_manifest_serializes_deterministic_descriptor_json() {
+        let config = descriptor_for(MEDIA_TYPE_OCI_CONFIG, br#"{"architecture":"amd64"}"#);
+        let mut layer = descriptor_for(MEDIA_TYPE_OCI_LAYER, b"layer-one");
+        layer.insert_annotation("org.opencontainers.image.title", "layer");
+        layer.insert_annotation("com.example.order", "first");
+        let manifest = OciImageManifest::new(config.clone(), vec![layer.clone()]);
+
+        let first = manifest.to_json_bytes();
+        let second = manifest.to_json_bytes();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            format!(
+                "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"{}\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[{{\"mediaType\":\"{}\",\"digest\":\"{}\",\"size\":{},\"annotations\":{{\"com.example.order\":\"first\",\"org.opencontainers.image.title\":\"layer\"}}}}]}}",
+                MEDIA_TYPE_OCI_MANIFEST,
+                config.media_type(),
+                config.digest(),
+                config.size(),
+                layer.media_type(),
+                layer.digest(),
+                layer.size()
+            )
+        );
     }
 
     #[test]
