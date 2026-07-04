@@ -19,6 +19,7 @@ pub struct RunRootfsConfig {
     program: Vec<u8>,
     args: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
+    working_dir: Option<String>,
     mvp_emulator: bool,
     guest_step_limit: Option<u64>,
 }
@@ -32,6 +33,7 @@ impl RunRootfsConfig {
             args: vec![program.clone()],
             program,
             env: Vec::new(),
+            working_dir: None,
             mvp_emulator: false,
             guest_step_limit: None,
         }
@@ -54,6 +56,12 @@ impl RunRootfsConfig {
         E: Into<Vec<u8>>,
     {
         self.env = env.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
         self
     }
 
@@ -87,6 +95,11 @@ impl RunRootfsConfig {
     #[must_use]
     pub fn env(&self) -> &[Vec<u8>] {
         &self.env
+    }
+
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
     }
 
     #[must_use]
@@ -314,6 +327,9 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
 
     let load_start = Instant::now();
     let mut vfs = load_rootfs(&config.rootfs)?;
+    if let Some(working_dir) = config.working_dir() {
+        vfs.chdir(working_dir)?;
+    }
     crate::host_step_trace(format_args!(
         "run-rootfs rootfs-loaded elapsed_ms={}",
         crate::host_step_elapsed_ms(load_start)
@@ -1216,6 +1232,29 @@ mod tests {
 
         assert_eq!(output.status(), 0);
         assert_eq!(output.stdout(), b"");
+        assert_eq!(output.stderr(), b"");
+    }
+
+    #[test]
+    fn run_rootfs_applies_initial_working_dir_to_relative_paths() {
+        let rootfs = TestRootfs::new("working-dir");
+        rootfs.write_static_elf("/bin/sh");
+        rootfs.create_dir("/work");
+        rootfs.write_file("/work/message.txt", b"from cwd\n");
+
+        let output = run_rootfs(
+            emulated_config(&rootfs, b"/bin/sh")
+                .with_args([
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"cat message.txt".to_vec(),
+                ])
+                .with_working_dir("/work"),
+        )
+        .unwrap();
+
+        assert_eq!(output.status(), 0);
+        assert_eq!(output.stdout(), b"from cwd\n");
         assert_eq!(output.stderr(), b"");
     }
 

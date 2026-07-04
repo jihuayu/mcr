@@ -44,3 +44,8 @@ cargo test -p mcr-testkit
   stdout/stderr, snapshot ID, and trace ID. Snapshot-rootfs mounting, working
   directory application, cancellation, and end-to-end `RUN` mutation remain
   follow-up work.
+- 2026-07-04 checkpoint: `RunRootfsConfig` and `BuildRunSpec` now preserve and
+  apply the build working directory before guest execution. Focused tests cover
+  build-run config translation and relative guest paths resolving from the
+  configured working directory. Snapshot-rootfs mounting, cancellation, and
+  end-to-end `RUN` mutation remain follow-up work.

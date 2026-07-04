@@ -101,6 +101,7 @@ impl BuildRunSpec {
         let argv = self.command.argv()?;
         let mut config = RunRootfsConfig::new(&self.rootfs, argv[0].clone())
             .with_args(argv)
+            .with_working_dir(self.working_dir.to_string())
             .with_env(
                 self.env
                     .iter()
@@ -261,6 +262,7 @@ mod tests {
         let config = spec.to_run_rootfs_config().unwrap();
 
         assert_eq!(config.rootfs(), Path::new("rootfs"));
+        assert_eq!(config.working_dir(), Some("/"));
         assert_eq!(config.program(), b"/bin/sh");
         assert_eq!(
             config.args(),
@@ -285,5 +287,19 @@ mod tests {
             spec.to_run_rootfs_config(),
             Err(BuildRunError::EmptyExecProgram)
         ));
+    }
+
+    #[test]
+    fn build_run_config_preserves_working_directory() {
+        let spec = BuildRunSpec::new(
+            SnapshotId::new("step-3").unwrap(),
+            "rootfs",
+            BuildRunCommand::exec(b"/bin/pwd".to_vec(), [] as [&[u8]; 0]),
+        )
+        .with_working_dir(SnapshotPath::new("/work/app").unwrap());
+
+        let config = spec.to_run_rootfs_config().unwrap();
+
+        assert_eq!(config.working_dir(), Some("/work/app"));
     }
 }
