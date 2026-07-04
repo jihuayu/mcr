@@ -127,6 +127,14 @@ level-trigger `epoll` must continue to observe Linux readiness semantics,
 including fd generation checks, close wakeups, timeout behavior, and
 Linux-compatible errno mapping.
 
+The first readiness checkpoint establishes the backend contract without
+switching sockets to IOCP yet: host completion classes map to `SocketEvents`,
+`mcr-net` associates completions with a socket readiness token and generation,
+and the semantic `WSAPoll` path remains the fallback when no completion-backed
+readiness is available. The full backend still needs overlapped operation
+ownership, IOCP registration, worker draining, cancellation, and differential
+tests against the fallback path.
+
 ### AcceptEx And ConnectEx
 
 `AcceptEx` and `ConnectEx` should be added after the IOCP socket lifetime model

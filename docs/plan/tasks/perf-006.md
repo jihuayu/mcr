@@ -1,7 +1,7 @@
 ---
 id: perf-006
 scope: network-performance
-status: pending
+status: in-progress
 depends-on: [perf-001, net-002]
 ---
 
@@ -40,3 +40,14 @@ gh workflow run x86-runtime-smoke.yml -f suite=network
 - Completions must preserve fd generation checks, close wakeups, timeout
   behavior, and Linux errno mapping.
 - Keep the semantic WSAPoll/select backend as an A/B comparison and fallback.
+
+## Checkpoints
+
+- 2026-07-04: Added the IOCP-readiness seam without replacing the current
+  Winsock path. `mcr-win` now defines host socket completion classes and their
+  readiness-bit mapping. `mcr-net` assigns generation-bearing readiness tokens
+  to host socket handles, drains completion notifications into a readiness
+  cache, ignores stale-token completions, and falls back to `WSAPoll` when no
+  completion-backed readiness is available. The full IOCP backend, overlapped
+  operation ownership, cancellation/drain lifecycle, and ignored testkit
+  performance smoke remain follow-up work.

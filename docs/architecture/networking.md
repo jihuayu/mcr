@@ -187,6 +187,14 @@ The Phase 2 epoll subset is level-triggered. `EPOLLONESHOT`, edge-triggered
 semantics, `EPOLLEXCLUSIVE`, and signal-mask variants either remain deferred or
 return explicit Linux-compatible errors until a task expands the contract.
 
+The IOCP backend feeds this same policy through a socket readiness token owned
+by `mcr-net`. Host completions such as accept, connect, receive, send, close,
+and error map to readiness bits under the active token generation; stale
+completions from a replaced or closed host socket are ignored. The current
+Winsock backend still falls back to `WSAPoll` when no completion-backed
+readiness is cached, so IOCP remains an implementation backend rather than a new
+guest-visible wait model.
+
 ## Socket Options
 
 Socket options are a whitelist, not a passthrough. Initial support should focus

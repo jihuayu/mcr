@@ -65,6 +65,67 @@ pub struct SocketEvents {
     pub invalid: bool,
 }
 
+/// Host socket completion classes that can wake guest readiness waiters.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SocketCompletionKind {
+    Accept,
+    Connect,
+    Receive,
+    Send,
+    PeerClosed,
+    Closed,
+    Error,
+}
+
+impl SocketCompletionKind {
+    /// Maps a host completion into the level-trigger readiness bits visible to
+    /// `select`, `poll`, and `epoll`.
+    pub const fn readiness(self) -> SocketEvents {
+        match self {
+            Self::Accept | Self::Receive => SocketEvents {
+                readable: true,
+                writable: false,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            },
+            Self::Connect | Self::Send => SocketEvents {
+                readable: false,
+                writable: true,
+                priority: false,
+                error: false,
+                hang_up: false,
+                invalid: false,
+            },
+            Self::PeerClosed => SocketEvents {
+                readable: true,
+                writable: false,
+                priority: false,
+                error: false,
+                hang_up: true,
+                invalid: false,
+            },
+            Self::Closed => SocketEvents {
+                readable: false,
+                writable: false,
+                priority: false,
+                error: true,
+                hang_up: true,
+                invalid: false,
+            },
+            Self::Error => SocketEvents {
+                readable: false,
+                writable: false,
+                priority: false,
+                error: true,
+                hang_up: false,
+                invalid: false,
+            },
+        }
+    }
+}
+
 impl SocketEvents {
     /// Read readiness interest.
     pub const fn read() -> Self {
@@ -1152,12 +1213,13 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
+    use super::{NetworkStack, SocketCompletionKind, SocketEvents};
+
     #[cfg(windows)]
     use super::{
         AddressFamily, HostShutdown, HostSocketOptionName, HostSocketOptionValue, SocketKind,
         SocketPoll, SocketProtocol,
     };
-    use super::{NetworkStack, SocketEvents};
 
     #[test]
     fn socket_events_empty_detects_flags() {
@@ -1174,6 +1236,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(ready, 0);
+    }
+
+    #[test]
+    fn socket_completion_kind_maps_to_readiness_bits() {
+        assert_eq!(
+            SocketCompletionKind::Accept.readiness(),
+            SocketEvents::read()
+        );
+        assert_eq!(
+            SocketCompletionKind::Receive.readiness(),
+            SocketEvents::read()
+        );
+        assert_eq!(
+            SocketCompletionKind::Connect.readiness(),
+            SocketEvents::write()
+        );
+        assert_eq!(
+            SocketCompletionKind::Send.readiness(),
+            SocketEvents::write()
+        );
+
+        let peer_closed = SocketCompletionKind::PeerClosed.readiness();
+        assert!(peer_closed.readable);
+        assert!(peer_closed.hang_up);
+        assert!(!peer_closed.error);
+
+        let closed = SocketCompletionKind::Closed.readiness();
+        assert!(closed.hang_up);
+        assert!(closed.error);
+
+        let error = SocketCompletionKind::Error.readiness();
+        assert!(error.error);
+        assert!(!error.hang_up);
     }
 
     #[cfg(windows)]

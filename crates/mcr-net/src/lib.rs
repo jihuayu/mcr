@@ -8,7 +8,7 @@ use std::{
 
 use mcr_win::{
     AddressFamily, HostError, HostErrorKind, HostShutdown, HostSocket, HostSocketOptionName,
-    HostSocketOptionValue, NetworkStack, SocketEvents, SocketKind,
+    HostSocketOptionValue, NetworkStack, SocketCompletionKind, SocketEvents, SocketKind,
     SocketProtocol as HostSocketProtocol,
 };
 
@@ -68,6 +68,57 @@ impl SocketId {
 impl fmt::Display for SocketId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SocketReadinessToken {
+    socket: SocketId,
+    generation: u64,
+}
+
+impl SocketReadinessToken {
+    #[must_use]
+    pub const fn new(socket: SocketId, generation: u64) -> Self {
+        Self { socket, generation }
+    }
+
+    #[must_use]
+    pub const fn socket(self) -> SocketId {
+        self.socket
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostSocketCompletion {
+    token: SocketReadinessToken,
+    kind: SocketCompletionKind,
+}
+
+impl HostSocketCompletion {
+    #[must_use]
+    pub const fn new(token: SocketReadinessToken, kind: SocketCompletionKind) -> Self {
+        Self { token, kind }
+    }
+
+    #[must_use]
+    pub const fn token(self) -> SocketReadinessToken {
+        self.token
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> SocketCompletionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn readiness(self) -> SocketEvents {
+        self.kind.readiness()
     }
 }
 
@@ -527,6 +578,12 @@ pub trait HostSocketHandle: fmt::Debug {
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, HostIoError>;
+    fn drain_readiness_completions(
+        &mut self,
+        _token: SocketReadinessToken,
+    ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
+        Ok(Vec::new())
+    }
     fn shutdown(&mut self, how: ShutdownHow) -> Result<(), HostIoError>;
 }
 
@@ -725,6 +782,62 @@ impl HostSocketTransport for NoopHostSocketTransport {
 #[derive(Debug)]
 struct HostSocketEntry {
     handle: Box<dyn HostSocketHandle>,
+    readiness_token: SocketReadinessToken,
+}
+
+#[derive(Debug, Default)]
+struct SocketReadinessCache {
+    ready: BTreeMap<SocketReadinessToken, SocketEvents>,
+}
+
+impl SocketReadinessCache {
+    fn apply_completion(
+        &mut self,
+        active_token: SocketReadinessToken,
+        completion: HostSocketCompletion,
+    ) {
+        if completion.token() != active_token {
+            return;
+        }
+
+        let readiness = self.ready.entry(active_token).or_default();
+        merge_socket_events(readiness, completion.readiness());
+    }
+
+    fn readiness(
+        &self,
+        active_token: SocketReadinessToken,
+        interest: SocketEvents,
+    ) -> Option<SocketEvents> {
+        self.ready
+            .get(&active_token)
+            .map(|readiness| socket_readiness_for_interest(*readiness, interest))
+            .filter(|readiness| !readiness.is_empty())
+    }
+
+    fn clear_socket(&mut self, id: SocketId) {
+        self.ready.retain(|token, _| token.socket() != id);
+    }
+}
+
+fn merge_socket_events(target: &mut SocketEvents, update: SocketEvents) {
+    target.readable |= update.readable;
+    target.writable |= update.writable;
+    target.priority |= update.priority;
+    target.error |= update.error;
+    target.hang_up |= update.hang_up;
+    target.invalid |= update.invalid;
+}
+
+fn socket_readiness_for_interest(readiness: SocketEvents, interest: SocketEvents) -> SocketEvents {
+    SocketEvents {
+        readable: readiness.readable && interest.readable,
+        writable: readiness.writable && interest.writable,
+        priority: readiness.priority && interest.priority,
+        error: readiness.error,
+        hang_up: readiness.hang_up,
+        invalid: readiness.invalid,
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -864,23 +977,32 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Default)]
 pub struct GuestSocketTable {
     next_id: u64,
+    next_readiness_generation: u64,
     sockets: BTreeMap<SocketId, GuestSocket>,
     host_handles: BTreeMap<SocketId, HostSocketEntry>,
+    readiness_cache: SocketReadinessCache,
     transport: Option<Box<dyn HostSocketTransport>>,
+}
+
+impl Default for GuestSocketTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Debug for GuestSocketTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GuestSocketTable")
             .field("next_id", &self.next_id)
+            .field("next_readiness_generation", &self.next_readiness_generation)
             .field("sockets", &self.sockets)
             .field(
                 "host_handles",
                 &self.host_handles.keys().collect::<Vec<_>>(),
             )
+            .field("readiness_cache", &self.readiness_cache)
             .field("has_transport", &self.transport.is_some())
             .finish()
     }
@@ -891,8 +1013,10 @@ impl GuestSocketTable {
     pub fn new() -> Self {
         Self {
             next_id: SocketId::MIN.get(),
+            next_readiness_generation: 1,
             sockets: BTreeMap::new(),
             host_handles: BTreeMap::new(),
+            readiness_cache: SocketReadinessCache::default(),
             transport: None,
         }
     }
@@ -901,8 +1025,10 @@ impl GuestSocketTable {
     pub fn with_transport(transport: impl HostSocketTransport + 'static) -> Self {
         Self {
             next_id: SocketId::MIN.get(),
+            next_readiness_generation: 1,
             sockets: BTreeMap::new(),
             host_handles: BTreeMap::new(),
+            readiness_cache: SocketReadinessCache::default(),
             transport: Some(Box::new(transport)),
         }
     }
@@ -931,9 +1057,16 @@ impl GuestSocketTable {
     ) -> Result<SocketId, SocketError> {
         validate_socket_protocol(spec.socket_type, spec.protocol)?;
         let id = self.allocate_id()?;
+        let readiness_token = self.allocate_readiness_token(id)?;
         let previous_socket = self.sockets.insert(id, GuestSocket::new(id, spec));
         debug_assert!(previous_socket.is_none());
-        let previous_handle = self.host_handles.insert(id, HostSocketEntry { handle });
+        let previous_handle = self.host_handles.insert(
+            id,
+            HostSocketEntry {
+                handle,
+                readiness_token,
+            },
+        );
         debug_assert!(previous_handle.is_none());
         Ok(id)
     }
@@ -1445,11 +1578,33 @@ impl GuestSocketTable {
             return Err(SocketError::BadSocket { id });
         }
 
-        let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
-        let readiness = entry
-            .handle
-            .poll(interest, timeout)
-            .map_err(SocketError::from_host)?;
+        let (token, completions) = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
+            let token = entry.readiness_token;
+            let completions = entry
+                .handle
+                .drain_readiness_completions(token)
+                .map_err(SocketError::from_host)?;
+            (token, completions)
+        };
+        for completion in completions {
+            self.readiness_cache.apply_completion(token, completion);
+        }
+
+        if let Some(readiness) = self.readiness_cache.readiness(token, interest) {
+            if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+                self.finish_nonblocking_connect(id)?;
+            }
+            return Ok(readiness);
+        }
+
+        let readiness = {
+            let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
+            entry
+                .handle
+                .poll(interest, timeout)
+                .map_err(SocketError::from_host)?
+        };
         if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
             self.finish_nonblocking_connect(id)?;
         }
@@ -1507,17 +1662,26 @@ impl GuestSocketTable {
         if !self.host_handles.contains_key(&id) {
             let spec = self.socket_spec(id)?;
             let options = self.socket(id)?.options();
-            let transport = self.transport.as_ref().ok_or_else(|| {
-                SocketError::unsupported(
-                    operation,
-                    LinuxErrno::FunctionNotImplemented,
-                    "host socket transport is not configured",
-                )
-            })?;
-            let handle = transport
-                .open_socket(spec, options)
-                .map_err(SocketError::from_host)?;
-            self.host_handles.insert(id, HostSocketEntry { handle });
+            let handle = {
+                let transport = self.transport.as_ref().ok_or_else(|| {
+                    SocketError::unsupported(
+                        operation,
+                        LinuxErrno::FunctionNotImplemented,
+                        "host socket transport is not configured",
+                    )
+                })?;
+                transport
+                    .open_socket(spec, options)
+                    .map_err(SocketError::from_host)?
+            };
+            let readiness_token = self.allocate_readiness_token(id)?;
+            self.host_handles.insert(
+                id,
+                HostSocketEntry {
+                    handle,
+                    readiness_token,
+                },
+            );
         }
         self.host_entry_mut(id, operation)
     }
@@ -1604,6 +1768,7 @@ impl GuestSocketTable {
                     write: true,
                 };
                 self.host_handles.remove(&id);
+                self.readiness_cache.clear_socket(id);
                 Ok(())
             }
         }
@@ -1629,6 +1794,24 @@ impl GuestSocketTable {
         })?;
         self.next_id = self.next_id.checked_add(1).unwrap_or(0);
         Ok(id)
+    }
+
+    fn allocate_readiness_token(
+        &mut self,
+        id: SocketId,
+    ) -> Result<SocketReadinessToken, SocketError> {
+        let generation = self.next_readiness_generation;
+        self.next_readiness_generation =
+            self.next_readiness_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    SocketError::invalid_input(
+                        SocketOperation::AllocateSocketId,
+                        LinuxErrno::InvalidArgument,
+                        "socket readiness generation space is exhausted",
+                    )
+                })?;
+        Ok(SocketReadinessToken::new(id, generation))
     }
 }
 
@@ -2055,7 +2238,7 @@ fn validate_address_domain(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::*;
@@ -2070,6 +2253,9 @@ mod tests {
         connect_error: Option<HostIoError>,
         socket_error: Option<HostIoError>,
         fail_send: Option<HostIoError>,
+        readiness_completions: Vec<ReadinessCompletionFixture>,
+        fallback_readiness: Option<SocketEvents>,
+        poll_calls: Option<Rc<Cell<usize>>>,
         accepted: Vec<(FakeHostSocketHandle, SocketAddress)>,
         bound: Option<SocketAddress>,
         listened: bool,
@@ -2126,6 +2312,19 @@ mod tests {
         fn with_accepted(peer: SocketAddress, incoming: &[u8]) -> Self {
             Self {
                 accepted: vec![(Self::with_incoming(incoming), peer)],
+                ..Self::default()
+            }
+        }
+
+        fn with_readiness(
+            completions: Vec<ReadinessCompletionFixture>,
+            fallback_readiness: Option<SocketEvents>,
+            poll_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                readiness_completions: completions,
+                fallback_readiness,
+                poll_calls: Some(poll_calls),
                 ..Self::default()
             }
         }
@@ -2359,6 +2558,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReadinessCompletionFixture {
+        Current(SocketCompletionKind),
+        Stale(SocketCompletionKind),
+    }
+
     impl HostSocketHandle for FakeHostSocketHandle {
         fn bind(&mut self, address: SocketAddress) -> Result<SocketAddress, HostIoError> {
             self.bound = Some(address);
@@ -2455,6 +2660,12 @@ mod tests {
             interest: SocketEvents,
             _timeout: Option<Duration>,
         ) -> Result<SocketEvents, HostIoError> {
+            if let Some(calls) = &self.poll_calls {
+                calls.set(calls.get() + 1);
+            }
+            if let Some(readiness) = self.fallback_readiness {
+                return Ok(readiness);
+            }
             Ok(SocketEvents {
                 readable: interest.readable && !self.incoming.is_empty(),
                 writable: interest.writable,
@@ -2463,6 +2674,29 @@ mod tests {
                 hang_up: false,
                 invalid: false,
             })
+        }
+
+        fn drain_readiness_completions(
+            &mut self,
+            token: SocketReadinessToken,
+        ) -> Result<Vec<HostSocketCompletion>, HostIoError> {
+            let completions = self
+                .readiness_completions
+                .drain(..)
+                .map(|completion| match completion {
+                    ReadinessCompletionFixture::Current(kind) => {
+                        HostSocketCompletion::new(token, kind)
+                    }
+                    ReadinessCompletionFixture::Stale(kind) => HostSocketCompletion::new(
+                        SocketReadinessToken::new(
+                            token.socket(),
+                            token.generation().saturating_add(1),
+                        ),
+                        kind,
+                    ),
+                })
+                .collect();
+            Ok(completions)
         }
 
         fn shutdown(&mut self, _how: ShutdownHow) -> Result<(), HostIoError> {
@@ -3021,6 +3255,87 @@ mod tests {
                 .local_address(),
             Some(local)
         );
+    }
+
+    #[test]
+    fn iocp_readiness_receive_completion_feeds_poll_without_wsapoll_fallback() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            vec![ReadinessCompletionFixture::Current(
+                SocketCompletionKind::Receive,
+            )],
+            None,
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::read(), Some(Duration::from_secs(30)))
+            .expect("completion readiness");
+
+        assert!(readiness.readable);
+        assert!(!readiness.writable);
+        assert_eq!(poll_calls.get(), 0);
+    }
+
+    #[test]
+    fn iocp_readiness_ignores_stale_completion_generation() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            vec![ReadinessCompletionFixture::Stale(
+                SocketCompletionKind::Receive,
+            )],
+            Some(SocketEvents::default()),
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::read(), Some(Duration::ZERO))
+            .expect("fallback readiness");
+
+        assert!(readiness.is_empty());
+        assert_eq!(poll_calls.get(), 1);
+    }
+
+    #[test]
+    fn iocp_readiness_uses_wsapoll_fallback_without_completion() {
+        let poll_calls = Rc::new(Cell::new(0));
+        let handle = FakeHostSocketHandle::with_readiness(
+            Vec::new(),
+            Some(SocketEvents::write()),
+            Rc::clone(&poll_calls),
+        );
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket_with_handle(
+                SocketSpec::new(SocketDomain::Inet, SocketType::Stream, SocketProtocol::Tcp)
+                    .expect("tcp spec"),
+                Box::new(handle),
+            )
+            .expect("socket with readiness handle");
+
+        let readiness = table
+            .poll(stream, SocketEvents::write(), Some(Duration::ZERO))
+            .expect("fallback readiness");
+
+        assert!(readiness.writable);
+        assert!(!readiness.readable);
+        assert_eq!(poll_calls.get(), 1);
     }
 
     #[test]
