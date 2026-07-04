@@ -202,6 +202,36 @@ fn perf_baseline_guest_smoke_workloads() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires MCR_BIN and a materialized alpine-rootfs"]
+fn perf_fork_exec_baseline() -> Result<()> {
+    let Some(context) = GuestPerfContext::discover()? else {
+        return Ok(());
+    };
+    let mut report = PerfBaselineReport::new("mcr-testkit fork/exec performance baseline");
+
+    let command = context.command(SHELL_STARTUP);
+    let (output_result, wall_time) = measure_wall_time(|| command.run());
+    let output = output_result?;
+    report.push(
+        PerfMeasurement::new(SHELL_STARTUP.name, SHELL_STARTUP.operations, wall_time)
+            .with_field("category", SHELL_STARTUP.category)
+            .with_field("script", SHELL_STARTUP.script)
+            .with_field("status", output.status_code().unwrap_or_default()),
+    );
+
+    assert_eq!(
+        output.status_code(),
+        Some(0),
+        "guest fork/exec workload failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(output.stdout()),
+        String::from_utf8_lossy(output.stderr())
+    );
+
+    println!("{report}");
+    Ok(())
+}
+
+#[test]
 #[ignore = "captures DNS cache performance baseline output without guest network access"]
 fn perf_dns_cache_baseline() {
     let report = dns_cache_baseline_report("mcr-testkit DNS cache performance baseline");

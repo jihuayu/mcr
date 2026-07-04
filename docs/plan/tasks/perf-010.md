@@ -1,7 +1,7 @@
 ---
 id: perf-010
 scope: task-performance
-status: in-progress
+status: done
 depends-on: [perf-001, task-002]
 ---
 
@@ -54,3 +54,7 @@ cargo test -p mcr-testkit perf_fork_exec -- --ignored --nocapture
   with Linux-compatible errno and not corrupt parent state.
 - Treat `posix_spawn`-like behavior as the same direct-exec optimization when it
   is represented by supported guest syscalls.
+- Completed 2026-07-04: the deferred fork+exec runtime checkpoint now has
+  focused fork, exec, and wait4 verification plus an ignored `mcr-testkit`
+  `perf_fork_exec_baseline` that measures the guest shell startup path when
+  `MCR_BIN` and a materialized Alpine rootfs are available.
