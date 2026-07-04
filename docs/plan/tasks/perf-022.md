@@ -1,7 +1,7 @@
 ---
 id: perf-022
 scope: network-performance
-status: pending
+status: done
 depends-on: [perf-020]
 ---
 
@@ -55,3 +55,7 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
 - Exposed the RIO capability gate through `mcr-net::HostSocketHandle` and
   `GuestSocketTable`. Non-RIO handles default to an explicit unsupported
   capability, while the Windows host handle delegates to `mcr-win`.
+- Closed as the RIO gate, not an enabled data path. Targeted verification
+  covered `mcr-win` and `mcr-net` RIO tests plus clippy. The implementation
+  intentionally keeps RIO disabled until a measured workload proves it beats the
+  IOCP backend and registered-buffer lifetime/cancellation semantics are proven.
