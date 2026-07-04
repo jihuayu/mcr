@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fmt,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -279,6 +279,13 @@ impl SnapshotSpec {
             self.opaque_directories(),
         )
     }
+
+    pub fn export_upper_layer_tar(&self) -> Result<Vec<u8>, SnapshotExportError> {
+        let plan = self.deterministic_layer_plan()?;
+        let regular_contents = read_upper_regular_contents(self.upper_root(), &plan)?;
+        plan.to_uncompressed_tar(&regular_contents)
+            .map_err(SnapshotExportError::Layer)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,6 +451,73 @@ impl fmt::Display for LayerExportError {
 }
 
 impl Error for LayerExportError {}
+
+#[derive(Debug)]
+pub enum SnapshotExportError {
+    Snapshot(SnapshotError),
+    Layer(LayerExportError),
+    Io { path: PathBuf, source: io::Error },
+}
+
+impl fmt::Display for SnapshotExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Snapshot(error) => error.fmt(formatter),
+            Self::Layer(error) => error.fmt(formatter),
+            Self::Io { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read upper root content `{}`: {source}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl Error for SnapshotExportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Layer(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<SnapshotError> for SnapshotExportError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
+fn read_upper_regular_contents(
+    upper_root: &WritableUpperRoot,
+    plan: &SnapshotLayerPlan,
+) -> Result<BTreeMap<SnapshotPath, Vec<u8>>, SnapshotExportError> {
+    let mut contents = BTreeMap::new();
+    for entry in plan.entries() {
+        let LayerEntryKind::Filesystem { metadata } = entry.kind() else {
+            continue;
+        };
+        if !matches!(metadata.kind(), SnapshotFileKind::Regular { .. }) {
+            continue;
+        }
+        let host_path = upper_host_path(upper_root, entry.path());
+        let bytes = fs::read(&host_path).map_err(|source| SnapshotExportError::Io {
+            path: host_path,
+            source,
+        })?;
+        contents.insert(entry.path().clone(), bytes);
+    }
+    Ok(contents)
+}
+
+fn upper_host_path(upper_root: &WritableUpperRoot, path: &SnapshotPath) -> PathBuf {
+    upper_root
+        .host_path()
+        .join(path.as_str().trim_start_matches('/'))
+}
 
 fn append_layer_tar_entry(
     archive: &mut Vec<u8>,
@@ -958,7 +1032,11 @@ fn join_snapshot_child(parent: &str, child: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn package_name_is_stable() {
@@ -1428,6 +1506,40 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_spec_exports_upper_root_regular_content_to_layer_tar() {
+        let upper = temp_root("upper-export");
+        std::fs::create_dir_all(upper.join("etc")).unwrap();
+        std::fs::write(upper.join("etc/config"), b"name=mcr\n").unwrap();
+
+        let mut spec = SnapshotSpec::new(
+            SnapshotId::new("upper-step").unwrap(),
+            WritableUpperRoot::new(&upper).unwrap(),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/etc").unwrap(),
+            LinuxMetadata::new(SnapshotFileKind::Directory, 0o755, 0, 0, 0),
+        );
+        spec.upsert_sidecar(
+            SnapshotPath::new("/etc/config").unwrap(),
+            LinuxMetadata::new(SnapshotFileKind::Regular { size: 9 }, 0o640, 100, 200, 0),
+        );
+        spec.delete_lower_path(SnapshotPath::new("/etc/old").unwrap())
+            .unwrap();
+
+        let archive = spec.export_upper_layer_tar().unwrap();
+
+        assert_eq!(
+            tar_entry_names(&archive),
+            vec!["etc", "etc/.wh.old", "etc/config"]
+        );
+        assert_eq!(
+            tar_entry_payload(&archive, "etc/config"),
+            Some(b"name=mcr\n".as_slice())
+        );
+        std::fs::remove_dir_all(upper).unwrap();
+    }
+
+    #[test]
     fn layer_plan_export_rejects_missing_or_mismatched_regular_content() {
         let plan = SnapshotLayerPlan::from_parts(
             [SnapshotEntry::new(
@@ -1718,5 +1830,16 @@ mod tests {
     struct TarEntryView<'a> {
         name: String,
         payload: &'a [u8],
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mcr-snapshot-{label}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }

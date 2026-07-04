@@ -1,7 +1,7 @@
 ---
 id: snapshot-002
 scope: phase3-snapshot
-status: in-progress
+status: done
 depends-on: [snapshot-001]
 ---
 
@@ -42,4 +42,6 @@ cargo test -p mcr-snapshot
 - 2026-07-04 checkpoint: added deterministic uncompressed tar export for the
   layer plan, including regular file content validation, Linux metadata,
   hardlinks, symlinks, devices, FIFOs, whiteouts, and opaque directory markers.
-  Full upper-root diff walking remains follow-up work.
+- 2026-07-04 completion: `SnapshotSpec::export_upper_layer_tar` now walks the
+  deterministic layer plan, reads regular file content from the writable upper
+  root, and emits the OCI layer tar stream used by image export checkpoints.
