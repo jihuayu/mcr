@@ -163,6 +163,18 @@ The fast path must preserve guest PID/TID behavior, parent/child wait state,
 close-on-exec, inherited cwd/root/env where applicable, and error reporting when
 `execve` fails.
 
+The first checkpoint keeps that optimization narrow. Fork-like syscalls create
+the child task, wait state, and cloned fd table immediately, but the runtime
+marks the child memory as deferred instead of copying the parent address space.
+If the child reaches `execve` through read-only setup code, the runtime reads
+the exec arguments from parent memory while the deferred snapshot invariant still
+holds, loads the new image directly into the child process, and applies
+close-on-exec to the child fd table. If the parent is about to mutate memory, if
+the child writes memory before exec, if the child uses a non-exec syscall, or if
+`execve` fails, the runtime materializes the child memory from the parent before
+continuing. This keeps parent memory
+uncorrupted and preserves the existing wait/exit fallback behavior.
+
 ### Posix-Spawn-Like Path
 
 Where libc or toolchains express process creation as `posix_spawn`-like
