@@ -46,3 +46,11 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   mapping.
 - Keep the WSAPoll fallback for unsupported sockets, unsupported host versions,
   and differential testing.
+
+## Checkpoints
+
+- Added the first `mcr-win` IOCP host boundary: `HostIoCompletionPort` can
+  create a Windows completion port, associate host handles internally, post
+  synthetic completion packets, and poll/wait for packets with timeout mapping.
+  Non-Windows builds report explicit unsupported errors, so higher layers can
+  retain the WSAPoll fallback while socket integration is added.

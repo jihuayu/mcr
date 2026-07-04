@@ -7,6 +7,7 @@
 pub mod clocks;
 pub mod error;
 pub mod files;
+pub mod iocp;
 pub mod memory;
 pub mod native_exec;
 pub mod network;
@@ -23,6 +24,7 @@ pub use files::{
     FileAccess, FileCreation, FileOptions, FileShare, HostFile, RenameMode, create_hard_link,
     create_symlink_file, delete_file, rename_file, replace_file,
 };
+pub use iocp::{HostIoCompletionPacket, HostIoCompletionPort};
 pub use memory::{HostMemory, MemoryProtection};
 pub use native_exec::{
     DEFAULT_MXCSR, HostCpuRegisters, HostFloatingPointState, HostXmmRegisters,
