@@ -360,12 +360,29 @@ pub struct RuntimeDiagnostics {
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     vmas: Vec<DiagnosticVma>,
+    tasks: Vec<DiagnosticTask>,
     last_syscall: Option<DiagnosticSyscall>,
+    in_flight_syscall: Option<DiagnosticSyscall>,
+    native_execution_enabled: bool,
 }
 
 impl RuntimeDiagnostics {
     #[must_use]
     pub fn capture(kernel: &GuestKernel, events: &[SyscallTraceEvent]) -> Self {
+        Self::capture_with_native_execution(kernel, events, false)
+    }
+
+    #[must_use]
+    fn capture_runtime(subsystems: &RuntimeSubsystems, events: &[SyscallTraceEvent]) -> Self {
+        Self::capture_with_native_execution(&subsystems.tasks, events, subsystems.native_execution)
+    }
+
+    #[must_use]
+    fn capture_with_native_execution(
+        kernel: &GuestKernel,
+        events: &[SyscallTraceEvent],
+        native_execution_enabled: bool,
+    ) -> Self {
         let process = kernel
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process");
@@ -381,7 +398,13 @@ impl RuntimeDiagnostics {
                 .iter()
                 .map(DiagnosticVma::from_guest_vma)
                 .collect(),
+            tasks: kernel
+                .tasks()
+                .map(DiagnosticTask::from_guest_task)
+                .collect(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
+            in_flight_syscall: in_flight_syscall(events),
+            native_execution_enabled,
         }
     }
 
@@ -409,6 +432,234 @@ impl RuntimeDiagnostics {
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
     }
+
+    #[must_use]
+    pub const fn in_flight_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.in_flight_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> &[DiagnosticTask] {
+        &self.tasks
+    }
+
+    #[must_use]
+    pub const fn native_execution_enabled(&self) -> bool {
+        self.native_execution_enabled
+    }
+
+    #[must_use]
+    pub fn stall_diagnostic(&self) -> RuntimeStallDiagnostic {
+        RuntimeStallDiagnostic::from_diagnostics(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStallKind {
+    GuestWaitFutex,
+    Readiness,
+    Scheduling,
+    NativeExecution,
+    Unknown,
+}
+
+impl RuntimeStallKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GuestWaitFutex => "guest wait/futex",
+            Self::Readiness => "readiness",
+            Self::Scheduling => "scheduling",
+            Self::NativeExecution => "native execution",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeStallKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStallDiagnostic {
+    kind: RuntimeStallKind,
+    reason: String,
+    in_flight_syscall: Option<DiagnosticSyscall>,
+    last_syscall: Option<DiagnosticSyscall>,
+    runnable_tasks: usize,
+    fd_wait_tasks: usize,
+    child_wait_tasks: usize,
+}
+
+impl RuntimeStallDiagnostic {
+    #[must_use]
+    fn capture_runtime(subsystems: &RuntimeSubsystems, events: &[SyscallTraceEvent]) -> Self {
+        RuntimeDiagnostics::capture_runtime(subsystems, events).stall_diagnostic()
+    }
+
+    #[must_use]
+    pub fn from_diagnostics(diagnostics: &RuntimeDiagnostics) -> Self {
+        let runnable_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::Runnable))
+            .count();
+        let fd_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForFd { .. }))
+            .count();
+        let child_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForChild))
+            .count();
+
+        let (kind, reason) = if let Some(syscall) = diagnostics.in_flight_syscall() {
+            if syscall.name() == "futex" {
+                (
+                    RuntimeStallKind::GuestWaitFutex,
+                    format!("in-flight futex syscall at rip=0x{:x}", syscall.rip()),
+                )
+            } else if readiness_syscall_name(syscall.name()) {
+                (
+                    RuntimeStallKind::Readiness,
+                    format!("in-flight readiness syscall `{}`", syscall.name()),
+                )
+            } else {
+                (
+                    RuntimeStallKind::Unknown,
+                    format!("in-flight syscall `{}`", syscall.name()),
+                )
+            }
+        } else if fd_wait_tasks > 0 {
+            (
+                RuntimeStallKind::Readiness,
+                format!("{fd_wait_tasks} task(s) waiting for fd readiness"),
+            )
+        } else if child_wait_tasks > 0 {
+            (
+                RuntimeStallKind::Scheduling,
+                format!("{child_wait_tasks} task(s) waiting for child process completion"),
+            )
+        } else if diagnostics.native_execution_enabled() && runnable_tasks > 0 {
+            (
+                RuntimeStallKind::NativeExecution,
+                format!("{runnable_tasks} runnable task(s) in native execution mode"),
+            )
+        } else if runnable_tasks == 0 && !diagnostics.tasks().is_empty() {
+            (
+                RuntimeStallKind::Scheduling,
+                "no runnable guest tasks remain".to_owned(),
+            )
+        } else {
+            (
+                RuntimeStallKind::Unknown,
+                "no known stall signal captured".to_owned(),
+            )
+        };
+
+        Self {
+            kind,
+            reason,
+            in_flight_syscall: diagnostics.in_flight_syscall().cloned(),
+            last_syscall: diagnostics.last_syscall().cloned(),
+            runnable_tasks,
+            fd_wait_tasks,
+            child_wait_tasks,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeStallKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub const fn in_flight_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.in_flight_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
+        self.last_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub const fn runnable_tasks(&self) -> usize {
+        self.runnable_tasks
+    }
+
+    #[must_use]
+    pub const fn fd_wait_tasks(&self) -> usize {
+        self.fd_wait_tasks
+    }
+
+    #[must_use]
+    pub const fn child_wait_tasks(&self) -> usize {
+        self.child_wait_tasks
+    }
+}
+
+impl fmt::Display for RuntimeStallDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} stall: {}", self.kind, self.reason)?;
+        if let Some(syscall) = &self.in_flight_syscall {
+            write!(
+                formatter,
+                "; in-flight syscall={}({}) rip=0x{:x}",
+                syscall.name(),
+                syscall.number(),
+                syscall.rip()
+            )?;
+        }
+        if let Some(syscall) = &self.last_syscall {
+            write!(
+                formatter,
+                "; last syscall={}({}) result={:?}",
+                syscall.name(),
+                syscall.number(),
+                syscall.result()
+            )?;
+        }
+        write!(
+            formatter,
+            "; tasks runnable={} fd_wait={} child_wait={}",
+            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks
+        )
+    }
+}
+
+fn readiness_syscall_name(name: &str) -> bool {
+    matches!(name, "poll" | "ppoll" | "epoll_wait" | "epoll_pwait2")
+}
+
+fn in_flight_syscall(events: &[SyscallTraceEvent]) -> Option<DiagnosticSyscall> {
+    let mut completed = Vec::new();
+    for event in events.iter().rev() {
+        match event {
+            SyscallTraceEvent::Enter(event) => {
+                let key = (event.context.pid, event.context.tid);
+                if !completed.contains(&key) {
+                    return Some(DiagnosticSyscall::from_enter_event(event));
+                }
+            }
+            SyscallTraceEvent::Exit(event) => {
+                completed.push((event.context.pid, event.context.tid));
+            }
+            SyscallTraceEvent::Unsupported(event) => {
+                completed.push((event.context.pid, event.context.tid));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,6 +790,66 @@ impl DiagnosticVmaKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticTask {
+    pid: mcr_sys::GuestPid,
+    tid: mcr_sys::GuestTid,
+    rip: u64,
+    state: DiagnosticTaskState,
+}
+
+impl DiagnosticTask {
+    #[must_use]
+    pub fn from_guest_task(task: &GuestTask) -> Self {
+        Self {
+            pid: task.pid(),
+            tid: task.tid(),
+            rip: task.regs().rip(),
+            state: DiagnosticTaskState::from_task_state(task.state()),
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> mcr_sys::GuestPid {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn tid(&self) -> mcr_sys::GuestTid {
+        self.tid
+    }
+
+    #[must_use]
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> DiagnosticTaskState {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticTaskState {
+    Runnable,
+    WaitingForChild,
+    WaitingForFd { fd: i32, write: bool },
+    Exited { status: i32 },
+}
+
+impl DiagnosticTaskState {
+    #[must_use]
+    pub const fn from_task_state(state: TaskState) -> Self {
+        match state {
+            TaskState::Runnable => Self::Runnable,
+            TaskState::WaitingForChild { .. } => Self::WaitingForChild,
+            TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
+            TaskState::Exited { status } => Self::Exited { status },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticSyscall {
     name: String,
     number: u64,
@@ -566,6 +877,17 @@ impl DiagnosticSyscall {
                 result: Some(event.result),
                 rip: event.context.rip,
             }),
+        }
+    }
+
+    #[must_use]
+    pub fn from_enter_event(event: &mcr_sys::SyscallEnterEvent) -> Self {
+        Self {
+            name: event.syscall.name().to_owned(),
+            number: event.syscall.number().raw(),
+            args: event.args.raw(),
+            result: None,
+            rip: event.context.rip,
         }
     }
 
@@ -639,7 +961,22 @@ impl RuntimeWithTracer<RuntimeDiagnosticsTracer> {
 
     #[must_use]
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        RuntimeDiagnostics::capture(self.kernel(), self.tracer().events())
+        RuntimeDiagnostics::capture_runtime(self.dispatcher.subsystems(), self.tracer().events())
+    }
+
+    #[must_use]
+    pub fn stall_diagnostic(&self) -> RuntimeStallDiagnostic {
+        RuntimeStallDiagnostic::capture_runtime(
+            self.dispatcher.subsystems(),
+            self.tracer().events(),
+        )
+    }
+
+    pub fn run_guest_until_exit_with_step_limit(
+        &mut self,
+        max_guest_steps: u64,
+    ) -> Result<i32, GuestRunError> {
+        run_guest_until_exit_with_diagnostic_step_limit(&mut self.dispatcher, max_guest_steps)
     }
 
     #[must_use]
@@ -2683,6 +3020,10 @@ pub enum GuestRunError {
     WaitResume {
         errno: LinuxErrno,
     },
+    StepLimitExceeded {
+        steps: u64,
+        diagnostic: RuntimeStallDiagnostic,
+    },
     GuestExecution(GuestExecutionError),
 }
 
@@ -2695,6 +3036,7 @@ impl GuestRunError {
             | Self::InitialTaskNotRunnable { .. }
             | Self::NoRunnableTasks => LinuxErrno::ESRCH,
             Self::WaitResume { errno } => *errno,
+            Self::StepLimitExceeded { .. } => LinuxErrno::ETIMEDOUT,
             Self::GuestExecution(error) => error.linux_errno(),
         }
     }
@@ -2714,6 +3056,12 @@ impl fmt::Display for GuestRunError {
             Self::NoRunnableTasks => write!(formatter, "no runnable guest tasks remain"),
             Self::WaitResume { errno } => {
                 write!(formatter, "failed to resume waiting guest task: {errno}")
+            }
+            Self::StepLimitExceeded { steps, diagnostic } => {
+                write!(
+                    formatter,
+                    "guest execution step limit exceeded after {steps} step(s): {diagnostic}"
+                )
             }
             Self::GuestExecution(error) => error.fmt(formatter),
         }
@@ -2747,6 +3095,34 @@ fn run_guest_until_exit_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
+    run_guest_until_exit_loop(dispatcher, None, |_| {
+        unreachable!("step-limit diagnostic is only captured when a limit is set")
+    })
+}
+
+fn run_guest_until_exit_with_diagnostic_step_limit(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, RuntimeDiagnosticsTracer>,
+    max_guest_steps: u64,
+) -> Result<i32, GuestRunError> {
+    run_guest_until_exit_loop(dispatcher, Some(max_guest_steps), |dispatcher| {
+        RuntimeStallDiagnostic::capture_runtime(
+            dispatcher.subsystems(),
+            dispatcher.tracer().events(),
+        )
+    })
+}
+
+fn run_guest_until_exit_loop<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    max_guest_steps: Option<u64>,
+    mut capture_diagnostic: impl FnMut(
+        &SyscallDispatcher<RuntimeSubsystems, T>,
+    ) -> RuntimeStallDiagnostic,
+) -> Result<i32, GuestRunError>
+where
+    T: SyscallTracer,
+{
+    let mut guest_steps = 0u64;
     loop {
         if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
             return Ok(status);
@@ -2771,7 +3147,14 @@ where
             ) {
                 continue;
             }
+            if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
+                return Err(GuestRunError::StepLimitExceeded {
+                    steps: guest_steps,
+                    diagnostic: capture_diagnostic(dispatcher),
+                });
+            }
             dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+            guest_steps = guest_steps.saturating_add(1);
             if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
                 break;
             }
@@ -6266,8 +6649,9 @@ mod tests {
         LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
         LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
         LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
-        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallRegisters,
-        SyscallReturn, SyscallTraceEvent,
+        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallArgs,
+        SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent, TraceContext,
+        Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -12460,6 +12844,95 @@ mod tests {
     }
 
     #[test]
+    fn stall_diagnostic_identifies_guest_wait_futex() {
+        let runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let events = vec![syscall_enter_event(
+            Syscall::Futex,
+            [0x402000, u64::from(LINUX_FUTEX_WAIT), 7, 0, 0, 0],
+        )];
+
+        let diagnostic = RuntimeDiagnostics::capture(runtime.kernel(), &events).stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::GuestWaitFutex);
+        assert_eq!(diagnostic.in_flight_syscall().unwrap().name(), "futex");
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_readiness_wait() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .kernel_mut()
+            .block_task_for_fd(INITIAL_GUEST_TID, 3, false)
+            .unwrap();
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::Readiness);
+        assert_eq!(diagnostic.fd_wait_tasks(), 1);
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_scheduling_wait() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        let child_pid = runtime.kernel_mut().fork_child(INITIAL_GUEST_TID).unwrap();
+        let wait = runtime.kernel_mut().wait4_current(
+            INITIAL_GUEST_TID,
+            Wait4SyscallArgs::new(child_pid as i32, 0x402000, 0, 0),
+        );
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::Scheduling);
+        assert_eq!(diagnostic.child_wait_tasks(), 1);
+    }
+
+    #[test]
+    fn stall_diagnostic_identifies_native_execution_window() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.enable_native_execution();
+
+        let diagnostic = runtime.stall_diagnostic();
+
+        assert_eq!(diagnostic.kind(), RuntimeStallKind::NativeExecution);
+        assert_eq!(diagnostic.runnable_tasks(), 1);
+    }
+
+    #[test]
+    fn bounded_guest_run_reports_timeout_stall_diagnostic() {
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&(Syscall::Getpid.number().raw() as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05, 0xeb, 0xf7]);
+        let mut runtime = RuntimeWithTracer::with_diagnostics(test_program_with_entry_code(
+            "/bin/spin",
+            0x401000,
+            &code,
+        ))
+        .unwrap();
+        runtime.enable_native_execution();
+
+        let error = runtime
+            .run_guest_until_exit_with_step_limit(3)
+            .expect_err("looping guest should hit the diagnostic step limit");
+
+        match error {
+            GuestRunError::StepLimitExceeded { steps, diagnostic } => {
+                assert_eq!(steps, 3);
+                assert_eq!(diagnostic.kind(), RuntimeStallKind::NativeExecution);
+                assert_eq!(diagnostic.last_syscall().unwrap().name(), "getpid");
+                assert_eq!(
+                    diagnostic.last_syscall().unwrap().result(),
+                    Some(SyscallReturn::Success(1))
+                );
+            }
+            other => panic!("expected step-limit diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn crash_report_includes_registers_and_runtime_diagnostics() {
         let mut runtime =
             RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
@@ -12485,6 +12958,19 @@ mod tests {
             report.diagnostics().last_syscall().unwrap().name(),
             "gettid"
         );
+    }
+
+    fn syscall_enter_event(syscall: Syscall, args: [u64; 6]) -> SyscallTraceEvent {
+        SyscallTraceEvent::Enter(SyscallEnterEvent {
+            context: TraceContext {
+                pid: INITIAL_GUEST_PID,
+                tid: INITIAL_GUEST_TID,
+                rip: 0x401234,
+            },
+            syscall,
+            args: SyscallArgs::new(args),
+            decoded: Vec::new(),
+        })
     }
 
     fn context(syscall: Syscall, args: [u64; 6]) -> GuestContext {

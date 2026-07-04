@@ -19,6 +19,7 @@ pub struct RunRootfsConfig {
     args: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     mvp_emulator: bool,
+    guest_step_limit: Option<u64>,
 }
 
 impl RunRootfsConfig {
@@ -31,6 +32,7 @@ impl RunRootfsConfig {
             program,
             env: Vec::new(),
             mvp_emulator: false,
+            guest_step_limit: None,
         }
     }
 
@@ -61,6 +63,12 @@ impl RunRootfsConfig {
     }
 
     #[must_use]
+    pub const fn with_guest_step_limit(mut self, max_guest_steps: u64) -> Self {
+        self.guest_step_limit = Some(max_guest_steps);
+        self
+    }
+
+    #[must_use]
     pub fn rootfs(&self) -> &Path {
         &self.rootfs
     }
@@ -83,6 +91,11 @@ impl RunRootfsConfig {
     #[must_use]
     pub const fn mvp_emulator(&self) -> bool {
         self.mvp_emulator
+    }
+
+    #[must_use]
+    pub const fn guest_step_limit(&self) -> Option<u64> {
+        self.guest_step_limit
     }
 }
 
@@ -302,7 +315,12 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
     )?;
     runtime.enable_native_execution();
 
-    match runtime.run_guest_until_exit() {
+    let run_result = match config.guest_step_limit() {
+        Some(max_guest_steps) => runtime.run_guest_until_exit_with_step_limit(max_guest_steps),
+        None => runtime.run_guest_until_exit(),
+    };
+
+    match run_result {
         Ok(status) => Ok(RunRootfsOutput::new(
             status,
             runtime.vfs().stdout_snapshot(),

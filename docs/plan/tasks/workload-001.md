@@ -56,3 +56,14 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   complete within a bounded local run. `node -v` and `cargo --version` also did
   not complete within several minutes and were stopped. These are runtime
   execution blockers, not fixture-contract gaps.
+- Added a deterministic runtime stall diagnostic for bounded language workload
+  runs. `RuntimeWithTracer<RuntimeDiagnosticsTracer>::run_guest_until_exit_with_step_limit`
+  and `RunRootfsConfig::with_guest_step_limit` now return a `GuestRunError`
+  timeout diagnostic that classifies the snapshot as guest wait/futex,
+  readiness, scheduling, native execution, or unknown, without changing normal
+  unbounded runtime behavior. Focused runtime tests cover futex, fd readiness,
+  wait4 scheduling, native execution, and step-limit timeout reporting.
+- Remaining blocker: rerun `node -v`, `go version`, and `cargo --version` with
+  materialized language rootfs payloads and record the concrete stall category.
+  The isolated workload diagnostics worktree does not contain those package
+  rootfs payloads.
