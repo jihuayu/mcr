@@ -10,6 +10,7 @@
 | BuildKit worker/executor | Phase 4 | Needs a stable runtime executor contract, snapshot diff boundary, and native builder proof first. |
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
 | Full overlay lower/upper layer implementation | Phase 3 | VFS must remain compatible with it, but export semantics belong to builder work. |
+| Overlapped file and pipe backend | Later optimization | `perf-003` closed with the `mcr-win` submission boundary and synchronous fallback only. Reopen for real backend work covering overlapped handle flags, event/thread-pool/IOCP completion source, runtime wait wiring, close/cancel drain semantics, and fallback comparison tests. |
 | IOCP event backend | Later optimization | Tracked by `perf-006`; WSAPoll plus runtime readiness queue remains the Phase 2 correctness backend. |
 | Registered I/O network backend | Measurement gate | `perf-008` closed without implementation; reopen only if IOCP measurements expose a small-message datagram bottleneck and a RIO prototype proves benefit without Windows-only buffer or lifetime leakage. |
 | General UDP socket semantics | Later compatibility | Phase 2 only needs UDP if it is the chosen implementation detail for DNS. |

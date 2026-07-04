@@ -1,7 +1,7 @@
 ---
 id: perf-003
 scope: io-performance
-status: in-progress
+status: done
 depends-on: [perf-001, fd-001, win-001]
 ---
 
@@ -60,3 +60,16 @@ Opening Windows file and pipe handles with overlapped-compatible flags, binding
 them to an event/thread-pool/IOCP completion source, and wiring completion
 readiness into the runtime wait model remain pending. The VFS/runtime
 synchronous paths are intentionally unchanged in this checkpoint.
+
+## Closure Decision
+
+The 2026-07-04 checkpoint closes `perf-003` as the host I/O submission-boundary
+work, not as a completed real overlapped backend. The implemented boundary is
+enough for later backends to own buffers, report fallback results, and preserve
+the cancellation/completion race shape under `mcr-win`, while current
+VFS/runtime file and pipe I/O still execute through synchronous fallback paths.
+
+The actual Windows overlapped file/pipe backend is deferred to the backlog. That
+follow-up must cover overlapped-compatible handle open flags, a concrete
+completion source, runtime wait wiring, close/cancel drain behavior, and
+differential verification against the synchronous fallback.
