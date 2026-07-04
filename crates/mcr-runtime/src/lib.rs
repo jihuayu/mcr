@@ -67,6 +67,7 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
 const PERF_SUMMARY_TRACE_ENV: &str = "MCR_TRACE_PERF_SUMMARY";
+const STICKY_SCHED_ENV: &str = "MCR_SCHED_STICKY";
 
 pub(crate) fn host_step_trace_enabled() -> bool {
     std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
@@ -3146,8 +3147,10 @@ where
     T: SyscallTracer,
 {
     dispatcher.subsystems_mut().perf_begin_run();
+    let sticky_scheduler = std::env::var_os(STICKY_SCHED_ENV).is_some();
     let result = (|| -> Result<i32, GuestRunError> {
         let mut guest_steps = 0u64;
+        let mut last_dispatched_tid = None;
         loop {
             if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
                 return Ok(status);
@@ -3158,10 +3161,21 @@ where
                 .resume_waiting_tasks()
                 .map_err(|errno| GuestRunError::WaitResume { errno })?;
             dispatcher.subsystems_mut().resume_fd_waiters();
-            let mut runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
-            dispatcher
-                .subsystems()
-                .prioritize_pending_fork_exec_tids(&mut runnable_tids);
+            let mut runnable_tids = if sticky_scheduler {
+                last_dispatched_tid
+                    .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
+                    .map_or_else(
+                        || dispatcher.subsystems().tasks.runnable_tids(),
+                        |tid| vec![tid],
+                    )
+            } else {
+                dispatcher.subsystems().tasks.runnable_tids()
+            };
+            if runnable_tids.len() != 1 {
+                dispatcher
+                    .subsystems()
+                    .prioritize_pending_fork_exec_tids(&mut runnable_tids);
+            }
             if runnable_tids.is_empty() {
                 dispatcher.subsystems_mut().perf_record_no_runnable();
                 return Err(GuestRunError::NoRunnableTasks);
@@ -3186,6 +3200,7 @@ where
                 }
                 dispatcher.subsystems_mut().perf_record_dispatch(tid, pid);
                 dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+                last_dispatched_tid = Some(tid);
                 guest_steps = guest_steps.saturating_add(1);
                 if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
                     break;
@@ -6619,6 +6634,17 @@ impl RuntimeSubsystems {
                 .is_some_and(|task| self.pending_fork_exec.contains_key(&task.pid()));
             (!pending_child, *tid)
         });
+    }
+
+    fn sticky_scheduler_candidate(&self, tid: mcr_sys::GuestTid) -> Option<mcr_sys::GuestTid> {
+        let task = self.tasks.task(tid)?;
+        if !matches!(task.state(), TaskState::Runnable) {
+            return None;
+        }
+        if self.has_pending_fork_exec_children(task.pid()) {
+            return None;
+        }
+        Some(tid)
     }
 
     fn materialize_pending_fork_exec_children(
