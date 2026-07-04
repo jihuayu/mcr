@@ -150,6 +150,14 @@ impl SocketFastPathKind {
             Self::ConnectEx => SocketCompletionKind::Connect,
         }
     }
+
+    #[cfg(windows)]
+    const fn extension_guid(self) -> Guid {
+        match self {
+            Self::AcceptEx => WSAID_ACCEPTEX,
+            Self::ConnectEx => WSAID_CONNECTEX,
+        }
+    }
 }
 
 impl SocketEvents {
@@ -571,6 +579,11 @@ impl HostSocket {
         recv_vectored_platform(self, buffers)
     }
 
+    /// Looks up a Winsock extension function pointer for this socket.
+    pub fn extension_function(&self, kind: SocketFastPathKind) -> HostResult<usize> {
+        extension_function_platform(self, kind)
+    }
+
     /// Submits an overlapped receive. The socket must be associated with an IOCP.
     pub fn submit_overlapped_recv(&self, buffer: Vec<u8>) -> HostSocketIoSubmission {
         submit_overlapped_socket_io_platform(self, HostSocketIoDirection::Receive, buffer)
@@ -761,6 +774,14 @@ fn recv_from_vectored_platform(
     _buffers: &mut [IoSliceMut<'_>],
 ) -> HostResult<(usize, SocketAddr)> {
     Err(HostError::unsupported(HostOperation::RecvSocket))
+}
+
+#[cfg(not(windows))]
+fn extension_function_platform(
+    _socket: &HostSocket,
+    _kind: SocketFastPathKind,
+) -> HostResult<usize> {
+    Err(HostError::unsupported(HostOperation::GetSocketOption))
 }
 
 #[cfg(not(windows))]
@@ -1173,6 +1194,36 @@ fn recv_from_vectored_platform(
 }
 
 #[cfg(windows)]
+fn extension_function_platform(socket: &HostSocket, kind: SocketFastPathKind) -> HostResult<usize> {
+    let mut guid = kind.extension_guid();
+    let mut function = 0usize;
+    let mut bytes_returned = 0u32;
+    let status = unsafe {
+        // SAFETY: Input and output buffers point to initialized stack storage for this call.
+        WSAIoctl(
+            socket.raw(),
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            std::ptr::from_mut(&mut guid).cast(),
+            std::mem::size_of::<Guid>() as u32,
+            std::ptr::from_mut(&mut function).cast(),
+            std::mem::size_of::<usize>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == crate::windows::SOCKET_ERROR {
+        return Err(crate::error::last_winsock_error(
+            HostOperation::GetSocketOption,
+        ));
+    }
+    if function == 0 || bytes_returned < std::mem::size_of::<usize>() as u32 {
+        return Err(HostError::invalid_input(HostOperation::GetSocketOption));
+    }
+    Ok(function)
+}
+
+#[cfg(windows)]
 fn submit_overlapped_socket_io_platform(
     socket: &HostSocket,
     direction: HostSocketIoDirection,
@@ -1532,6 +1583,8 @@ const WSA_IO_PENDING: i32 = 997;
 #[cfg(windows)]
 const TRUE: crate::windows::Bool = 1;
 #[cfg(windows)]
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xc800_0006;
+#[cfg(windows)]
 const SOL_SOCKET: i32 = 0xffff;
 #[cfg(windows)]
 const SO_REUSEADDR: i32 = 0x0004;
@@ -1597,6 +1650,32 @@ struct WsaBuf {
     len: u32,
     buf: *mut std::ffi::c_char,
 }
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[cfg(windows)]
+const WSAID_ACCEPTEX: Guid = Guid {
+    data1: 0xb536_7df1,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
+
+#[cfg(windows)]
+const WSAID_CONNECTEX: Guid = Guid {
+    data1: 0x25a2_07b9,
+    data2: 0xddf3,
+    data3: 0x4660,
+    data4: [0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e],
+};
 
 #[cfg(windows)]
 #[derive(Debug)]
@@ -1976,6 +2055,17 @@ unsafe extern "system" {
         overlapped: *mut std::ffi::c_void,
         completion_routine: *mut std::ffi::c_void,
     ) -> i32;
+    fn WSAIoctl(
+        socket: crate::windows::Socket,
+        io_control_code: u32,
+        in_buffer: *mut std::ffi::c_void,
+        in_buffer_size: u32,
+        out_buffer: *mut std::ffi::c_void,
+        out_buffer_size: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut std::ffi::c_void,
+        completion_routine: *mut std::ffi::c_void,
+    ) -> i32;
     fn ioctlsocket(socket: crate::windows::Socket, cmd: i32, argp: *mut u32) -> i32;
     fn setsockopt(
         socket: crate::windows::Socket,
@@ -2024,7 +2114,7 @@ mod tests {
     #[cfg(windows)]
     use super::{
         AddressFamily, HostIoCompletionPort, HostShutdown, HostSocketOptionName,
-        HostSocketOptionValue, SocketKind, SocketPoll, SocketProtocol,
+        HostSocketOptionValue, SocketFastPathKind, SocketKind, SocketPoll, SocketProtocol,
     };
 
     #[test]
@@ -2103,6 +2193,28 @@ mod tests {
 
         socket.set_nonblocking(true).unwrap();
         socket.set_nonblocking(false).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tcp_socket_resolves_winsock_extension_functions() {
+        let stack = NetworkStack::start().unwrap();
+        let socket = stack
+            .open_socket(AddressFamily::Inet, SocketKind::Stream, SocketProtocol::Tcp)
+            .unwrap();
+
+        assert_ne!(
+            socket
+                .extension_function(SocketFastPathKind::AcceptEx)
+                .unwrap(),
+            0
+        );
+        assert_ne!(
+            socket
+                .extension_function(SocketFastPathKind::ConnectEx)
+                .unwrap(),
+            0
+        );
     }
 
     #[cfg(windows)]

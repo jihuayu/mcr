@@ -45,3 +45,12 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
 - Successful `ConnectEx` completions must apply `SO_UPDATE_CONNECT_CONTEXT` and
   still report guest completion through Linux readiness and `SO_ERROR`.
 - Plain `accept` and nonblocking `connect` remain required fallbacks.
+
+## Checkpoints
+
+- Added the `mcr-win` Winsock extension-function lookup boundary.
+  `HostSocket::extension_function` resolves opaque `AcceptEx` and `ConnectEx`
+  function pointers with `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` for the
+  owning socket. The actual overlapped `AcceptEx`/`ConnectEx` submission,
+  context update, cancellation, and `mcr-net` readiness integration remain in
+  this task.
