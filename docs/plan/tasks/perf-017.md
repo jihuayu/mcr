@@ -1,7 +1,7 @@
 ---
 id: perf-017
 scope: io-performance
-status: pending
+status: done
 depends-on: [perf-004, perf-016]
 ---
 
@@ -55,3 +55,6 @@ cargo test -p mcr-testkit perf_iovec -- --ignored --nocapture
   or gathers guest iovec buffers, and updates the file offset once. Unsupported
   fd kinds still use the existing per-iovec fallback, and no borrowed guest
   buffers are exposed to host completion records.
+- Closed as implemented for the safe regular-file scope. Targeted verification
+  covered `mcr-vfs` and `mcr-runtime` readv/writev tests plus clippy for both
+  crates; the `mcr-win` scatter/gather filters currently have no matching tests.
