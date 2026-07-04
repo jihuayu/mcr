@@ -179,6 +179,7 @@ name = "mcr-vfs"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "mcr-win",
 ]
 
 [[package]]

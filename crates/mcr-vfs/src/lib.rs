@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -3237,13 +3236,6 @@ impl VirtualFileSystem {
                 .truncate()?;
             truncated = true;
         }
-        if flags.can_read() && is_regular_file {
-            self.tree
-                .lookup_path_mut(&path)
-                .ok_or(VfsError::NoEntry)?
-                .materialize_deferred_content()?;
-        }
-
         let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
         let kind = match node.kind() {
             PathNodeKind::Directory => FileKind::Directory,
@@ -4311,10 +4303,45 @@ fn read_memory_at(data: &[u8], offset: u64, buffer: &mut [u8]) -> VfsResult<usiz
 }
 
 fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
-    let mut file = fs::File::open(path).map_err(|_| VfsError::NoEntry)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|_| VfsError::InvalidPath)?;
-    file.read(buffer).map_err(|_| VfsError::InvalidPath)
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+
+    let file = mcr_win::HostFile::open(
+        path,
+        mcr_win::FileOptions::new(
+            mcr_win::FileAccess::Read,
+            mcr_win::FileCreation::OpenExisting,
+        )
+        .with_overlapped_io(),
+    )
+    .map_err(vfs_error_from_host)?;
+    let completion = file
+        .submit_overlapped_read_at(offset, vec![0; buffer.len()])
+        .complete_or_fallback(&file)
+        .map_err(|failure| vfs_error_from_host(failure.error().clone()))?;
+    let count = completion.bytes_transferred().min(buffer.len());
+    buffer[..count].copy_from_slice(&completion.buffer()[..count]);
+    Ok(count)
+}
+
+fn vfs_error_from_host(error: mcr_win::HostError) -> VfsError {
+    match error.kind() {
+        mcr_win::HostErrorKind::NotFound => VfsError::NoEntry,
+        mcr_win::HostErrorKind::AccessDenied => VfsError::PermissionDenied,
+        mcr_win::HostErrorKind::Interrupted | mcr_win::HostErrorKind::WouldBlock => {
+            VfsError::WouldBlock
+        }
+        mcr_win::HostErrorKind::BrokenPipe => VfsError::BrokenPipe,
+        mcr_win::HostErrorKind::AlreadyExists
+        | mcr_win::HostErrorKind::InvalidInput
+        | mcr_win::HostErrorKind::TimedOut
+        | mcr_win::HostErrorKind::OutOfMemory
+        | mcr_win::HostErrorKind::Unsupported
+        | mcr_win::HostErrorKind::Poisoned
+        | mcr_win::HostErrorKind::Unavailable
+        | mcr_win::HostErrorKind::Other => VfsError::InvalidPath,
+    }
 }
 
 fn inode_backend_for_path_node(node: &PathNode, host_path: PathBuf) -> InodeBackend {
@@ -5360,6 +5387,46 @@ mod tests {
         assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 5);
         assert_eq!(&buffer, b"HELLO");
         assert_eq!(vfs.cache_snapshot().small_read_entries, 1);
+    }
+
+    #[test]
+    fn deferred_host_file_reads_do_not_materialize_on_open_or_read() {
+        let host_path =
+            std::env::temp_dir().join(format!("mcr-vfs-deferred-host-read-{}", std::process::id()));
+        fs::write(&host_path, b"abcdef").unwrap();
+
+        let rootfs = Rootfs::new("/host/root");
+        let mut tree = PathTree::new();
+        tree.create_dir("/tmp").unwrap();
+        tree.create_file_with_host_content("/tmp/deferred", &host_path, 6, 0o644)
+            .unwrap();
+        let mut vfs = VirtualFileSystem::from_parts(rootfs, tree, FdTable::with_stdio());
+        let guest_path = guest_path("/tmp/deferred");
+
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/deferred", OpenFlags::new(O_RDONLY), 0)
+            .unwrap();
+        assert!(
+            vfs.tree()
+                .lookup_path(&guest_path)
+                .unwrap()
+                .deferred_host_path()
+                .is_some()
+        );
+
+        assert_eq!(vfs.lseek(fd, 2, SeekWhence::Set).unwrap(), 2);
+        let mut buffer = [0; 3];
+        assert_eq!(vfs.read(fd, &mut buffer).unwrap(), 3);
+        assert_eq!(&buffer, b"cde");
+        assert!(
+            vfs.tree()
+                .lookup_path(&guest_path)
+                .unwrap()
+                .deferred_host_path()
+                .is_some()
+        );
+
+        let _ = fs::remove_file(host_path);
     }
 
     #[test]

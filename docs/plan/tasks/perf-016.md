@@ -61,3 +61,7 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   operations and return owned buffers through `HostIoSubmission::Completed` or
   `HostIoSubmission::Failed`. VFS/runtime readiness integration and pipe handle
   wiring remain in this task.
+- VFS deferred rootfs regular-file reads now keep host-backed file content
+  unmaterialized on open and read through the host adapter's offset-based
+  overlapped boundary. Writes, truncation, and other mutations still
+  materialize the file into VFS-owned memory before changing contents.

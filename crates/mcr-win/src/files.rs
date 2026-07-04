@@ -170,16 +170,57 @@ impl HostFile {
 
 #[cfg(not(windows))]
 fn submit_overlapped_at_platform(
-    _file: &HostFile,
+    file: &HostFile,
     direction: HostIoDirection,
-    _offset: u64,
-    buffer: Vec<u8>,
+    offset: u64,
+    mut buffer: Vec<u8>,
 ) -> HostIoSubmission {
-    HostIoSubmission::Fallback(HostIoFallback::new(
-        direction,
-        HostIoFallbackReason::SynchronousBackend,
-        buffer,
-    ))
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut cloned = match file.file.try_clone() {
+        Ok(cloned) => cloned,
+        Err(error) => {
+            return HostIoSubmission::Failed(HostIoFailure::new(
+                direction,
+                HostError::from_io(direction.operation(), error),
+                buffer,
+            ));
+        }
+    };
+    if let Err(error) = cloned.seek(SeekFrom::Start(offset)) {
+        return HostIoSubmission::Failed(HostIoFailure::new(
+            direction,
+            HostError::from_io(direction.operation(), error),
+            buffer,
+        ));
+    }
+
+    match direction {
+        HostIoDirection::Read => match cloned.read(&mut buffer) {
+            Ok(bytes_transferred) => HostIoSubmission::Completed(HostIoCompletion::new(
+                direction,
+                bytes_transferred,
+                buffer,
+            )),
+            Err(error) => HostIoSubmission::Failed(HostIoFailure::new(
+                direction,
+                HostError::from_io(direction.operation(), error),
+                buffer,
+            )),
+        },
+        HostIoDirection::Write => match cloned.write(&buffer) {
+            Ok(bytes_transferred) => HostIoSubmission::Completed(HostIoCompletion::new(
+                direction,
+                bytes_transferred,
+                buffer,
+            )),
+            Err(error) => HostIoSubmission::Failed(HostIoFailure::new(
+                direction,
+                HostError::from_io(direction.operation(), error),
+                buffer,
+            )),
+        },
+    }
 }
 
 #[cfg(windows)]
