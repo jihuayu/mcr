@@ -149,7 +149,7 @@ pub enum RunRootfsError {
     },
     Vfs(mcr_vfs::VfsError),
     Linux(LinuxErrno),
-    GuestRun(crate::GuestRunError),
+    GuestRun(Box<crate::GuestRunError>),
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -329,7 +329,7 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
-        Err(error) => Err(RunRootfsError::GuestRun(error)),
+        Err(error) => Err(RunRootfsError::GuestRun(Box::new(error))),
     }
 }
 
@@ -1138,7 +1138,7 @@ mod tests {
 
     #[test]
     fn guest_run_error_reports_native_fault_registers() {
-        let error = RunRootfsError::GuestRun(crate::GuestRunError::GuestExecution(
+        let error = RunRootfsError::GuestRun(Box::new(crate::GuestRunError::GuestExecution(
             crate::GuestExecutionError::Execution(mcr_jit::ExecutionError::NativeFault {
                 signal: -1073741819,
                 rip: 0x7000_004d_5305,
@@ -1156,7 +1156,7 @@ mod tests {
                     value: 0x7000_004d_1234,
                 }],
             }),
-        ));
+        )));
         let rendered = error.to_string();
 
         assert!(rendered.contains("fault registers:"));

@@ -46,30 +46,50 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, Cl
     }
 
     let mut mvp_emulator = false;
+    let mut guest_step_limit = None;
     let mut rootfs = args.next().ok_or(CliError::Usage)?;
-    if rootfs == "--mvp-emulator" {
-        mvp_emulator = true;
-        rootfs = args.next().ok_or(CliError::Usage)?;
+    loop {
+        if rootfs == "--mvp-emulator" {
+            mvp_emulator = true;
+            rootfs = args.next().ok_or(CliError::Usage)?;
+        } else if rootfs == "--guest-step-limit" {
+            let value = args.next().ok_or(CliError::Usage)?;
+            guest_step_limit = Some(parse_guest_step_limit(value)?);
+            rootfs = args.next().ok_or(CliError::Usage)?;
+        } else {
+            break;
+        }
     }
     let program = args.next().ok_or(CliError::Usage)?;
     let mut guest_args = vec![os_bytes(&program)];
     guest_args.extend(args.map(|arg| os_bytes(&arg)));
 
-    Ok(Command::RunRootfs(
-        RunRootfsConfig::new(rootfs, os_bytes(&program))
-            .with_args(guest_args)
-            .with_mvp_emulator(mvp_emulator),
-    ))
+    let mut config = RunRootfsConfig::new(rootfs, os_bytes(&program))
+        .with_args(guest_args)
+        .with_mvp_emulator(mvp_emulator);
+    if let Some(guest_step_limit) = guest_step_limit {
+        config = config.with_guest_step_limit(guest_step_limit);
+    }
+
+    Ok(Command::RunRootfs(config))
 }
 
 fn os_bytes(value: &OsString) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
 
+fn parse_guest_step_limit(value: OsString) -> Result<u64, CliError> {
+    value
+        .to_string_lossy()
+        .parse::<u64>()
+        .map_err(|_| CliError::InvalidGuestStepLimit(value.to_string_lossy().into_owned()))
+}
+
 #[derive(Debug)]
 enum CliError {
     Usage,
     UnknownCommand(String),
+    InvalidGuestStepLimit(String),
     Runtime(mcr_runtime::RunRootfsError),
     Io(io::Error),
 }
@@ -79,9 +99,12 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: mcr run-rootfs [--mvp-emulator] <rootfs> <program> [args...]"
+                "usage: mcr run-rootfs [--mvp-emulator] [--guest-step-limit <steps>] <rootfs> <program> [args...]"
             ),
             Self::UnknownCommand(command) => write!(formatter, "unknown command `{command}`"),
+            Self::InvalidGuestStepLimit(value) => {
+                write!(formatter, "invalid guest step limit `{value}`")
+            }
             Self::Runtime(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
         }
@@ -93,7 +116,7 @@ impl std::error::Error for CliError {
         match self {
             Self::Runtime(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Usage | Self::UnknownCommand(_) => None,
+            Self::Usage | Self::UnknownCommand(_) | Self::InvalidGuestStepLimit(_) => None,
         }
     }
 }
@@ -160,6 +183,23 @@ mod tests {
 
         let Command::RunRootfs(config) = command;
         assert!(config.mvp_emulator());
+        assert_eq!(config.rootfs(), std::path::Path::new("rootfs"));
+        assert_eq!(config.program(), b"/bin/sh");
+    }
+
+    #[test]
+    fn parses_run_rootfs_guest_step_limit_flag() {
+        let command = parse_command([
+            OsString::from("run-rootfs"),
+            OsString::from("--guest-step-limit"),
+            OsString::from("1234"),
+            OsString::from("rootfs"),
+            OsString::from("/bin/sh"),
+        ])
+        .unwrap();
+
+        let Command::RunRootfs(config) = command;
+        assert_eq!(config.guest_step_limit(), Some(1234));
         assert_eq!(config.rootfs(), std::path::Path::new("rootfs"));
         assert_eq!(config.program(), b"/bin/sh");
     }
