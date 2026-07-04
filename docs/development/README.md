@@ -213,15 +213,16 @@ Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
 through the host shell.
 
 Ignored performance baselines print `mcr_perf_baseline.version=1` reports with
-environment metadata, wall time, operation counts, and derived throughput. They
-started as measurement gates, but selected paths can be promoted to viability
-gates when they determine product value. Run local subsystem baselines with:
+environment metadata, wall time, operation counts, and derived throughput.
+Setting `MCR_PERF_ENFORCE_GATES=1` turns the stored local thresholds into
+assertions for the selected runtime, VFS, network, worker-pool, native patch,
+intrinsic, and guest workload paths. Run local subsystem baselines with:
 
 ```powershell
 cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
 cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
 cargo test -p mcr-net perf_baseline -- --ignored --nocapture
-cargo test -p mcr-task perf_worker_pool -- --ignored --nocapture
+cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 ```
 
 The task-specific DNS cache and worker-pool gates are host-only reports that
@@ -233,8 +234,10 @@ cargo test -p mcr-testkit perf_worker_pool -- --ignored --nocapture
 ```
 
 The guest workload baseline additionally requires `MCR_BIN` and a materialized
-`alpine-rootfs`. Public-network `curl` and `git ls-remote` measurements run only
-when `MCR_PERF_PUBLIC_NETWORK=1` is set:
+`alpine-rootfs`. Public-network `curl`, `git ls-remote`, and shallow `git
+clone` measurements run only when `MCR_PERF_PUBLIC_NETWORK=1` is set. Public
+network thresholds are enforced only when
+`MCR_PERF_ENFORCE_PUBLIC_NETWORK=1` is also set:
 
 ```powershell
 MCR_BIN=target/debug/mcr cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
@@ -247,7 +250,9 @@ shape:
 
 ```powershell
 cargo build --release -p mcr-cli
-target\release\mcr.exe run-rootfs tests\fixtures\rootfs\alpine-rootfs /bin/sh -c "GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null"
+$env:MCR_BIN = (Resolve-Path target\release\mcr.exe).Path
+$env:MCR_PERF_ENFORCE_GATES = '1'
+cargo test -p mcr-testkit --test perf_baseline -- --ignored --nocapture
 ```
 
 Linux x86-64 guest smokes must be treated as x86_64-host validation. Do not

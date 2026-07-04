@@ -50,6 +50,11 @@ fn perf_baseline_high_concurrency_loopback_sockets() -> Result<(), Box<dyn std::
     .with_field("connections", connections)
     .with_field("operations_model", "accept_recv_send")
     .with_field("transport", "WinHostSocketTransport")];
+    enforce_wall_time_gate(
+        "net_high_concurrency_loopback_accept_echo",
+        wall_time,
+        2_000,
+    );
     print_perf_report("mcr-net loopback performance baseline", &measurements);
     Ok(())
 }
@@ -94,6 +99,9 @@ fn perf_baseline_dns_cache_lookup_and_purge() {
         measure_wall_time(|| cache.purge_expired(Duration::from_secs(71)));
     assert_eq!(purged, entries);
     assert!(cache.is_empty());
+    enforce_wall_time_gate("net_dns_cache_insert", insert_wall_time, 500);
+    enforce_wall_time_gate("net_dns_cache_lookup_hit", lookup_wall_time, 500);
+    enforce_wall_time_gate("net_dns_cache_purge_expired", purge_wall_time, 500);
 
     let measurements = [
         PerfMeasurement::new("net_dns_cache_insert", entries as u64, insert_wall_time)
@@ -170,6 +178,38 @@ fn unix_timestamp_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+fn enforce_wall_time_gate(name: &str, wall_time: Duration, default_max_wall_ms: u64) {
+    if std::env::var_os("MCR_PERF_ENFORCE_GATES").is_none() {
+        return;
+    }
+
+    let threshold_key = perf_threshold_env_key(name);
+    let max_wall_ms = std::env::var(&threshold_key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(default_max_wall_ms as f64);
+    let actual_wall_ms = wall_time.as_secs_f64() * 1_000.0;
+    assert!(
+        actual_wall_ms <= max_wall_ms,
+        "perf workload `{name}` exceeded wall-time gate: actual {actual_wall_ms:.3}ms > max {max_wall_ms:.3}ms; override with {threshold_key}",
+    );
+}
+
+fn perf_threshold_env_key(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("MCR_PERF_MAX_WALL_MS_{normalized}")
 }
 
 fn dns_config(resolv_conf: &[u8]) -> GuestDnsConfig {

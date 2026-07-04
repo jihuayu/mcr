@@ -36,6 +36,10 @@ jobs:
       - name: Build mcr CLI
         run: cargo build -p mcr-cli
 
+      - name: Build release mcr CLI
+        if: ${{ inputs.suite == 'performance' || inputs.suite == 'all' }}
+        run: cargo build --release -p mcr-cli
+
       - name: Run shell smokes
         if: ${{ inputs.suite == 'shell' || inputs.suite == 'all' }}
         shell: pwsh
@@ -54,7 +58,8 @@ jobs:
         if: ${{ inputs.suite == 'performance' || inputs.suite == 'all' }}
         shell: pwsh
         run: |
-          $env:MCR_BIN = (Resolve-Path target/debug/mcr.exe).Path
+          $env:MCR_BIN = (Resolve-Path target/release/mcr.exe).Path
+          $env:MCR_PERF_ENFORCE_GATES = '1'
           cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
           cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
           cargo test -p mcr-net perf_baseline -- --ignored --nocapture

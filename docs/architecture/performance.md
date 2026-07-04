@@ -70,10 +70,11 @@ https://example.com` was about `1947ms`, while `git ls-remote
 https://github.com/octocat/Hello-World.git HEAD` was about `114131ms`. That
 shape pointed to runtime handoff overhead rather than network throughput alone.
 `perf-015` closed the first product-value proof with opt-in summary tracing and
-sticky scheduling. The 2026-07-04 release rerun with `MCR_SCHED_STICKY=1`
-measured `curl https://example.com` at `485.074ms` and `git ls-remote` at
-`1872.576ms`; the direct trace reported zero scheduler sleeps, with remap and
-pipe IPC still visible for later backend work.
+sticky scheduling. Sticky scheduling is now the default policy, with
+`MCR_SCHED_STICKY=0` reserved for differential debugging. The 2026-07-04
+release rerun measured `curl https://example.com` at `485.074ms` and
+`git ls-remote` at `1872.576ms`; the direct trace reported zero scheduler
+sleeps, with remap and pipe IPC still visible for later backend work.
 
 ## File And I/O Optimization
 
@@ -425,14 +426,18 @@ The first baseline suites are intentionally split by subsystem boundary:
 - `mcr-testkit` measures guest shell startup, small-file I/O, directory
   metadata walks through the materialized Alpine rootfs and `MCR_BIN`; the
   public-network `curl` and `git ls-remote` measurements are opt-in with
-  `MCR_PERF_PUBLIC_NETWORK=1`, while the `perf_dns` and `perf_worker_pool`
-  filters provide task-specific host-only reports for active perf checkpoints.
+  `MCR_PERF_PUBLIC_NETWORK=1`, while the `perf_dns`, `perf_worker_pool`, and
+  intrinsic filters provide task-specific host-only reports for active perf
+  checkpoints.
 
 These suites started as baselines, not performance assertions. For
 product-critical paths, that is no longer enough. `perf-015` promoted selected
 shell/network metadata measurements into a viability gate: the benchmark still
 reports raw wall time and operation counts, but the task may block milestone
 progress when the runtime remains orders of magnitude slower than the host for
-small payloads. Long-term threshold storage and trend dashboards can remain
-later work; the immediate gate is local, repeatable, and tied to specific
-commands.
+small payloads. `perf-024` extends that model across the local subsystem
+baselines and release guest workloads. `MCR_PERF_ENFORCE_GATES=1` enforces the
+stored local thresholds, and public-network thresholds for `curl`,
+`git ls-remote`, and shallow `git clone` are opt-in with
+`MCR_PERF_ENFORCE_PUBLIC_NETWORK=1` to avoid failing normal runs on network
+variance.

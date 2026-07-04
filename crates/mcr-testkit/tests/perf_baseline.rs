@@ -65,6 +65,14 @@ const GIT_LS_REMOTE: GuestPerfWorkload = GuestPerfWorkload {
     requires_public_network: true,
     gate_max_wall_ms: 5_000,
 };
+const GIT_SHALLOW_CLONE: GuestPerfWorkload = GuestPerfWorkload {
+    name: "guest_git_shallow_clone",
+    script: "d=/tmp/mcr-perf-clone-$$; rm -rf \"$d\"; GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/octocat/Hello-World.git \"$d\" >/dev/null; status=$?; rm -rf \"$d\"; exit $status",
+    operations: 1,
+    category: "network_smoke_git_clone",
+    requires_public_network: true,
+    gate_max_wall_ms: 20_000,
+};
 
 const GUEST_PERF_WORKLOADS: &[GuestPerfWorkload] = &[
     SHELL_STARTUP,
@@ -72,6 +80,7 @@ const GUEST_PERF_WORKLOADS: &[GuestPerfWorkload] = &[
     DIRECTORY_METADATA_WALK,
     CURL_EXAMPLE,
     GIT_LS_REMOTE,
+    GIT_SHALLOW_CLONE,
 ];
 
 #[derive(Debug)]

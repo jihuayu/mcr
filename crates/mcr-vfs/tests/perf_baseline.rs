@@ -19,6 +19,7 @@ fn perf_baseline_vfs_file_and_directory_paths() -> Result<(), Box<dyn std::error
             .with_field("bytes_per_file", 32)
             .with_field("operations_model", "open_write_close_open_read_close"),
     );
+    enforce_wall_time_gate("vfs_small_file_io", file_wall_time, 1_000);
 
     let mut dir_vfs = sample_vfs()?;
     seed_directory(&mut dir_vfs, "/tmp/perf-dir", 128)?;
@@ -31,6 +32,7 @@ fn perf_baseline_vfs_file_and_directory_paths() -> Result<(), Box<dyn std::error
             .with_field("passes", 16)
             .with_field("operations_model", "getdents64_plus_statx_per_entry"),
     );
+    enforce_wall_time_gate("vfs_directory_metadata_walk", dir_wall_time, 2_000);
 
     print_perf_report("mcr-vfs local performance baseline", &measurements);
     Ok(())
@@ -129,6 +131,38 @@ fn unix_timestamp_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+fn enforce_wall_time_gate(name: &str, wall_time: Duration, default_max_wall_ms: u64) {
+    if std::env::var_os("MCR_PERF_ENFORCE_GATES").is_none() {
+        return;
+    }
+
+    let threshold_key = perf_threshold_env_key(name);
+    let max_wall_ms = std::env::var(&threshold_key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(default_max_wall_ms as f64);
+    let actual_wall_ms = wall_time.as_secs_f64() * 1_000.0;
+    assert!(
+        actual_wall_ms <= max_wall_ms,
+        "perf workload `{name}` exceeded wall-time gate: actual {actual_wall_ms:.3}ms > max {max_wall_ms:.3}ms; override with {threshold_key}",
+    );
+}
+
+fn perf_threshold_env_key(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("MCR_PERF_MAX_WALL_MS_{normalized}")
 }
 
 fn seed_directory(

@@ -4,11 +4,12 @@ Targeted shell/network metadata performance is no longer a later backlog item.
 `perf-015` closed the first front-loaded gate by reducing the `git ls-remote`
 latency cliff with opt-in summary tracing and sticky scheduling.
 
-## Promoted Performance Track
+## Completed Promoted Performance Track
 
-These items are promoted from backlog into the active performance goal. Each
-item must still land as a narrow task commit with measurements and correctness
-checks.
+These items were promoted from backlog into the front-loaded performance goal
+and are now closed as narrow task commits with measurements and correctness
+checks. Future work should reopen a new task with fresh evidence rather than
+treating these as open backlog.
 
 | Item | Active task | Gate |
 |---|---|---|
