@@ -46,6 +46,16 @@ cargo test -p mcr-testkit perf_native_execution -- --ignored --nocapture
   runtime derive syscall and Windows FS-relative patch plans from one read of
   each new executable range. This reduces first-dispatch work for large package
   binaries without changing the per-process invalidation boundary.
-- Remaining blocker: rerun a bounded package-backed `node -v` or `go version`
-  smoke with materialized language rootfs fixtures and capture whether the next
-  stall is guest wait/futex, readiness, scheduling, or native execution.
+- 2026-07-04 checkpoint: Windows FS-relative TLS candidates are now recorded
+  without materializing no-op rewrites when the guest FS base is zero, and
+  unchanged nonzero bases only materialize newly discovered executable-range
+  candidates. Real FS-base transitions still rewrite the full candidate set so
+  syscall patching and TLS semantics remain intact. Fixed-width code patching
+  is also batched by host allocation to avoid per-candidate protection toggles
+  when large Node or Rust executable ranges need thousands of rewrites.
+- Remaining blocker: after the FS-relative patch apply checkpoint, local
+  package-rootfs `node -v` and `cargo --version` no longer time out in native
+  patch application. They return guest runtime errors from native execution
+  faults at null address instead (`node`: RIP `0x700357c6`; `cargo`: RIP
+  `0x7006680a`), so follow-up work should diagnose the faulting native
+  instruction/register state rather than patch-cache throughput.

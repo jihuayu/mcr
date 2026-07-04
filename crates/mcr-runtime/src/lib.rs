@@ -3663,13 +3663,29 @@ struct ExecutableSyscallPatch {
 struct ExecutableNativePatches {
     syscall_patches: Vec<ExecutableSyscallPatch>,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    fs_relative_patches: Vec<(u64, FsRelativePatch)>,
+    fs_relative_patches: Vec<FsRelativePatchSite>,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 struct FsRelativePatch {
     original: [u8; 9],
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+struct FsRelativePatchSite {
+    address: u64,
+    patch: FsRelativePatch,
+    materialized: bool,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsRelativePatchWork {
+    None,
+    New,
+    All,
 }
 
 #[cfg(any(
@@ -3738,15 +3754,11 @@ fn find_executable_native_patches(
         #[cfg(all(windows, target_arch = "x86_64"))]
         let fs_patch_start_len = patches.fs_relative_patches.len();
         #[cfg(all(windows, target_arch = "x86_64"))]
-        for offset in 0..bytes.len() {
-            if let Some(original) = fs_relative_original(&bytes[offset..]).or_else(|| {
-                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
-            }) {
-                patches
-                    .fs_relative_patches
-                    .push((start + offset as u64, FsRelativePatch { original }));
-            }
-        }
+        patches.fs_relative_patches.extend(fs_relative_patch_sites(
+            &bytes,
+            start,
+            previous_fs_base,
+        ));
         host_step_trace(format_args!(
             "runtime native-patch-scan done range=[0x{start:016x}..0x{end:016x}) syscall_patches={} fs_relative_patches={} elapsed_ms={}",
             patches.syscall_patches.len() - syscall_patch_start_len,
@@ -3775,9 +3787,7 @@ fn apply_executable_syscall_patches(
         "runtime syscall-patch apply start patches={}",
         patches.len()
     ));
-    for patch in patches {
-        memory.patch_code(patch.address, &[0xcc, 0x90])?;
-    }
+    memory.patch_code_fixed(patches.iter().map(|patch| (patch.address, [0xcc, 0x90])))?;
     host_step_trace(format_args!(
         "runtime syscall-patch apply done patches={} elapsed_ms={}",
         patches.len(),
@@ -3787,23 +3797,47 @@ fn apply_executable_syscall_patches(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn apply_fs_relative_patches(
+fn fs_relative_patch_work(
+    cached_fs_base: u64,
+    fs_base: u64,
+    cached_patch_count: usize,
+    new_unmaterialized_patch_count: usize,
+    new_materialized_patch_count: usize,
+) -> FsRelativePatchWork {
+    if cached_fs_base != fs_base {
+        if fs_base != 0 || cached_patch_count > 0 || new_materialized_patch_count > 0 {
+            FsRelativePatchWork::All
+        } else {
+            FsRelativePatchWork::None
+        }
+    } else if fs_base != 0 && new_unmaterialized_patch_count > 0 {
+        FsRelativePatchWork::New
+    } else {
+        FsRelativePatchWork::None
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn apply_fs_relative_patch_entries(
     memory: &mut GuestMemory,
     fs_base: u64,
-    patches: &BTreeMap<u64, FsRelativePatch>,
+    patch_count: usize,
+    patches: impl IntoIterator<Item = (u64, FsRelativePatch)>,
 ) -> Result<(), GuestExecutionError> {
     let patch_start = Instant::now();
     host_step_trace(format_args!(
         "runtime fs-relative-patch apply start patches={} fs_base=0x{fs_base:016x}",
-        patches.len()
+        patch_count
     ));
-    for (address, patch) in patches {
-        let bytes = fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original);
-        memory.patch_code(*address, &bytes)?;
-    }
+    memory.patch_code_fixed(patches.into_iter().map(|(address, patch)| {
+        (
+            address,
+            fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original),
+        )
+    }))?;
     host_step_trace(format_args!(
         "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
-        patches.len(),
+        patch_count,
         host_step_elapsed_ms(patch_start)
     ));
     Ok(())
@@ -3817,6 +3851,43 @@ fn range_is_covered(start: u64, end: u64, ranges: &[(u64, u64)]) -> bool {
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
     left_start < right_end && right_start < left_end
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch_sites(
+    bytes: &[u8],
+    range_start: u64,
+    previous_fs_base: u64,
+) -> Vec<FsRelativePatchSite> {
+    let mut patches = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_offset) = bytes[offset..].iter().position(|byte| *byte == 0x64) {
+        offset += relative_offset;
+        if let Some(original) = fs_relative_original(&bytes[offset..]) {
+            patches.push(FsRelativePatchSite {
+                address: range_start + offset as u64,
+                patch: FsRelativePatch { original },
+                materialized: false,
+            });
+        }
+        offset += 1;
+    }
+
+    if previous_fs_base != 0 {
+        for offset in 0..bytes.len() {
+            if let Some(original) =
+                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
+            {
+                patches.push(FsRelativePatchSite {
+                    address: range_start + offset as u64,
+                    patch: FsRelativePatch { original },
+                    materialized: true,
+                });
+            }
+        }
+    }
+
+    patches
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -4277,17 +4348,65 @@ impl RuntimeSubsystems {
             apply_executable_syscall_patches(memory, &patches.syscall_patches)?;
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
-                let mut added_fs_patch = false;
-                for (address, patch) in patches.fs_relative_patches {
+                let cached_fs_patch_count = cache.fs_relative_patches.len();
+                let mut new_unmaterialized_fs_patch_addresses = Vec::new();
+                let mut new_materialized_fs_patch_addresses = Vec::new();
+                for site in patches.fs_relative_patches {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
-                        cache.fs_relative_patches.entry(address)
+                        cache.fs_relative_patches.entry(site.address)
                     {
-                        entry.insert(patch);
-                        added_fs_patch = true;
+                        entry.insert(site.patch);
+                        if site.materialized {
+                            new_materialized_fs_patch_addresses.push(site.address);
+                        } else {
+                            new_unmaterialized_fs_patch_addresses.push(site.address);
+                        }
                     }
                 }
-                if cache.fs_base != fs_base || added_fs_patch {
-                    apply_fs_relative_patches(memory, fs_base, &cache.fs_relative_patches)?;
+                match fs_relative_patch_work(
+                    cache.fs_base,
+                    fs_base,
+                    cached_fs_patch_count,
+                    new_unmaterialized_fs_patch_addresses.len(),
+                    new_materialized_fs_patch_addresses.len(),
+                ) {
+                    FsRelativePatchWork::All => {
+                        apply_fs_relative_patch_entries(
+                            memory,
+                            fs_base,
+                            cache.fs_relative_patches.len(),
+                            cache
+                                .fs_relative_patches
+                                .iter()
+                                .map(|(&address, &patch)| (address, patch)),
+                        )?;
+                    }
+                    FsRelativePatchWork::New => {
+                        apply_fs_relative_patch_entries(
+                            memory,
+                            fs_base,
+                            new_unmaterialized_fs_patch_addresses.len(),
+                            new_unmaterialized_fs_patch_addresses
+                                .iter()
+                                .filter_map(|address| {
+                                    cache
+                                        .fs_relative_patches
+                                        .get(address)
+                                        .map(|&patch| (*address, patch))
+                                }),
+                        )?;
+                    }
+                    FsRelativePatchWork::None
+                        if !new_unmaterialized_fs_patch_addresses.is_empty()
+                            || !new_materialized_fs_patch_addresses.is_empty() =>
+                    {
+                        host_step_trace(format_args!(
+                            "runtime fs-relative-patch apply skipped patches={} fs_base=0x{fs_base:016x}",
+                            new_unmaterialized_fs_patch_addresses.len()
+                                + new_materialized_fs_patch_addresses.len()
+                        ));
+                    }
+                    FsRelativePatchWork::None => {}
                 }
             }
         }
@@ -13706,6 +13825,85 @@ mod tests {
         assert_eq!(
             guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
             [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_defers_zero_fs_base_tls_rewrites() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            fs_load
+        );
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .fs_relative_patches
+                .len(),
+            1,
+            "zero-base native patching should record TLS candidates for a later nonzero base"
+        );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90]
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_skips_new_zero_base_fs_patch_work() {
+        assert_eq!(
+            fs_relative_patch_work(0, 0, 0, 45_171, 0),
+            FsRelativePatchWork::None
+        );
+        assert_eq!(
+            fs_relative_patch_work(0, 0x7000_0000, 0, 45_171, 0),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 0, 45_171, 0),
+            FsRelativePatchWork::None
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 0, 0, 1),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0, 1, 0, 0),
+            FsRelativePatchWork::All
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0x7000_0000, 0, 1, 0),
+            FsRelativePatchWork::New
+        );
+        assert_eq!(
+            fs_relative_patch_work(0x7000_0000, 0x7000_0000, 0, 0, 1),
+            FsRelativePatchWork::None
         );
     }
 

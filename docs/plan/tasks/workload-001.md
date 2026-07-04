@@ -86,3 +86,12 @@ mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"
   timeout is repeated native patch-cache work after guest entry, including
   repeated scans of the two executable ranges and reapplying roughly `1616`
   FS-relative patches for `fs_base=0x700a6b28`.
+- The native patch cache now skips no-op Windows FS-relative rewrite application
+  when `fs_base=0` while keeping the candidates for later nonzero FS bases, and
+  applies only newly discovered candidates when the FS base is unchanged.
+  Fixed-width patch writes are batched by host allocation so large nonzero
+  FS-base rewrites do not toggle executable protections once per candidate.
+  Local package-rootfs validation no longer times out in the patch-apply window:
+  `node -v` and `cargo --version` both return guest runtime errors from native
+  null-address faults instead (`node`: RIP `0x700357c6`; `cargo`: RIP
+  `0x7006680a`).

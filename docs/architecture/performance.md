@@ -307,6 +307,16 @@ the `0f 05` byte pair and skips the decoder entirely for candidate-free ranges;
 when candidates exist, decoding stops after the last candidate so large package
 binary tails are not walked after the final possible `syscall`.
 
+Windows FS-relative TLS patching records candidates separately from materializing
+rewrites. When the guest FS base is zero, newly discovered candidates stay in the
+cache but are not rewritten back to their original bytes, avoiding no-op patch
+work for large binaries. When the FS base is unchanged and only new executable
+ranges appear, only the new candidates are materialized; a real FS-base change
+still rewrites the full candidate set to preserve guest TLS semantics. Batched
+code patching groups fixed-width rewrites by host allocation so large syscall or
+TLS patch sets do not repeatedly toggle the same executable mapping's
+protection for each candidate.
+
 ## Measurement Gates
 
 Each performance task must add or update an observable benchmark or smoke gate.

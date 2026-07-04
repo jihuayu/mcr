@@ -500,6 +500,62 @@ impl GuestMemory {
         Ok(old)
     }
 
+    pub fn patch_code_fixed<const N: usize>(
+        &mut self,
+        patches: impl IntoIterator<Item = (u64, [u8; N])>,
+    ) -> Result<(), GuestMemoryError> {
+        #[derive(Debug)]
+        struct PlannedPatch<const N: usize> {
+            allocation_offset: usize,
+            bytes: [u8; N],
+        }
+
+        let mut planned: BTreeMap<u64, Vec<PlannedPatch<N>>> = BTreeMap::new();
+        for (address, bytes) in patches {
+            let end = checked_raw_range(address, N as u64)?;
+            let vma = self
+                .vma_containing(address)
+                .cloned()
+                .ok_or(GuestMemoryError::NotMapped)?;
+            if end > vma.end {
+                return Err(GuestMemoryError::InvalidLength);
+            }
+
+            let allocation_offset = usize::try_from(vma.allocation_offset + (address - vma.start))
+                .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+            planned
+                .entry(vma.allocation_id)
+                .or_default()
+                .push(PlannedPatch {
+                    allocation_offset,
+                    bytes,
+                });
+        }
+
+        for (allocation_id, patches) in planned {
+            let ranges = self.allocation_protection_ranges(allocation_id)?;
+            let allocation = self
+                .allocations
+                .get_mut(&allocation_id)
+                .expect("VMA references live allocation");
+            allocation
+                .memory
+                .protect(MemoryProtection::ReadWrite)
+                .map_err(GuestMemoryError::Host)?;
+            for patch in patches {
+                let patch_end = patch
+                    .allocation_offset
+                    .checked_add(N)
+                    .ok_or(GuestMemoryError::RegionTooLarge)?;
+                allocation.memory.as_mut_slice()[patch.allocation_offset..patch_end]
+                    .copy_from_slice(&patch.bytes);
+            }
+            apply_allocation_protections(&allocation.memory, &ranges)?;
+        }
+
+        Ok(())
+    }
+
     fn try_set_brk(&mut self, requested: u64) -> Result<(), GuestMemoryError> {
         let new_mapped_end = align_up(requested)?;
         if new_mapped_end > self.address_space_end {
@@ -1572,6 +1628,32 @@ mod tests {
         let mut byte = [0];
         memory.read(addr + GUEST_PAGE_SIZE, &mut byte).unwrap();
         assert_eq!(byte, [b'x']);
+    }
+
+    #[test]
+    fn patch_code_fixed_updates_executable_bytes_and_restores_protection() {
+        let mut memory = memory();
+        let addr = memory
+            .mmap(anonymous(
+                0,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_EXEC,
+                0,
+            ))
+            .unwrap();
+
+        memory
+            .patch_code_fixed([(addr, [0xcc, 0x90]), (addr + 8, [0x90, 0xcc])])
+            .unwrap();
+
+        let mut bytes = [0; 10];
+        memory.read(addr, &mut bytes).unwrap();
+        assert_eq!(bytes[..2], [0xcc, 0x90]);
+        assert_eq!(bytes[8..10], [0x90, 0xcc]);
+        assert_eq!(
+            memory.write(addr, b"x"),
+            Err(GuestMemoryError::AccessDenied)
+        );
     }
 
     #[test]
