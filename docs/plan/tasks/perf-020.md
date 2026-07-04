@@ -54,3 +54,8 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   synthetic completion packets, and poll/wait for packets with timeout mapping.
   Non-Windows builds report explicit unsupported errors, so higher layers can
   retain the WSAPoll fallback while socket integration is added.
+- Added the Winsock socket lifetime precondition for the real backend:
+  `NetworkStack::open_socket_with_iocp` creates a `WSA_FLAG_OVERLAPPED` socket
+  and associates it with a host completion port under an MCR-owned completion
+  key. The existing `open_socket`/`WSAPoll` path remains the fallback until
+  overlapped `WSARecv`/`WSASend` ownership and readiness-drain integration land.

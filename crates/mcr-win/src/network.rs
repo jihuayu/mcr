@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::error::{HostError, HostErrorCode, HostOperation, HostResult};
+use crate::iocp::HostIoCompletionPort;
 
 /// Host address family for socket creation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -246,6 +247,18 @@ impl NetworkStack {
         open_socket_platform(family, kind, protocol)
     }
 
+    /// Opens a host socket in overlapped mode and associates it with an IOCP.
+    pub fn open_socket_with_iocp(
+        &self,
+        family: AddressFamily,
+        kind: SocketKind,
+        protocol: SocketProtocol,
+        port: &HostIoCompletionPort,
+        completion_key: usize,
+    ) -> HostResult<HostSocket> {
+        open_socket_with_iocp_platform(family, kind, protocol, port, completion_key)
+    }
+
     /// Polls host sockets for readiness.
     pub fn poll(
         &self,
@@ -419,6 +432,17 @@ fn open_socket_platform(
 }
 
 #[cfg(not(windows))]
+fn open_socket_with_iocp_platform(
+    _family: AddressFamily,
+    _kind: SocketKind,
+    _protocol: SocketProtocol,
+    _port: &HostIoCompletionPort,
+    _completion_key: usize,
+) -> HostResult<HostSocket> {
+    Err(HostError::unsupported(HostOperation::OpenSocket))
+}
+
+#[cfg(not(windows))]
 fn poll_platform(entries: &mut [SocketPoll<'_>], _timeout: Option<Duration>) -> HostResult<usize> {
     if entries.is_empty() {
         Ok(0)
@@ -565,13 +589,54 @@ fn open_socket_platform(
     kind: SocketKind,
     protocol: SocketProtocol,
 ) -> HostResult<HostSocket> {
-    // SAFETY: Arguments are plain Winsock constants.
-    let raw = unsafe {
-        socket(
-            family.to_winsock(),
-            kind.to_winsock(),
-            protocol.to_winsock(),
-        )
+    open_socket_raw_platform(family, kind, protocol, false)
+}
+
+#[cfg(windows)]
+fn open_socket_with_iocp_platform(
+    family: AddressFamily,
+    kind: SocketKind,
+    protocol: SocketProtocol,
+    port: &HostIoCompletionPort,
+    completion_key: usize,
+) -> HostResult<HostSocket> {
+    let socket = open_socket_raw_platform(family, kind, protocol, true)?;
+    // SAFETY: `socket` owns a valid overlapped Winsock SOCKET and keeps it alive
+    // for at least as long as any operations submitted through this adapter.
+    unsafe {
+        port.associate_raw_handle(socket.raw, completion_key)?;
+    }
+    Ok(socket)
+}
+
+#[cfg(windows)]
+fn open_socket_raw_platform(
+    family: AddressFamily,
+    kind: SocketKind,
+    protocol: SocketProtocol,
+    overlapped: bool,
+) -> HostResult<HostSocket> {
+    let raw = if overlapped {
+        // SAFETY: Arguments are plain Winsock constants; protocol info is not supplied.
+        unsafe {
+            WSASocketW(
+                family.to_winsock(),
+                kind.to_winsock(),
+                protocol.to_winsock(),
+                std::ptr::null_mut(),
+                0,
+                WSA_FLAG_OVERLAPPED,
+            )
+        }
+    } else {
+        // SAFETY: Arguments are plain Winsock constants.
+        unsafe {
+            socket(
+                family.to_winsock(),
+                kind.to_winsock(),
+                protocol.to_winsock(),
+            )
+        }
     };
     if raw == crate::windows::INVALID_SOCKET {
         return Err(crate::error::last_winsock_error(HostOperation::OpenSocket));
@@ -1123,6 +1188,8 @@ const POLLIN: i16 = 0x0300;
 const POLLPRI: i16 = 0x0400;
 
 #[cfg(windows)]
+const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+#[cfg(windows)]
 const SOL_SOCKET: i32 = 0xffff;
 #[cfg(windows)]
 const SO_REUSEADDR: i32 = 0x0004;
@@ -1398,6 +1465,14 @@ unsafe extern "system" {
     fn WSAStartup(version_requested: u16, data: *mut WsaData) -> i32;
     fn WSACleanup() -> i32;
     fn socket(af: i32, socket_type: i32, protocol: i32) -> crate::windows::Socket;
+    fn WSASocketW(
+        af: i32,
+        socket_type: i32,
+        protocol: i32,
+        protocol_info: *mut std::ffi::c_void,
+        group: u32,
+        flags: u32,
+    ) -> crate::windows::Socket;
     fn closesocket(socket: crate::windows::Socket) -> i32;
     fn WSAPoll(fd_array: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
     fn connect(socket: crate::windows::Socket, name: *const Sockaddr, name_len: i32) -> i32;
@@ -1505,8 +1580,8 @@ mod tests {
 
     #[cfg(windows)]
     use super::{
-        AddressFamily, HostShutdown, HostSocketOptionName, HostSocketOptionValue, SocketKind,
-        SocketPoll, SocketProtocol,
+        AddressFamily, HostIoCompletionPort, HostShutdown, HostSocketOptionName,
+        HostSocketOptionValue, SocketKind, SocketPoll, SocketProtocol,
     };
 
     #[test]
@@ -1585,6 +1660,30 @@ mod tests {
 
         socket.set_nonblocking(true).unwrap();
         socket.set_nonblocking(false).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iocp_socket_open_associates_with_completion_port() {
+        let stack = NetworkStack::start().unwrap();
+        let port = HostIoCompletionPort::new().unwrap();
+        let socket = stack
+            .open_socket_with_iocp(
+                AddressFamily::Inet,
+                SocketKind::Stream,
+                SocketProtocol::Tcp,
+                &port,
+                17,
+            )
+            .unwrap();
+
+        socket.set_nonblocking(true).unwrap();
+        port.post(4, 17, 0x55).unwrap();
+        let packet = port.get(Some(std::time::Duration::ZERO)).unwrap().unwrap();
+
+        assert_eq!(packet.bytes_transferred(), 4);
+        assert_eq!(packet.completion_key(), 17);
+        assert_eq!(packet.overlapped(), 0x55);
     }
 
     #[cfg(windows)]
