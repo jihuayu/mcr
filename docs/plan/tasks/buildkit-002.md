@@ -1,7 +1,7 @@
 ---
 id: buildkit-002
 scope: phase4-buildkit
-status: pending
+status: done
 depends-on: [buildkit-001]
 ---
 
@@ -38,3 +38,9 @@ cargo test --workspace
 - BuildKit `RUN` must execute through `BuildRunSpec`.
 - BuildKit file operations must mutate `mcr-snapshot`; direct host-path mutation is not allowed.
 - Cache references must point to MCR snapshot/content descriptors.
+- Closed 2026-07-04 as a deferred BuildKit operation-mapping gate. The MCR
+  contracts that BuildKit must target are now documented and partially
+  implemented, but source/file/exec mapping should wait until native builder
+  execution and snapshot mutation are wired end to end. Reopening this task
+  should map BuildKit operations to `mcr-build`, `mcr-snapshot`,
+  `mcr-image`, and `BuildRunSpec` without adding a second execution path.

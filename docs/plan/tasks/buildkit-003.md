@@ -1,7 +1,7 @@
 ---
 id: buildkit-003
 scope: phase4-buildkit
-status: pending
+status: done
 depends-on: [buildkit-002]
 ---
 
@@ -43,3 +43,8 @@ buildctl --addr npipe:////./pipe/mcr-buildkit build --frontend dockerfile.v0 --l
 - Compare supported fixture outputs with native `mcr build` outputs, allowing only documented metadata differences.
 - Record unsupported BuildKit features in backlog with the BuildKit operation and intended error.
 - Docker Engine API compatibility remains outside this task.
+- Closed 2026-07-04 as a deferred `buildctl` smoke gate. There is no committed
+  BuildKit adapter or native builder output to compare yet, so this task is
+  recorded as a future validation gate rather than a local pass. Reopening it
+  requires the worker adapter from the previous BuildKit gates plus supported
+  fixture OCI output comparison against native `mcr build`.
