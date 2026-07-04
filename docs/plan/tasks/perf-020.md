@@ -64,3 +64,6 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   `WSAOVERLAPPED`, event, and transfer buffer alive until a matching IOCP packet
   completes the pending operation and returns the owned buffer. Dropped pending
   operations cancel and drain before freeing host state.
+- Corrected IOCP packet handling so failed overlapped operations with a non-null
+  `OVERLAPPED` are surfaced as completion packets carrying the host error code,
+  rather than being mistaken for completion-port polling failures.

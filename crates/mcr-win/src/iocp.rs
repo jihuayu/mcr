@@ -10,6 +10,7 @@ pub struct HostIoCompletionPacket {
     bytes_transferred: u32,
     completion_key: usize,
     overlapped: usize,
+    error_code: Option<u32>,
 }
 
 impl HostIoCompletionPacket {
@@ -26,6 +27,11 @@ impl HostIoCompletionPacket {
     #[must_use]
     pub const fn overlapped(self) -> usize {
         self.overlapped
+    }
+
+    #[must_use]
+    pub const fn error_code(self) -> Option<u32> {
+        self.error_code
     }
 }
 
@@ -202,19 +208,28 @@ fn get_iocp_platform(
     };
     if ok == crate::windows::FALSE {
         let error = crate::windows::last_error();
-        if error == WAIT_TIMEOUT {
-            return Ok(None);
+        if overlapped.is_null() {
+            if error == WAIT_TIMEOUT {
+                return Ok(None);
+            }
+            return Err(crate::error::windows_error(
+                HostOperation::GetIoCompletionPort,
+                error,
+            ));
         }
-        return Err(crate::error::windows_error(
-            HostOperation::GetIoCompletionPort,
-            error,
-        ));
+        return Ok(Some(HostIoCompletionPacket {
+            bytes_transferred,
+            completion_key,
+            overlapped: overlapped as usize,
+            error_code: Some(error),
+        }));
     }
 
     Ok(Some(HostIoCompletionPacket {
         bytes_transferred,
         completion_key,
         overlapped: overlapped as usize,
+        error_code: None,
     }))
 }
 
@@ -276,6 +291,7 @@ mod tests {
         assert_eq!(packet.bytes_transferred(), 7);
         assert_eq!(packet.completion_key(), 11);
         assert_eq!(packet.overlapped(), 0x1234);
+        assert_eq!(packet.error_code(), None);
     }
 
     #[cfg(not(windows))]

@@ -393,6 +393,14 @@ impl PendingHostSocketIo {
             return HostSocketIoSubmission::Pending(self);
         }
         let buffer = self.buffer.take().unwrap_or_default();
+        if let Some(error) = packet.error_code() {
+            self.mark_completed_platform();
+            return HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
+                self.direction,
+                crate::error::windows_error(self.direction.operation(), error),
+                buffer,
+            ));
+        }
         if packet.bytes_transferred() as usize > buffer.len() {
             self.mark_completed_platform();
             return HostSocketIoSubmission::Failed(HostSocketIoFailure::new(
