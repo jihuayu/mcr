@@ -37,7 +37,11 @@ pub struct HostIoCompletion {
 }
 
 impl HostIoCompletion {
-    fn new(direction: HostIoDirection, bytes_transferred: usize, buffer: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        direction: HostIoDirection,
+        bytes_transferred: usize,
+        buffer: Vec<u8>,
+    ) -> Self {
         Self {
             direction,
             bytes_transferred,
@@ -75,7 +79,7 @@ pub struct HostIoFailure {
 }
 
 impl HostIoFailure {
-    fn new(direction: HostIoDirection, error: HostError, buffer: Vec<u8>) -> Self {
+    pub(crate) fn new(direction: HostIoDirection, error: HostError, buffer: Vec<u8>) -> Self {
         Self {
             direction,
             error,
@@ -108,6 +112,7 @@ impl HostIoFailure {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum HostIoSubmission {
     Completed(HostIoCompletion),
+    Failed(HostIoFailure),
     Pending(PendingHostIo),
     Fallback(HostIoFallback),
 }
@@ -119,6 +124,7 @@ impl HostIoSubmission {
     pub fn complete_or_fallback(self, file: &HostFile) -> HostIoResult {
         match self {
             Self::Completed(completion) => Ok(completion),
+            Self::Failed(failure) => Err(failure),
             Self::Fallback(fallback) => fallback.complete(file),
             Self::Pending(pending) => pending.unsupported_completion(),
         }

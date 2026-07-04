@@ -46,3 +46,18 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   close-drain paths.
 - Runtime readiness must be event driven; do not add timer polling as the normal
   overlapped completion path.
+
+## Checkpoints
+
+- Added the first real Windows overlapped regular-file operation boundary in
+  `mcr-win`: `FileOptions::with_overlapped_io()` opens a handle with
+  `FILE_FLAG_OVERLAPPED`, and `HostFile::submit_overlapped_read_at` /
+  `submit_overlapped_write_at` issue offset-based `ReadFile` / `WriteFile`
+  requests with an owned event and `GetOverlappedResult`.
+- Existing `submit_overlapped_read` / `submit_overlapped_write` keep returning
+  the synchronous fallback because they do not carry an offset and therefore
+  cannot safely preserve regular-file position on an overlapped handle.
+- This checkpoint proves the Windows adapter can execute real overlapped
+  operations and return owned buffers through `HostIoSubmission::Completed` or
+  `HostIoSubmission::Failed`. VFS/runtime readiness integration and pipe handle
+  wiring remain in this task.
