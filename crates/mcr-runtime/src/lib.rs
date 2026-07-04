@@ -5277,6 +5277,7 @@ impl RuntimeSubsystems {
         match operation {
             LINUX_EPOLL_CTL_ADD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
+                validate_epoll_events(event.events)?;
                 let instance = self.epolls.instance_mut(epoll_id)?;
                 if instance.watches.contains_key(&fd) {
                     return Err(LinuxErrno::EEXIST);
@@ -5292,6 +5293,7 @@ impl RuntimeSubsystems {
             }
             LINUX_EPOLL_CTL_MOD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
+                validate_epoll_events(event.events)?;
                 let instance = self.epolls.instance_mut(epoll_id)?;
                 let watch = instance.watches.get_mut(&fd).ok_or(LinuxErrno::ENOENT)?;
                 watch.events = event.events;
@@ -5382,6 +5384,16 @@ impl RuntimeSubsystems {
 
 const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
+
+const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
+    LINUX_EPOLLIN | LINUX_EPOLLPRI | LINUX_EPOLLOUT | LINUX_EPOLLERR | LINUX_EPOLLHUP;
+
+fn validate_epoll_events(events: u32) -> Result<(), LinuxErrno> {
+    if events & !LINUX_EPOLL_SUPPORTED_EVENTS != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(())
+}
 
 fn zero_elf_load_bss_tail(vfs: &VirtualFileSystem, fd: Fd, mapped_offset: u64, bytes: &mut [u8]) {
     if bytes.is_empty() {
@@ -6105,8 +6117,9 @@ mod tests {
         LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
         LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
         LINUX_CLONE_THREAD, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
-        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
+        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLET,
+        LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT, LINUX_EPOLLOUT,
+        LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
         LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
         LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
         LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
@@ -7936,6 +7949,94 @@ mod tests {
                 ))
                 .result,
             SyscallReturn::Errno(LinuxErrno::ENOENT)
+        );
+    }
+
+    #[test]
+    fn epoll_ctl_rejects_unsupported_event_flags() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(5)
+        );
+
+        for unsupported in [
+            LINUX_EPOLLET,
+            LINUX_EPOLLONESHOT,
+            LINUX_EPOLLEXCLUSIVE,
+            0x0000_2000,
+        ] {
+            write_epoll_event_for_test(
+                runtime.memory_mut(),
+                0x402100,
+                LINUX_EPOLLIN | unsupported,
+                1,
+            );
+            assert_eq!(
+                runtime
+                    .dispatch_syscall(context(
+                        Syscall::EpollCtl,
+                        [
+                            5,
+                            u64::from(LINUX_EPOLL_CTL_ADD),
+                            read_fd as u64,
+                            0x402100,
+                            0,
+                            0,
+                        ],
+                    ))
+                    .result,
+                SyscallReturn::Errno(LinuxErrno::EINVAL)
+            );
+        }
+
+        write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 1);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_ADD),
+                        read_fd as u64,
+                        0x402100,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        write_epoll_event_for_test(
+            runtime.memory_mut(),
+            0x402110,
+            LINUX_EPOLLIN | LINUX_EPOLLET,
+            2,
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_MOD),
+                        read_fd as u64,
+                        0x402110,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
         );
     }
 
