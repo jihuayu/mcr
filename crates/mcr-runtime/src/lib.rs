@@ -9085,7 +9085,11 @@ impl From<Runtime> for SyscallDispatcher<RuntimeSubsystems, NoopSyscallTracer> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeDiagnosticsTracer {
     events: Vec<SyscallTraceEvent>,
+    dropped_events: u64,
 }
+
+const RUNTIME_DIAGNOSTICS_EVENT_LIMIT: usize = 8192;
+const RUNTIME_DIAGNOSTICS_EVENT_DRAIN: usize = 4096;
 
 impl RuntimeDiagnosticsTracer {
     #[must_use]
@@ -9107,6 +9111,11 @@ impl RuntimeDiagnosticsTracer {
     }
 
     #[must_use]
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    #[must_use]
     pub fn into_events(self) -> Vec<SyscallTraceEvent> {
         self.events
     }
@@ -9114,6 +9123,12 @@ impl RuntimeDiagnosticsTracer {
 
 impl SyscallTracer for RuntimeDiagnosticsTracer {
     fn record(&mut self, event: SyscallTraceEvent) {
+        if self.events.len() >= RUNTIME_DIAGNOSTICS_EVENT_LIMIT {
+            self.events.drain(..RUNTIME_DIAGNOSTICS_EVENT_DRAIN);
+            self.dropped_events = self
+                .dropped_events
+                .saturating_add(RUNTIME_DIAGNOSTICS_EVENT_DRAIN as u64);
+        }
         self.events.push(event);
     }
 }
@@ -9136,8 +9151,8 @@ mod tests {
         LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SIGCHLD, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE,
         LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM,
         LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall,
-        SyscallArgs, SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent,
-        TraceContext, Wait4SyscallArgs,
+        SyscallArgs, SyscallEnterEvent, SyscallExitEvent, SyscallRegisters, SyscallReturn,
+        SyscallTraceEvent, TraceContext, Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -15442,6 +15457,39 @@ mod tests {
             runtime.tracer().events(),
             [SyscallTraceEvent::Enter(_), SyscallTraceEvent::Exit(_)]
         ));
+    }
+
+    #[test]
+    fn runtime_diagnostics_tracer_bounds_retained_events() {
+        let mut tracer = RuntimeDiagnosticsTracer::new();
+        for index in 0..(RUNTIME_DIAGNOSTICS_EVENT_LIMIT + 17) {
+            tracer.record(SyscallTraceEvent::Exit(SyscallExitEvent {
+                context: TraceContext {
+                    pid: INITIAL_GUEST_PID,
+                    tid: INITIAL_GUEST_TID,
+                    rip: index as u64,
+                },
+                syscall: Syscall::Getpid,
+                args: SyscallArgs::new([0; 6]),
+                result: SyscallReturn::Success(index as u64),
+                decoded: Vec::new(),
+                host_error: None,
+            }));
+        }
+
+        assert_eq!(tracer.events().len(), RUNTIME_DIAGNOSTICS_EVENT_DRAIN + 17);
+        assert_eq!(
+            tracer.dropped_events(),
+            RUNTIME_DIAGNOSTICS_EVENT_DRAIN as u64
+        );
+        let last = tracer.last_syscall().unwrap();
+        assert_eq!(last.name(), "getpid");
+        assert_eq!(
+            last.result(),
+            Some(SyscallReturn::Success(
+                (RUNTIME_DIAGNOSTICS_EVENT_LIMIT + 16) as u64
+            ))
+        );
     }
 
     #[test]
