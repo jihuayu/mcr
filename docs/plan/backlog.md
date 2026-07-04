@@ -10,7 +10,8 @@
 | BuildKit worker/executor | Phase 4 | Needs a stable runtime executor contract, snapshot diff boundary, and native builder proof first. |
 | Docker Engine API subset | Later than Phase 4 | CLI compatibility is not useful until the runtime and builder can run meaningful workloads. |
 | Full overlay lower/upper layer implementation | Phase 3 | VFS must remain compatible with it, but export semantics belong to builder work. |
-| IOCP event backend | Later optimization | WSAPoll plus runtime readiness queue is simpler for Phase 2 correctness. |
+| IOCP event backend | Later optimization | Tracked by `perf-006`; WSAPoll plus runtime readiness queue remains the Phase 2 correctness backend. |
+| Registered I/O network backend | Later optimization | Tracked by `perf-008`; only useful if IOCP measurements expose a small-message datagram bottleneck. |
 | General UDP socket semantics | Later compatibility | Phase 2 only needs UDP if it is the chosen implementation detail for DNS. |
 | Edge-triggered epoll and one-shot/exclusive watches | Later compatibility | Phase 2 readiness is level-triggered for CLI/network tool smoke tests. |
 | AF_UNIX compatibility | Later compatibility | TCP client behavior is the Phase 2 networking proof. |
