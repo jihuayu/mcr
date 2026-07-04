@@ -17,6 +17,9 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 pub use build_run::{
     BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
 };
@@ -68,6 +71,9 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
 const PERF_SUMMARY_TRACE_ENV: &str = "MCR_TRACE_PERF_SUMMARY";
 const STICKY_SCHED_ENV: &str = "MCR_SCHED_STICKY";
+const UNSAFE_SHARE_UNTIL_EXEC_ENV: &str = "MCR_UNSAFE_SHARE_UNTIL_EXEC";
+#[cfg(test)]
+static UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn host_step_trace_enabled() -> bool {
     std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
@@ -77,6 +83,19 @@ pub(crate) fn host_step_trace(message: fmt::Arguments<'_>) {
     if host_step_trace_enabled() {
         eprintln!("mcr hoststep: {message}");
     }
+}
+
+fn unsafe_share_until_exec_enabled() -> bool {
+    if std::env::var_os(UNSAFE_SHARE_UNTIL_EXEC_ENV).is_some() {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        if UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.load(Ordering::SeqCst) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn host_step_elapsed_ms(start: Instant) -> u128 {
@@ -138,9 +157,16 @@ pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard};
 
     static NATIVE_EXECUTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) fn native_execution_test_guard() -> MutexGuard<'static, ()> {
         NATIVE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn env_test_guard() -> MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -6708,6 +6734,9 @@ impl RuntimeSubsystems {
         &mut self,
         parent_pid: mcr_sys::GuestPid,
     ) -> Result<(), GuestMemoryError> {
+        if unsafe_share_until_exec_enabled() {
+            return Ok(());
+        }
         let child_pids = self
             .pending_fork_exec
             .iter()
@@ -9115,6 +9144,10 @@ mod tests {
 
     fn native_execution_test_guard() -> MutexGuard<'static, ()> {
         crate::test_support::native_execution_test_guard()
+    }
+
+    fn env_test_guard() -> MutexGuard<'static, ()> {
+        crate::test_support::env_test_guard()
     }
     use mcr_vfs::{
         AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
@@ -13731,6 +13764,21 @@ mod tests {
         }
     }
 
+    struct TestUnsafeShareUntilExec;
+
+    impl TestUnsafeShareUntilExec {
+        fn enable() -> Self {
+            UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for TestUnsafeShareUntilExec {
+        fn drop(&mut self) {
+            UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {
         memory.write(addr, &sec.to_le_bytes()).unwrap();
         memory.write(addr + 8, &nsec.to_le_bytes()).unwrap();
@@ -14877,6 +14925,57 @@ mod tests {
             .unwrap();
         assert_eq!(&parent_bytes, b"PARENT");
         assert_eq!(&child_bytes, b"parent");
+    }
+
+    #[test]
+    fn unsafe_share_until_exec_keeps_child_pending_after_parent_memory_write() {
+        let _guard = env_test_guard();
+        let _unsafe_share = TestUnsafeShareUntilExec::enable();
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content("/bin/new", test_program_bytes(0x501000), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/new"
+        );
     }
 
     #[test]
