@@ -49,3 +49,12 @@ gh workflow run x86-runtime-smoke.yml -f suite=performance
   regressions from public-network or runner variance.
 - Start with local command-specific gates before requiring centralized trend
   storage.
+
+## Checkpoints
+
+- Added opt-in wall-time regression gates to the `mcr-testkit` guest workload
+  baseline. Setting `MCR_PERF_ENFORCE_GATES=1` enforces stored local thresholds
+  for shell startup, small-file I/O, and directory metadata; public-network
+  `curl` and `git ls-remote` thresholds are enforced only when
+  `MCR_PERF_ENFORCE_PUBLIC_NETWORK=1` is also set. Each workload can be
+  overridden with `MCR_PERF_MAX_WALL_MS_<WORKLOAD_NAME>`.

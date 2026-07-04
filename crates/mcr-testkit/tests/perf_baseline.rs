@@ -18,6 +18,7 @@ struct GuestPerfWorkload {
     operations: u64,
     category: &'static str,
     requires_public_network: bool,
+    gate_max_wall_ms: u64,
 }
 
 const SHELL_STARTUP: GuestPerfWorkload = GuestPerfWorkload {
@@ -26,6 +27,7 @@ const SHELL_STARTUP: GuestPerfWorkload = GuestPerfWorkload {
     operations: 1,
     category: "shell_fork_exec_wait4",
     requires_public_network: false,
+    gate_max_wall_ms: 1_000,
 };
 const SMALL_FILE_IO: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_small_file_io",
@@ -33,6 +35,7 @@ const SMALL_FILE_IO: GuestPerfWorkload = GuestPerfWorkload {
     operations: 16,
     category: "small_file_io",
     requires_public_network: false,
+    gate_max_wall_ms: 4_000,
 };
 const DIRECTORY_METADATA_WALK: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_directory_metadata_walk",
@@ -40,6 +43,7 @@ const DIRECTORY_METADATA_WALK: GuestPerfWorkload = GuestPerfWorkload {
     operations: 32,
     category: "directory_metadata_walk",
     requires_public_network: false,
+    gate_max_wall_ms: 8_000,
 };
 const CURL_EXAMPLE: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_curl_example",
@@ -47,6 +51,7 @@ const CURL_EXAMPLE: GuestPerfWorkload = GuestPerfWorkload {
     operations: 1,
     category: "network_smoke_curl",
     requires_public_network: true,
+    gate_max_wall_ms: 3_000,
 };
 const GIT_LS_REMOTE: GuestPerfWorkload = GuestPerfWorkload {
     name: "guest_git_ls_remote",
@@ -54,6 +59,7 @@ const GIT_LS_REMOTE: GuestPerfWorkload = GuestPerfWorkload {
     operations: 1,
     category: "network_smoke_git",
     requires_public_network: true,
+    gate_max_wall_ms: 5_000,
 };
 
 const GUEST_PERF_WORKLOADS: &[GuestPerfWorkload] = &[
@@ -155,7 +161,16 @@ fn perf_baseline_guest_workloads_model_expected_commands() {
             workload.name
         );
         assert!(workload.operations > 0);
+        assert!(workload.gate_max_wall_ms > 0);
     }
+}
+
+#[test]
+fn perf_gate_threshold_keys_are_stable() {
+    assert_eq!(
+        perf_threshold_env_key("guest_git_ls_remote"),
+        "MCR_PERF_MAX_WALL_MS_GUEST_GIT_LS_REMOTE"
+    );
 }
 
 #[test]
@@ -184,6 +199,7 @@ fn perf_baseline_guest_smoke_workloads() -> Result<()> {
                 .with_field("category", workload.category)
                 .with_field("script", workload.script)
                 .with_field("requires_public_network", workload.requires_public_network)
+                .with_field("gate_max_wall_ms", workload.gate_max_wall_ms)
                 .with_field("status", output.status_code().unwrap_or_default()),
         );
 
@@ -195,10 +211,48 @@ fn perf_baseline_guest_smoke_workloads() -> Result<()> {
             String::from_utf8_lossy(output.stdout()),
             String::from_utf8_lossy(output.stderr())
         );
+        enforce_guest_perf_gate(*workload, wall_time);
     }
 
     println!("{report}");
     Ok(())
+}
+
+fn enforce_guest_perf_gate(workload: GuestPerfWorkload, wall_time: Duration) {
+    if env::var_os("MCR_PERF_ENFORCE_GATES").is_none() {
+        return;
+    }
+    if workload.requires_public_network && env::var_os("MCR_PERF_ENFORCE_PUBLIC_NETWORK").is_none()
+    {
+        return;
+    }
+
+    let threshold_key = perf_threshold_env_key(workload.name);
+    let max_wall_ms = env::var(&threshold_key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(workload.gate_max_wall_ms as f64);
+    let actual_wall_ms = wall_time.as_secs_f64() * 1_000.0;
+    assert!(
+        actual_wall_ms <= max_wall_ms,
+        "guest perf workload `{}` exceeded wall-time gate: actual {actual_wall_ms:.3}ms > max {max_wall_ms:.3}ms; override with {threshold_key}",
+        workload.name
+    );
+}
+
+fn perf_threshold_env_key(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("MCR_PERF_MAX_WALL_MS_{normalized}")
 }
 
 #[test]
