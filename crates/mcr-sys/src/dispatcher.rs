@@ -105,6 +105,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Writev, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Access, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pipe, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Select, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::SchedYield, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Madvise, SyscallSubsystem::Memory),
     SyscallDescriptor::new(Syscall::Gettimeofday, SyscallSubsystem::Time),
@@ -885,6 +886,13 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("fds", arg(0)),
             decimal_field("nfds", arg(1)),
             signed_field("timeout", arg(2)),
+        ],
+        Syscall::Select => vec![
+            decimal_field("nfds", arg(0)),
+            hex_field("readfds", arg(1)),
+            hex_field("writefds", arg(2)),
+            hex_field("exceptfds", arg(3)),
+            hex_field("timeout", arg(4)),
         ],
         Syscall::Ppoll => vec![
             hex_field("fds", arg(0)),

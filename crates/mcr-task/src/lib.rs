@@ -406,11 +406,33 @@ impl GprState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FutexWaitKey {
+    pid: Option<GuestPid>,
+    uaddr: GuestAddress,
+}
+
+impl FutexWaitKey {
+    #[must_use]
+    pub const fn new(pid: GuestPid, uaddr: GuestAddress, private: bool) -> Self {
+        Self {
+            pid: if private { Some(pid) } else { None },
+            uaddr,
+        }
+    }
+
+    #[must_use]
+    pub const fn uaddr(self) -> GuestAddress {
+        self.uaddr
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Runnable,
     WaitingForChild { args: Wait4SyscallArgs },
     WaitingForVfork { child_pid: GuestPid },
     WaitingForFd { fd: i32, write: bool },
+    WaitingForFutex { key: FutexWaitKey },
     Exited { status: i32 },
 }
 
@@ -1314,6 +1336,7 @@ impl GuestKernel {
                 TaskState::Runnable
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForFd { .. }
+                | TaskState::WaitingForFutex { .. }
                 | TaskState::Exited { .. } => None,
             })
             .collect();
@@ -1345,17 +1368,50 @@ impl GuestKernel {
         Ok(())
     }
 
-    pub fn resume_fd_waiters<F>(&mut self, mut ready: F)
+    pub fn resume_fd_waiters<F>(&mut self, mut ready: F) -> usize
     where
         F: FnMut(GuestPid, i32, bool) -> bool,
     {
+        let mut resumed = 0;
         for task in self.tasks.values_mut() {
             if let TaskState::WaitingForFd { fd, write } = task.state
                 && ready(task.pid, fd, write)
             {
                 task.state = TaskState::Runnable;
+                resumed += 1;
             }
         }
+        resumed
+    }
+
+    pub fn block_task_for_futex(
+        &mut self,
+        tid: GuestTid,
+        key: FutexWaitKey,
+    ) -> Result<(), TaskError> {
+        let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
+        task.state = TaskState::WaitingForFutex { key };
+        Ok(())
+    }
+
+    pub fn wake_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if limit == 0 {
+            return 0;
+        }
+
+        let mut resumed = 0;
+        for task in self.tasks.values_mut() {
+            if matches!(task.state, TaskState::WaitingForFutex { key: wait_key } if wait_key == key)
+            {
+                task.state = TaskState::Runnable;
+                resumed += 1;
+                if resumed == limit {
+                    break;
+                }
+            }
+        }
+        resumed
     }
 
     pub fn rt_sigaction_current(

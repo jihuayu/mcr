@@ -7,14 +7,18 @@ pub mod run_rootfs;
 
 use std::{
     collections::BTreeMap,
-    fmt,
-    io::{IoSlice, IoSliceMut},
+    fmt, fs,
+    io::{self, IoSlice, IoSliceMut},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 pub use build_run::{
     BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
@@ -51,9 +55,9 @@ use mcr_sys::{
     SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
-    CompletedWait, ExitState, GprState, GuestExecutable, GuestKernel, GuestProcess, GuestProgram,
-    GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError,
-    TaskState,
+    CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
+    GuestProgram, GuestTask, HostWorkerPoolDiagnostics, INITIAL_GUEST_PID, INITIAL_GUEST_TID,
+    TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -65,6 +69,11 @@ use mcr_win::SocketEvents;
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 const HOST_STEP_TRACE_ENV: &str = "MCR_HOSTSTEP_TRACE";
+const PERF_SUMMARY_TRACE_ENV: &str = "MCR_TRACE_PERF_SUMMARY";
+const STICKY_SCHED_ENV: &str = "MCR_SCHED_STICKY";
+const UNSAFE_SHARE_UNTIL_EXEC_ENV: &str = "MCR_UNSAFE_SHARE_UNTIL_EXEC";
+#[cfg(test)]
+static UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn host_step_trace_enabled() -> bool {
     std::env::var_os(HOST_STEP_TRACE_ENV).is_some()
@@ -74,6 +83,19 @@ pub(crate) fn host_step_trace(message: fmt::Arguments<'_>) {
     if host_step_trace_enabled() {
         eprintln!("mcr hoststep: {message}");
     }
+}
+
+fn unsafe_share_until_exec_enabled() -> bool {
+    if std::env::var_os(UNSAFE_SHARE_UNTIL_EXEC_ENV).is_some() {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        if UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.load(Ordering::SeqCst) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn host_step_elapsed_ms(start: Instant) -> u128 {
@@ -135,9 +157,16 @@ pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard};
 
     static NATIVE_EXECUTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) fn native_execution_test_guard() -> MutexGuard<'static, ()> {
         NATIVE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn env_test_guard() -> MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -179,6 +208,7 @@ struct FutexWaitEntry {
 }
 
 impl FutexWaitEntry {
+    #[cfg(test)]
     fn new(value: u32) -> Self {
         Self {
             value: AtomicU32::new(value),
@@ -193,6 +223,7 @@ struct FutexRegistry {
 }
 
 impl FutexRegistry {
+    #[cfg(test)]
     fn wait(
         &mut self,
         uaddr: u64,
@@ -254,6 +285,7 @@ impl FutexRegistry {
         woken
     }
 
+    #[cfg(test)]
     fn finish_wait(&self, uaddr: u64, entry: &Arc<FutexWaitEntry>) {
         decrement_waiter(&entry.waiters);
         self.prune_entry(uaddr, entry);
@@ -302,6 +334,7 @@ fn reserve_wake_count(waiters: &AtomicU64, count: u64) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn decrement_waiter(waiters: &AtomicU64) {
     let mut current = waiters.load(Ordering::SeqCst);
     while current != 0 {
@@ -535,6 +568,7 @@ pub struct RuntimeStallDiagnostic {
     runnable_tasks: usize,
     fd_wait_tasks: usize,
     child_wait_tasks: usize,
+    futex_wait_tasks: usize,
 }
 
 impl RuntimeStallDiagnostic {
@@ -559,6 +593,11 @@ impl RuntimeStallDiagnostic {
             .tasks()
             .iter()
             .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForChild))
+            .count();
+        let futex_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForFutex { .. }))
             .count();
 
         let (kind, reason) = if let Some(syscall) = diagnostics.in_flight_syscall() {
@@ -588,6 +627,11 @@ impl RuntimeStallDiagnostic {
                 RuntimeStallKind::Scheduling,
                 format!("{child_wait_tasks} task(s) waiting for child process completion"),
             )
+        } else if futex_wait_tasks > 0 {
+            (
+                RuntimeStallKind::GuestWaitFutex,
+                format!("{futex_wait_tasks} task(s) waiting for futex wake"),
+            )
         } else if diagnostics.native_execution_enabled() && runnable_tasks > 0 {
             (
                 RuntimeStallKind::NativeExecution,
@@ -613,6 +657,7 @@ impl RuntimeStallDiagnostic {
             runnable_tasks,
             fd_wait_tasks,
             child_wait_tasks,
+            futex_wait_tasks,
         }
     }
 
@@ -650,6 +695,11 @@ impl RuntimeStallDiagnostic {
     pub const fn child_wait_tasks(&self) -> usize {
         self.child_wait_tasks
     }
+
+    #[must_use]
+    pub const fn futex_wait_tasks(&self) -> usize {
+        self.futex_wait_tasks
+    }
 }
 
 impl fmt::Display for RuntimeStallDiagnostic {
@@ -675,8 +725,8 @@ impl fmt::Display for RuntimeStallDiagnostic {
         }
         write!(
             formatter,
-            "; tasks runnable={} fd_wait={} child_wait={}",
-            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks
+            "; tasks runnable={} fd_wait={} child_wait={} futex_wait={}",
+            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks, self.futex_wait_tasks
         )
     }
 }
@@ -878,6 +928,7 @@ pub enum DiagnosticTaskState {
     Runnable,
     WaitingForChild,
     WaitingForFd { fd: i32, write: bool },
+    WaitingForFutex { uaddr: u64 },
     Exited { status: i32 },
 }
 
@@ -890,6 +941,7 @@ impl DiagnosticTaskState {
                 Self::WaitingForChild
             }
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
+            TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
             TaskState::Exited { status } => Self::Exited { status },
         }
     }
@@ -2349,6 +2401,63 @@ fn clone_args_from_request(request: &SyscallRequest) -> CloneSyscallArgs {
     )
 }
 
+fn clone3_args_from_memory(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+    size: u64,
+) -> Result<CloneSyscallArgs, LinuxErrno> {
+    const CLONE_ARGS_MIN_SIZE: u64 = 64;
+    const CLONE_ARGS_FULL_SIZE: u64 = 88;
+    if addr == 0 {
+        return Err(LinuxErrno::EFAULT);
+    }
+    if !(CLONE_ARGS_MIN_SIZE..=CLONE_ARGS_FULL_SIZE).contains(&size) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let flags = read_guest_u64(memory, clone3_field_addr(addr, 0)?)?;
+    let pidfd = read_guest_u64(memory, clone3_field_addr(addr, 8)?)?;
+    let child_tid = read_guest_u64(memory, clone3_field_addr(addr, 16)?)?;
+    let parent_tid = read_guest_u64(memory, clone3_field_addr(addr, 24)?)?;
+    let exit_signal = read_guest_u64(memory, clone3_field_addr(addr, 32)?)?;
+    let stack = read_guest_u64(memory, clone3_field_addr(addr, 40)?)?;
+    let stack_size = read_guest_u64(memory, clone3_field_addr(addr, 48)?)?;
+    let tls = read_guest_u64(memory, clone3_field_addr(addr, 56)?)?;
+    let set_tid = if size >= 72 {
+        read_guest_u64(memory, clone3_field_addr(addr, 64)?)?
+    } else {
+        0
+    };
+    let set_tid_size = if size >= 80 {
+        read_guest_u64(memory, clone3_field_addr(addr, 72)?)?
+    } else {
+        0
+    };
+    let cgroup = if size >= CLONE_ARGS_FULL_SIZE {
+        read_guest_u64(memory, clone3_field_addr(addr, 80)?)?
+    } else {
+        0
+    };
+    if pidfd != 0 || set_tid != 0 || set_tid_size != 0 || cgroup != 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let child_stack = if stack == 0 || stack_size == 0 {
+        stack
+    } else {
+        stack.checked_add(stack_size).ok_or(LinuxErrno::EINVAL)?
+    };
+    Ok(CloneSyscallArgs::new(
+        flags | exit_signal,
+        child_stack,
+        parent_tid,
+        child_tid,
+        tls,
+    ))
+}
+
+fn clone3_field_addr(addr: u64, offset: u64) -> Result<u64, LinuxErrno> {
+    addr.checked_add(offset).ok_or(LinuxErrno::EFAULT)
+}
+
 fn optional_linux_id(value: u32) -> Option<u32> {
     (value != u32::MAX).then_some(value)
 }
@@ -3143,47 +3252,70 @@ fn run_guest_until_exit_loop<T>(
 where
     T: SyscallTracer,
 {
-    let mut guest_steps = 0u64;
-    loop {
-        if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
-            return Ok(status);
-        }
-        dispatcher
-            .subsystems_mut()
-            .resume_waiting_tasks()
-            .map_err(|errno| GuestRunError::WaitResume { errno })?;
-        dispatcher.subsystems_mut().resume_fd_waiters();
-        let mut runnable_tids = dispatcher.subsystems().tasks.runnable_tids();
-        dispatcher
-            .subsystems()
-            .prioritize_pending_fork_exec_tids(&mut runnable_tids);
-        if runnable_tids.is_empty() {
-            return Err(GuestRunError::NoRunnableTasks);
-        }
-        for tid in runnable_tids {
-            if !matches!(
+    dispatcher.subsystems_mut().perf_begin_run();
+    let sticky_scheduler = std::env::var_os(STICKY_SCHED_ENV).is_some();
+    let result = (|| -> Result<i32, GuestRunError> {
+        let mut guest_steps = 0u64;
+        let mut last_dispatched_tid = None;
+        loop {
+            if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
+                return Ok(status);
+            }
+            dispatcher.subsystems_mut().perf_record_scheduler_enter();
+            dispatcher
+                .subsystems_mut()
+                .resume_waiting_tasks()
+                .map_err(|errno| GuestRunError::WaitResume { errno })?;
+            dispatcher.subsystems_mut().resume_fd_waiters();
+            let mut runnable_tids = if sticky_scheduler {
+                last_dispatched_tid
+                    .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
+                    .map_or_else(
+                        || dispatcher.subsystems().tasks.runnable_tids(),
+                        |tid| vec![tid],
+                    )
+            } else {
+                dispatcher.subsystems().tasks.runnable_tids()
+            };
+            if runnable_tids.len() != 1 {
                 dispatcher
+                    .subsystems()
+                    .prioritize_pending_fork_exec_tids(&mut runnable_tids);
+            }
+            if runnable_tids.is_empty() {
+                dispatcher.subsystems_mut().perf_record_no_runnable();
+                return Err(GuestRunError::NoRunnableTasks);
+            }
+            for tid in runnable_tids {
+                let Some((pid, state)) = dispatcher
                     .subsystems()
                     .tasks
                     .task(tid)
-                    .map(mcr_task::GuestTask::state),
-                Some(TaskState::Runnable)
-            ) {
-                continue;
-            }
-            if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
-                return Err(GuestRunError::StepLimitExceeded {
-                    steps: guest_steps,
-                    diagnostic: capture_diagnostic(dispatcher),
-                });
-            }
-            dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
-            guest_steps = guest_steps.saturating_add(1);
-            if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
-                break;
+                    .map(|task| (task.pid(), task.state()))
+                else {
+                    continue;
+                };
+                if !matches!(state, TaskState::Runnable) {
+                    continue;
+                }
+                if max_guest_steps.is_some_and(|limit| guest_steps >= limit) {
+                    return Err(GuestRunError::StepLimitExceeded {
+                        steps: guest_steps,
+                        diagnostic: capture_diagnostic(dispatcher),
+                    });
+                }
+                dispatcher.subsystems_mut().perf_record_dispatch(tid, pid);
+                dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
+                last_dispatched_tid = Some(tid);
+                guest_steps = guest_steps.saturating_add(1);
+                if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
+                    break;
+                }
             }
         }
-    }
+    })();
+    dispatcher.subsystems_mut().perf_finish_run();
+    result
 }
 
 fn initial_process_exit_status(kernel: &GuestKernel) -> Result<Option<i32>, GuestRunError> {
@@ -3451,6 +3583,9 @@ where
         trap.registers().syscall_registers(),
     ));
     let syscall_registers = trap.registers().syscall_registers();
+    dispatcher
+        .subsystems_mut()
+        .perf_record_syscall(syscall_registers.syscall());
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
@@ -3526,6 +3661,9 @@ where
     };
 
     let syscall_registers = trap.registers().syscall_registers();
+    dispatcher
+        .subsystems_mut()
+        .perf_record_syscall(syscall_registers.syscall());
     let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
@@ -3689,6 +3827,9 @@ where
             next_rip: registers.rip + 2,
         };
         let syscall_registers = registers.syscall_registers();
+        dispatcher
+            .subsystems_mut()
+            .perf_record_syscall(syscall_registers.syscall());
         if is_fork_like_syscall_number(syscall_registers.rax) {
             let mut child_registers = registers;
             child_registers.apply_syscall_return(0, site.next_rip);
@@ -3750,7 +3891,9 @@ where
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         let blocked_after_syscall = matches!(
             task.state(),
-            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. }
+            TaskState::WaitingForChild { .. }
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForFutex { .. }
         );
         let final_regs = if task.regs() == gpr || blocked_after_syscall {
             let updated_regs = gpr_from_registers(registers);
@@ -3773,7 +3916,7 @@ where
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExecutableSyscallPatch {
     address: u64,
 }
@@ -3784,13 +3927,14 @@ struct ExecutableSyscallPatch {
 ))]
 #[derive(Clone, Debug, Default)]
 struct ExecutableNativePatches {
+    scanned_ranges: Vec<(u64, u64)>,
     syscall_patches: Vec<ExecutableSyscallPatch>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     fs_relative_patches: Vec<FsRelativePatchSite>,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FsRelativePatch {
     original: [u8; 9],
 }
@@ -3815,10 +3959,66 @@ enum FsRelativePatchWork {
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct NativeImagePatchKey {
+    hash: u64,
+    executable_len: u64,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 #[derive(Clone, Debug, Default)]
+struct NativePatchMetadata {
+    scanned_ranges: Vec<(u64, u64)>,
+    syscall_patches: Vec<ExecutableSyscallPatch>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fs_relative_patches: BTreeMap<u64, FsRelativePatch>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug)]
+struct NativePatchMetadataEntry {
+    base: u64,
+    metadata: NativePatchMetadata,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug)]
+struct NativeImagePatchRanges {
+    base: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+type NativeImagePatchKeyMap = BTreeMap<mcr_sys::GuestPid, NativeImagePatchKey>;
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+type NativeImagePatchRangeMap = BTreeMap<mcr_sys::GuestPid, NativeImagePatchRanges>;
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[derive(Clone, Debug)]
 struct NativePatchCache {
     fs_base: u64,
     scanned_ranges: Vec<(u64, u64)>,
+    image_metadata_checked: bool,
+    image_metadata_eligible: bool,
     #[cfg(all(windows, target_arch = "x86_64"))]
     fs_relative_patches: BTreeMap<u64, FsRelativePatch>,
 }
@@ -3830,17 +4030,508 @@ struct NativePatchCache {
 impl NativePatchCache {
     fn invalidate(&mut self) {
         self.scanned_ranges.clear();
+        self.image_metadata_eligible = false;
         #[cfg(all(windows, target_arch = "x86_64"))]
         self.fs_relative_patches.clear();
     }
 
     fn invalidate_range(&mut self, start: u64, end: u64) {
+        if !self
+            .scanned_ranges
+            .iter()
+            .any(|(range_start, range_end)| ranges_overlap(start, end, *range_start, *range_end))
+        {
+            return;
+        }
+        self.image_metadata_eligible = false;
         self.scanned_ranges.retain(|(range_start, range_end)| {
             !ranges_overlap(start, end, *range_start, *range_end)
         });
         #[cfg(all(windows, target_arch = "x86_64"))]
         self.fs_relative_patches
             .retain(|address, _| !(*address >= start && *address < end));
+    }
+
+    fn merge_metadata(&mut self, metadata: &NativePatchMetadata) -> bool {
+        for (start, end) in &metadata.scanned_ranges {
+            if !range_is_covered(*start, *end, &self.scanned_ranges) {
+                self.scanned_ranges.push((*start, *end));
+            }
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let mut added_fs_patch = false;
+            for (address, patch) in &metadata.fs_relative_patches {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.fs_relative_patches.entry(*address)
+                {
+                    entry.insert(*patch);
+                    added_fs_patch = true;
+                }
+            }
+            added_fs_patch
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            let _ = metadata;
+            false
+        }
+    }
+}
+
+impl Default for NativePatchCache {
+    fn default() -> Self {
+        Self {
+            fs_base: 0,
+            scanned_ranges: Vec::new(),
+            image_metadata_checked: false,
+            image_metadata_eligible: true,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            fs_relative_patches: BTreeMap::new(),
+        }
+    }
+}
+
+impl NativeImagePatchKey {
+    fn file_name(&self) -> String {
+        format!("{:016x}-{:016x}.bin", self.hash, self.executable_len)
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+const NATIVE_PATCH_CACHE_VERSION: u32 = 2;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn native_patch_cache_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MCR_NATIVE_PATCH_CACHE_DIR")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|base| base.join("mcr").join("native-patch-cache"))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn native_image_patch_key_and_ranges(
+    image: &mcr_elf::GuestMemoryImage,
+) -> Option<(NativeImagePatchKey, NativeImagePatchRanges)> {
+    let mut hash = FNV64_OFFSET;
+    let mut executable_len = 0u64;
+    let mut ranges = Vec::new();
+    let executable_vmas = image
+        .vmas()
+        .iter()
+        .filter(|vma| vma.permissions().execute())
+        .collect::<Vec<_>>();
+    let base = executable_vmas.first()?.start();
+    for vma in executable_vmas {
+        let len = vma.end().checked_sub(vma.start())?;
+        let bytes = image.read(vma.start(), usize::try_from(len).ok()?)?;
+        hash_u64(&mut hash, vma.start().checked_sub(base)?);
+        hash_u64(&mut hash, vma.end().checked_sub(base)?);
+        hash_u8(&mut hash, u8::from(vma.permissions().read()));
+        hash_u8(&mut hash, u8::from(vma.permissions().write()));
+        hash_u8(&mut hash, u8::from(vma.permissions().execute()));
+        hash_bytes(&mut hash, bytes);
+        executable_len = executable_len.checked_add(len)?;
+        ranges.push((vma.start(), vma.end()));
+    }
+    if executable_len == 0 {
+        return None;
+    }
+    Some((
+        NativeImagePatchKey {
+            hash,
+            executable_len,
+        },
+        NativeImagePatchRanges { base, ranges },
+    ))
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn native_executable_range_patch_key(
+    memory: &GuestMemory,
+    start: u64,
+    end: u64,
+    protection: GuestMemoryProtection,
+) -> Result<NativeImagePatchKey, GuestExecutionError> {
+    let len = end
+        .checked_sub(start)
+        .ok_or(GuestExecutionError::Memory(GuestMemoryError::InvalidLength))?;
+    let len_usize = usize::try_from(len)
+        .map_err(|_| GuestExecutionError::Memory(GuestMemoryError::RegionTooLarge))?;
+    let mut bytes = vec![0; len_usize];
+    memory.read(start, &mut bytes)?;
+
+    let mut hash = FNV64_OFFSET;
+    hash_u64(&mut hash, 0);
+    hash_u64(&mut hash, len);
+    hash_u8(&mut hash, u8::from(protection.read));
+    hash_u8(&mut hash, u8::from(protection.write));
+    hash_u8(&mut hash, u8::from(protection.execute));
+    hash_bytes(&mut hash, &bytes);
+    Ok(NativeImagePatchKey {
+        hash,
+        executable_len: len,
+    })
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn hash_u8(hash: &mut u64, value: u8) {
+    *hash ^= u64::from(value);
+    *hash = hash.wrapping_mul(FNV64_PRIME);
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn hash_u64(hash: &mut u64, value: u64) {
+    hash_bytes(hash, &value.to_le_bytes());
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        hash_u8(hash, *byte);
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn load_persistent_native_patch_metadata(
+    key: &NativeImagePatchKey,
+    base: u64,
+) -> io::Result<Option<NativePatchMetadata>> {
+    let Some(dir) = native_patch_cache_dir() else {
+        return Ok(None);
+    };
+    load_persistent_native_patch_metadata_from_dir(key, base, &dir)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn store_persistent_native_patch_metadata(
+    key: &NativeImagePatchKey,
+    metadata: &NativePatchMetadata,
+    base: u64,
+) -> io::Result<()> {
+    let Some(dir) = native_patch_cache_dir() else {
+        return Ok(());
+    };
+    store_persistent_native_patch_metadata_in_dir(key, metadata, base, &dir)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn load_persistent_native_patch_metadata_from_dir(
+    key: &NativeImagePatchKey,
+    base: u64,
+    dir: &Path,
+) -> io::Result<Option<NativePatchMetadata>> {
+    let path = dir.join(key.file_name());
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    decode_native_patch_metadata(key, &bytes, base).map(Some)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn store_persistent_native_patch_metadata_in_dir(
+    key: &NativeImagePatchKey,
+    metadata: &NativePatchMetadata,
+    base: u64,
+    dir: &Path,
+) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(key.file_name());
+    let temp_path = dir.join(format!("{}.{}.tmp", key.file_name(), std::process::id()));
+    fs::write(
+        &temp_path,
+        encode_native_patch_metadata(key, metadata, base)?,
+    )?;
+    match fs::rename(&temp_path, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp_path);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn encode_native_patch_metadata(
+    key: &NativeImagePatchKey,
+    metadata: &NativePatchMetadata,
+    base: u64,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(NATIVE_PATCH_CACHE_MAGIC);
+    push_cache_u32(&mut bytes, NATIVE_PATCH_CACHE_VERSION);
+    push_cache_u64(&mut bytes, key.hash);
+    push_cache_u64(&mut bytes, key.executable_len);
+    push_cache_u32(&mut bytes, metadata.scanned_ranges.len() as u32);
+    for (start, end) in &metadata.scanned_ranges {
+        push_cache_u64(&mut bytes, cache_relative_offset(*start, base)?);
+        push_cache_u64(&mut bytes, cache_relative_offset(*end, base)?);
+    }
+    push_cache_u32(&mut bytes, metadata.syscall_patches.len() as u32);
+    for patch in &metadata.syscall_patches {
+        push_cache_u64(&mut bytes, cache_relative_offset(patch.address, base)?);
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        push_cache_u32(&mut bytes, metadata.fs_relative_patches.len() as u32);
+        for (address, patch) in &metadata.fs_relative_patches {
+            push_cache_u64(&mut bytes, cache_relative_offset(*address, base)?);
+            bytes.extend_from_slice(&patch.original);
+        }
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        push_cache_u32(&mut bytes, 0);
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn decode_native_patch_metadata(
+    key: &NativeImagePatchKey,
+    bytes: &[u8],
+    base: u64,
+) -> io::Result<NativePatchMetadata> {
+    let mut reader = NativePatchMetadataReader::new(bytes);
+    reader.expect_magic(NATIVE_PATCH_CACHE_MAGIC)?;
+    let version = reader.read_u32()?;
+    if version != NATIVE_PATCH_CACHE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported native patch cache version",
+        ));
+    }
+    let stored_key = NativeImagePatchKey {
+        hash: reader.read_u64()?,
+        executable_len: reader.read_u64()?,
+    };
+    if &stored_key != key {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native patch cache key mismatch",
+        ));
+    }
+    let mut metadata = NativePatchMetadata::default();
+    for _ in 0..reader.read_u32()? {
+        metadata.scanned_ranges.push((
+            cache_absolute_address(reader.read_u64()?, base)?,
+            cache_absolute_address(reader.read_u64()?, base)?,
+        ));
+    }
+    for _ in 0..reader.read_u32()? {
+        metadata.syscall_patches.push(ExecutableSyscallPatch {
+            address: cache_absolute_address(reader.read_u64()?, base)?,
+        });
+    }
+    let fs_count = reader.read_u32()?;
+    for _ in 0..fs_count {
+        let address = cache_absolute_address(reader.read_u64()?, base)?;
+        let original = reader.read_array::<9>()?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            metadata
+                .fs_relative_patches
+                .insert(address, FsRelativePatch { original });
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            let _ = (address, original);
+        }
+    }
+    reader.expect_eof()?;
+    Ok(metadata)
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn cache_relative_offset(address: u64, base: u64) -> io::Result<u64> {
+    address.checked_sub(base).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native patch metadata address precedes cache base",
+        )
+    })
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn cache_absolute_address(offset: u64, base: u64) -> io::Result<u64> {
+    base.checked_add(offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native patch metadata address overflows cache base",
+        )
+    })
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+struct NativePatchMetadataReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+impl<'a> NativePatchMetadataReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn expect_magic(&mut self, magic: &[u8]) -> io::Result<()> {
+        if self.read_slice(magic.len())? != magic {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid native patch cache magic",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        Ok(self
+            .read_slice(N)?
+            .try_into()
+            .expect("slice length is checked"))
+    }
+
+    fn read_slice(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cache offset overflow"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated cache"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn expect_eof(&self) -> io::Result<()> {
+        if self.offset != self.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native patch cache has trailing bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn push_cache_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn push_cache_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn native_patch_metadata_from_patches(patches: &ExecutableNativePatches) -> NativePatchMetadata {
+    NativePatchMetadata {
+        scanned_ranges: patches.scanned_ranges.clone(),
+        syscall_patches: patches.syscall_patches.clone(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: patches
+            .fs_relative_patches
+            .iter()
+            .map(|site| (site.address, site.patch))
+            .collect(),
     }
 }
 
@@ -3868,6 +4559,7 @@ fn find_executable_native_patches(
         ));
         let mut bytes = vec![0; len];
         memory.read(start, &mut bytes)?;
+        patches.scanned_ranges.push((start, end));
         let syscall_patch_start_len = patches.syscall_patches.len();
         for site in mcr_jit::syscall_instruction_sites(&bytes, start) {
             patches
@@ -3917,6 +4609,100 @@ fn apply_executable_syscall_patches(
         host_step_elapsed_ms(patch_start)
     ));
     Ok(())
+}
+
+fn apply_native_patch_metadata(
+    memory: &mut GuestMemory,
+    fs_base: u64,
+    metadata: &NativePatchMetadata,
+) -> Result<(), GuestExecutionError> {
+    apply_executable_syscall_patches(memory, &metadata.syscall_patches)?;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    apply_fs_relative_patch_entries(
+        memory,
+        fs_base,
+        metadata.fs_relative_patches.len(),
+        metadata
+            .fs_relative_patches
+            .iter()
+            .map(|(&address, &patch)| (address, patch)),
+    )?;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = fs_base;
+    }
+    Ok(())
+}
+
+fn metadata_for_ranges(
+    metadata: &NativePatchMetadata,
+    ranges: &[(u64, u64)],
+) -> NativePatchMetadata {
+    NativePatchMetadata {
+        scanned_ranges: metadata
+            .scanned_ranges
+            .iter()
+            .copied()
+            .filter(|(start, end)| range_is_covered(*start, *end, ranges))
+            .collect(),
+        syscall_patches: metadata
+            .syscall_patches
+            .iter()
+            .copied()
+            .filter(|patch| address_in_ranges(patch.address, ranges))
+            .collect(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: metadata
+            .fs_relative_patches
+            .iter()
+            .filter_map(|(address, patch)| {
+                address_in_ranges(*address, ranges).then_some((*address, *patch))
+            })
+            .collect(),
+    }
+}
+
+fn rebase_native_patch_metadata(
+    metadata: &NativePatchMetadata,
+    source_base: u64,
+    target_base: u64,
+) -> Option<NativePatchMetadata> {
+    Some(NativePatchMetadata {
+        scanned_ranges: metadata
+            .scanned_ranges
+            .iter()
+            .map(|(start, end)| {
+                Some((
+                    rebase_native_patch_address(*start, source_base, target_base)?,
+                    rebase_native_patch_address(*end, source_base, target_base)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?,
+        syscall_patches: metadata
+            .syscall_patches
+            .iter()
+            .map(|patch| {
+                Some(ExecutableSyscallPatch {
+                    address: rebase_native_patch_address(patch.address, source_base, target_base)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: metadata
+            .fs_relative_patches
+            .iter()
+            .map(|(address, patch)| {
+                Some((
+                    rebase_native_patch_address(*address, source_base, target_base)?,
+                    *patch,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?,
+    })
+}
+
+fn rebase_native_patch_address(address: u64, source_base: u64, target_base: u64) -> Option<u64> {
+    target_base.checked_add(address.checked_sub(source_base)?)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -3970,6 +4756,12 @@ fn range_is_covered(start: u64, end: u64, ranges: &[(u64, u64)]) -> bool {
     ranges
         .iter()
         .any(|(range_start, range_end)| start >= *range_start && end <= *range_end)
+}
+
+fn address_in_ranges(address: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| *start <= address && address < *end)
 }
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
@@ -4094,6 +4886,7 @@ fn is_fork_like_syscall_number(number: u64) -> bool {
     number == mcr_sys::Syscall::Fork.number().raw()
         || number == mcr_sys::Syscall::Vfork.number().raw()
         || number == mcr_sys::Syscall::Clone.number().raw()
+        || number == mcr_sys::Syscall::Clone3.number().raw()
 }
 
 #[cfg(any(
@@ -4354,6 +5147,266 @@ struct FileBackedMappingCacheSnapshot {
     misses: usize,
 }
 
+#[derive(Debug, Default)]
+struct RuntimePerfSummary {
+    enabled: bool,
+    run_started_at: Option<Instant>,
+    guest_syscall_count: u64,
+    scheduler_enter_count: u64,
+    scheduler_no_runnable_count: u64,
+    scheduler_runnable_but_switched_count: u64,
+    scheduler_sleep_count: u64,
+    scheduler_sleep_total_us: u128,
+    last_dispatched: Option<(mcr_sys::GuestTid, mcr_sys::GuestPid)>,
+    pid_switch_count: u64,
+    same_pid_switch_count: u64,
+    cross_pid_switch_count: u64,
+    remap_samples_us: Vec<u128>,
+    clone_count: u64,
+    vfork_clone_count: u64,
+    fork_clone_count: u64,
+    execve_count: u64,
+    clone_to_exec_samples_us: Vec<u128>,
+    pipe_read_count: u64,
+    pipe_read_empty_count: u64,
+    pipe_write_count: u64,
+    pipe_wakeup_count: u64,
+    fd_wakeup_count: u64,
+    poll_count: u64,
+    select_count: u64,
+    wait4_count: u64,
+    futex_count: u64,
+}
+
+impl RuntimePerfSummary {
+    fn begin_run(&mut self) {
+        self.enabled = std::env::var_os(PERF_SUMMARY_TRACE_ENV).is_some();
+        if !self.enabled {
+            return;
+        }
+        *self = Self {
+            enabled: true,
+            run_started_at: Some(Instant::now()),
+            ..Self::default()
+        };
+    }
+
+    fn record_scheduler_enter(&mut self) {
+        if self.enabled {
+            self.scheduler_enter_count = self.scheduler_enter_count.saturating_add(1);
+        }
+    }
+
+    fn record_no_runnable(&mut self) {
+        if self.enabled {
+            self.scheduler_no_runnable_count = self.scheduler_no_runnable_count.saturating_add(1);
+        }
+    }
+
+    fn record_dispatch(
+        &mut self,
+        tid: mcr_sys::GuestTid,
+        pid: mcr_sys::GuestPid,
+        previous_still_runnable: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        if let Some((last_tid, last_pid)) = self.last_dispatched
+            && last_tid != tid
+        {
+            if previous_still_runnable {
+                self.scheduler_runnable_but_switched_count =
+                    self.scheduler_runnable_but_switched_count.saturating_add(1);
+            }
+            if last_pid == pid {
+                self.same_pid_switch_count = self.same_pid_switch_count.saturating_add(1);
+            } else {
+                self.pid_switch_count = self.pid_switch_count.saturating_add(1);
+                self.cross_pid_switch_count = self.cross_pid_switch_count.saturating_add(1);
+            }
+        }
+        self.last_dispatched = Some((tid, pid));
+    }
+
+    fn record_syscall(&mut self, syscall: mcr_sys::Syscall) {
+        if !self.enabled {
+            return;
+        }
+        self.guest_syscall_count = self.guest_syscall_count.saturating_add(1);
+        match syscall {
+            mcr_sys::Syscall::Poll | mcr_sys::Syscall::Ppoll => {
+                self.poll_count = self.poll_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Select => {
+                self.select_count = self.select_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Wait4 => {
+                self.wait4_count = self.wait4_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Futex => {
+                self.futex_count = self.futex_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Execve => {
+                self.execve_count = self.execve_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_fork_like(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        clone_args: Option<CloneSyscallArgs>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match syscall {
+            mcr_sys::Syscall::Clone => {
+                self.clone_count = self.clone_count.saturating_add(1);
+                if clone_args.is_some_and(|args| args.has_clone_vfork()) {
+                    self.vfork_clone_count = self.vfork_clone_count.saturating_add(1);
+                } else {
+                    self.fork_clone_count = self.fork_clone_count.saturating_add(1);
+                }
+            }
+            mcr_sys::Syscall::Vfork => {
+                self.vfork_clone_count = self.vfork_clone_count.saturating_add(1);
+            }
+            mcr_sys::Syscall::Fork => {
+                self.fork_clone_count = self.fork_clone_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_remap(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.remap_samples_us.push(elapsed.as_micros());
+        }
+    }
+
+    fn record_clone_to_exec(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.clone_to_exec_samples_us.push(elapsed.as_micros());
+        }
+    }
+
+    fn record_pipe_io(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        kind: FileKind,
+        result: &SyscallReturn,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match (syscall, kind) {
+            (mcr_sys::Syscall::Read | mcr_sys::Syscall::Readv, FileKind::PipeRead) => {
+                self.pipe_read_count = self.pipe_read_count.saturating_add(1);
+                if matches!(result, SyscallReturn::Errno(LinuxErrno::EAGAIN)) {
+                    self.pipe_read_empty_count = self.pipe_read_empty_count.saturating_add(1);
+                }
+            }
+            (mcr_sys::Syscall::Write | mcr_sys::Syscall::Writev, FileKind::PipeWrite) => {
+                self.pipe_write_count = self.pipe_write_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_fd_wakeups(&mut self, count: usize) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        let count = count as u64;
+        self.fd_wakeup_count = self.fd_wakeup_count.saturating_add(count);
+        self.pipe_wakeup_count = self.pipe_wakeup_count.saturating_add(count);
+    }
+
+    fn finish_run(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let wall_ms = self
+            .run_started_at
+            .map(|start| start.elapsed().as_millis())
+            .unwrap_or_default();
+        let remap = sample_summary(&mut self.remap_samples_us);
+        let clone_to_exec = sample_summary(&mut self.clone_to_exec_samples_us);
+        eprintln!(
+            "mcr perf-summary: wall_ms={wall_ms} guest_syscall_count={} scheduler_enter_count={} scheduler_sleep_count={} scheduler_sleep_total_us={} scheduler_no_runnable_count={} scheduler_runnable_but_switched_count={}",
+            self.guest_syscall_count,
+            self.scheduler_enter_count,
+            self.scheduler_sleep_count,
+            self.scheduler_sleep_total_us,
+            self.scheduler_no_runnable_count,
+            self.scheduler_runnable_but_switched_count
+        );
+        eprintln!(
+            "mcr perf-summary: pid_switch_count={} same_pid_switch_count={} cross_pid_switch_count={}",
+            self.pid_switch_count, self.same_pid_switch_count, self.cross_pid_switch_count
+        );
+        eprintln!(
+            "mcr perf-summary: remap_count={} remap_total_us={} remap_avg_us={} remap_p50_us={} remap_p95_us={}",
+            remap.count, remap.total_us, remap.avg_us, remap.p50_us, remap.p95_us
+        );
+        eprintln!(
+            "mcr perf-summary: clone_count={} vfork_clone_count={} fork_clone_count={} execve_count={} clone_to_exec_count={} clone_to_exec_total_us={} clone_to_exec_avg_us={}",
+            self.clone_count,
+            self.vfork_clone_count,
+            self.fork_clone_count,
+            self.execve_count,
+            clone_to_exec.count,
+            clone_to_exec.total_us,
+            clone_to_exec.avg_us
+        );
+        eprintln!(
+            "mcr perf-summary: pipe_read_count={} pipe_read_empty_count={} pipe_write_count={} pipe_wakeup_count={} fd_wakeup_count={} poll_count={} select_count={} wait4_count={} futex_count={}",
+            self.pipe_read_count,
+            self.pipe_read_empty_count,
+            self.pipe_write_count,
+            self.pipe_wakeup_count,
+            self.fd_wakeup_count,
+            self.poll_count,
+            self.select_count,
+            self.wait4_count,
+            self.futex_count
+        );
+    }
+}
+
+#[derive(Default)]
+struct SampleSummary {
+    count: usize,
+    total_us: u128,
+    avg_us: u128,
+    p50_us: u128,
+    p95_us: u128,
+}
+
+fn sample_summary(samples: &mut [u128]) -> SampleSummary {
+    if samples.is_empty() {
+        return SampleSummary::default();
+    }
+    samples.sort_unstable();
+    let total_us = samples.iter().sum::<u128>();
+    let count = samples.len();
+    SampleSummary {
+        count,
+        total_us,
+        avg_us: total_us / count as u128,
+        p50_us: percentile_us(samples, 50),
+        p95_us: percentile_us(samples, 95),
+    }
+}
+
+fn percentile_us(samples: &[u128], percentile: usize) -> u128 {
+    let index = samples.len().saturating_sub(1) * percentile / 100;
+    samples[index]
+}
+
 #[derive(Debug)]
 pub struct RuntimeSubsystems {
     tasks: GuestKernel,
@@ -4370,12 +5423,33 @@ pub struct RuntimeSubsystems {
     native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
     signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
     native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
+    native_image_patch_keys: NativeImagePatchKeyMap,
+    native_image_patch_ranges: NativeImagePatchRangeMap,
+    native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
     pending_fork_child_regs: Option<GprState>,
+    perf_summary: RuntimePerfSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingForkExec {
     parent_pid: mcr_sys::GuestPid,
+    created_at: Instant,
+}
+
+fn native_image_patch_maps(
+    tasks: &GuestKernel,
+    pid: mcr_sys::GuestPid,
+) -> (NativeImagePatchKeyMap, NativeImagePatchRangeMap) {
+    let Some(process) = tasks.process(pid) else {
+        return (BTreeMap::new(), BTreeMap::new());
+    };
+    let Some((key, ranges)) = native_image_patch_key_and_ranges(process.image().memory()) else {
+        return (BTreeMap::new(), BTreeMap::new());
+    };
+    (
+        BTreeMap::from([(pid, key)]),
+        BTreeMap::from([(pid, ranges)]),
+    )
 }
 
 impl RuntimeSubsystems {
@@ -4396,6 +5470,8 @@ impl RuntimeSubsystems {
                 .memory(),
         )?;
         sync_proc_self(&mut vfs, &tasks, mcr_task::INITIAL_GUEST_PID);
+        let (native_image_patch_keys, native_image_patch_ranges) =
+            native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::new(vfs, memory),
@@ -4411,7 +5487,11 @@ impl RuntimeSubsystems {
             native_fp: BTreeMap::new(),
             signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
+            native_image_patch_keys,
+            native_image_patch_ranges,
+            native_image_patch_metadata: BTreeMap::new(),
             pending_fork_child_regs: None,
+            perf_summary: RuntimePerfSummary::default(),
         })
     }
 
@@ -4429,6 +5509,8 @@ impl RuntimeSubsystems {
                 .memory(),
         )?;
         sync_proc_self(&mut vfs, &tasks, mcr_task::INITIAL_GUEST_PID);
+        let (native_image_patch_keys, native_image_patch_ranges) =
+            native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
             tasks,
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
@@ -4444,7 +5526,11 @@ impl RuntimeSubsystems {
             native_fp: BTreeMap::new(),
             signal_alt_stacks: BTreeMap::new(),
             native_patch_caches: BTreeMap::new(),
+            native_image_patch_keys,
+            native_image_patch_ranges,
+            native_image_patch_metadata: BTreeMap::new(),
             pending_fork_child_regs: None,
+            perf_summary: RuntimePerfSummary::default(),
         })
     }
 
@@ -4477,6 +5563,29 @@ impl RuntimeSubsystems {
         self.native_fp.insert(tid, state);
     }
 
+    fn cached_native_patch_metadata(
+        &mut self,
+        key: &NativeImagePatchKey,
+        base: u64,
+    ) -> Option<NativePatchMetadata> {
+        if let Some(entry) = self.native_image_patch_metadata.get(key)
+            && let Some(metadata) = rebase_native_patch_metadata(&entry.metadata, entry.base, base)
+        {
+            return Some(metadata);
+        }
+        let metadata = load_persistent_native_patch_metadata(key, base)
+            .ok()
+            .flatten()?;
+        self.native_image_patch_metadata.insert(
+            key.clone(),
+            NativePatchMetadataEntry {
+                base,
+                metadata: metadata.clone(),
+            },
+        );
+        Some(metadata)
+    }
+
     fn ensure_native_patch_cache(
         &mut self,
         pid: mcr_sys::GuestPid,
@@ -4484,7 +5593,59 @@ impl RuntimeSubsystems {
     ) -> Result<(), GuestExecutionError> {
         let patch_start = Instant::now();
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
+        let mut store_image_metadata = None;
+        if !cache.image_metadata_checked && cache.image_metadata_eligible {
+            cache.image_metadata_checked = true;
+            if let Some(key) = self.native_image_patch_keys.get(&pid).cloned() {
+                let image_ranges = self.native_image_patch_ranges.get(&pid).cloned();
+                let metadata = image_ranges
+                    .as_ref()
+                    .and_then(|ranges| self.cached_native_patch_metadata(&key, ranges.base));
+                if let Some(metadata) = metadata {
+                    {
+                        let memory = self
+                            .memory_for_process_mut(pid)
+                            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+                        apply_native_patch_metadata(memory, fs_base, &metadata)?;
+                    }
+                    cache.merge_metadata(&metadata);
+                } else if let Some(ranges) = image_ranges {
+                    store_image_metadata = Some((key, ranges.base, ranges.ranges));
+                }
+            }
+        }
+
+        let executable_ranges = self
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
+            .vmas()
+            .filter(|vma| vma.protection().execute)
+            .filter(|vma| !range_is_covered(vma.start(), vma.end(), &cache.scanned_ranges))
+            .map(|vma| (vma.start(), vma.end(), vma.protection()))
+            .collect::<Vec<_>>();
+        let mut store_range_metadata = Vec::new();
+        for (start, end, protection) in executable_ranges {
+            let key = {
+                let memory = self
+                    .memory_for_process(pid)
+                    .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+                native_executable_range_patch_key(memory, start, end, protection)?
+            };
+            if let Some(metadata) = self.cached_native_patch_metadata(&key, start) {
+                {
+                    let memory = self
+                        .memory_for_process_mut(pid)
+                        .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+                    apply_native_patch_metadata(memory, fs_base, &metadata)?;
+                }
+                cache.merge_metadata(&metadata);
+            } else {
+                store_range_metadata.push((key, start, (start, end)));
+            }
+        }
+
         let scanned_ranges = cache.scanned_ranges.clone();
+        let scanned_metadata;
         host_step_trace(format_args!(
             "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
             scanned_ranges.len()
@@ -4494,6 +5655,7 @@ impl RuntimeSubsystems {
                 .memory_for_process_mut(pid)
                 .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
             let patches = find_executable_native_patches(memory, &scanned_ranges, cache.fs_base)?;
+            scanned_metadata = native_patch_metadata_from_patches(&patches);
             apply_executable_syscall_patches(memory, &patches.syscall_patches)?;
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
@@ -4557,6 +5719,36 @@ impl RuntimeSubsystems {
                     }
                     FsRelativePatchWork::None => {}
                 }
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                cache.merge_metadata(&scanned_metadata);
+            }
+        }
+        if let Some((key, base, ranges)) = store_image_metadata {
+            let image_metadata = metadata_for_ranges(&scanned_metadata, &ranges);
+            if !image_metadata.scanned_ranges.is_empty() {
+                self.native_image_patch_metadata.insert(
+                    key.clone(),
+                    NativePatchMetadataEntry {
+                        base,
+                        metadata: image_metadata.clone(),
+                    },
+                );
+                let _ = store_persistent_native_patch_metadata(&key, &image_metadata, base);
+            }
+        }
+        for (key, base, range) in store_range_metadata {
+            let range_metadata = metadata_for_ranges(&scanned_metadata, &[range]);
+            if !range_metadata.scanned_ranges.is_empty() {
+                self.native_image_patch_metadata.insert(
+                    key.clone(),
+                    NativePatchMetadataEntry {
+                        base,
+                        metadata: range_metadata.clone(),
+                    },
+                );
+                let _ = store_persistent_native_patch_metadata(&key, &range_metadata, base);
             }
         }
         let scanned_now = self
@@ -4687,6 +5879,7 @@ impl FileSyscalls for RuntimeSubsystems {
             )),
             _ => self.files.dispatch_file(request),
         };
+        self.perf_record_pipe_io(request.syscall, arg_i32(request, 0), &outcome.result);
         if matches!(outcome.result, SyscallReturn::Success(_)) {
             if let Err(errno) = self.store_selected_process_fds(pid) {
                 return SyscallOutcome::errno(errno);
@@ -4733,14 +5926,16 @@ impl MemorySyscalls for RuntimeSubsystems {
         }
         if let SyscallReturn::Success(result) = outcome.result {
             match request.syscall {
-                mcr_sys::Syscall::Mmap => {
+                mcr_sys::Syscall::Mmap if arg_u32(request, 2) & mcr_sys::LINUX_PROT_EXEC != 0 => {
                     self.invalidate_native_patch_cache_range(pid, result, arg(request, 1));
                 }
-                mcr_sys::Syscall::Munmap | mcr_sys::Syscall::Mprotect => {
+                mcr_sys::Syscall::Munmap => {
                     self.invalidate_native_patch_cache_range(pid, arg(request, 0), arg(request, 1));
                 }
-                mcr_sys::Syscall::Brk => {
-                    self.invalidate_native_patch_cache(pid);
+                mcr_sys::Syscall::Mprotect
+                    if arg_u32(request, 2) & mcr_sys::LINUX_PROT_EXEC != 0 =>
+                {
+                    self.invalidate_native_patch_cache_range(pid, arg(request, 0), arg(request, 1));
                 }
                 _ => {}
             }
@@ -4821,6 +6016,7 @@ impl EventSyscalls for RuntimeSubsystems {
         }
         match request.syscall {
             mcr_sys::Syscall::Poll => self.dispatch_poll(request),
+            mcr_sys::Syscall::Select => self.dispatch_select(request),
             mcr_sys::Syscall::Ppoll => self.dispatch_ppoll(request),
             mcr_sys::Syscall::Eventfd2 => self.dispatch_eventfd2(request),
             mcr_sys::Syscall::EpollCreate1 => self.dispatch_epoll_create1(request),
@@ -4881,12 +6077,11 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Prlimit64 => self.dispatch_prlimit64(request),
             mcr_sys::Syscall::Getcpu => self.dispatch_getcpu(request),
             mcr_sys::Syscall::Membarrier => self.dispatch_membarrier(request),
-            mcr_sys::Syscall::Rseq | mcr_sys::Syscall::Clone3 => {
-                SyscallOutcome::errno(LinuxErrno::ENOSYS)
-            }
-            mcr_sys::Syscall::Fork | mcr_sys::Syscall::Vfork | mcr_sys::Syscall::Clone => {
-                self.dispatch_fork_like(request)
-            }
+            mcr_sys::Syscall::Rseq => SyscallOutcome::errno(LinuxErrno::ENOSYS),
+            mcr_sys::Syscall::Fork
+            | mcr_sys::Syscall::Vfork
+            | mcr_sys::Syscall::Clone
+            | mcr_sys::Syscall::Clone3 => self.dispatch_fork_like(request),
             _ => self.dispatch_kernel_task(request),
         }
     }
@@ -5103,6 +6298,76 @@ impl RuntimeSubsystems {
         Ok(bytes)
     }
 
+    fn perf_begin_run(&mut self) {
+        self.perf_summary.begin_run();
+    }
+
+    fn perf_finish_run(&mut self) {
+        self.perf_summary.finish_run();
+    }
+
+    fn perf_record_scheduler_enter(&mut self) {
+        self.perf_summary.record_scheduler_enter();
+    }
+
+    fn perf_record_no_runnable(&mut self) {
+        self.perf_summary.record_no_runnable();
+    }
+
+    fn perf_record_dispatch(&mut self, tid: mcr_sys::GuestTid, pid: mcr_sys::GuestPid) {
+        let previous_still_runnable =
+            self.perf_summary
+                .last_dispatched
+                .is_some_and(|(last_tid, _)| {
+                    self.tasks
+                        .task(last_tid)
+                        .is_some_and(|task| matches!(task.state(), TaskState::Runnable))
+                });
+        self.perf_summary
+            .record_dispatch(tid, pid, previous_still_runnable);
+    }
+
+    fn perf_record_syscall(&mut self, syscall: mcr_sys::Syscall) {
+        self.perf_summary.record_syscall(syscall);
+    }
+
+    fn perf_record_fork_like(
+        &mut self,
+        syscall: mcr_sys::Syscall,
+        clone_args: Option<CloneSyscallArgs>,
+    ) {
+        self.perf_summary.record_fork_like(syscall, clone_args);
+    }
+
+    fn perf_record_remap(&mut self, elapsed: Duration) {
+        self.perf_summary.record_remap(elapsed);
+    }
+
+    fn perf_record_clone_to_exec(&mut self, elapsed: Duration) {
+        self.perf_summary.record_clone_to_exec(elapsed);
+    }
+
+    fn perf_record_fd_wakeups(&mut self, count: usize) {
+        self.perf_summary.record_fd_wakeups(count);
+    }
+
+    fn perf_record_pipe_io(&mut self, syscall: mcr_sys::Syscall, fd: Fd, result: &SyscallReturn) {
+        if !matches!(
+            syscall,
+            mcr_sys::Syscall::Read
+                | mcr_sys::Syscall::Readv
+                | mcr_sys::Syscall::Write
+                | mcr_sys::Syscall::Writev
+        ) {
+            return;
+        }
+        let Ok(entry) = self.files.vfs().fds().get(fd) else {
+            return;
+        };
+        self.perf_summary
+            .record_pipe_io(syscall, entry.file().kind(), result);
+    }
+
     fn select_process_context(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
         self.select_fds_for_process(pid)?;
@@ -5153,40 +6418,45 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        let selected_pid = self.selected_memory_pid;
-        let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
-            Some(
-                self.files
-                    .memory()
-                    .try_clone_runtime()
-                    .map_err(|error| error.errno())?,
-            )
-        } else {
-            None
-        };
-        let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
-        self.drop_selected_memory_allocations();
-        match target_snapshot.try_clone_runtime_at_guest_addresses() {
-            Ok(memory) => {
-                if let Some(snapshot) = selected_snapshot {
-                    self.process_memory.insert(selected_pid, snapshot);
+        let remap_start = Instant::now();
+        let result = (|| {
+            let selected_pid = self.selected_memory_pid;
+            let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
+                Some(
+                    self.files
+                        .memory()
+                        .try_clone_runtime()
+                        .map_err(|error| error.errno())?,
+                )
+            } else {
+                None
+            };
+            let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+            self.drop_selected_memory_allocations();
+            match target_snapshot.try_clone_runtime_at_guest_addresses() {
+                Ok(memory) => {
+                    if let Some(snapshot) = selected_snapshot {
+                        self.process_memory.insert(selected_pid, snapshot);
+                    }
+                    *self.files.memory_mut() = memory;
+                    self.selected_memory_pid = pid;
+                    Ok(())
                 }
-                *self.files.memory_mut() = memory;
-                self.selected_memory_pid = pid;
-                Ok(())
-            }
-            Err(error) => {
-                self.process_memory.insert(pid, target_snapshot);
-                if let Some(snapshot) = selected_snapshot {
-                    let restored = snapshot
-                        .try_clone_runtime_at_guest_addresses()
-                        .map_err(|restore_error| restore_error.errno())?;
-                    self.process_memory.insert(selected_pid, snapshot);
-                    *self.files.memory_mut() = restored;
+                Err(error) => {
+                    self.process_memory.insert(pid, target_snapshot);
+                    if let Some(snapshot) = selected_snapshot {
+                        let restored = snapshot
+                            .try_clone_runtime_at_guest_addresses()
+                            .map_err(|restore_error| restore_error.errno())?;
+                        self.process_memory.insert(selected_pid, snapshot);
+                        *self.files.memory_mut() = restored;
+                    }
+                    Err(error.errno())
                 }
-                Err(error.errno())
             }
-        }
+        })();
+        self.perf_record_remap(remap_start.elapsed());
+        result
     }
 
     fn dispatch_sched_yield(&mut self) -> SyscallOutcome {
@@ -5474,10 +6744,24 @@ impl RuntimeSubsystems {
         });
     }
 
+    fn sticky_scheduler_candidate(&self, tid: mcr_sys::GuestTid) -> Option<mcr_sys::GuestTid> {
+        let task = self.tasks.task(tid)?;
+        if !matches!(task.state(), TaskState::Runnable) {
+            return None;
+        }
+        if self.has_pending_fork_exec_children(task.pid()) {
+            return None;
+        }
+        Some(tid)
+    }
+
     fn materialize_pending_fork_exec_children(
         &mut self,
         parent_pid: mcr_sys::GuestPid,
     ) -> Result<(), GuestMemoryError> {
+        if unsafe_share_until_exec_enabled() {
+            return Ok(());
+        }
         let child_pids = self
             .pending_fork_exec
             .iter()
@@ -5513,6 +6797,20 @@ impl RuntimeSubsystems {
         self.process_memory.insert(child_pid, memory);
         if let Some(cache) = self.native_patch_caches.get(&pending.parent_pid).cloned() {
             self.native_patch_caches.insert(child_pid, cache);
+        }
+        if let Some(key) = self
+            .native_image_patch_keys
+            .get(&pending.parent_pid)
+            .cloned()
+        {
+            self.native_image_patch_keys.insert(child_pid, key);
+        }
+        if let Some(ranges) = self
+            .native_image_patch_ranges
+            .get(&pending.parent_pid)
+            .cloned()
+        {
+            self.native_image_patch_ranges.insert(child_pid, ranges);
         }
         host_step_trace(format_args!(
             "runtime materialize-fork-child done parent_pid={} child_pid={child_pid} elapsed_ms={}",
@@ -5620,7 +6918,9 @@ impl RuntimeSubsystems {
     }
 
     fn drop_native_patch_cache_for_process(&mut self, pid: mcr_sys::GuestPid) {
-        self.invalidate_native_patch_cache(pid);
+        self.native_patch_caches.remove(&pid);
+        self.native_image_patch_keys.remove(&pid);
+        self.native_image_patch_ranges.remove(&pid);
     }
 
     fn close_unshared_process_sockets(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
@@ -5969,6 +7269,8 @@ impl RuntimeSubsystems {
             write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
             self.store_selected_process_memory(pid)?;
             self.futexes.wake(clear_child_tid, u32::MAX);
+            self.tasks
+                .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
         }
 
         let process_exited = matches!(
@@ -5998,7 +7300,7 @@ impl RuntimeSubsystems {
         let selected_pid = self.selected_fds_pid;
         let selected_fds = self.files.vfs().fds().clone();
         let process_fds = self.process_fds.clone();
-        self.tasks.resume_fd_waiters(|pid, fd, write| {
+        let resumed = self.tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
                 Some(&selected_fds)
             } else {
@@ -6007,6 +7309,7 @@ impl RuntimeSubsystems {
             fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
                 .unwrap_or(true)
         });
+        self.perf_record_fd_wakeups(resumed);
     }
 
     fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
@@ -6057,14 +7360,35 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let clone_args =
-            (request.syscall == mcr_sys::Syscall::Clone).then(|| clone_args_from_request(request));
+        let clone_args = match request.syscall {
+            mcr_sys::Syscall::Clone => Some(clone_args_from_request(request)),
+            mcr_sys::Syscall::Clone3 => {
+                match clone3_args_from_memory(self.files.memory(), arg(request, 0), arg(request, 1))
+                {
+                    Ok(args) => Some(args),
+                    Err(errno) => return SyscallOutcome::errno(errno),
+                }
+            }
+            _ => None,
+        };
+        self.perf_record_fork_like(request.syscall, clone_args);
         let pending_child_regs = self.pending_fork_child_regs.take();
         let outcome = if self.native_execution {
             match pending_child_regs {
-                Some(child_regs) => self.dispatch_native_fork_like_task(request, child_regs),
+                Some(child_regs) => {
+                    self.dispatch_native_fork_like_task(request, clone_args, child_regs)
+                }
+                None if request.syscall == mcr_sys::Syscall::Clone3 => self.tasks.clone_current(
+                    request.context.tid,
+                    clone_args.expect("clone3 args decoded"),
+                ),
                 None => self.tasks.dispatch_for_current_task(request),
             }
+        } else if request.syscall == mcr_sys::Syscall::Clone3 {
+            self.tasks.clone_current(
+                request.context.tid,
+                clone_args.expect("clone3 args decoded"),
+            )
         } else {
             self.tasks.dispatch_for_current_task(request)
         };
@@ -6083,8 +7407,13 @@ impl RuntimeSubsystems {
         let Some(child_pid) = fork_child_pid(&outcome.decoded) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        self.pending_fork_exec
-            .insert(child_pid, PendingForkExec { parent_pid: pid });
+        self.pending_fork_exec.insert(
+            child_pid,
+            PendingForkExec {
+                parent_pid: pid,
+                created_at: Instant::now(),
+            },
+        );
         self.process_fds
             .insert(child_pid, self.files.vfs().fds().clone());
         self.fork_native_fp(request.context.tid, child_pid);
@@ -6094,6 +7423,7 @@ impl RuntimeSubsystems {
     fn dispatch_native_fork_like_task(
         &mut self,
         request: &SyscallRequest,
+        clone_args: Option<CloneSyscallArgs>,
         child_regs: GprState,
     ) -> SyscallOutcome {
         match request.syscall {
@@ -6103,17 +7433,13 @@ impl RuntimeSubsystems {
             mcr_sys::Syscall::Vfork => self
                 .tasks
                 .vfork_current_with_child_regs(request.context.tid, child_regs),
-            mcr_sys::Syscall::Clone => self.tasks.clone_current_with_child_regs(
-                request.context.tid,
-                mcr_sys::CloneSyscallArgs::new(
-                    arg(request, 0),
-                    arg(request, 1),
-                    arg(request, 2),
-                    arg(request, 3),
-                    arg(request, 4),
-                ),
-                child_regs,
-            ),
+            mcr_sys::Syscall::Clone | mcr_sys::Syscall::Clone3 => {
+                self.tasks.clone_current_with_child_regs(
+                    request.context.tid,
+                    clone_args.expect("clone args decoded"),
+                    child_regs,
+                )
+            }
             _ => SyscallOutcome::unsupported(),
         }
     }
@@ -6191,7 +7517,7 @@ impl RuntimeSubsystems {
         self.native_fp.remove(&request.context.tid);
         self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
-        self.invalidate_native_patch_cache(request.context.pid);
+        self.native_patch_caches.remove(&request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)?;
         Ok(false)
@@ -6202,11 +7528,12 @@ impl RuntimeSubsystems {
         request: &SyscallRequest,
     ) -> Result<(), LinuxErrno> {
         let child_pid = request.context.pid;
-        let parent_pid = self
+        let pending = self
             .pending_fork_exec
             .get(&child_pid)
-            .map(|pending| pending.parent_pid)
+            .copied()
             .ok_or(LinuxErrno::ESRCH)?;
+        let parent_pid = pending.parent_pid;
         self.select_fds_for_process(child_pid)?;
         sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
 
@@ -6241,6 +7568,7 @@ impl RuntimeSubsystems {
             return Err(error.linux_errno());
         }
         self.pending_fork_exec.remove(&child_pid);
+        self.perf_record_clone_to_exec(pending.created_at.elapsed());
         let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
         for socket_id in closed_fd_ids
             .socket_ids
@@ -6269,7 +7597,7 @@ impl RuntimeSubsystems {
         self.native_fp.remove(&request.context.tid);
         self.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(child_pid)?;
-        self.invalidate_native_patch_cache(child_pid);
+        self.native_patch_caches.remove(&child_pid);
         self.store_selected_process_fds(child_pid)
     }
 
@@ -6289,7 +7617,22 @@ impl RuntimeSubsystems {
             let memory = self.memory_from_process_image(&image)?;
             self.process_memory.insert(pid, memory);
         }
+        self.set_native_image_patch_key(pid, &image);
         Ok(())
+    }
+
+    fn set_native_image_patch_key(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        image: &mcr_elf::GuestMemoryImage,
+    ) {
+        if let Some((key, ranges)) = native_image_patch_key_and_ranges(image) {
+            self.native_image_patch_keys.insert(pid, key);
+            self.native_image_patch_ranges.insert(pid, ranges);
+        } else {
+            self.native_image_patch_keys.remove(&pid);
+            self.native_image_patch_ranges.remove(&pid);
+        }
     }
 
     fn memory_from_process_image(
@@ -6322,48 +7665,71 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_memory_for_process(pid) {
             return SyscallOutcome::errno(errno);
         }
-        outcome(self.futex(FutexSyscallArgs::new(
-            arg(request, 0),
-            arg_u32(request, 1),
-            arg_u32(request, 2),
-            arg(request, 3),
-            arg(request, 4),
-            arg_u32(request, 5),
-        )))
+        self.futex(
+            request.context.pid,
+            request.context.tid,
+            FutexSyscallArgs::new(
+                arg(request, 0),
+                arg_u32(request, 1),
+                arg_u32(request, 2),
+                arg(request, 3),
+                arg(request, 4),
+                arg_u32(request, 5),
+            ),
+        )
     }
 
-    fn futex(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
+    fn futex(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        args: FutexSyscallArgs,
+    ) -> SyscallOutcome {
         if args.op & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG) != 0 {
-            return Err(LinuxErrno::EINVAL);
-        }
-        if !args.is_private() {
-            return Err(LinuxErrno::ENOSYS);
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         if args.uaddr % 4 != 0 {
-            return Err(LinuxErrno::EINVAL);
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
 
         match args.command() {
-            LINUX_FUTEX_WAIT => self.futex_wait(args),
-            LINUX_FUTEX_WAKE => Ok(self.futex_wake(args)),
-            _ => Err(LinuxErrno::EINVAL),
+            LINUX_FUTEX_WAIT => self.futex_wait(pid, tid, args),
+            LINUX_FUTEX_WAKE => SyscallOutcome::success(self.futex_wake(pid, args)),
+            _ => SyscallOutcome::errno(LinuxErrno::EINVAL),
         }
     }
 
-    fn futex_wait(&mut self, args: FutexSyscallArgs) -> Result<u64, LinuxErrno> {
-        let value = read_guest_u32(self.files.memory(), args.uaddr)?;
+    fn futex_wait(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        args: FutexSyscallArgs,
+    ) -> SyscallOutcome {
+        let value = match read_guest_u32(self.files.memory(), args.uaddr) {
+            Ok(value) => value,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
         if value != args.val {
-            return Err(LinuxErrno::EAGAIN);
+            return SyscallOutcome::errno(LinuxErrno::EAGAIN);
         }
-        let timeout = read_futex_timeout(self.files.memory(), args.timeout)?;
-        let memory = self.files.memory();
-        self.futexes.wait(args.uaddr, value, timeout, || {
-            read_guest_u32(memory, args.uaddr).is_ok_and(|current| current != args.val)
-        })
+        let timeout = match read_futex_timeout(self.files.memory(), args.timeout) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        if timeout.is_some() {
+            return SyscallOutcome::errno(LinuxErrno::ETIMEDOUT);
+        }
+
+        let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        match self.tasks.block_task_for_futex(tid, key) {
+            Ok(()) => SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex"),
+            Err(error) => error.into_outcome(),
+        }
     }
 
-    fn futex_wake(&mut self, args: FutexSyscallArgs) -> u64 {
-        self.futexes.wake(args.uaddr, args.val)
+    fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
+        let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        self.tasks.wake_futex_waiters(key, args.val) as u64
     }
 
     fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -6419,6 +7785,37 @@ impl RuntimeSubsystems {
         outcome
     }
 
+    fn dispatch_select(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let nfds = match select_nfds(arg(request, 0)) {
+            Ok(nfds) => nfds,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match read_select_timeout(self.files.memory(), arg(request, 4)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let outcome = outcome(self.select_fds(
+            nfds,
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+            timeout,
+        ));
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+        }
+        outcome
+    }
+
     fn poll_fds(
         &mut self,
         fds_addr: u64,
@@ -6443,6 +7840,81 @@ impl RuntimeSubsystems {
             }
         }
         Ok(ready)
+    }
+
+    fn select_fds(
+        &mut self,
+        nfds: usize,
+        readfds_addr: u64,
+        writefds_addr: u64,
+        exceptfds_addr: u64,
+        timeout: Option<Duration>,
+    ) -> Result<u64, LinuxErrno> {
+        let interests = read_select_interests(
+            self.files.memory(),
+            nfds,
+            readfds_addr,
+            writefds_addr,
+            exceptfds_addr,
+        )?;
+        let mut ready = self.select_ready_fds(&interests, Some(Duration::ZERO))?;
+        if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {
+            ready = self.select_ready_fds(&interests, timeout)?;
+        }
+
+        write_select_fd_set(self.files.memory_mut(), readfds_addr, nfds, &ready.read)?;
+        write_select_fd_set(self.files.memory_mut(), writefds_addr, nfds, &ready.write)?;
+        write_select_fd_set(
+            self.files.memory_mut(),
+            exceptfds_addr,
+            nfds,
+            &ready.exceptional,
+        )?;
+        Ok(ready.count() as u64)
+    }
+
+    fn select_ready_fds(
+        &mut self,
+        interests: &[SelectInterest],
+        timeout: Option<Duration>,
+    ) -> Result<SelectReadyFds, LinuxErrno> {
+        let mut ready = SelectReadyFds::default();
+        let wait_index = self.select_wait_interest_index(interests, timeout);
+        for (index, interest) in interests.iter().enumerate() {
+            let wait_timeout = if wait_index == Some(index) {
+                timeout
+            } else {
+                Some(Duration::ZERO)
+            };
+            let revents = self.poll_fd_revents(interest.fd, interest.events, wait_timeout)?;
+            if revents & LINUX_POLLNVAL != 0 {
+                return Err(LinuxErrno::EBADF);
+            }
+            if interest.read && select_revents_readable(revents) {
+                ready.read.push(interest.fd);
+            }
+            if interest.write && select_revents_writable(revents) {
+                ready.write.push(interest.fd);
+            }
+            if interest.exceptional && revents & LINUX_POLLPRI != 0 {
+                ready.exceptional.push(interest.fd);
+            }
+        }
+        Ok(ready)
+    }
+
+    fn select_wait_interest_index(
+        &self,
+        interests: &[SelectInterest],
+        timeout: Option<Duration>,
+    ) -> Option<usize> {
+        if matches!(timeout, Some(duration) if duration.is_zero()) {
+            return None;
+        }
+        interests
+            .iter()
+            .position(|interest| self.files.vfs().socket_id_for_fd(interest.fd).is_ok())
+            .or_else(|| (!interests.is_empty()).then_some(0))
     }
 
     fn poll_fd_revents(
@@ -6732,6 +8204,41 @@ impl RuntimeSubsystems {
 
 const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
+const SELECT_FD_BITS: usize = 64;
+const MAX_SELECT_FDS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectInterest {
+    fd: Fd,
+    events: i16,
+    read: bool,
+    write: bool,
+    exceptional: bool,
+}
+
+#[derive(Default)]
+struct SelectReadyFds {
+    read: Vec<Fd>,
+    write: Vec<Fd>,
+    exceptional: Vec<Fd>,
+}
+
+impl SelectReadyFds {
+    fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.write.is_empty() && self.exceptional.is_empty()
+    }
+
+    fn count(&self) -> usize {
+        let mut fds =
+            Vec::with_capacity(self.read.len() + self.write.len() + self.exceptional.len());
+        fds.extend_from_slice(&self.read);
+        fds.extend_from_slice(&self.write);
+        fds.extend_from_slice(&self.exceptional);
+        fds.sort_unstable();
+        fds.dedup();
+        fds.len()
+    }
+}
 
 const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
     LINUX_EPOLLIN | LINUX_EPOLLPRI | LINUX_EPOLLOUT | LINUX_EPOLLERR | LINUX_EPOLLHUP;
@@ -7132,6 +8639,128 @@ fn write_pollfd_revents(
         .map_err(memory_errno)
 }
 
+fn select_nfds(raw: u64) -> Result<usize, LinuxErrno> {
+    let signed = raw as i64;
+    if signed < 0 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    let nfds = usize::try_from(signed).map_err(|_| LinuxErrno::EINVAL)?;
+    if nfds > MAX_SELECT_FDS {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(nfds)
+}
+
+fn read_select_timeout(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<Option<Duration>, LinuxErrno> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let tv_sec = read_guest_i64(memory, addr)?;
+    let tv_usec = read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?;
+    if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(Some(Duration::new(
+        tv_sec as u64,
+        u32::try_from(tv_usec * 1_000).map_err(|_| LinuxErrno::EINVAL)?,
+    )))
+}
+
+fn read_select_interests(
+    memory: &impl GuestMemoryAccess,
+    nfds: usize,
+    readfds_addr: u64,
+    writefds_addr: u64,
+    exceptfds_addr: u64,
+) -> Result<Vec<SelectInterest>, LinuxErrno> {
+    let mut interests = Vec::new();
+    for fd in 0..nfds {
+        let read = select_fd_set_contains(memory, readfds_addr, fd)?;
+        let write = select_fd_set_contains(memory, writefds_addr, fd)?;
+        let exceptional = select_fd_set_contains(memory, exceptfds_addr, fd)?;
+        if !read && !write && !exceptional {
+            continue;
+        }
+        let mut events = 0;
+        if read {
+            events |= LINUX_POLLIN | LINUX_POLLRDNORM;
+        }
+        if write {
+            events |= LINUX_POLLOUT | LINUX_POLLWRNORM;
+        }
+        if exceptional {
+            events |= LINUX_POLLPRI;
+        }
+        interests.push(SelectInterest {
+            fd: i32::try_from(fd).map_err(|_| LinuxErrno::EINVAL)?,
+            events,
+            read,
+            write,
+            exceptional,
+        });
+    }
+    Ok(interests)
+}
+
+fn select_fd_set_contains(
+    memory: &impl GuestMemoryAccess,
+    set_addr: u64,
+    fd: usize,
+) -> Result<bool, LinuxErrno> {
+    if set_addr == 0 {
+        return Ok(false);
+    }
+    let word_addr = select_fd_word_addr(set_addr, fd)?;
+    let word = read_guest_u64(memory, word_addr)?;
+    Ok(word & select_fd_bit(fd) != 0)
+}
+
+fn write_select_fd_set(
+    memory: &mut impl GuestMemoryAccess,
+    set_addr: u64,
+    nfds: usize,
+    fds: &[Fd],
+) -> Result<(), LinuxErrno> {
+    if set_addr == 0 {
+        return Ok(());
+    }
+    write_zeroed(memory, set_addr, select_fd_set_len(nfds)?)?;
+    for fd in fds {
+        if *fd < 0 {
+            continue;
+        }
+        let fd = usize::try_from(*fd).map_err(|_| LinuxErrno::EINVAL)?;
+        if fd >= nfds {
+            continue;
+        }
+        let word_addr = select_fd_word_addr(set_addr, fd)?;
+        let word = read_guest_u64(memory, word_addr)? | select_fd_bit(fd);
+        memory
+            .write_bytes(word_addr, &word.to_le_bytes())
+            .map_err(memory_errno)?;
+    }
+    Ok(())
+}
+
+fn select_fd_set_len(nfds: usize) -> Result<usize, LinuxErrno> {
+    nfds.checked_add(SELECT_FD_BITS - 1)
+        .map(|bits| bits / SELECT_FD_BITS * 8)
+        .ok_or(LinuxErrno::EINVAL)
+}
+
+fn select_fd_word_addr(set_addr: u64, fd: usize) -> Result<u64, LinuxErrno> {
+    set_addr
+        .checked_add(((fd / SELECT_FD_BITS) * 8) as u64)
+        .ok_or(LinuxErrno::EFAULT)
+}
+
+fn select_fd_bit(fd: usize) -> u64 {
+    1u64 << (fd % SELECT_FD_BITS)
+}
+
 fn read_epoll_event(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -7257,6 +8886,14 @@ fn poll_revents_from_socket_events(readiness: SocketEvents, events: i16) -> i16 
         revents |= LINUX_POLLNVAL;
     }
     revents
+}
+
+fn select_revents_readable(revents: i16) -> bool {
+    revents & (LINUX_POLL_READ_NORMAL | LINUX_POLLERR | LINUX_POLLHUP) != 0
+}
+
+fn select_revents_writable(revents: i16) -> bool {
+    revents & (LINUX_POLL_WRITE_NORMAL | LINUX_POLLERR | LINUX_POLLHUP) != 0
 }
 
 fn fork_child_pid(decoded: &[TraceField]) -> Option<mcr_sys::GuestPid> {
@@ -7498,7 +9135,11 @@ impl From<Runtime> for SyscallDispatcher<RuntimeSubsystems, NoopSyscallTracer> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeDiagnosticsTracer {
     events: Vec<SyscallTraceEvent>,
+    dropped_events: u64,
 }
+
+const RUNTIME_DIAGNOSTICS_EVENT_LIMIT: usize = 8192;
+const RUNTIME_DIAGNOSTICS_EVENT_DRAIN: usize = 4096;
 
 impl RuntimeDiagnosticsTracer {
     #[must_use]
@@ -7520,6 +9161,11 @@ impl RuntimeDiagnosticsTracer {
     }
 
     #[must_use]
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    #[must_use]
     pub fn into_events(self) -> Vec<SyscallTraceEvent> {
         self.events
     }
@@ -7527,6 +9173,12 @@ impl RuntimeDiagnosticsTracer {
 
 impl SyscallTracer for RuntimeDiagnosticsTracer {
     fn record(&mut self, event: SyscallTraceEvent) {
+        if self.events.len() >= RUNTIME_DIAGNOSTICS_EVENT_LIMIT {
+            self.events.drain(..RUNTIME_DIAGNOSTICS_EVENT_DRAIN);
+            self.dropped_events = self
+                .dropped_events
+                .saturating_add(RUNTIME_DIAGNOSTICS_EVENT_DRAIN as u64);
+        }
         self.events.push(event);
     }
 }
@@ -7540,23 +9192,27 @@ mod tests {
         GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6,
         LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
         LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
-        LINUX_CLONE_THREAD, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-        LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLET,
-        LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT, LINUX_EPOLLOUT,
-        LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
+        LINUX_CLONE_THREAD, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC,
+        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
+        LINUX_EPOLLET, LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT,
+        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
         LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
         LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
-        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR,
-        LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK,
-        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall, SyscallArgs,
-        SyscallEnterEvent, SyscallRegisters, SyscallReturn, SyscallTraceEvent, TraceContext,
-        Wait4SyscallArgs,
+        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SIGCHLD, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE,
+        LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM,
+        LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall,
+        SyscallArgs, SyscallEnterEvent, SyscallExitEvent, SyscallRegisters, SyscallReturn,
+        SyscallTraceEvent, TraceContext, Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
 
     fn native_execution_test_guard() -> MutexGuard<'static, ()> {
         crate::test_support::native_execution_test_guard()
+    }
+
+    fn env_test_guard() -> MutexGuard<'static, ()> {
+        crate::test_support::env_test_guard()
     }
     use mcr_vfs::{
         AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
@@ -8282,20 +9938,81 @@ mod tests {
     }
 
     #[test]
-    fn process_shared_futex_wait_and_wake_return_enosys() {
+    fn process_shared_futex_wait_mismatch_and_wake_are_supported() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0u32.to_le_bytes())
+            .unwrap();
 
         let wait = runtime.dispatch_syscall(context(
             Syscall::Futex,
-            [0x402000, u64::from(LINUX_FUTEX_WAIT), 0, 0, 0, 0],
+            [0x402000, u64::from(LINUX_FUTEX_WAIT), 1, 0, 0, 0],
         ));
         let wake = runtime.dispatch_syscall(context(
             Syscall::Futex,
             [0x402000, u64::from(LINUX_FUTEX_WAKE), 1, 0, 0, 0],
         ));
 
-        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
-        assert_eq!(wake.result, SyscallReturn::Errno(LinuxErrno::ENOSYS));
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+        assert_eq!(wake.result, SyscallReturn::Success(0));
+    }
+
+    #[test]
+    fn futex_wait_blocks_guest_task_and_wake_resumes_it() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &7u32.to_le_bytes())
+            .unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_SYSVSEM;
+
+        let clone = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+        assert_eq!(clone.result, SyscallReturn::Success(2));
+
+        let wait = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                7,
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForFutex {
+                key: FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true)
+            }
+        );
+
+        let wake = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            2,
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+
+        assert_eq!(wake.result, SyscallReturn::Success(1));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
     }
 
     #[test]
@@ -9105,6 +10822,95 @@ mod tests {
             pollfd_revents(runtime.memory(), 0x402100),
             LINUX_POLLRDNORM | LINUX_POLLOUT | LINUX_POLLWRNORM
         );
+    }
+
+    #[test]
+    fn select_reports_regular_file_readiness_and_clears_unready_sets() {
+        let mut runtime =
+            Runtime::with_vfs(test_program("/bin/app", 0x401000), sample_vfs()).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, b"/tmp/file\0")
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Openat,
+                    [AT_FDCWD as u64, 0x402000, u64::from(O_RDONLY), 0, 0, 0,]
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        write_select_fdset(runtime.memory_mut(), 0x402100, 4, &[3]);
+        write_select_fdset(runtime.memory_mut(), 0x402180, 4, &[3]);
+        write_timeval(runtime.memory_mut(), 0x402200, 0, 0);
+
+        let result = runtime.dispatch_syscall(context(
+            Syscall::Select,
+            [4, 0x402100, 0x402180, 0, 0x402200, 0],
+        ));
+
+        assert_eq!(result.result, SyscallReturn::Success(1));
+        assert!(select_fdset_contains(runtime.memory(), 0x402100, 3));
+        assert!(!select_fdset_contains(runtime.memory(), 0x402180, 3));
+    }
+
+    #[test]
+    fn select_reports_socket_readiness_and_bad_fds() {
+        let transport = runtime_socket_transport();
+        transport.push_incoming(b"pong");
+        let mut runtime = Runtime::with_vfs_and_socket_transport(
+            test_program("/bin/app", 0x401000),
+            sample_vfs(),
+            transport.handle(),
+        )
+        .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &ipv4_sockaddr(8080))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [3, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        write_select_fdset(runtime.memory_mut(), 0x402100, 4, &[3]);
+        write_select_fdset(runtime.memory_mut(), 0x402180, 4, &[3]);
+        write_timeval(runtime.memory_mut(), 0x402200, 0, 0);
+        let ready = runtime.dispatch_syscall(context(
+            Syscall::Select,
+            [4, 0x402100, 0x402180, 0, 0x402200, 0],
+        ));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert!(select_fdset_contains(runtime.memory(), 0x402100, 3));
+        assert!(select_fdset_contains(runtime.memory(), 0x402180, 3));
+
+        write_select_fdset(runtime.memory_mut(), 0x402300, 100, &[99]);
+        write_timeval(runtime.memory_mut(), 0x402380, 0, 0);
+        let bad_fd =
+            runtime.dispatch_syscall(context(Syscall::Select, [100, 0x402300, 0, 0, 0x402380, 0]));
+        assert_eq!(bad_fd.result, SyscallReturn::Errno(LinuxErrno::EBADF));
     }
 
     #[test]
@@ -12053,6 +13859,52 @@ mod tests {
         i16::from_le_bytes(bytes)
     }
 
+    fn write_select_fdset(memory: &mut GuestMemory, addr: u64, nfds: usize, fds: &[Fd]) {
+        write_select_fd_set(memory, addr, nfds, fds).unwrap();
+    }
+
+    fn select_fdset_contains(memory: &GuestMemory, addr: u64, fd: usize) -> bool {
+        select_fd_set_contains(memory, addr, fd).unwrap()
+    }
+
+    fn write_timeval(memory: &mut GuestMemory, addr: u64, sec: i64, usec: i64) {
+        memory.write(addr, &sec.to_le_bytes()).unwrap();
+        memory.write(addr + 8, &usec.to_le_bytes()).unwrap();
+    }
+
+    fn write_clone3_args(
+        memory: &mut GuestMemory,
+        addr: u64,
+        flags: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+    ) {
+        for (index, value) in [flags, 0, 0, 0, exit_signal, stack, stack_size, 0, 0, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            memory
+                .write(addr + (index * 8) as u64, &value.to_le_bytes())
+                .unwrap();
+        }
+    }
+
+    struct TestUnsafeShareUntilExec;
+
+    impl TestUnsafeShareUntilExec {
+        fn enable() -> Self {
+            UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for TestUnsafeShareUntilExec {
+        fn drop(&mut self) {
+            UNSAFE_SHARE_UNTIL_EXEC_TEST_OVERRIDE.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn write_timespec(memory: &mut GuestMemory, addr: u64, sec: i64, nsec: i64) {
         memory.write(addr, &sec.to_le_bytes()).unwrap();
         memory.write(addr + 8, &nsec.to_le_bytes()).unwrap();
@@ -13089,6 +14941,83 @@ mod tests {
     }
 
     #[test]
+    fn clone3_vfork_defers_memory_clone_until_child_execve() {
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/new",
+            test_program_bytes_with_marker(0x501000, 0x5a),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+        write_clone3_args(
+            runtime.memory_mut(),
+            0x402200,
+            LINUX_CLONE_VM | LINUX_CLONE_VFORK,
+            LINUX_SIGCHLD,
+            0x7000_0000,
+            0x1000,
+        );
+
+        let clone3 = runtime.dispatch_syscall(context(Syscall::Clone3, [0x402200, 88, 0, 0, 0, 0]));
+
+        assert_eq!(clone3.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForVfork { child_pid: 2 }
+        );
+        assert_eq!(runtime.kernel().task(2).unwrap().regs().rsp(), 0x7000_1000);
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/new"
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+    }
+
+    #[test]
     fn parent_memory_mutation_materializes_deferred_fork_child_first() {
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime.memory_mut().write(0x402000, b"parent").unwrap();
@@ -13122,6 +15051,57 @@ mod tests {
             .unwrap();
         assert_eq!(&parent_bytes, b"PARENT");
         assert_eq!(&child_bytes, b"parent");
+    }
+
+    #[test]
+    fn unsafe_share_until_exec_keeps_child_pending_after_parent_memory_write() {
+        let _guard = env_test_guard();
+        let _unsafe_share = TestUnsafeShareUntilExec::enable();
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content("/bin/new", test_program_bytes(0x501000), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+        let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+        assert_eq!(fork.result, SyscallReturn::Success(2));
+        runtime.memory_mut().write(0x402100, b"/bin/new\0").unwrap();
+
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .pending_fork_exec
+                .contains_key(&2)
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .process_memory
+                .contains_key(&2)
+        );
+
+        let exec = runtime.dispatch_syscall(context_for(
+            2,
+            2,
+            Syscall::Execve,
+            [0x402100, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime
+                .kernel()
+                .process(2)
+                .unwrap()
+                .image()
+                .executable()
+                .path(),
+            b"/bin/new"
+        );
     }
 
     #[test]
@@ -13591,6 +15571,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_diagnostics_tracer_bounds_retained_events() {
+        let mut tracer = RuntimeDiagnosticsTracer::new();
+        for index in 0..(RUNTIME_DIAGNOSTICS_EVENT_LIMIT + 17) {
+            tracer.record(SyscallTraceEvent::Exit(SyscallExitEvent {
+                context: TraceContext {
+                    pid: INITIAL_GUEST_PID,
+                    tid: INITIAL_GUEST_TID,
+                    rip: index as u64,
+                },
+                syscall: Syscall::Getpid,
+                args: SyscallArgs::new([0; 6]),
+                result: SyscallReturn::Success(index as u64),
+                decoded: Vec::new(),
+                host_error: None,
+            }));
+        }
+
+        assert_eq!(tracer.events().len(), RUNTIME_DIAGNOSTICS_EVENT_DRAIN + 17);
+        assert_eq!(
+            tracer.dropped_events(),
+            RUNTIME_DIAGNOSTICS_EVENT_DRAIN as u64
+        );
+        let last = tracer.last_syscall().unwrap();
+        assert_eq!(last.name(), "getpid");
+        assert_eq!(
+            last.result(),
+            Some(SyscallReturn::Success(
+                (RUNTIME_DIAGNOSTICS_EVENT_LIMIT + 16) as u64
+            ))
+        );
+    }
+
+    #[test]
     fn runtime_getpid_gettid_fast_path_preserves_trace_and_esrch() {
         let mut runtime = Runtime::with_tracer(
             test_program("/bin/app", 0x401000),
@@ -13813,12 +15826,6 @@ mod tests {
                 .result,
             SyscallReturn::Errno(LinuxErrno::ENOSYS)
         );
-        assert_eq!(
-            runtime
-                .dispatch_syscall(context(Syscall::Clone3, [0x402000, 88, 0, 0, 0, 0]))
-                .result,
-            SyscallReturn::Errno(LinuxErrno::ENOSYS)
-        );
     }
 
     #[test]
@@ -13921,18 +15928,11 @@ mod tests {
 
     #[test]
     fn runtime_unimplemented_fake_syscalls_return_enosys_and_trace_args() {
-        for (syscall, args, decoded_field) in [
-            (
-                Syscall::Rseq,
-                [0x402000, 32, 0, 0x53053053, 0, 0],
-                ("rseq", "0x402000"),
-            ),
-            (
-                Syscall::Clone3,
-                [0x402000, 88, 0, 0, 0, 0],
-                ("cl_args", "0x402000"),
-            ),
-        ] {
+        for (syscall, args, decoded_field) in [(
+            Syscall::Rseq,
+            [0x402000, 32, 0, 0x53053053, 0, 0],
+            ("rseq", "0x402000"),
+        )] {
             let mut runtime = Runtime::with_tracer(
                 test_program("/bin/app", 0x401000),
                 InMemorySyscallTracer::new(),
@@ -14083,6 +16083,181 @@ mod tests {
 
         assert_eq!(guest_bytes(runtime.memory(), 0x401000, 7), code[..7]);
         assert_eq!(guest_bytes(runtime.memory(), 0x401007, 2), [0xcc, 0x90]);
+    }
+
+    #[test]
+    fn native_patch_metadata_persistent_cache_round_trips() {
+        let dir = unique_test_dir("native-patch-cache-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = NativeImagePatchKey {
+            hash: 0x1234,
+            executable_len: 0x2000,
+        };
+        let metadata = NativePatchMetadata {
+            scanned_ranges: vec![(0x401000, 0x402000)],
+            syscall_patches: vec![ExecutableSyscallPatch { address: 0x401123 }],
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            fs_relative_patches: BTreeMap::from([(
+                0x401200,
+                FsRelativePatch {
+                    original: [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0],
+                },
+            )]),
+        };
+
+        store_persistent_native_patch_metadata_in_dir(&key, &metadata, 0x400000, &dir).unwrap();
+        let loaded = load_persistent_native_patch_metadata_from_dir(&key, 0x600000, &dir)
+            .unwrap()
+            .expect("metadata should load");
+
+        assert_eq!(loaded.scanned_ranges, vec![(0x601000, 0x602000)]);
+        assert_eq!(
+            loaded.syscall_patches,
+            vec![ExecutableSyscallPatch { address: 0x601123 }]
+        );
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        assert_eq!(
+            loaded.fs_relative_patches,
+            BTreeMap::from([(
+                0x601200,
+                FsRelativePatch {
+                    original: [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0],
+                },
+            )])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_patch_cache_applies_image_metadata_without_rescanning_image() {
+        let code = [0x0f, 0x05, 0x90];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+        let key = runtime
+            .dispatcher
+            .subsystems()
+            .native_image_patch_keys
+            .get(&pid)
+            .cloned()
+            .expect("test image should have native patch key");
+        let ranges = runtime
+            .dispatcher
+            .subsystems()
+            .native_image_patch_ranges
+            .get(&pid)
+            .cloned()
+            .expect("test image should have native patch ranges");
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .native_image_patch_metadata
+            .insert(
+                key,
+                NativePatchMetadataEntry {
+                    base: ranges.base,
+                    metadata: NativePatchMetadata {
+                        scanned_ranges: ranges.ranges,
+                        syscall_patches: vec![ExecutableSyscallPatch { address: 0x401000 }],
+                        #[cfg(all(windows, target_arch = "x86_64"))]
+                        fs_relative_patches: BTreeMap::new(),
+                    },
+                },
+            );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+    }
+
+    #[test]
+    fn native_patch_cache_applies_executable_range_metadata_at_current_base() {
+        let code = [0x0f, 0x05, 0x90];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+        let (start, end, protection) = runtime
+            .memory()
+            .vmas()
+            .find(|vma| vma.protection().execute)
+            .map(|vma| (vma.start(), vma.end(), vma.protection()))
+            .expect("test image should have executable VMA");
+        let key =
+            native_executable_range_patch_key(runtime.memory(), start, end, protection).unwrap();
+        {
+            let subsystems = runtime.dispatcher.subsystems_mut();
+            subsystems.native_image_patch_keys.remove(&pid);
+            subsystems.native_image_patch_ranges.remove(&pid);
+            subsystems.native_image_patch_metadata.insert(
+                key,
+                NativePatchMetadataEntry {
+                    base: 0x500000,
+                    metadata: NativePatchMetadata {
+                        scanned_ranges: vec![(0x500000, 0x500000 + (end - start))],
+                        syscall_patches: vec![ExecutableSyscallPatch { address: 0x500000 }],
+                        #[cfg(all(windows, target_arch = "x86_64"))]
+                        fs_relative_patches: BTreeMap::new(),
+                    },
+                },
+            );
+        }
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), 0x401000, 2), [0xcc, 0x90]);
+    }
+
+    #[test]
+    fn native_patch_cache_survives_guest_brk_changes() {
+        let mut runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[0x0f, 0x05, 0x90],
+        ))
+        .unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+        let scanned_ranges = runtime
+            .dispatcher
+            .subsystems()
+            .native_patch_caches
+            .get(&pid)
+            .unwrap()
+            .scanned_ranges
+            .clone();
+        let current_brk = runtime.memory().current_brk();
+        let request =
+            SyscallRequest::from_guest_context(context(Syscall::Brk, [current_brk, 0, 0, 0, 0, 0]));
+
+        let outcome = runtime
+            .dispatcher
+            .subsystems_mut()
+            .dispatch_memory(&request);
+
+        assert_eq!(outcome.result, SyscallReturn::Success(current_brk));
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .scanned_ranges,
+            scanned_ranges
+        );
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -14558,6 +16733,14 @@ mod tests {
                 syscall.number().raw(),
                 args,
             ));
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mcr-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn test_program(path: &str, entrypoint: u64) -> GuestProgram {
