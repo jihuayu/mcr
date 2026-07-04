@@ -1,7 +1,7 @@
 ---
 id: perf-018
 scope: memory-performance
-status: ready
+status: done
 depends-on: [perf-005, perf-012, perf-015]
 ---
 
@@ -66,3 +66,10 @@ cargo test -p mcr-testkit perf_baseline -- --ignored --nocapture
   updating bytes or host protections, so read-only executable/library pages can
   be reused across fork snapshots while writable mappings keep private process
   semantics.
+- Closed 2026-07-04: shared read-only clone allocations now detach at guest
+  page granularity when a write, `mprotect`, or native patch mutates a shared
+  range in flexible-address mode. Untouched pages keep using the original host
+  allocation, while fixed-address native memory keeps the conservative
+  allocation-level copy path because those mappings must preserve guest VA
+  placement. Targeted verification covered clone COW, `mprotect`, and native
+  patch cache tests.

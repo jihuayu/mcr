@@ -150,7 +150,15 @@ regular-file inode, VFS generation, file offset, and requested mapping length.
 The cache lives above the VFS and below guest memory materialization: it never
 exposes host paths or handles, writes cached bytes into each guest VMA with the
 requested permissions restored afterward, and bypasses reuse for initially
-writable private mappings until a real copy-on-write page backend exists.
+writable private mappings.
+
+Process-memory clones reuse non-writable host allocations in flexible-address
+mode. When a later write, `mprotect`, or native patch mutates a shared range,
+the runtime splits the affected guest VMA range at page boundaries, copies only
+the touched pages into a private host allocation, and leaves untouched pages
+shared. Fixed-address native memory keeps the conservative allocation-level
+copy path because those allocations must preserve guest virtual address
+placement.
 
 ### Rootfs Startup
 

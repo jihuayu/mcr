@@ -498,6 +498,7 @@ impl GuestMemory {
 
         self.split_vma_at(args.addr);
         self.split_vma_at(end);
+        self.ensure_guest_page_range_unique(args.addr, end)?;
 
         let keys = self
             .vmas
@@ -515,7 +516,6 @@ impl GuestMemory {
         for (allocation_id, offset, len) in operations {
             let offset = usize::try_from(offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
             let len = usize::try_from(len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-            self.ensure_allocation_unique(allocation_id)?;
             let allocation = self
                 .allocations
                 .get(&allocation_id)
@@ -696,8 +696,12 @@ impl GuestMemory {
             return Err(GuestMemoryError::InvalidLength);
         }
 
+        self.ensure_guest_page_range_unique(address, end)?;
+        let vma = self
+            .vma_containing(address)
+            .cloned()
+            .ok_or(GuestMemoryError::NotMapped)?;
         let ranges = self.allocation_protection_ranges(vma.allocation_id)?;
-        self.ensure_allocation_unique(vma.allocation_id)?;
         let allocation = self
             .allocations
             .get(&vma.allocation_id)
@@ -727,6 +731,19 @@ impl GuestMemory {
         &mut self,
         patches: impl IntoIterator<Item = (u64, [u8; N])>,
     ) -> Result<(), GuestMemoryError> {
+        let patches = patches.into_iter().collect::<Vec<_>>();
+        for (address, _) in &patches {
+            let end = checked_raw_range(*address, N as u64)?;
+            let vma = self
+                .vma_containing(*address)
+                .cloned()
+                .ok_or(GuestMemoryError::NotMapped)?;
+            if end > vma.end {
+                return Err(GuestMemoryError::InvalidLength);
+            }
+            self.ensure_guest_page_range_unique(*address, end)?;
+        }
+
         #[derive(Debug)]
         struct PlannedPatch<const N: usize> {
             allocation_offset: usize,
@@ -757,7 +774,6 @@ impl GuestMemory {
 
         for (allocation_id, patches) in planned {
             let ranges = self.allocation_protection_ranges(allocation_id)?;
-            self.ensure_allocation_unique(allocation_id)?;
             let allocation = self
                 .allocations
                 .get(&allocation_id)
@@ -782,6 +798,106 @@ impl GuestMemory {
             apply_allocation_protections(&allocation.memory, &ranges)?;
         }
 
+        Ok(())
+    }
+
+    fn ensure_guest_page_range_unique(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), GuestMemoryError> {
+        if start >= end {
+            return Ok(());
+        }
+        let page_start = align_down_to(start, GUEST_PAGE_SIZE);
+        let page_end = align_up_to(end, GUEST_PAGE_SIZE)?;
+        self.ensure_guest_range_unique(page_start, page_end)
+    }
+
+    fn ensure_guest_range_unique(&mut self, start: u64, end: u64) -> Result<(), GuestMemoryError> {
+        if start >= end {
+            return Ok(());
+        }
+        if matches!(self.host_address_mode, HostAddressMode::FixedGuest) {
+            let allocation_ids = self
+                .vmas
+                .values()
+                .filter(|vma| vma.start < end && start < vma.end)
+                .map(|vma| vma.allocation_id)
+                .collect::<BTreeSet<_>>();
+            for allocation_id in allocation_ids {
+                self.ensure_allocation_unique(allocation_id)?;
+            }
+            return Ok(());
+        }
+
+        self.split_vma_at(start);
+        self.split_vma_at(end);
+        let keys = self
+            .vmas
+            .range(start..end)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in keys {
+            let vma = self
+                .vmas
+                .get(&key)
+                .cloned()
+                .ok_or(GuestMemoryError::NotMapped)?;
+            self.detach_shared_vma(vma)?;
+        }
+        self.drop_unreferenced_allocations();
+        Ok(())
+    }
+
+    fn detach_shared_vma(&mut self, vma: GuestVma) -> Result<(), GuestMemoryError> {
+        let Some(allocation) = self.allocations.get(&vma.allocation_id) else {
+            return Err(GuestMemoryError::NotMapped);
+        };
+        if Arc::strong_count(&allocation.memory) == 1 {
+            return Ok(());
+        }
+
+        let len = usize::try_from(vma.len()).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let offset =
+            usize::try_from(vma.allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let bytes = {
+            let ranges = self.allocation_protection_ranges(vma.allocation_id)?;
+            let mut guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
+            let bytes = allocation.memory.as_slice()[offset..offset + len].to_vec();
+            guard.restore()?;
+            bytes
+        };
+
+        let mut memory = allocate_guest_host_memory_at(
+            vma.start,
+            len,
+            MemoryProtection::ReadWrite,
+            self.host_address_mode,
+        )?;
+        memory.as_mut_slice().copy_from_slice(&bytes);
+        memory
+            .protect(vma.protection.to_host())
+            .map_err(GuestMemoryError::Host)?;
+
+        let allocation_id = self.next_allocation_id;
+        self.next_allocation_id = self
+            .next_allocation_id
+            .checked_add(1)
+            .ok_or(GuestMemoryError::OutOfMemory)?;
+        self.allocations.insert(
+            allocation_id,
+            GuestAllocation {
+                guest_start: vma.start,
+                memory: Arc::new(memory),
+            },
+        );
+        let detached = self
+            .vmas
+            .get_mut(&vma.start)
+            .ok_or(GuestMemoryError::NotMapped)?;
+        detached.allocation_id = allocation_id;
+        detached.allocation_offset = 0;
         Ok(())
     }
 
@@ -1341,8 +1457,12 @@ impl GuestMemory {
                 .cloned()
                 .ok_or(GuestMemoryError::NotMapped)?;
             AccessKind::Write.check(vma.protection)?;
+            self.ensure_guest_page_range_unique(cursor, vma.end.min(end))?;
+            let vma = self
+                .vma_containing(cursor)
+                .cloned()
+                .ok_or(GuestMemoryError::NotMapped)?;
             let chunk_len = (vma.end.min(end) - cursor) as usize;
-            self.ensure_allocation_unique(vma.allocation_id)?;
             let allocation_offset = usize::try_from(vma.allocation_offset + (cursor - vma.start))
                 .map_err(|_| GuestMemoryError::RegionTooLarge)?;
             self.allocation_memory_mut(vma.allocation_id)?
@@ -2154,14 +2274,72 @@ mod tests {
             .unwrap();
         clone.write(addr, b"child").unwrap();
 
+        let clone_allocation_id = clone.vma_containing(addr).unwrap().allocation_id;
         assert!(!std::sync::Arc::ptr_eq(
             &memory.allocations.get(&allocation_id).unwrap().memory,
-            &clone.allocations.get(&allocation_id).unwrap().memory
+            &clone.allocations.get(&clone_allocation_id).unwrap().memory
         ));
         let mut parent = [0; 5];
         let mut child = [0; 5];
         memory.read(addr, &mut parent).unwrap();
         clone.read(addr, &mut child).unwrap();
+        assert_eq!(&parent, b"ppppp");
+        assert_eq!(&child, b"child");
+    }
+
+    #[test]
+    fn try_clone_runtime_detaches_only_mutated_read_only_pages() {
+        let mut memory = memory();
+        let addr = MMAP_BASE;
+        memory
+            .insert_loaded_mapping(
+                addr,
+                GUEST_PAGE_SIZE * 3,
+                GuestMemoryProtection::new(true, false, false),
+                &vec![b'p'; (GUEST_PAGE_SIZE * 3) as usize],
+            )
+            .unwrap();
+        let parent_allocation_id = memory.vma_containing(addr).unwrap().allocation_id;
+
+        let mut clone = memory.try_clone_runtime().unwrap();
+        let middle = addr + GUEST_PAGE_SIZE;
+        clone
+            .mprotect(MprotectSyscallArgs {
+                addr: middle,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+            })
+            .unwrap();
+        clone.write(middle, b"child").unwrap();
+
+        let clone_left_id = clone.vma_containing(addr).unwrap().allocation_id;
+        let clone_middle_id = clone.vma_containing(middle).unwrap().allocation_id;
+        let clone_right_id = clone
+            .vma_containing(addr + GUEST_PAGE_SIZE * 2)
+            .unwrap()
+            .allocation_id;
+        let parent_memory = &memory
+            .allocations
+            .get(&parent_allocation_id)
+            .unwrap()
+            .memory;
+        assert!(std::sync::Arc::ptr_eq(
+            parent_memory,
+            &clone.allocations.get(&clone_left_id).unwrap().memory
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            parent_memory,
+            &clone.allocations.get(&clone_middle_id).unwrap().memory
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            parent_memory,
+            &clone.allocations.get(&clone_right_id).unwrap().memory
+        ));
+
+        let mut parent = [0; 5];
+        let mut child = [0; 5];
+        memory.read(middle, &mut parent).unwrap();
+        clone.read(middle, &mut child).unwrap();
         assert_eq!(&parent, b"ppppp");
         assert_eq!(&child, b"child");
     }
