@@ -54,6 +54,9 @@ use mcr_vfs::{
 };
 use mcr_win::SocketEvents;
 
+#[cfg(test)]
+static NATIVE_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 const LINUX_CLOCK_REALTIME: u64 = 0;
@@ -7005,7 +7008,7 @@ impl SyscallTracer for RuntimeDiagnosticsTracer {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::MutexGuard};
 
     use mcr_net::SocketState;
     use mcr_sys::{
@@ -7026,6 +7029,12 @@ mod tests {
     };
     use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
+
+    fn native_execution_test_guard() -> MutexGuard<'static, ()> {
+        crate::NATIVE_EXECUTION_TEST_LOCK
+            .lock()
+            .expect("native execution test lock should not be poisoned")
+    }
     use mcr_vfs::{
         AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
         O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PathTree, RENAME_NOREPLACE, Rootfs,
@@ -12512,6 +12521,7 @@ mod tests {
 
     #[test]
     fn native_fork_keeps_parent_and_child_memory_isolated() {
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
             0x401000,
@@ -12556,6 +12566,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_execution_uses_patchable_low_mmap_base() {
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
         runtime.enable_native_execution();
 
@@ -13171,6 +13182,7 @@ mod tests {
 
     #[test]
     fn native_patch_cache_scans_only_new_executable_ranges() {
+        let _guard = native_execution_test_guard();
         let mut runtime = Runtime::new(test_program_with_entry_code(
             "/bin/app",
             0x401000,
@@ -13246,6 +13258,7 @@ mod tests {
 
     #[test]
     fn native_patch_cache_does_not_rewrite_syscall_bytes_inside_immediate() {
+        let _guard = native_execution_test_guard();
         let code = [
             0xc7, 0x04, 0x24, 0x00, 0x0f, 0x05, 0x00, // mov dword ptr [rsp],0x50f00
             0x0f, 0x05, // syscall
@@ -13266,6 +13279,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_patch_cache_rewrites_fs_relative_tls_accesses_per_base() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13300,6 +13314,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_patch_cache_survives_memory_rematerialization() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13332,6 +13347,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn native_patch_cache_recovers_existing_fs_replacement_after_invalidation() {
+        let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0];
         let mut code = fs_load.to_vec();
         code.extend_from_slice(&[0x0f, 0x05]);
@@ -13470,6 +13486,7 @@ mod tests {
 
     #[test]
     fn stall_diagnostic_identifies_native_execution_window() {
+        let _guard = native_execution_test_guard();
         let mut runtime =
             RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
         runtime.enable_native_execution();
@@ -13482,6 +13499,7 @@ mod tests {
 
     #[test]
     fn bounded_guest_run_reports_timeout_stall_diagnostic() {
+        let _guard = native_execution_test_guard();
         let mut code = vec![0xb8];
         code.extend_from_slice(&(Syscall::Getpid.number().raw() as u32).to_le_bytes());
         code.extend_from_slice(&[0x0f, 0x05, 0xeb, 0xf7]);

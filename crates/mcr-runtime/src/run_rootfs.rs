@@ -1177,11 +1177,13 @@ mod tests {
 
     struct TestRootfs {
         path: PathBuf,
+        _native_guard: MutexGuard<'static, ()>,
         _guard: MutexGuard<'static, ()>,
     }
 
     impl TestRootfs {
         fn new(name: &str) -> Self {
+            let native_guard = crate::NATIVE_EXECUTION_TEST_LOCK.lock().unwrap();
             let guard = RUN_ROOTFS_TEST_LOCK.lock().unwrap();
             let path = std::env::temp_dir().join(format!(
                 "mcr-runtime-run-rootfs-{name}-{}-{:?}",
@@ -1192,6 +1194,7 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self {
                 path,
+                _native_guard: native_guard,
                 _guard: guard,
             }
         }
