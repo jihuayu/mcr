@@ -12,6 +12,7 @@ pub mod memory;
 pub mod native_exec;
 pub mod network;
 pub mod overlapped_io;
+pub mod pipes;
 pub mod random;
 pub mod sync;
 
@@ -40,6 +41,7 @@ pub use overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
     HostIoResult, HostIoSubmission, PendingHostIo,
 };
+pub use pipes::HostPipePair;
 pub use random::fill_random;
 pub use sync::{
     AddressWaitResult, wait_on_address_u32, wake_by_address_all_u32, wake_by_address_single_u32,

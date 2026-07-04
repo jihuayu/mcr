@@ -75,3 +75,9 @@ cargo test -p mcr-testkit perf_file_io -- --ignored --nocapture
   `wait_complete`, cancellation, or drop-drain finishes the host operation.
   Immediate completions and synchronous errors still return `Completed` or
   `Failed`, and unsupported non-offset operations still use the fallback.
+- Added the first real Windows overlapped pipe host boundary. `HostPipePair`
+  creates a byte-mode named-pipe pair with `FILE_FLAG_OVERLAPPED` on both ends,
+  exposes the ends as `HostFile`s, and reuses the existing `HostIoSubmission`
+  pending/completion/cancellation model for pipe read/write. VFS/runtime pipes
+  remain MCR-owned for now; wiring guest pipe descriptors to host-backed pipes
+  and readiness completion dispatch remains in this task.

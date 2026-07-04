@@ -121,6 +121,11 @@ impl HostFile {
         open_platform(path.as_ref(), options)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn from_windows_handle(handle: crate::windows::Handle, overlapped: bool) -> Self {
+        Self { handle, overlapped }
+    }
+
     /// Reads bytes from the host file.
     pub fn read(&self, buf: &mut [u8]) -> HostResult<usize> {
         read_platform(self, buf)
