@@ -195,6 +195,7 @@ pub struct HostWorkerPoolDiagnostics {
 
 impl HostWorkerPoolDiagnostics {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         role: HostWorkerPoolRole,
         max_workers: usize,
@@ -536,6 +537,7 @@ fn host_worker_loop(state: Arc<HostWorkerPoolExecutorState>) {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     #[test]
     fn pool_config_rejects_zero_and_unbounded_worker_limits() {
@@ -634,7 +636,7 @@ mod tests {
         completed.sort_unstable();
         assert_eq!(completed, [0, 1, 2]);
 
-        let diagnostics = executor.diagnostics();
+        let diagnostics = wait_for_completed_jobs(&executor, 3);
         assert_eq!(diagnostics.active_workers(), 0);
         assert_eq!(diagnostics.queued_jobs(), 0);
         assert_eq!(diagnostics.completed_jobs(), 3);
@@ -725,5 +727,23 @@ mod tests {
             cvar.notify_all();
         }
         executor.shutdown();
+    }
+
+    fn wait_for_completed_jobs(
+        executor: &HostWorkerPoolExecutor,
+        expected: usize,
+    ) -> HostWorkerPoolDiagnostics {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let diagnostics = executor.diagnostics();
+            if diagnostics.completed_jobs() >= expected && diagnostics.active_workers() == 0 {
+                return diagnostics;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker pool did not report {expected} completed jobs before timeout: {diagnostics:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
