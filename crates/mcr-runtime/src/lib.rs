@@ -5692,10 +5692,9 @@ fn emulate_fs_absolute_mov_load(
     instruction: &NativeFaultInstruction,
 ) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
     let bytes = instruction.bytes.as_slice();
-    if bytes.first().copied() != Some(0x64) {
+    let Some(mut index) = fs_relative_instruction_operand_start(bytes) else {
         return Ok(None);
-    }
-    let mut index = 1usize;
+    };
     let rex = if bytes
         .get(index)
         .is_some_and(|byte| (0x40..=0x4f).contains(byte))
@@ -5756,22 +5755,27 @@ fn emulate_fs_absolute_sub(
     instruction: &NativeFaultInstruction,
 ) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
     let bytes = instruction.bytes.as_slice();
-    if bytes.len() != 9
-        || bytes[0] != 0x64
-        || bytes[1] != 0x48
-        || bytes[2] != 0x2b
-        || bytes[4] != 0x25
-        || bytes[3] & 0xc7 != 0x04
+    let Some(index) = fs_relative_instruction_operand_start(bytes) else {
+        return Ok(None);
+    };
+    if bytes.len() != index + 8
+        || bytes[index] != 0x48
+        || bytes[index + 1] != 0x2b
+        || bytes[index + 3] != 0x25
+        || bytes[index + 2] & 0xc7 != 0x04
     {
         return Ok(None);
     }
-    let displacement =
-        i32::from_le_bytes(bytes[5..9].try_into().expect("displacement length checked"));
+    let displacement = i32::from_le_bytes(
+        bytes[index + 4..index + 8]
+            .try_into()
+            .expect("displacement length checked"),
+    );
     let addr = fs_base.wrapping_add(displacement as i64 as u64);
     let mut rhs_bytes = [0; 8];
     memory.read(addr, &mut rhs_bytes)?;
     let rhs = u64::from_le_bytes(rhs_bytes);
-    let reg = (bytes[3] >> 3) & 0x07;
+    let reg = (bytes[index + 2] >> 3) & 0x07;
     let lhs = host_register64(&registers, reg)?;
     let result = lhs.wrapping_sub(rhs);
     set_host_register64(&mut registers, reg, result)?;
@@ -5787,6 +5791,22 @@ fn emulate_fs_absolute_sub(
             GuestMemoryError::InvalidAddress,
         ))?;
     Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_instruction_operand_start(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, 0x26 | 0x2e | 0x36 | 0x3e | 0x66 | 0x67 | 0xf2 | 0xf3))
+    {
+        index += 1;
+    }
+    if bytes.get(index).copied() == Some(0x64) {
+        Some(index + 1)
+    } else {
+        None
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -19746,6 +19766,38 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
+    fn native_fs_fault_emulates_prefixed_absolute_mov64_load() {
+        let _guard = native_execution_test_guard();
+        let code = [
+            0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x0f, 0x05,
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0xfeed_face_cafe_beefu64.to_le_bytes())
+            .unwrap();
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("prefixed fs-relative mov fault instruction decodes");
+
+        let registers = emulate_fs_relative_native_fault(
+            runtime.memory(),
+            mcr_win::HostCpuRegisters {
+                rip: 0x401000,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            0x402000,
+            &instruction,
+        )
+        .unwrap()
+        .expect("instruction is emulated");
+
+        assert_eq!(registers.rax, 0xfeed_face_cafe_beef);
+        assert_eq!(registers.rip, 0x40100d);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
     fn native_fs_fault_emulates_absolute_sub64() {
         let _guard = native_execution_test_guard();
         let code = [0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0, 0, 0, 0x0f, 0x05];
@@ -19776,6 +19828,77 @@ mod tests {
         assert_eq!(registers.rip, 0x401009);
         assert_ne!(registers.rflags & 0x40, 0);
         assert_eq!(registers.rflags & 0x01, 0);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_fs_fault_emulates_prefixed_absolute_sub64() {
+        let _guard = native_execution_test_guard();
+        let code = [
+            0x66, 0x66, 0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0, 0, 0, 0x0f, 0x05,
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402028, &0x42u64.to_le_bytes())
+            .unwrap();
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("prefixed fs-relative sub fault instruction decodes");
+
+        let registers = emulate_fs_relative_native_fault(
+            runtime.memory(),
+            mcr_win::HostCpuRegisters {
+                rax: 0x42,
+                rflags: 0x202,
+                rip: 0x401000,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            0x402000,
+            &instruction,
+        )
+        .unwrap()
+        .expect("instruction is emulated");
+
+        assert_eq!(registers.rax, 0);
+        assert_eq!(registers.rip, 0x40100b);
+        assert_ne!(registers.rflags & 0x40, 0);
+        assert_eq!(registers.rflags & 0x01, 0);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_execution_restores_saved_zero_flag_for_following_branch() {
+        let _guard = native_execution_test_guard();
+        let code = [
+            0x75, 0x09, // jne fail
+            0xb8, 0xe7, 0, 0, 0, // mov eax,exit_group
+            0x31, 0xff, // xor edi,edi
+            0x0f, 0x05, // syscall
+            0xb8, 0xe7, 0, 0, 0, // mov eax,exit_group
+            0xbf, 99, 0, 0, 0, // mov edi,99
+            0x0f, 0x05, // syscall
+        ];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let rsp = runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .regs()
+            .rsp();
+        runtime
+            .kernel_mut()
+            .task_mut(INITIAL_GUEST_TID)
+            .unwrap()
+            .set_regs(GprState::with_full_registers(0x401000, rsp, [0; 15], 0x246));
+        runtime.enable_native_execution();
+
+        let step = runtime
+            .dispatch_guest_execution()
+            .expect("saved zero flag should suppress native jne");
+
+        assert_eq!(step.task_state(), TaskState::Exited { status: 0 });
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

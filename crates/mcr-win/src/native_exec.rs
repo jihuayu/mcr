@@ -302,17 +302,15 @@ mod windows_x86_64 {
         movdqu xmm14, xmmword ptr [r15 + 368]
         movdqu xmm15, xmmword ptr [r15 + 384]
 
+        mov rax, [r15 + 56]
+        sub rax, 16
+        mov rsp, rax
         mov rax, [r15 + 136]
         and rax, 0x0000000000000ed5
         or rax, 0x202
-        push rax
-        popfq
-
-        mov rax, [r15 + 56]
-        sub rax, 8
-        mov rsp, rax
-        mov rax, [r15 + 128]
         mov [rsp], rax
+        mov rax, [r15 + 128]
+        mov [rsp + 8], rax
 
         mov rax, [r15 + 0]
         mov rbx, [r15 + 8]
@@ -329,6 +327,7 @@ mod windows_x86_64 {
         mov r13, [r15 + 104]
         mov r14, [r15 + 112]
         mov r15, [r15 + 120]
+        popfq
         ret
 
     .Lmcr_native_trap_landing:
@@ -610,17 +609,15 @@ mod linux_x86_64 {
         movdqu xmm14, xmmword ptr [r15 + 368]
         movdqu xmm15, xmmword ptr [r15 + 384]
 
+        mov rax, [r15 + 56]
+        sub rax, 16
+        mov rsp, rax
         mov rax, [r15 + 136]
         and rax, 0x0000000000000ed5
         or rax, 0x202
-        push rax
-        popfq
-
-        mov rax, [r15 + 56]
-        sub rax, 8
-        mov rsp, rax
-        mov rax, [r15 + 128]
         mov [rsp], rax
+        mov rax, [r15 + 128]
+        mov [rsp + 8], rax
 
         mov rax, [r15 + 0]
         mov rbx, [r15 + 8]
@@ -637,6 +634,7 @@ mod linux_x86_64 {
         mov r13, [r15 + 104]
         mov r14, [r15 + 112]
         mov r15, [r15 + 120]
+        popfq
         ret
 
     .Lmcr_native_trap_landing:
