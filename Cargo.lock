@@ -204,9 +204,6 @@ dependencies = [
 [[package]]
 name = "mcr-win"
 version = "0.1.0"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "r-efi"
