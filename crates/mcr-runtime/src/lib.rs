@@ -55,13 +55,15 @@ pub use runtime::{
     GuestExecutionError, GuestExecutionStep, GuestRunError, Runtime, RuntimeError,
     RuntimeWithTracer,
 };
+#[cfg(test)]
 pub(crate) use runtime::{
     dispatch_guest_task_with_dispatcher, dispatch_native_libc_intrinsic_task,
-    guest_execution_errno, run_guest_until_exit_with_diagnostic_step_limit,
 };
+pub(crate) use runtime::{guest_execution_errno, run_guest_until_exit_with_diagnostic_step_limit};
 pub use subsystems::RuntimeSubsystems;
 pub(crate) use subsystems::{EPOLL_EVENT_SIZE, MAX_SELECT_FDS, POLLFD_SIZE, SELECT_FD_BITS};
 pub use tracing::RuntimeDiagnosticsTracer;
+#[cfg(test)]
 pub(crate) use tracing::{RUNTIME_DIAGNOSTICS_EVENT_DRAIN, RUNTIME_DIAGNOSTICS_EVENT_LIMIT};
 
 use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
