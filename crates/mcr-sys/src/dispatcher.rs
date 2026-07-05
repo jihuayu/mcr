@@ -101,6 +101,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::RtSigreturn, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Ioctl, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pread64, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Pwrite64, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Readv, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Writev, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Access, SyscallSubsystem::File),
@@ -575,7 +576,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         ],
         Syscall::Fstat => vec![decimal_field("fd", arg(0)), hex_field("statbuf", arg(1))],
         Syscall::Fsync | Syscall::Fdatasync => vec![decimal_field("fd", arg(0))],
-        Syscall::Pread64 => vec![
+        Syscall::Pread64 | Syscall::Pwrite64 => vec![
             decimal_field("fd", arg(0)),
             hex_field("buf", arg(1)),
             decimal_field("count", arg(2)),
@@ -1005,6 +1006,7 @@ mod tests {
             Syscall::Fcntl,
             Syscall::Ioctl,
             Syscall::Pread64,
+            Syscall::Pwrite64,
             Syscall::Fsync,
             Syscall::Fdatasync,
         ] {
@@ -1112,6 +1114,16 @@ mod tests {
                 &[
                     ("fd", "6"),
                     ("buf", "0x9100"),
+                    ("count", "32"),
+                    ("offset", "7"),
+                ][..],
+            ),
+            (
+                Syscall::Pwrite64,
+                [6, 0x9200, 32, 7, 0, 0],
+                &[
+                    ("fd", "6"),
+                    ("buf", "0x9200"),
                     ("count", "32"),
                     ("offset", "7"),
                 ][..],

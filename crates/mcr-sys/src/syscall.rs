@@ -55,6 +55,7 @@ pub enum Syscall {
     RtSigreturn,
     Ioctl,
     Pread64,
+    Pwrite64,
     Readv,
     Writev,
     Access,
@@ -188,6 +189,7 @@ impl Syscall {
     pub const RT_SIGRETURN: SyscallNumber = SyscallNumber::new(15);
     pub const IOCTL: SyscallNumber = SyscallNumber::new(16);
     pub const PREAD64: SyscallNumber = SyscallNumber::new(17);
+    pub const PWRITE64: SyscallNumber = SyscallNumber::new(18);
     pub const READV: SyscallNumber = SyscallNumber::new(19);
     pub const WRITEV: SyscallNumber = SyscallNumber::new(20);
     pub const ACCESS: SyscallNumber = SyscallNumber::new(21);
@@ -319,6 +321,7 @@ impl Syscall {
             15 => Self::RtSigreturn,
             16 => Self::Ioctl,
             17 => Self::Pread64,
+            18 => Self::Pwrite64,
             19 => Self::Readv,
             20 => Self::Writev,
             21 => Self::Access,
@@ -457,6 +460,7 @@ impl Syscall {
             Self::RtSigreturn => Self::RT_SIGRETURN,
             Self::Ioctl => Self::IOCTL,
             Self::Pread64 => Self::PREAD64,
+            Self::Pwrite64 => Self::PWRITE64,
             Self::Readv => Self::READV,
             Self::Writev => Self::WRITEV,
             Self::Access => Self::ACCESS,
@@ -593,6 +597,7 @@ impl Syscall {
             Self::RtSigreturn => "rt_sigreturn",
             Self::Ioctl => "ioctl",
             Self::Pread64 => "pread64",
+            Self::Pwrite64 => "pwrite64",
             Self::Readv => "readv",
             Self::Writev => "writev",
             Self::Access => "access",
@@ -739,6 +744,7 @@ mod tests {
 
         for (number, syscall, name) in [
             (Syscall::PREAD64, Syscall::Pread64, "pread64"),
+            (Syscall::PWRITE64, Syscall::Pwrite64, "pwrite64"),
             (Syscall::FSYNC, Syscall::Fsync, "fsync"),
             (Syscall::FDATASYNC, Syscall::Fdatasync, "fdatasync"),
             (Syscall::SELECT, Syscall::Select, "select"),

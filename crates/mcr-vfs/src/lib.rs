@@ -2732,6 +2732,49 @@ impl FdTable {
         }
     }
 
+    pub fn pwrite(
+        &mut self,
+        tree: &mut PathTree,
+        fd: Fd,
+        offset: u64,
+        buffer: &[u8],
+    ) -> VfsResult<usize> {
+        let entry = self.get_mut(fd)?;
+        if !entry.flags().can_write() {
+            return Err(VfsError::BadFd);
+        }
+
+        match entry.file.kind {
+            FileKind::Regular => {
+                let inode_id = entry.inode_id();
+                let node = tree.lookup_inode_mut(inode_id).ok_or(VfsError::NoEntry)?;
+                let description = entry.description();
+                let offset = if description.flags.append() {
+                    node.attr().size
+                } else {
+                    offset
+                };
+                node.write_at(offset, buffer)
+            }
+            FileKind::Dev(
+                DevNodeKind::Null
+                | DevNodeKind::Zero
+                | DevNodeKind::Urandom
+                | DevNodeKind::Stdout
+                | DevNodeKind::Stderr,
+            ) => Ok(buffer.len()),
+            FileKind::Dev(DevNodeKind::Stdin) => Err(VfsError::BadFd),
+            FileKind::Directory => Err(VfsError::IsDirectory),
+            FileKind::Symlink => Err(VfsError::InvalidPath),
+            FileKind::PipeRead => Err(VfsError::BadFd),
+            FileKind::PipeWrite => Err(VfsError::BadFd),
+            FileKind::Socket => Err(VfsError::BadFd),
+            FileKind::Epoll => Err(VfsError::BadFd),
+            FileKind::Eventfd => Err(VfsError::BadFd),
+            FileKind::Stdio(_) => Err(VfsError::BadFd),
+        }
+    }
+
     pub fn seek(
         &mut self,
         tree: &PathTree,
@@ -3488,6 +3531,18 @@ impl VirtualFileSystem {
             .get(fd)
             .is_ok_and(|entry| matches!(entry.file().kind(), FileKind::Regular));
         let count = self.fds.write(&mut self.tree, fd, buffer)?;
+        if regular_write && count > 0 {
+            self.invalidate_vfs_caches();
+        }
+        Ok(count)
+    }
+
+    pub fn pwrite(&mut self, fd: Fd, offset: u64, buffer: &[u8]) -> VfsResult<usize> {
+        let regular_write = self
+            .fds
+            .get(fd)
+            .is_ok_and(|entry| matches!(entry.file().kind(), FileKind::Regular));
+        let count = self.fds.pwrite(&mut self.tree, fd, offset, buffer)?;
         if regular_write && count > 0 {
             self.invalidate_vfs_caches();
         }
@@ -4899,6 +4954,23 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(&buffer, b"ell");
         assert_eq!(vfs.fds().get(fd).unwrap().offset(), 2);
+    }
+
+    #[test]
+    fn pwrite_writes_regular_file_without_changing_fd_offset() {
+        let mut vfs = sample_vfs();
+        let fd = vfs
+            .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDWR), 0)
+            .unwrap();
+        assert_eq!(vfs.lseek(fd, 4, SeekWhence::Set).unwrap(), 4);
+
+        let count = vfs.pwrite(fd, 1, b"aa").unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(vfs.fds().get(fd).unwrap().offset(), 4);
+        let mut buffer = [0; 5];
+        assert_eq!(vfs.pread(fd, 0, &mut buffer).unwrap(), 5);
+        assert_eq!(&buffer, b"haalo");
     }
 
     #[test]

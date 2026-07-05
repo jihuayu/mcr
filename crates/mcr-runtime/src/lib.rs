@@ -1164,6 +1164,7 @@ where
             mcr_sys::Syscall::Read => self.sys_read(request),
             mcr_sys::Syscall::Write => self.sys_write(request),
             mcr_sys::Syscall::Pread64 => self.sys_pread64(request),
+            mcr_sys::Syscall::Pwrite64 => self.sys_pwrite64(request),
             mcr_sys::Syscall::Readv => self.sys_readv(request),
             mcr_sys::Syscall::Writev => self.sys_writev(request),
             mcr_sys::Syscall::Close => self.sys_close(request),
@@ -1724,6 +1725,23 @@ where
         self.memory
             .write_bytes(addr, &buffer[..count])
             .map_err(memory_errno)?;
+        Ok(count as u64)
+    }
+
+    fn sys_pwrite64(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let fd = arg_i32(request, 0);
+        let addr = arg(request, 1);
+        let len = usize_arg(request, 2)?;
+        let offset = arg(request, 3);
+        if offset > i64::MAX as u64 {
+            return Err(LinuxErrno::EINVAL);
+        }
+
+        let mut buffer = vec![0; len];
+        self.memory
+            .read_bytes(addr, &mut buffer)
+            .map_err(memory_errno)?;
+        let count = self.vfs.pwrite(fd, offset, &buffer).map_err(vfs_errno)?;
         Ok(count as u64)
     }
 
@@ -13098,6 +13116,43 @@ mod tests {
                 &mut runtime,
                 Syscall::Pread64,
                 [3, 0x2200, 1, u64::MAX, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn pwrite64_writes_without_changing_guest_fd_offset() {
+        let mut runtime = runtime_with_sample_vfs();
+        runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+        runtime.memory_mut().write(0x2000, b"aa");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+            ),
+            SyscallReturn::Success(3)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Lseek, [3, 4, 0, 0, 0, 0]),
+            SyscallReturn::Success(4)
+        );
+
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Pwrite64, [3, 0x2000, 2, 1, 0, 0]),
+            SyscallReturn::Success(2)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Read, [3, 0x2100, 1, 0, 0, 0]),
+            SyscallReturn::Success(1)
+        );
+        assert_eq!(runtime.memory().read(0x2100, 1), b"o");
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Pwrite64,
+                [3, 0x2000, 1, u64::MAX, 0, 0],
             ),
             SyscallReturn::Errno(LinuxErrno::EINVAL)
         );
