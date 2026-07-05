@@ -80,6 +80,29 @@ context clones or remaps guest memory on every cross-process switch, and
 `arch-003` replaces it with per-process state ownership so scheduling switches
 references instead of memory contents.
 
+## Hot-Path Constant-Cost Debt
+
+A 2026-07-05 hot-path review measured where the runtime pays fixed costs on
+every syscall, every scheduler iteration, or every VFS operation regardless of
+workload size. These are recorded as performance debt with owning tasks; fixes
+must keep guest-visible syscall, fd, task, VFS, and socket contracts stable.
+
+| Fixed cost | Where | Task |
+|---|---|---|
+| Guest I/O syscalls allocate a temporary `Vec` per call and copy guest -> buffer -> backend -> buffer -> guest, even though guest memory is same-process host memory. | `mcr-runtime` filesystem syscall bodies | `perf-026` |
+| Guest C-string reads do one full VMA lookup per byte for every path-taking syscall. | `mcr-memory` access trait | `perf-026` |
+| Every scheduler iteration clones the selected process `FdTable` plus the whole per-process fd-table map to poll fd waiters, and rescans all tasks into fresh `Vec`s. | `mcr-runtime` scheduler loop, `mcr-task` wait kernel | `perf-027` |
+| Fd-blocked tasks are re-polled each iteration instead of being woken by pipe/socket mutation events that the VFS already signals internally. | `mcr-runtime`, `mcr-vfs` | `perf-027` |
+| Any regular-file write invalidates the entire VFS metadata/directory/small-read cache through one global generation. | `mcr-vfs` cache | `perf-028` |
+| Listing one directory scans every path in the filesystem; host-backed reads reopen the host file per call; deferred rootfs files fully materialize into resident memory on first read. | `mcr-vfs` path tree and I/O helpers | `perf-028` |
+| Native execution installs and removes the vectored exception handler on every execution slice, and syscall descriptor lookup linearly scans the dispatch table per syscall. | `mcr-win` native execution, `mcr-sys` dispatcher | `perf-029` |
+| `epoll_wait` clones the watch list per call, and poll/select can issue one host poll per socket fd instead of one batched `WSAPoll`. | `mcr-runtime` event subsystem | `perf-029` |
+
+The zero-copy borrow boundary in `perf-026` is the widest lever: it converts
+the dominant read/write shape from one allocation plus two copies into direct
+slice access for contiguous VMA ranges, with the existing copy path kept as
+the cross-VMA and permission-fault fallback.
+
 ## File And I/O Optimization
 
 ### Async Host I/O
