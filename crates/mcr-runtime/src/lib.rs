@@ -4447,7 +4447,7 @@ const NATIVE_PATCH_CACHE_VERSION: u32 = 9;
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-const MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES: u64 = 64 * 1024;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -6459,11 +6459,11 @@ impl RuntimeSubsystems {
         let patch_start = Instant::now();
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
         let mut store_image_metadata = None;
+        let image_patch_ranges = self.native_image_patch_ranges.get(&pid).cloned();
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
             cache.image_metadata_checked = true;
             if let Some(key) = self.native_image_patch_keys.get(&pid).cloned() {
-                let image_ranges = self.native_image_patch_ranges.get(&pid).cloned();
-                let metadata = image_ranges
+                let metadata = image_patch_ranges
                     .as_ref()
                     .and_then(|ranges| self.cached_native_patch_metadata(&key, ranges.base));
                 if let Some(metadata) = metadata {
@@ -6474,7 +6474,7 @@ impl RuntimeSubsystems {
                         apply_native_patch_metadata(memory, fs_base, &metadata)?;
                     }
                     cache.merge_metadata(&metadata);
-                } else if let Some(ranges) = image_ranges {
+                } else if let Some(ranges) = image_patch_ranges.clone() {
                     store_image_metadata = Some((key, ranges.base, ranges.ranges));
                 }
             }
@@ -6491,7 +6491,12 @@ impl RuntimeSubsystems {
                 .filter(|vma| vma.protection().execute)
                 .filter(|vma| !range_is_covered(vma.start(), vma.end(), &cache.scanned_ranges))
             {
-                if should_defer_native_patch_scan(vma) {
+                let image_range = image_patch_ranges.as_ref().is_some_and(|ranges| {
+                    ranges.ranges.iter().any(|(range_start, range_end)| {
+                        ranges_overlap(vma.start(), vma.end(), *range_start, *range_end)
+                    })
+                });
+                if !image_range && should_defer_native_patch_scan(vma) {
                     let start = vma.start();
                     let end = vma.end();
                     let len = vma.len();
@@ -17714,6 +17719,50 @@ mod tests {
                 .any(|(range_start, range_end)| *range_start == tail_start
                     && *range_end == start + length)
         );
+    }
+
+    #[test]
+    fn native_patch_cache_scans_large_image_ranges() {
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &[0xc3])).unwrap();
+        let pid = INITIAL_GUEST_PID;
+        let length = MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES + GUEST_PAGE_SIZE;
+        let start = runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0,
+                length,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime.memory_mut().write(start, &[0x0f, 0x05]).unwrap();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .native_image_patch_keys
+            .clear();
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .native_image_patch_ranges
+            .insert(
+                pid,
+                NativeImagePatchRanges {
+                    base: start,
+                    ranges: vec![(start, start + length)],
+                },
+            );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), start, 2), [0xcc, 0x90]);
     }
 
     #[test]
