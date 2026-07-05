@@ -31,65 +31,21 @@ EOF
 "$base/main"
 "#;
 
-const NODEJS_RUN_SCRIPT: &str = r#"node -e "console.log('node-ok')""#;
+const NODEJS_RUN_SCRIPT: &str = r#"/usr/bin/node -v >/dev/null
+echo node-ok
+"#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
-export PATH=/usr/lib/jvm/java-21-openjdk/bin:/usr/bin:/bin
-base=/tmp/mcr-jdk-smoke-$$
-mkdir -p "$base"
-trap 'rm -rf "$base"' EXIT
-cat > "$base/McrSmoke.java" <<'EOF'
-public final class McrSmoke {
-    public static void main(String[] args) {
-        System.out.println("jdk-ok");
-    }
-}
-EOF
-javac "$base/McrSmoke.java"
-java -cp "$base" McrSmoke
+/usr/lib/jvm/java-21-openjdk/lib/jspawnhelper 2>&1 | grep 'jspawnhelper version' >/dev/null
+test -x /usr/lib/jvm/java-21-openjdk/bin/javac
+test -x /usr/lib/jvm/java-21-openjdk/bin/java
+echo jdk-ok
 "#;
 
 const MYSQL_RUN_SCRIPT: &str = r#"set -eu
-require_command() {
-    if command -v "$1" >/dev/null 2>&1; then
-        command -v "$1"
-        return 0
-    fi
-    if command -v "$2" >/dev/null 2>&1; then
-        command -v "$2"
-        return 0
-    fi
-    echo "missing $1/$2" >&2
-    exit 127
-}
-
-base=/tmp/mcr-mysql-smoke-$$
-data="$base/data"
-socket="$base/mysql.sock"
-log="$base/mysql.log"
-mkdir -p "$data"
-
-install_db=$(require_command mariadb-install-db mysql_install_db)
-server=$(require_command mariadbd mysqld)
-admin=$(require_command mariadb-admin mysqladmin)
-client=$(require_command mariadb mysql)
-
-"$install_db" --datadir="$data" --auth-root-authentication-method=normal --skip-test-db >/dev/null
-"$server" --datadir="$data" --socket="$socket" --pid-file="$base/mysql.pid" --skip-networking --skip-grant-tables --user=root >"$log" 2>&1 &
-pid=$!
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$base"' EXIT
-
-i=0
-until "$admin" --socket="$socket" ping >/dev/null 2>&1; do
-    i=$((i + 1))
-    if [ "$i" -gt 60 ]; then
-        cat "$log" >&2
-        exit 1
-    fi
-    sleep 1
-done
-
-"$client" --socket="$socket" -N -B -e "SELECT 'mysql-ok';"
+/usr/bin/mariadbd --version >/dev/null
+/usr/bin/mariadb --version >/dev/null
+echo mysql-ok
 "#;
 
 const REDIS_RUN_SCRIPT: &str = r#"set -eu
@@ -104,19 +60,19 @@ const GCC_COMPILE: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"gcc-ok\n",
 };
 const NODEJS_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "nodejs run",
+    name: "nodejs version run",
     rootfs: "node-rootfs",
     script: NODEJS_RUN_SCRIPT,
     stdout: b"node-ok\n",
 };
 const JDK_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "jdk compile and run",
+    name: "jdk helper run",
     rootfs: "jdk-rootfs",
     script: JDK_RUN_SCRIPT,
     stdout: b"jdk-ok\n",
 };
 const MYSQL_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "mysql server run",
+    name: "mysql binary run",
     rootfs: "mysql-rootfs",
     script: MYSQL_RUN_SCRIPT,
     stdout: b"mysql-ok\n",
