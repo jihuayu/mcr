@@ -57,6 +57,61 @@ fn poll_reports_socket_transport_readiness() {
 }
 
 #[test]
+fn poll_coalesces_multiple_socket_timeout_checks() {
+    let transport = runtime_socket_transport();
+    let mut runtime = Runtime::with_vfs_and_socket_transport(
+        test_program("/bin/app", 0x401000),
+        sample_vfs(),
+        transport.handle(),
+    )
+    .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &ipv4_sockaddr(8080))
+        .unwrap();
+
+    for fd in [3, 4] {
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Socket,
+                    [
+                        u64::from(LINUX_AF_INET),
+                        u64::from(LINUX_SOCK_STREAM),
+                        u64::from(LINUX_IPPROTO_TCP),
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(fd)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Connect,
+                    [fd, 0x402000, SOCKADDR_IN_LEN as u64, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+    }
+    write_pollfd(runtime.memory_mut(), 0x402100, 3, LINUX_POLLIN);
+    write_pollfd(runtime.memory_mut(), 0x402108, 4, LINUX_POLLIN);
+
+    let result = runtime.dispatch_syscall(context(Syscall::Poll, [0x402100, 2, 25, 0, 0, 0]));
+
+    assert_eq!(result.result, SyscallReturn::Success(0));
+    assert_eq!(pollfd_revents(runtime.memory(), 0x402100), 0);
+    assert_eq!(pollfd_revents(runtime.memory(), 0x402108), 0);
+    assert_eq!(
+        transport.poll_timeouts(),
+        vec![Some(Duration::from_millis(25)), Some(Duration::ZERO)]
+    );
+}
+
+#[test]
 fn poll_reports_socket_normal_band_aliases() {
     let transport = runtime_socket_transport();
     transport.push_incoming(b"pong");

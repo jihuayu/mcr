@@ -24,6 +24,19 @@ impl EventSyscalls for RuntimeSubsystems {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SocketPollSlot {
+    index: usize,
+    socket_id: SocketId,
+    socket_events: SocketEvents,
+    poll_events: i16,
+}
+
+struct PollFdSlot {
+    addr: u64,
+    revents: i16,
+}
+
 impl RuntimeSubsystems {
     pub(crate) fn dispatch_futex(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
@@ -192,15 +205,42 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
 
-        let mut ready = 0u64;
+        let mut fds = Vec::with_capacity(nfds);
+        let mut sockets = Vec::new();
+        let mut has_ready = false;
         for index in 0..nfds {
             let pollfd_addr = fds_addr
                 .checked_add((index * POLLFD_SIZE) as u64)
                 .ok_or(LinuxErrno::EFAULT)?;
-            let mut pollfd = read_pollfd(self.files.memory(), pollfd_addr)?;
-            pollfd.revents = self.poll_fd_revents(pollfd.fd, pollfd.events, timeout)?;
-            write_pollfd_revents(self.files.memory_mut(), pollfd_addr, pollfd.revents)?;
-            if pollfd.revents != 0 {
+            let pollfd = read_pollfd(self.files.memory(), pollfd_addr)?;
+            let (revents, socket) =
+                self.poll_fd_base_revents_and_socket(pollfd.fd, pollfd.events)?;
+            if revents != 0 {
+                has_ready = true;
+            }
+            let slot_index = fds.len();
+            if let Some((socket_id, socket_events)) = socket {
+                sockets.push(SocketPollSlot {
+                    index: slot_index,
+                    socket_id,
+                    socket_events,
+                    poll_events: pollfd.events,
+                });
+            }
+            fds.push(PollFdSlot {
+                addr: pollfd_addr,
+                revents,
+            });
+        }
+
+        self.poll_socket_slots(&sockets, timeout, has_ready, |index, revents| {
+            fds[index].revents |= revents;
+        })?;
+
+        let mut ready = 0u64;
+        for slot in fds {
+            write_pollfd_revents(self.files.memory_mut(), slot.addr, slot.revents)?;
+            if slot.revents != 0 {
                 ready = ready.checked_add(1).ok_or(LinuxErrno::EINVAL)?;
             }
         }
@@ -243,15 +283,35 @@ impl RuntimeSubsystems {
         interests: &[SelectInterest],
         timeout: Option<Duration>,
     ) -> Result<SelectReadyFds, LinuxErrno> {
-        let mut ready = SelectReadyFds::default();
-        let wait_index = self.select_wait_interest_index(interests, timeout);
+        let mut revents = Vec::with_capacity(interests.len());
+        let mut sockets = Vec::new();
+        let mut has_ready = false;
         for (index, interest) in interests.iter().enumerate() {
-            let wait_timeout = if wait_index == Some(index) {
-                timeout
-            } else {
-                Some(Duration::ZERO)
-            };
-            let revents = self.poll_fd_revents(interest.fd, interest.events, wait_timeout)?;
+            let (fd_revents, socket) =
+                self.poll_fd_base_revents_and_socket(interest.fd, interest.events)?;
+            if fd_revents & LINUX_POLLNVAL != 0 {
+                return Err(LinuxErrno::EBADF);
+            }
+            if fd_revents != 0 {
+                has_ready = true;
+            }
+            if let Some((socket_id, socket_events)) = socket {
+                sockets.push(SocketPollSlot {
+                    index,
+                    socket_id,
+                    socket_events,
+                    poll_events: interest.events,
+                });
+            }
+            revents.push(fd_revents);
+        }
+
+        self.poll_socket_slots(&sockets, timeout, has_ready, |index, socket_revents| {
+            revents[index] |= socket_revents;
+        })?;
+
+        let mut ready = SelectReadyFds::default();
+        for (interest, revents) in interests.iter().zip(revents.into_iter()) {
             if revents & LINUX_POLLNVAL != 0 {
                 return Err(LinuxErrno::EBADF);
             }
@@ -268,33 +328,36 @@ impl RuntimeSubsystems {
         Ok(ready)
     }
 
-    pub(crate) fn select_wait_interest_index(
-        &self,
-        interests: &[SelectInterest],
-        timeout: Option<Duration>,
-    ) -> Option<usize> {
-        if matches!(timeout, Some(duration) if duration.is_zero()) {
-            return None;
-        }
-        interests
-            .iter()
-            .position(|interest| self.files.vfs().socket_id_for_fd(interest.fd).is_ok())
-            .or_else(|| (!interests.is_empty()).then_some(0))
-    }
-
     pub(crate) fn poll_fd_revents(
         &mut self,
         fd: Fd,
         events: i16,
         timeout: Option<Duration>,
     ) -> Result<i16, LinuxErrno> {
+        let (mut revents, socket) = self.poll_fd_base_revents_and_socket(fd, events)?;
+        if let Some((socket_id, socket_events)) = socket {
+            let readiness = self
+                .files
+                .sockets_mut()
+                .poll(socket_id, socket_events, timeout)
+                .map_err(net_errno)?;
+            revents |= poll_revents_from_socket_events(readiness, events);
+        }
+        Ok(revents)
+    }
+
+    fn poll_fd_base_revents_and_socket(
+        &self,
+        fd: Fd,
+        events: i16,
+    ) -> Result<(i16, Option<(SocketId, SocketEvents)>), LinuxErrno> {
         if fd < 0 {
-            return Ok(0);
+            return Ok((0, None));
         }
 
-        let mut revents = match self.files.vfs().poll_readiness(fd) {
+        let revents = match self.files.vfs().poll_readiness(fd) {
             Ok(readiness) => poll_revents_from_vfs(readiness, events),
-            Err(VfsError::BadFd) => return Ok(LINUX_POLLNVAL),
+            Err(VfsError::BadFd) => return Ok((LINUX_POLLNVAL, None)),
             Err(error) => return Err(vfs_errno(error)),
         };
 
@@ -302,15 +365,46 @@ impl RuntimeSubsystems {
             let socket_id = self.files.socket_id_for_fd(fd)?;
             let socket_events = poll_interest_to_socket_events(events);
             if !socket_events.is_empty() {
-                let readiness = self
-                    .files
-                    .sockets_mut()
-                    .poll(socket_id, socket_events, timeout)
-                    .map_err(net_errno)?;
-                revents |= poll_revents_from_socket_events(readiness, events);
+                return Ok((revents, Some((socket_id, socket_events))));
             }
         }
-        Ok(revents)
+
+        Ok((revents, None))
+    }
+
+    fn poll_socket_slots(
+        &mut self,
+        sockets: &[SocketPollSlot],
+        timeout: Option<Duration>,
+        has_ready: bool,
+        mut apply: impl FnMut(usize, i16),
+    ) -> Result<(), LinuxErrno> {
+        if sockets.is_empty() {
+            return Ok(());
+        }
+
+        let requests = sockets
+            .iter()
+            .map(|socket| (socket.socket_id, socket.socket_events))
+            .collect::<Vec<_>>();
+        let socket_timeout = if has_ready {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
+        let readiness = self
+            .files
+            .sockets_mut()
+            .poll_many(&requests, socket_timeout)
+            .map_err(net_errno)?;
+
+        for (socket, readiness) in sockets.iter().zip(readiness.into_iter()) {
+            apply(
+                socket.index,
+                poll_revents_from_socket_events(readiness, socket.poll_events),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn dispatch_epoll_create1(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -519,10 +613,51 @@ impl RuntimeSubsystems {
         maxevents: usize,
         timeout: Option<Duration>,
     ) -> Result<Vec<LinuxEpollEvent>, LinuxErrno> {
-        let mut ready = Vec::new();
-        for watch in watches {
+        if watches.len() == 1 {
+            let watch = &watches[0];
             let poll_events = epoll_events_to_poll_events(watch.events);
             let revents = self.epoll_watch_revents(watch.fd, poll_events, timeout)?;
+            let epoll_events = poll_revents_to_epoll_events(revents, watch.events);
+            if epoll_events == 0 {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![LinuxEpollEvent {
+                events: epoll_events,
+                data: watch.data,
+            }]);
+        }
+
+        let mut revents = Vec::with_capacity(watches.len());
+        let mut sockets = Vec::new();
+        let mut has_ready = false;
+        for (index, watch) in watches.iter().enumerate() {
+            let poll_events = epoll_events_to_poll_events(watch.events);
+            let (mut watch_revents, socket) =
+                self.poll_fd_base_revents_and_socket(watch.fd, poll_events)?;
+            if watch_revents & LINUX_POLLNVAL != 0 {
+                watch_revents = LINUX_POLLERR | LINUX_POLLHUP;
+            }
+            let epoll_events = poll_revents_to_epoll_events(watch_revents, watch.events);
+            if epoll_events != 0 {
+                has_ready = true;
+            }
+            if let Some((socket_id, socket_events)) = socket {
+                sockets.push(SocketPollSlot {
+                    index,
+                    socket_id,
+                    socket_events,
+                    poll_events,
+                });
+            }
+            revents.push(watch_revents);
+        }
+
+        self.poll_socket_slots(&sockets, timeout, has_ready, |index, socket_revents| {
+            revents[index] |= socket_revents;
+        })?;
+
+        let mut ready = Vec::new();
+        for (watch, revents) in watches.iter().zip(revents.into_iter()) {
             let epoll_events = poll_revents_to_epoll_events(revents, watch.events);
             if epoll_events != 0 {
                 ready.push(LinuxEpollEvent {
