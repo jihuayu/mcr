@@ -83,7 +83,7 @@ pub const X_OK: u32 = 1;
 const DEV_NULL_INODE_ID: InodeId = 1 << 61;
 const DEV_ZERO_INODE_ID: InodeId = DEV_NULL_INODE_ID + 1;
 const DEV_URANDOM_INODE_ID: InodeId = DEV_NULL_INODE_ID + 2;
-const FIRST_USER_FD: Fd = 3;
+const FIRST_ALLOCATABLE_FD: Fd = 0;
 const FIRST_PIPE_INODE_ID: InodeId = 1 << 62;
 const PROC_INODE_ID: InodeId = 1 << 60;
 const PROC_SELF_INODE_ID: InodeId = PROC_INODE_ID + 1;
@@ -2174,7 +2174,7 @@ impl FdTable {
     }
 
     pub fn insert(&mut self, file: FileRef, cloexec: bool) -> VfsResult<Fd> {
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         self.insert_exact(fd, file, cloexec)?;
         Ok(fd)
     }
@@ -2185,7 +2185,7 @@ impl FdTable {
         flags: OpenFlags,
         path: Option<GuestPath>,
     ) -> VfsResult<Fd> {
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         self.insert_entry(fd, file, flags.cloexec(), flags, path)
     }
 
@@ -2194,7 +2194,7 @@ impl FdTable {
             return Err(VfsError::InvalidPath);
         }
 
-        let read_fd = self.next_fd_from(FIRST_USER_FD)?;
+        let read_fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         let write_fd = self.next_fd_from(read_fd.checked_add(1).ok_or(VfsError::BadFd)?)?;
         let pipe_id = self.allocate_pipe_id()?;
         let pipe_inode = Arc::new(Inode::new(
@@ -2238,7 +2238,7 @@ impl FdTable {
             socket_inode_id(socket_id)?,
             InodeBackend::Socket(SocketNode::new(socket_id)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Socket),
@@ -2258,7 +2258,7 @@ impl FdTable {
             epoll_inode_id(epoll_id)?,
             InodeBackend::Epoll(EpollNode::new(epoll_id)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Epoll),
@@ -2281,7 +2281,7 @@ impl FdTable {
             eventfd_inode_id(eventfd_id)?,
             InodeBackend::Eventfd(EventfdNode::new(eventfd_id, initial)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOCATABLE_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Eventfd),
@@ -3671,7 +3671,7 @@ impl VirtualFileSystem {
     }
 
     pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {
-        self.fds.dup(oldfd, FIRST_USER_FD, false)
+        self.fds.dup(oldfd, FIRST_ALLOCATABLE_FD, false)
     }
 
     pub fn dup2(&mut self, oldfd: Fd, newfd: Fd) -> VfsResult<Fd> {
@@ -4931,6 +4931,16 @@ mod tests {
         assert_eq!(first, 3);
         assert_eq!(second, 4);
         assert_eq!(reused, first);
+    }
+
+    #[test]
+    fn fd_allocation_reuses_closed_stdio_descriptor() {
+        let mut table = FdTable::with_stdio();
+        table.close(0).unwrap();
+
+        let reopened = table.insert(regular_file(10), false).unwrap();
+
+        assert_eq!(reopened, 0);
     }
 
     #[test]
