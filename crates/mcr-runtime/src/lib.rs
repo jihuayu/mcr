@@ -3368,6 +3368,7 @@ where
                 .subsystems_mut()
                 .resume_waiting_tasks()
                 .map_err(|errno| GuestRunError::WaitResume { errno })?;
+            dispatcher.subsystems_mut().resume_futex_timeouts();
             dispatcher.subsystems_mut().resume_fd_waiters();
             let mut runnable_tids = if sticky_scheduler {
                 last_dispatched_tid
@@ -4080,6 +4081,14 @@ where
             next_rip: registers.rip + 2,
         };
         let syscall_registers = registers.syscall_registers();
+        let unmapself_exit = if syscall_registers.syscall() == mcr_sys::Syscall::Munmap {
+            dispatcher
+                .subsystems()
+                .memory_for_process(pid)
+                .and_then(|memory| native_unmapself_exit_syscall(memory, site.next_rip))
+        } else {
+            None
+        };
         dispatcher
             .subsystems_mut()
             .perf_record_syscall(syscall_registers.syscall());
@@ -4132,6 +4141,36 @@ where
                 before_rip,
                 task.regs().rip(),
                 dispatch_result.encoded_rax,
+                task.state(),
+            ));
+        }
+        if let Some((exit_rip, exit_status)) = unmapself_exit {
+            let exit_registers = mcr_sys::SyscallRegisters {
+                rax: mcr_sys::Syscall::Exit.number().raw(),
+                rdi: exit_status,
+                rip: exit_rip,
+                ..mcr_sys::SyscallRegisters::default()
+            };
+            dispatcher
+                .subsystems_mut()
+                .perf_record_syscall(mcr_sys::Syscall::Exit);
+            let exit_result = dispatcher.dispatch(GuestContext::new(pid, tid, exit_registers));
+            let mut trap_registers = registers;
+            trap_registers.rip = exit_rip;
+            let trap_regs = gpr_from_registers(trap_registers);
+            let task = dispatcher
+                .subsystems_mut()
+                .tasks
+                .task_mut(tid)
+                .ok_or(GuestExecutionError::MissingTask(tid))?;
+            if task.regs() == gpr {
+                task.set_regs(trap_regs);
+            }
+            return Ok(GuestExecutionStep::new(
+                tid,
+                before_rip,
+                task.regs().rip(),
+                exit_result.encoded_rax,
                 task.state(),
             ));
         }
@@ -5603,6 +5642,35 @@ fn read_guest_block(
     Ok(bytes)
 }
 
+fn native_unmapself_exit_syscall(memory: &GuestMemory, rip: u64) -> Option<(u64, u64)> {
+    let bytes = read_guest_block(memory, rip, 16).ok()?;
+    if bytes.len() >= 10
+        && bytes[0..8] == [0x48, 0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00]
+        && native_syscall_or_patch_bytes(&bytes[8..10])
+    {
+        return Some((rip + 8, 0));
+    }
+    if bytes.len() >= 9
+        && bytes[0..7] == [0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00]
+        && native_syscall_or_patch_bytes(&bytes[7..9])
+    {
+        return Some((rip + 7, 0));
+    }
+    if bytes.len() >= 12
+        && bytes[0] == 0xbf
+        && bytes[5..10] == [0xb8, 0x3c, 0x00, 0x00, 0x00]
+        && native_syscall_or_patch_bytes(&bytes[10..12])
+    {
+        let status = u32::from_le_bytes(bytes[1..5].try_into().ok()?) as u64;
+        return Some((rip + 10, status));
+    }
+    None
+}
+
+fn native_syscall_or_patch_bytes(bytes: &[u8]) -> bool {
+    matches!(bytes, [0x0f, 0x05] | [0xcc, 0x90])
+}
+
 fn registers_from_gpr(value: GprState) -> GuestRegisters {
     GuestRegisters {
         rax: value.rax(),
@@ -6400,6 +6468,7 @@ pub struct RuntimeSubsystems {
     process_fds: BTreeMap<mcr_sys::GuestPid, FdTable>,
     selected_fds_pid: mcr_sys::GuestPid,
     futexes: FutexRegistry,
+    futex_timeouts: BTreeMap<mcr_sys::GuestTid, Instant>,
     epolls: EpollRegistry,
     native_execution: bool,
     native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
@@ -6475,6 +6544,7 @@ impl RuntimeSubsystems {
             process_fds: BTreeMap::new(),
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
+            futex_timeouts: BTreeMap::new(),
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
@@ -6517,6 +6587,7 @@ impl RuntimeSubsystems {
             process_fds: BTreeMap::new(),
             selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
             futexes: FutexRegistry::default(),
+            futex_timeouts: BTreeMap::new(),
             epolls: EpollRegistry::default(),
             native_execution: false,
             native_fp: BTreeMap::new(),
@@ -8585,12 +8656,17 @@ impl RuntimeSubsystems {
                 write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
                 self.store_selected_process_memory(pid)?;
                 self.futexes.wake(clear_child_tid, u32::MAX);
-                self.tasks
-                    .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
-                self.tasks
-                    .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, false), u32::MAX);
+                self.wake_guest_futex_waiters(
+                    FutexWaitKey::new(pid, clear_child_tid, true),
+                    u32::MAX,
+                );
+                self.wake_guest_futex_waiters(
+                    FutexWaitKey::new(pid, clear_child_tid, false),
+                    u32::MAX,
+                );
             }
         }
+        self.futex_timeouts.remove(&tid);
 
         let process_exited = matches!(
             self.tasks.process(pid).map(GuestProcess::exit_state),
@@ -8652,10 +8728,8 @@ impl RuntimeSubsystems {
         let owner_died = (value & !LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED;
         write_guest_u32(self.files.memory_mut(), futex_addr, owner_died)?;
         self.store_selected_process_memory(pid)?;
-        self.tasks
-            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, true), 1);
-        self.tasks
-            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, false), 1);
+        self.wake_guest_futex_waiters(FutexWaitKey::new(pid, futex_addr, true), 1);
+        self.wake_guest_futex_waiters(FutexWaitKey::new(pid, futex_addr, false), 1);
         Ok(())
     }
 
@@ -8667,6 +8741,30 @@ impl RuntimeSubsystems {
             self.drop_process_resources(wait.waited().pid())?;
         }
         Ok(completed)
+    }
+
+    fn resume_futex_timeouts(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .futex_timeouts
+            .iter()
+            .filter_map(|(tid, deadline)| (*deadline <= now).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in expired {
+            self.futex_timeouts.remove(&tid);
+            let _ = self.tasks.resume_futex_waiter_with_return(
+                tid,
+                SyscallReturn::errno(LinuxErrno::ETIMEDOUT).encode_u64(),
+            );
+        }
+    }
+
+    fn wake_guest_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
+        let woken = self.tasks.wake_futex_waiters_with_tids(key, limit);
+        for tid in &woken {
+            self.futex_timeouts.remove(tid);
+        }
+        woken.len()
     }
 
     fn resume_fd_waiters(&mut self) {
@@ -9103,20 +9201,27 @@ impl RuntimeSubsystems {
             Ok(timeout) => timeout,
             Err(errno) => return SyscallOutcome::errno(errno),
         };
-        if timeout.is_some() {
-            return SyscallOutcome::errno(LinuxErrno::ETIMEDOUT);
-        }
-
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
         match self.tasks.block_task_for_futex(tid, key) {
-            Ok(()) => SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex"),
+            Ok(()) => {
+                if let Some(timeout) = timeout {
+                    let now = Instant::now();
+                    let deadline = now
+                        .checked_add(timeout)
+                        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
+                    self.futex_timeouts.insert(tid, deadline);
+                } else {
+                    self.futex_timeouts.remove(&tid);
+                }
+                SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex")
+            }
             Err(error) => error.into_outcome(),
         }
     }
 
     fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
-        self.tasks.wake_futex_waiters(key, args.val) as u64
+        self.wake_guest_futex_waiters(key, args.val) as u64
     }
 
     fn futex_requeue(
@@ -9139,8 +9244,11 @@ impl RuntimeSubsystems {
         let requeue_limit = u32::try_from(args.timeout).unwrap_or(u32::MAX);
         let (woken, requeued) =
             self.tasks
-                .wake_and_requeue_futex_waiters(from, to, args.val, requeue_limit);
-        Ok((woken + requeued) as u64)
+                .wake_and_requeue_futex_waiters_with_tids(from, to, args.val, requeue_limit);
+        for tid in &woken {
+            self.futex_timeouts.remove(tid);
+        }
+        Ok((woken.len() + requeued) as u64)
     }
 
     fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -11763,7 +11871,14 @@ mod tests {
             ],
         ));
 
-        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::ETIMEDOUT));
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        runtime.dispatcher.subsystems_mut().resume_futex_timeouts();
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(task.state(), TaskState::Runnable);
+        assert_eq!(
+            SyscallReturn::decode_rax(task.regs().rax()),
+            SyscallReturn::Errno(LinuxErrno::ETIMEDOUT)
+        );
     }
 
     #[test]
@@ -11810,8 +11925,12 @@ mod tests {
         ));
 
         assert_eq!(invalid.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+        assert_eq!(timed_out.result, SyscallReturn::Success(0));
+        runtime.dispatcher.subsystems_mut().resume_futex_timeouts();
+        let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(task.state(), TaskState::Runnable);
         assert_eq!(
-            timed_out.result,
+            SyscallReturn::decode_rax(task.regs().rax()),
             SyscallReturn::Errno(LinuxErrno::ETIMEDOUT)
         );
     }
@@ -17795,6 +17914,34 @@ mod tests {
             }
             other => panic!("expected enter and exit trace for {syscall}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_unmapself_exit_syscall_recognizes_musl_sequence() {
+        let runtime = Runtime::new(test_program_with_entry_code(
+            "/bin/app",
+            0x401000,
+            &[
+                0x48, 0x31, 0xff, // xor rdi,rdi
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,exit
+                0x0f, 0x05, // syscall
+            ],
+        ))
+        .unwrap();
+
+        assert_eq!(
+            native_unmapself_exit_syscall(runtime.memory(), 0x401000),
+            Some((0x401008, 0))
+        );
+        let mut runtime = runtime;
+        runtime
+            .memory_mut()
+            .patch_code(0x401008, &[0xcc, 0x90])
+            .unwrap();
+        assert_eq!(
+            native_unmapself_exit_syscall(runtime.memory(), 0x401000),
+            Some((0x401008, 0))
+        );
     }
 
     #[test]

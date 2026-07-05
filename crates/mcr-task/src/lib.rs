@@ -1401,18 +1401,22 @@ impl GuestKernel {
     }
 
     pub fn wake_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
+        self.wake_futex_waiters_with_tids(key, limit).len()
+    }
+
+    pub fn wake_futex_waiters_with_tids(&mut self, key: FutexWaitKey, limit: u32) -> Vec<GuestTid> {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         if limit == 0 {
-            return 0;
+            return Vec::new();
         }
 
-        let mut resumed = 0;
+        let mut resumed = Vec::new();
         for task in self.tasks.values_mut() {
             if matches!(task.state, TaskState::WaitingForFutex { key: wait_key } if wait_key == key)
             {
                 task.state = TaskState::Runnable;
-                resumed += 1;
-                if resumed == limit {
+                resumed.push(task.tid);
+                if resumed.len() == limit {
                     break;
                 }
             }
@@ -1427,17 +1431,29 @@ impl GuestKernel {
         wake_limit: u32,
         requeue_limit: u32,
     ) -> (usize, usize) {
+        let (woken, requeued) =
+            self.wake_and_requeue_futex_waiters_with_tids(from, to, wake_limit, requeue_limit);
+        (woken.len(), requeued)
+    }
+
+    pub fn wake_and_requeue_futex_waiters_with_tids(
+        &mut self,
+        from: FutexWaitKey,
+        to: FutexWaitKey,
+        wake_limit: u32,
+        requeue_limit: u32,
+    ) -> (Vec<GuestTid>, usize) {
         let wake_limit = usize::try_from(wake_limit).unwrap_or(usize::MAX);
         let requeue_limit = usize::try_from(requeue_limit).unwrap_or(usize::MAX);
-        let mut woken = 0;
+        let mut woken = Vec::new();
         let mut requeued = 0;
         for task in self.tasks.values_mut() {
             if !matches!(task.state, TaskState::WaitingForFutex { key } if key == from) {
                 continue;
             }
-            if woken < wake_limit {
+            if woken.len() < wake_limit {
                 task.state = TaskState::Runnable;
-                woken += 1;
+                woken.push(task.tid);
             } else if requeued < requeue_limit {
                 task.state = TaskState::WaitingForFutex { key: to };
                 requeued += 1;
@@ -1446,6 +1462,20 @@ impl GuestKernel {
             }
         }
         (woken, requeued)
+    }
+
+    pub fn resume_futex_waiter_with_return(
+        &mut self,
+        tid: GuestTid,
+        encoded_rax: u64,
+    ) -> Result<(), TaskError> {
+        let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
+        if !matches!(task.state, TaskState::WaitingForFutex { .. }) {
+            return Ok(());
+        }
+        task.regs = task.regs.with_syscall_return(task.regs.rip(), encoded_rax);
+        task.state = TaskState::Runnable;
+        Ok(())
     }
 
     pub fn rt_sigaction_current(
