@@ -31,8 +31,7 @@ EOF
 "$base/main"
 "#;
 
-const NODEJS_RUN_SCRIPT: &str = r#"/usr/bin/node -v >/dev/null
-echo node-ok
+const NODEJS_RUN_SCRIPT: &str = r#"/usr/bin/node -e 'require("fs").writeSync(1, "node-ok\n")'
 "#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
@@ -60,7 +59,7 @@ const GCC_COMPILE: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"gcc-ok\n",
 };
 const NODEJS_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "nodejs version run",
+    name: "nodejs script run",
     rootfs: "node-rootfs",
     script: NODEJS_RUN_SCRIPT,
     stdout: b"node-ok\n",
