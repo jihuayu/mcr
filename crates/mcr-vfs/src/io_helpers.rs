@@ -69,6 +69,7 @@ pub(crate) fn read_regular_node_at(
     proc_self: &ProcSelfData,
     offset: u64,
     buffer: &mut [u8],
+    host_file: Option<&mcr_win::HostFile>,
 ) -> VfsResult<usize> {
     let proc_data;
     let data = match node.kind() {
@@ -83,7 +84,10 @@ pub(crate) fn read_regular_node_at(
         _ => node.data(),
     };
     if let Some(path) = node.deferred_host_path() {
-        return read_host_file_at(path, offset, buffer);
+        return match host_file {
+            Some(file) => read_host_file_at(file, offset, buffer),
+            None => read_host_path_at(path, offset, buffer),
+        };
     }
     read_memory_at(data, offset, buffer)
 }
@@ -115,12 +119,8 @@ pub(crate) fn scatter_vectored(source: &[u8], buffers: &mut [Vec<u8>]) {
     }
 }
 
-pub(crate) fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    let file = mcr_win::HostFile::open(
+pub(crate) fn open_host_read_handle(path: &Path) -> VfsResult<mcr_win::HostFile> {
+    mcr_win::HostFile::open(
         path,
         mcr_win::FileOptions::new(
             mcr_win::FileAccess::Read,
@@ -128,10 +128,26 @@ pub(crate) fn read_host_file_at(path: &Path, offset: u64, buffer: &mut [u8]) -> 
         )
         .with_overlapped_io(),
     )
-    .map_err(vfs_error_from_host)?;
+    .map_err(vfs_error_from_host)
+}
+
+pub(crate) fn read_host_path_at(path: &Path, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+    let file = open_host_read_handle(path)?;
+    read_host_file_at(&file, offset, buffer)
+}
+
+pub(crate) fn read_host_file_at(
+    file: &mcr_win::HostFile,
+    offset: u64,
+    buffer: &mut [u8],
+) -> VfsResult<usize> {
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+
     let completion = file
         .submit_overlapped_read_at(offset, vec![0; buffer.len()])
-        .complete_or_fallback(&file)
+        .complete_or_fallback(file)
         .map_err(|failure| vfs_error_from_host(failure.error().clone()))?;
     let count = completion.bytes_transferred().min(buffer.len());
     buffer[..count].copy_from_slice(&completion.buffer()[..count]);

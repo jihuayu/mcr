@@ -184,6 +184,7 @@ impl ResolvedPath {
 pub struct PathTree {
     pub(crate) nodes: BTreeMap<GuestPath, InodeId>,
     pub(crate) inodes: BTreeMap<InodeId, PathNode>,
+    children: BTreeMap<GuestPath, BTreeMap<String, InodeId>>,
     pub(crate) next_inode_id: InodeId,
 }
 
@@ -196,6 +197,7 @@ impl PathTree {
         Self {
             nodes,
             inodes,
+            children: BTreeMap::new(),
             next_inode_id: ROOT_INODE_ID + 1,
         }
     }
@@ -344,21 +346,11 @@ impl PathTree {
             return Err(VfsError::NotDirectory);
         }
 
-        let parent_len = path.components.len();
         let mut children = Vec::new();
-        for (child_path, child_inode) in &self.nodes {
-            if child_path.components.len() != parent_len + 1 {
-                continue;
-            }
-            if !child_path.starts_with(path) {
-                continue;
-            }
+        for (name, child_inode) in self.children.get(path).into_iter().flatten() {
             let child_node = self.inodes.get(child_inode).ok_or(VfsError::InvalidPath)?;
-            let Some(name) = child_path.file_name() else {
-                continue;
-            };
             children.push(DirectoryChild {
-                name: name.to_owned(),
+                name: name.clone(),
                 inode: child_node.inode_id,
                 file_type: child_node.attr().dirent_type(),
             });
@@ -449,7 +441,8 @@ impl PathTree {
         }
         let inode_id = node.inode_id;
         self.inodes.insert(inode_id, node);
-        self.nodes.insert(path, inode_id);
+        self.nodes.insert(path.clone(), inode_id);
+        self.index_child(&path, inode_id);
         Ok(())
     }
 
@@ -460,7 +453,8 @@ impl PathTree {
         if !self.inodes.contains_key(&inode_id) {
             return Err(VfsError::NoEntry);
         }
-        self.nodes.insert(path, inode_id);
+        self.nodes.insert(path.clone(), inode_id);
+        self.index_child(&path, inode_id);
         Ok(())
     }
 
@@ -551,21 +545,21 @@ impl PathTree {
     }
 
     pub(crate) fn replace_path_node(&mut self, path: GuestPath, node: PathNode) {
-        if let Some(existing_inode_id) = self.nodes.insert(path, node.inode_id) {
+        if let Some(existing_inode_id) = self.nodes.insert(path.clone(), node.inode_id) {
             self.inodes.remove(&existing_inode_id);
         }
+        self.index_child(&path, node.inode_id);
         self.inodes.insert(node.inode_id, node);
     }
 
     pub(crate) fn remove_path_link(&mut self, path: &GuestPath) -> VfsResult<InodeId> {
-        self.nodes.remove(path).ok_or(VfsError::NoEntry)
+        let inode_id = self.nodes.remove(path).ok_or(VfsError::NoEntry)?;
+        self.unindex_child(path);
+        Ok(inode_id)
     }
 
     pub(crate) fn is_empty_directory(&self, path: &GuestPath) -> bool {
-        let child_len = path.components.len() + 1;
-        !self.nodes.keys().any(|child_path| {
-            child_path.components.len() == child_len && child_path.starts_with(path)
-        })
+        self.children.get(path).is_none_or(BTreeMap::is_empty)
     }
 
     pub(crate) fn paths_under_prefix(&self, prefix: &GuestPath) -> Vec<GuestPath> {
@@ -597,6 +591,34 @@ impl PathTree {
         let inode_id = self.next_inode_id;
         self.next_inode_id += 1;
         inode_id
+    }
+
+    fn index_child(&mut self, path: &GuestPath, inode_id: InodeId) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        self.children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_owned(), inode_id);
+    }
+
+    fn unindex_child(&mut self, path: &GuestPath) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        if let Some(children) = self.children.get_mut(&parent) {
+            children.remove(name);
+            if children.is_empty() {
+                self.children.remove(&parent);
+            }
+        }
     }
 }
 

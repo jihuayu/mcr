@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -91,6 +92,7 @@ const FIRST_EVENTFD_INODE_ID: InodeId = (1 << 59) + (1 << 57);
 const SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const SYMLINK_LIMIT: usize = 40;
 const SMALL_READ_CACHE_LIMIT: usize = 4096;
+const HOST_READ_HANDLE_CACHE_LIMIT: usize = 32;
 mod cache;
 mod error;
 mod fd;

@@ -807,7 +807,8 @@ impl FdTable {
                     return Err(VfsError::IsDirectory);
                 }
                 let mut description = entry.description();
-                let count = read_regular_node_at(node, proc_self, description.offset, buffer)?;
+                let count =
+                    read_regular_node_at(node, proc_self, description.offset, buffer, None)?;
                 description.offset += count as u64;
                 Ok(count)
             }
@@ -854,7 +855,7 @@ impl FdTable {
                 if node.attr().is_directory() {
                     return Err(VfsError::IsDirectory);
                 }
-                read_regular_node_at(node, proc_self, offset, buffer)
+                read_regular_node_at(node, proc_self, offset, buffer, None)
             }
             FileKind::Dev(DevNodeKind::Null) => Ok(0),
             FileKind::Dev(DevNodeKind::Zero) => {

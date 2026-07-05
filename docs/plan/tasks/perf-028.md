@@ -1,7 +1,7 @@
 ---
 id: perf-028
 scope: vfs-performance
-status: ready
+status: done
 depends-on: [perf-002]
 ---
 
@@ -60,3 +60,15 @@ cargo test -p mcr-testkit --test perf_baseline perf_baseline_guest_smoke_workloa
 - Linux-visible inode identity, readdir ordering, metadata, and unlink/rename
   semantics must not change; the existing VFS and guest small-file/directory
   baselines are the measurement.
+
+## Result
+
+- Added a per-directory child index in `PathTree`, so static directory listings
+  no longer scan the full path table for every `getdents64`.
+- Split cache invalidation by inode for metadata, small reads, directory
+  listings, and deferred host read handles; structural mount/proc changes still
+  use broad invalidation.
+- Kept deferred host-backed files read-through for read-only reads and mappings,
+  with materialization only on write/truncate.
+- Added a bounded per-inode host read handle cache to avoid reopening the same
+  deferred host-backed file for repeated reads.

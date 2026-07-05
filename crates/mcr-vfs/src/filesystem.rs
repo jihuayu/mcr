@@ -134,8 +134,8 @@ impl VirtualFileSystem {
         )?;
         let path = resolved.guest_path().clone();
         let node_missing = resolved.inode().is_none();
-        let mut created = false;
-        let mut truncated = false;
+        let mut created_parent = None;
+        let mut truncated_inode = None;
 
         if node_missing {
             if !flags.create() {
@@ -144,7 +144,7 @@ impl VirtualFileSystem {
             self.tree.ensure_parent_dir(&path)?;
             self.check_parent_write_permissions(&path)?;
             self.create_resolved_file(path.clone(), mode & !self.umask)?;
-            created = true;
+            created_parent = self.parent_inode(&path);
         } else if flags.create() && flags.exclusive() {
             return Err(VfsError::AlreadyExists);
         }
@@ -167,15 +167,15 @@ impl VirtualFileSystem {
         if flags.can_write() {
             access_mode |= W_OK;
         }
-        if !created {
+        if created_parent.is_none() {
             node.attr().check_access(access_mode)?;
         }
         if flags.truncate() && flags.can_write() && is_regular_file {
+            truncated_inode = Some(node.inode_id());
             self.tree
                 .lookup_path_mut(&path)
                 .ok_or(VfsError::NoEntry)?
                 .truncate()?;
-            truncated = true;
         }
         let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
         let kind = match node.kind() {
@@ -196,8 +196,11 @@ impl VirtualFileSystem {
             flags,
             Some(path),
         )?;
-        if created || truncated || flags.can_write() {
-            self.invalidate_vfs_caches();
+        if let Some(parent_inode) = created_parent {
+            self.invalidate_inode_cache(parent_inode);
+        }
+        if let Some(inode_id) = truncated_inode {
+            self.invalidate_inode_cache(inode_id);
         }
         Ok(fd)
     }
@@ -207,7 +210,7 @@ impl VirtualFileSystem {
         let inode_id = file.inode().id();
         if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
             self.tree.inodes.remove(&inode_id);
-            self.invalidate_vfs_caches();
+            self.invalidate_inode_cache(inode_id);
         }
         Ok(())
     }
@@ -217,7 +220,7 @@ impl VirtualFileSystem {
         let inode_id = file.inode().id();
         if self.tree.lookup_inode(inode_id).is_some() && self.tree.link_count(inode_id) == 0 {
             self.tree.inodes.remove(&inode_id);
-            self.invalidate_vfs_caches();
+            self.invalidate_inode_cache(inode_id);
         }
         Ok(file)
     }
@@ -226,7 +229,15 @@ impl VirtualFileSystem {
         if let Some(count) = self.read_from_small_cache(fd, buffer)? {
             return Ok(count);
         }
-        self.fds.read(&self.tree, &self.proc_self, fd, buffer)
+        let Some((inode_id, offset)) = self.regular_read_request(fd)? else {
+            return self.fds.read(&self.tree, &self.proc_self, fd, buffer);
+        };
+        let count = self.read_regular_inode_at(inode_id, offset, buffer)?;
+        let entry = self.fds.get(fd)?;
+        entry.description().offset = offset
+            .checked_add(count as u64)
+            .ok_or(VfsError::InvalidPath)?;
+        Ok(count)
     }
 
     pub fn can_regular_readv_fast_path(&self, fd: Fd) -> VfsResult<bool> {
@@ -241,31 +252,21 @@ impl VirtualFileSystem {
     }
 
     pub fn readv_regular(&mut self, fd: Fd, buffers: &mut [Vec<u8>]) -> VfsResult<Option<usize>> {
-        let entry = self.fds.get_mut(fd)?;
-        if !entry.flags().can_read() {
-            return Err(VfsError::BadFd);
-        }
-        if !matches!(entry.file().kind(), FileKind::Regular | FileKind::Symlink) {
+        let Some((inode_id, offset)) = self.regular_read_request(fd)? else {
             return Ok(None);
-        }
-
-        let node = self
-            .tree
-            .lookup_inode(entry.inode_id())
-            .ok_or(VfsError::NoEntry)?;
-        if node.attr().is_directory() {
-            return Err(VfsError::IsDirectory);
-        }
+        };
         let total_len = vectored_len(buffers.iter().map(Vec::len))?;
         if total_len == 0 {
             return Ok(Some(0));
         }
 
         let mut staging = vec![0; total_len];
-        let mut description = entry.description();
-        let count = read_regular_node_at(node, &self.proc_self, description.offset, &mut staging)?;
+        let count = self.read_regular_inode_at(inode_id, offset, &mut staging)?;
         scatter_vectored(&staging[..count], buffers);
-        description.offset += count as u64;
+        let entry = self.fds.get(fd)?;
+        entry.description().offset = offset
+            .checked_add(count as u64)
+            .ok_or(VfsError::InvalidPath)?;
         Ok(Some(count))
     }
 
@@ -273,8 +274,12 @@ impl VirtualFileSystem {
         if let Some(count) = self.cached_small_read_at(fd, offset, buffer)? {
             return Ok(count);
         }
-        self.fds
-            .pread(&self.tree, &self.proc_self, fd, offset, buffer)
+        let Some((inode_id, _)) = self.regular_read_request(fd)? else {
+            return self
+                .fds
+                .pread(&self.tree, &self.proc_self, fd, offset, buffer);
+        };
+        self.read_regular_inode_at(inode_id, offset, buffer)
     }
 
     pub fn regular_file_cache_key(&self, fd: Fd) -> VfsResult<Option<RegularFileCacheKey>> {
@@ -294,7 +299,7 @@ impl VirtualFileSystem {
         }
         Ok(Some(RegularFileCacheKey {
             inode,
-            generation: self.cache.borrow().regular_file_generation,
+            generation: self.cache.borrow().regular_file_generation(inode),
         }))
     }
 
@@ -330,14 +335,7 @@ impl VirtualFileSystem {
         if map_len == 0 {
             return Ok(None);
         }
-        let file = mcr_win::HostFile::open(
-            path,
-            mcr_win::FileOptions::new(
-                mcr_win::FileAccess::Read,
-                mcr_win::FileCreation::OpenExisting,
-            ),
-        )
-        .map_err(vfs_error_from_host)?;
+        let file = self.cached_host_read_handle(entry.inode_id(), path)?;
         match file.map_readonly_at(offset, map_len) {
             Ok(mapping) => Ok(Some(mapping)),
             Err(error)
@@ -361,7 +359,7 @@ impl VirtualFileSystem {
     }
 
     pub fn writev_regular(&mut self, fd: Fd, buffers: &[Vec<u8>]) -> VfsResult<Option<usize>> {
-        let count = {
+        let (inode_id, count) = {
             let entry = self.fds.get_mut(fd)?;
             if !entry.flags().can_write() {
                 return Err(VfsError::BadFd);
@@ -392,22 +390,26 @@ impl VirtualFileSystem {
             };
             let count = node.write_at(offset, &staging)?;
             description.offset = offset + count as u64;
-            count
+            (inode_id, count)
         };
         if count > 0 {
-            self.invalidate_vfs_caches();
+            self.invalidate_inode_cache(inode_id);
         }
         Ok(Some(count))
     }
 
     pub fn write(&mut self, fd: Fd, buffer: &[u8]) -> VfsResult<usize> {
-        let regular_write = self
+        let regular_inode = self
             .fds
             .get(fd)
-            .is_ok_and(|entry| matches!(entry.file().kind(), FileKind::Regular));
+            .ok()
+            .filter(|entry| matches!(entry.file().kind(), FileKind::Regular))
+            .map(FdEntry::inode_id);
         let count = self.fds.write(&mut self.tree, fd, buffer)?;
-        if regular_write && count > 0 {
-            self.invalidate_vfs_caches();
+        if count > 0 {
+            if let Some(inode_id) = regular_inode {
+                self.invalidate_inode_cache(inode_id);
+            }
         }
         Ok(count)
     }
@@ -581,23 +583,25 @@ impl VirtualFileSystem {
 
     pub fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()> {
         let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
-        self.tree
+        let node = self
+            .tree
             .lookup_path_mut(resolved.guest_path())
-            .ok_or(VfsError::NoEntry)?
-            .metadata
-            .set_mode(mode);
-        self.invalidate_vfs_caches();
+            .ok_or(VfsError::NoEntry)?;
+        let inode_id = node.inode_id();
+        node.metadata.set_mode(mode);
+        self.invalidate_inode_cache(inode_id);
         Ok(())
     }
 
     pub fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>) -> VfsResult<()> {
         let resolved = self.resolve_at(AT_FDCWD, path, ResolveOptions::FOLLOW, false)?;
-        self.tree
+        let node = self
+            .tree
             .lookup_path_mut(resolved.guest_path())
-            .ok_or(VfsError::NoEntry)?
-            .metadata
-            .set_owner(uid, gid);
-        self.invalidate_vfs_caches();
+            .ok_or(VfsError::NoEntry)?;
+        let inode_id = node.inode_id();
+        node.metadata.set_owner(uid, gid);
+        self.invalidate_inode_cache(inode_id);
         Ok(())
     }
 
@@ -628,7 +632,7 @@ impl VirtualFileSystem {
             .ok_or(VfsError::NoEntry)?
             .metadata
             .set_times(times);
-        self.invalidate_vfs_caches();
+        self.invalidate_inode_cache(inode_id);
         Ok(())
     }
 
@@ -717,7 +721,7 @@ impl VirtualFileSystem {
                 deferred_host_path: None,
             },
         )?;
-        self.invalidate_vfs_caches();
+        self.invalidate_parent_cache(resolved.guest_path());
         Ok(())
     }
 
@@ -743,9 +747,10 @@ impl VirtualFileSystem {
             return Err(VfsError::IsDirectory);
         }
         self.check_parent_write_permissions(&target)?;
+        let parent_inode = self.parent_inode(&target);
         let inode_id = self.tree.remove_path_link(&target)?;
         self.drop_link(inode_id);
-        self.invalidate_vfs_caches();
+        self.invalidate_inode_caches([parent_inode, Some(inode_id)].into_iter().flatten());
         Ok(())
     }
 
@@ -774,7 +779,7 @@ impl VirtualFileSystem {
                 deferred_host_path: None,
             },
         )?;
-        self.invalidate_vfs_caches();
+        self.invalidate_parent_cache(resolved.guest_path());
         Ok(())
     }
 
@@ -830,7 +835,14 @@ impl VirtualFileSystem {
             .increment_link_count()?;
         self.tree
             .insert_link(new_resolved.guest_path().clone(), old_inode)?;
-        self.invalidate_vfs_caches();
+        self.invalidate_inode_caches(
+            [
+                self.parent_inode(new_resolved.guest_path()),
+                Some(old_inode),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         Ok(())
     }
 
@@ -888,8 +900,10 @@ impl VirtualFileSystem {
             self.validate_rename_replacement(old_inode, target_inode, &new_path)?;
             self.remove_existing_rename_target(&new_path, target_inode)?;
         }
+        let old_parent = self.parent_inode(&old_path);
+        let new_parent = self.parent_inode(&new_path);
         self.move_path(&old_path, &new_path)?;
-        self.invalidate_vfs_caches();
+        self.invalidate_inode_caches([old_parent, new_parent, new_inode].into_iter().flatten());
         Ok(())
     }
 
@@ -906,7 +920,7 @@ impl VirtualFileSystem {
             .lookup_inode_mut(inode_id)
             .ok_or(VfsError::NoEntry)?
             .set_len(length)?;
-        self.invalidate_vfs_caches();
+        self.invalidate_inode_cache(inode_id);
         Ok(())
     }
 
@@ -968,6 +982,42 @@ impl VirtualFileSystem {
         Ok(Some(count))
     }
 
+    fn regular_read_request(&self, fd: Fd) -> VfsResult<Option<(InodeId, u64)>> {
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_read() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular | FileKind::Symlink) {
+            return Ok(None);
+        }
+        Ok(Some((entry.inode_id(), entry.offset())))
+    }
+
+    fn read_regular_inode_at(
+        &self,
+        inode_id: InodeId,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<usize> {
+        let node = self.tree.lookup_inode(inode_id).ok_or(VfsError::NoEntry)?;
+        if node.attr().is_directory() {
+            return Err(VfsError::IsDirectory);
+        }
+        let host_file = node
+            .deferred_host_path()
+            .map(|path| self.cached_host_read_handle(inode_id, path))
+            .transpose()?;
+        read_regular_node_at(node, &self.proc_self, offset, buffer, host_file.as_deref())
+    }
+
+    fn cached_host_read_handle(
+        &self,
+        inode_id: InodeId,
+        path: &Path,
+    ) -> VfsResult<Rc<mcr_win::HostFile>> {
+        self.cache.borrow_mut().host_read_handle(inode_id, path)
+    }
+
     fn resolve_at(
         &self,
         dirfd: Fd,
@@ -1016,6 +1066,11 @@ impl VirtualFileSystem {
                 deferred_host_path: None,
             },
         )
+    }
+
+    fn parent_inode(&self, path: &GuestPath) -> Option<InodeId> {
+        let parent = path.parent()?;
+        self.tree.lookup_path(&parent).map(PathNode::inode_id)
     }
 
     fn validate_rename_replacement(
@@ -1273,6 +1328,20 @@ impl VirtualFileSystem {
 
     fn invalidate_proc_caches(&self) {
         self.cache.borrow_mut().invalidate_proc_views();
+    }
+
+    fn invalidate_inode_cache(&self, inode_id: InodeId) {
+        self.cache.borrow_mut().invalidate_inode(inode_id);
+    }
+
+    fn invalidate_inode_caches(&self, inode_ids: impl IntoIterator<Item = InodeId>) {
+        self.cache.borrow_mut().invalidate_inodes(inode_ids);
+    }
+
+    fn invalidate_parent_cache(&self, path: &GuestPath) {
+        if let Some(parent_inode) = self.parent_inode(path) {
+            self.invalidate_inode_cache(parent_inode);
+        }
     }
 
     #[cfg(test)]

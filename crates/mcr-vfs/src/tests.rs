@@ -1052,6 +1052,49 @@ fn deferred_host_file_can_expose_readonly_host_mapping_without_materializing() {
 }
 
 #[test]
+fn deferred_host_file_reads_reuse_cached_host_handle_until_write() {
+    let host_path = std::env::temp_dir().join(format!(
+        "mcr-vfs-deferred-host-cache-{}",
+        std::process::id()
+    ));
+    fs::write(&host_path, b"abcdef").unwrap();
+
+    let rootfs = Rootfs::new("/host/root");
+    let mut tree = PathTree::new();
+    tree.create_dir("/tmp").unwrap();
+    tree.create_file_with_host_content("/tmp/deferred", &host_path, 6, 0o644)
+        .unwrap();
+    let mut vfs = VirtualFileSystem::from_parts(rootfs, tree, FdTable::with_stdio());
+    let read_fd = vfs
+        .openat(AT_FDCWD, "/tmp/deferred", OpenFlags::new(O_RDONLY), 0)
+        .unwrap();
+
+    let mut buffer = [0; 2];
+    assert_eq!(vfs.read(read_fd, &mut buffer).unwrap(), 2);
+    assert_eq!(&buffer, b"ab");
+    assert_eq!(vfs.cache_snapshot().host_read_handle_entries, 1);
+
+    assert_eq!(vfs.pread(read_fd, 2, &mut buffer).unwrap(), 2);
+    assert_eq!(&buffer, b"cd");
+    assert_eq!(vfs.cache_snapshot().host_read_handle_entries, 1);
+
+    let write_fd = vfs
+        .openat(AT_FDCWD, "/tmp/deferred", OpenFlags::new(O_RDWR), 0)
+        .unwrap();
+    assert_eq!(vfs.write(write_fd, b"XY").unwrap(), 2);
+    assert_eq!(vfs.cache_snapshot().host_read_handle_entries, 0);
+    assert!(
+        vfs.tree()
+            .lookup_path(&guest_path("/tmp/deferred"))
+            .unwrap()
+            .deferred_host_path()
+            .is_none()
+    );
+
+    let _ = fs::remove_file(host_path);
+}
+
+#[test]
 fn getdents64_entries_match_linux_record_layout() {
     let mut vfs = sample_vfs();
     let fd = vfs
@@ -1079,6 +1122,45 @@ fn getdents64_entries_match_linux_record_layout() {
     assert_eq!(entries.last().unwrap().file_type, DT_REG);
     vfs.lseek(fd, 0, SeekWhence::Set).unwrap();
     assert_eq!(vfs.getdents64(fd, 1).unwrap_err(), VfsError::InvalidPath);
+}
+
+#[test]
+fn directory_listing_cache_survives_unrelated_directory_mutation() {
+    let mut vfs = sample_vfs();
+    let tmp_fd = vfs
+        .openat(AT_FDCWD, "/tmp", OpenFlags::new(O_RDONLY | O_DIRECTORY), 0)
+        .unwrap();
+    let private_fd = vfs
+        .openat(
+            AT_FDCWD,
+            "/private",
+            OpenFlags::new(O_RDONLY | O_DIRECTORY),
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        entry_names(&vfs.getdents64(tmp_fd, 4096).unwrap()),
+        vec![".", "..", "file"]
+    );
+    assert_eq!(
+        entry_names(&vfs.getdents64(private_fd, 4096).unwrap()),
+        vec![".", "..", "secret"]
+    );
+    let cached = vfs.cache_snapshot();
+    assert_eq!(cached.directory_listing_entries, 2);
+
+    vfs.mkdirat(AT_FDCWD, "/private/new", 0o755).unwrap();
+    let invalidated = vfs.cache_snapshot();
+    assert!(invalidated.generation > cached.generation);
+    assert_eq!(invalidated.directory_listing_entries, 1);
+
+    vfs.lseek(tmp_fd, 0, SeekWhence::Set).unwrap();
+    assert_eq!(
+        entry_names(&vfs.getdents64(tmp_fd, 4096).unwrap()),
+        vec![".", "..", "file"]
+    );
+    assert_eq!(vfs.cache_snapshot().directory_listing_entries, 1);
 }
 
 #[test]
