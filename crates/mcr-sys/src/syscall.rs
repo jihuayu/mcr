@@ -64,6 +64,7 @@ pub enum Syscall {
     SchedYield,
     Madvise,
     Gettimeofday,
+    Times,
     Getrlimit,
     Getrusage,
     Sysinfo,
@@ -202,6 +203,7 @@ impl Syscall {
     pub const SCHED_YIELD: SyscallNumber = SyscallNumber::new(24);
     pub const MADVISE: SyscallNumber = SyscallNumber::new(28);
     pub const GETTIMEOFDAY: SyscallNumber = SyscallNumber::new(96);
+    pub const TIMES: SyscallNumber = SyscallNumber::new(100);
     pub const GETRLIMIT: SyscallNumber = SyscallNumber::new(97);
     pub const GETRUSAGE: SyscallNumber = SyscallNumber::new(98);
     pub const SYSINFO: SyscallNumber = SyscallNumber::new(99);
@@ -387,6 +389,7 @@ impl Syscall {
             97 => Self::Getrlimit,
             98 => Self::Getrusage,
             99 => Self::Sysinfo,
+            100 => Self::Times,
             102 => Self::Getuid,
             104 => Self::Getgid,
             105 => Self::Setuid,
@@ -481,6 +484,7 @@ impl Syscall {
             Self::SchedYield => Self::SCHED_YIELD,
             Self::Madvise => Self::MADVISE,
             Self::Gettimeofday => Self::GETTIMEOFDAY,
+            Self::Times => Self::TIMES,
             Self::Getrlimit => Self::GETRLIMIT,
             Self::Getrusage => Self::GETRUSAGE,
             Self::Sysinfo => Self::SYSINFO,
@@ -622,6 +626,7 @@ impl Syscall {
             Self::SchedYield => "sched_yield",
             Self::Madvise => "madvise",
             Self::Gettimeofday => "gettimeofday",
+            Self::Times => "times",
             Self::Getrlimit => "getrlimit",
             Self::Getrusage => "getrusage",
             Self::Sysinfo => "sysinfo",
@@ -771,6 +776,7 @@ mod tests {
             (Syscall::SCHED_YIELD, Syscall::SchedYield, "sched_yield"),
             (Syscall::MADVISE, Syscall::Madvise, "madvise"),
             (Syscall::GETTIMEOFDAY, Syscall::Gettimeofday, "gettimeofday"),
+            (Syscall::TIMES, Syscall::Times, "times"),
             (Syscall::GETRLIMIT, Syscall::Getrlimit, "getrlimit"),
             (Syscall::GETRUSAGE, Syscall::Getrusage, "getrusage"),
             (Syscall::SYSINFO, Syscall::Sysinfo, "sysinfo"),

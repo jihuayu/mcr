@@ -12,7 +12,7 @@ pub mod trace;
 pub use abi::{
     GuestAddress, GuestPid, GuestTid, LINUX_DIRENT64_NAME_OFFSET, LINUX_UTSNAME_FIELD_LEN,
     LinuxDirent64Header, LinuxIovec, LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec,
-    LinuxUtsname, SyscallArgs, SyscallRegisters,
+    LinuxTms, LinuxUtsname, SyscallArgs, SyscallRegisters,
 };
 pub use dispatcher::{
     EventSyscalls, FileSyscalls, GuestContext, InMemorySyscallTracer, MemorySyscalls,

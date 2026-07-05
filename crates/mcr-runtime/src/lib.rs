@@ -49,7 +49,7 @@ use mcr_sys::{
     LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN,
     LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
     LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx,
-    LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
+    LinuxStatxTimestamp, LinuxTimespec, LinuxTms, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
     NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
     SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
     SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
@@ -112,6 +112,7 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_CLOCK_TICKS_PER_SECOND: u64 = 100;
 const LINUX_CPU_AFFINITY_MASK_BYTES: u64 = 8;
 const LINUX_RUSAGE_SELF: i32 = 0;
 const LINUX_RUSAGE_CHILDREN: i32 = -1;
@@ -7188,6 +7189,7 @@ impl TimeSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Gettimeofday => {
                 outcome(self.gettimeofday(arg(request, 0), arg(request, 1)))
             }
+            mcr_sys::Syscall::Times => outcome(self.times(arg(request, 0))),
             mcr_sys::Syscall::Nanosleep => {
                 outcome(self.nanosleep(arg(request, 0), arg(request, 1)))
             }
@@ -7362,6 +7364,20 @@ impl RuntimeSubsystems {
             write_guest_timezone_utc(self.files.memory_mut(), timezone_addr)?;
         }
         Ok(0)
+    }
+
+    fn times(&mut self, tms_addr: u64) -> Result<u64, LinuxErrno> {
+        if tms_addr != 0 {
+            write_guest_tms(self.files.memory_mut(), tms_addr, LinuxTms::default())?;
+        }
+        let elapsed = mcr_win::monotonic_time().map_err(time_errno)?;
+        let ticks = elapsed
+            .as_secs()
+            .saturating_mul(LINUX_CLOCK_TICKS_PER_SECOND)
+            .saturating_add(
+                u64::from(elapsed.subsec_nanos()) / (1_000_000_000 / LINUX_CLOCK_TICKS_PER_SECOND),
+            );
+        Ok(ticks)
     }
 
     fn nanosleep(&mut self, req_addr: u64, _rem_addr: u64) -> Result<u64, LinuxErrno> {
@@ -10085,6 +10101,19 @@ fn write_guest_timeval(
         .map_err(memory_errno)
 }
 
+fn write_guest_tms(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    tms: LinuxTms,
+) -> Result<(), LinuxErrno> {
+    let mut bytes = [0u8; std::mem::size_of::<LinuxTms>()];
+    bytes[0..8].copy_from_slice(&tms.tms_utime.to_le_bytes());
+    bytes[8..16].copy_from_slice(&tms.tms_stime.to_le_bytes());
+    bytes[16..24].copy_from_slice(&tms.tms_cutime.to_le_bytes());
+    bytes[24..32].copy_from_slice(&tms.tms_cstime.to_le_bytes());
+    memory.write_bytes(addr, &bytes).map_err(memory_errno)
+}
+
 fn write_guest_timezone_utc(
     memory: &mut impl GuestMemoryAccess,
     addr: u64,
@@ -11777,6 +11806,22 @@ mod tests {
             null_timespec.result,
             SyscallReturn::Errno(LinuxErrno::EFAULT)
         );
+    }
+
+    #[test]
+    fn times_writes_linux_tms_and_allows_null_buffer() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime.memory_mut().write(0x402000, &[0xff; 32]).unwrap();
+
+        let result = runtime.dispatch_syscall(context(Syscall::Times, [0x402000, 0, 0, 0, 0, 0]));
+        let null_buffer = runtime.dispatch_syscall(context(Syscall::Times, [0, 0, 0, 0, 0, 0]));
+
+        assert!(matches!(result.result, SyscallReturn::Success(_)));
+        assert!(matches!(null_buffer.result, SyscallReturn::Success(_)));
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402000), 0);
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402008), 0);
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402010), 0);
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402018), 0);
     }
 
     #[test]

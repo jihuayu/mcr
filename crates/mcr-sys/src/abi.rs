@@ -80,6 +80,15 @@ pub struct LinuxTimespec {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxTms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinuxIovec {
     pub iov_base: u64,
     pub iov_len: u64,
@@ -191,8 +200,8 @@ mod tests {
 
     use super::{
         LINUX_DIRENT64_NAME_OFFSET, LINUX_UTSNAME_FIELD_LEN, LinuxDirent64Header, LinuxIovec,
-        LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, SyscallArgs,
-        SyscallRegisters,
+        LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec, LinuxTms, LinuxUtsname,
+        SyscallArgs, SyscallRegisters,
     };
     use crate::syscall::Syscall;
 
@@ -217,6 +226,7 @@ mod tests {
     #[test]
     fn abi_struct_sizes_match_linux_x86_64_layouts() {
         assert_eq!(size_of::<LinuxTimespec>(), 16);
+        assert_eq!(size_of::<LinuxTms>(), 32);
         assert_eq!(size_of::<LinuxIovec>(), 16);
         assert_eq!(size_of::<LinuxStat>(), 144);
         assert_eq!(size_of::<LinuxStatxTimestamp>(), 16);

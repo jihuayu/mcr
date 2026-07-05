@@ -110,6 +110,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::SchedYield, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Madvise, SyscallSubsystem::Memory),
     SyscallDescriptor::new(Syscall::Gettimeofday, SyscallSubsystem::Time),
+    SyscallDescriptor::new(Syscall::Times, SyscallSubsystem::Time),
     SyscallDescriptor::new(Syscall::Getrlimit, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getrusage, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Sysinfo, SyscallSubsystem::Task),
@@ -824,6 +825,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             vec![decimal_field("clockid", arg(0)), hex_field("res", arg(1))]
         }
         Syscall::Gettimeofday => vec![hex_field("tv", arg(0)), hex_field("tz", arg(1))],
+        Syscall::Times => vec![hex_field("buf", arg(0))],
         Syscall::Nanosleep => vec![hex_field("req", arg(0)), hex_field("rem", arg(1))],
         Syscall::Getrandom => vec![
             hex_field("buf", arg(0)),
@@ -1039,6 +1041,7 @@ mod tests {
             (Syscall::SchedYield, SyscallSubsystem::Task),
             (Syscall::Madvise, SyscallSubsystem::Memory),
             (Syscall::Gettimeofday, SyscallSubsystem::Time),
+            (Syscall::Times, SyscallSubsystem::Time),
             (Syscall::Getrlimit, SyscallSubsystem::Task),
             (Syscall::Getrusage, SyscallSubsystem::Task),
             (Syscall::Sysinfo, SyscallSubsystem::Task),
@@ -1169,6 +1172,11 @@ mod tests {
                 Syscall::ClockGetres,
                 [1, 0xa000, 0, 0, 0, 0],
                 &[("clockid", "1"), ("res", "0xa000")][..],
+            ),
+            (
+                Syscall::Times,
+                [0xa080, 0, 0, 0, 0, 0],
+                &[("buf", "0xa080")][..],
             ),
             (
                 Syscall::SchedGetaffinity,
