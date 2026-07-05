@@ -112,10 +112,12 @@ pub enum Syscall {
     Tkill,
     Uname,
     Fcntl,
+    Flock,
     Ftruncate,
     Getdents,
     Getcwd,
     Chdir,
+    Fchdir,
     Mkdir,
     Rmdir,
     Link,
@@ -130,6 +132,7 @@ pub enum Syscall {
     ArchPrctl,
     Gettid,
     Futex,
+    SchedGetaffinity,
     Getdents64,
     SetTidAddress,
     ClockGettime,
@@ -245,10 +248,12 @@ impl Syscall {
     pub const KILL: SyscallNumber = SyscallNumber::new(62);
     pub const UNAME: SyscallNumber = SyscallNumber::new(63);
     pub const FCNTL: SyscallNumber = SyscallNumber::new(72);
+    pub const FLOCK: SyscallNumber = SyscallNumber::new(73);
     pub const FTRUNCATE: SyscallNumber = SyscallNumber::new(77);
     pub const GETDENTS: SyscallNumber = SyscallNumber::new(78);
     pub const GETCWD: SyscallNumber = SyscallNumber::new(79);
     pub const CHDIR: SyscallNumber = SyscallNumber::new(80);
+    pub const FCHDIR: SyscallNumber = SyscallNumber::new(81);
     pub const MKDIR: SyscallNumber = SyscallNumber::new(83);
     pub const RMDIR: SyscallNumber = SyscallNumber::new(84);
     pub const RENAME: SyscallNumber = SyscallNumber::new(82);
@@ -264,6 +269,7 @@ impl Syscall {
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
     pub const TKILL: SyscallNumber = SyscallNumber::new(200);
     pub const FUTEX: SyscallNumber = SyscallNumber::new(202);
+    pub const SCHED_GETAFFINITY: SyscallNumber = SyscallNumber::new(204);
     pub const GETDENTS64: SyscallNumber = SyscallNumber::new(217);
     pub const SET_TID_ADDRESS: SyscallNumber = SyscallNumber::new(218);
     pub const CLOCK_GETTIME: SyscallNumber = SyscallNumber::new(228);
@@ -356,12 +362,14 @@ impl Syscall {
             62 => Self::Kill,
             63 => Self::Uname,
             72 => Self::Fcntl,
+            73 => Self::Flock,
             74 => Self::Fsync,
             75 => Self::Fdatasync,
             77 => Self::Ftruncate,
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
+            81 => Self::Fchdir,
             82 => Self::Rename,
             83 => Self::Mkdir,
             84 => Self::Rmdir,
@@ -398,6 +406,7 @@ impl Syscall {
             186 => Self::Gettid,
             200 => Self::Tkill,
             202 => Self::Futex,
+            204 => Self::SchedGetaffinity,
             217 => Self::Getdents64,
             218 => Self::SetTidAddress,
             228 => Self::ClockGettime,
@@ -516,10 +525,12 @@ impl Syscall {
             Self::Kill => Self::KILL,
             Self::Uname => Self::UNAME,
             Self::Fcntl => Self::FCNTL,
+            Self::Flock => Self::FLOCK,
             Self::Ftruncate => Self::FTRUNCATE,
             Self::Getdents => Self::GETDENTS,
             Self::Getcwd => Self::GETCWD,
             Self::Chdir => Self::CHDIR,
+            Self::Fchdir => Self::FCHDIR,
             Self::Mkdir => Self::MKDIR,
             Self::Rmdir => Self::RMDIR,
             Self::Link => Self::LINK,
@@ -535,6 +546,7 @@ impl Syscall {
             Self::Gettid => Self::GETTID,
             Self::Tkill => Self::TKILL,
             Self::Futex => Self::FUTEX,
+            Self::SchedGetaffinity => Self::SCHED_GETAFFINITY,
             Self::Getdents64 => Self::GETDENTS64,
             Self::SetTidAddress => Self::SET_TID_ADDRESS,
             Self::ClockGettime => Self::CLOCK_GETTIME,
@@ -653,10 +665,12 @@ impl Syscall {
             Self::Kill => "kill",
             Self::Uname => "uname",
             Self::Fcntl => "fcntl",
+            Self::Flock => "flock",
             Self::Ftruncate => "ftruncate",
             Self::Getdents => "getdents",
             Self::Getcwd => "getcwd",
             Self::Chdir => "chdir",
+            Self::Fchdir => "fchdir",
             Self::Mkdir => "mkdir",
             Self::Rmdir => "rmdir",
             Self::Link => "link",
@@ -672,6 +686,7 @@ impl Syscall {
             Self::Gettid => "gettid",
             Self::Tkill => "tkill",
             Self::Futex => "futex",
+            Self::SchedGetaffinity => "sched_getaffinity",
             Self::Getdents64 => "getdents64",
             Self::SetTidAddress => "set_tid_address",
             Self::ClockGettime => "clock_gettime",
@@ -759,8 +774,15 @@ mod tests {
             (Syscall::SIGALTSTACK, Syscall::Sigaltstack, "sigaltstack"),
             (Syscall::STATFS, Syscall::Statfs, "statfs"),
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
+            (Syscall::FCHDIR, Syscall::Fchdir, "fchdir"),
+            (Syscall::FLOCK, Syscall::Flock, "flock"),
             (Syscall::PRCTL, Syscall::Prctl, "prctl"),
             (Syscall::TKILL, Syscall::Tkill, "tkill"),
+            (
+                Syscall::SCHED_GETAFFINITY,
+                Syscall::SchedGetaffinity,
+                "sched_getaffinity",
+            ),
             (Syscall::CLOCK_GETRES, Syscall::ClockGetres, "clock_getres"),
             (Syscall::PRLIMIT64, Syscall::Prlimit64, "prlimit64"),
             (Syscall::GETCPU, Syscall::Getcpu, "getcpu"),

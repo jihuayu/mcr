@@ -39,6 +39,10 @@ pub const F_GETPIPE_SZ: u32 = 1032;
 pub const F_RDLCK: i16 = 0;
 pub const F_WRLCK: i16 = 1;
 pub const F_UNLCK: i16 = 2;
+pub const LOCK_SH: u32 = 1;
+pub const LOCK_EX: u32 = 2;
+pub const LOCK_NB: u32 = 4;
+pub const LOCK_UN: u32 = 8;
 pub const FD_CLOEXEC: u32 = 1;
 pub const F_OK: u32 = 0;
 pub const O_ACCMODE: u32 = 0o3;
@@ -3246,6 +3250,27 @@ impl VirtualFileSystem {
         self.rootfs.set_cwd(resolved.guest_path().clone())
     }
 
+    pub fn fchdir(&mut self, fd: Fd) -> VfsResult<()> {
+        let path = self.fds.get(fd)?.path().ok_or(VfsError::BadFd)?.clone();
+        let node = self.tree.lookup_path(&path).ok_or(VfsError::NoEntry)?;
+        if !node.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+        node.attr().check_access(X_OK)?;
+        self.rootfs.set_cwd(path)
+    }
+
+    pub fn flock(&mut self, fd: Fd, operation: u32) -> VfsResult<()> {
+        self.fds.get(fd)?;
+        let lock_mode = operation & !LOCK_NB;
+        if operation & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN) != 0
+            || !matches!(lock_mode, LOCK_SH | LOCK_EX | LOCK_UN)
+        {
+            return Err(VfsError::InvalidPath);
+        }
+        Ok(())
+    }
+
     pub fn umask(&mut self, mask: u32) -> u32 {
         let old = self.umask;
         self.umask = mask & 0o777;
@@ -5901,6 +5926,18 @@ mod tests {
         );
         assert_eq!(vfs.chdir("/tmp/pkg"), Ok(()));
         assert_eq!(vfs.getcwd().unwrap(), "/tmp/pkg");
+        let pkg_fd = vfs
+            .openat(
+                AT_FDCWD,
+                "/tmp/pkg",
+                OpenFlags::new(O_RDONLY | O_DIRECTORY),
+                0,
+            )
+            .unwrap();
+        assert_eq!(vfs.chdir("/"), Ok(()));
+        assert_eq!(vfs.fchdir(pkg_fd), Ok(()));
+        assert_eq!(vfs.getcwd().unwrap(), "/tmp/pkg");
+        assert_eq!(vfs.flock(pkg_fd, LOCK_EX | LOCK_NB), Ok(()));
         assert_eq!(vfs.umask(0o077), 0o022);
 
         vfs.symlinkat("../file", AT_FDCWD, "file-link").unwrap();

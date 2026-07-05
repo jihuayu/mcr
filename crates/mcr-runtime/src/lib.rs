@@ -106,10 +106,13 @@ pub(crate) fn host_step_elapsed_ms(start: Instant) -> u128 {
 
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
+const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const LINUX_CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_CPU_AFFINITY_MASK_BYTES: u64 = 8;
 const LINUX_RUSAGE_SELF: i32 = 0;
 const LINUX_RUSAGE_CHILDREN: i32 = -1;
 const LINUX_RUSAGE_THREAD: i32 = 1;
@@ -127,6 +130,7 @@ const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
 const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+const LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
 const LINUX_FUTEX_REQUEUE: u32 = 3;
 const LINUX_FUTEX_CMP_REQUEUE: u32 = 4;
 const LINUX_FUTEX_OWNER_DIED: u32 = 0x4000_0000;
@@ -1197,6 +1201,7 @@ where
             mcr_sys::Syscall::Dup2 => self.sys_dup2(request),
             mcr_sys::Syscall::Dup3 => self.sys_dup3(request),
             mcr_sys::Syscall::Fcntl => self.sys_fcntl(request),
+            mcr_sys::Syscall::Flock => self.sys_flock(request),
             mcr_sys::Syscall::Ioctl => self.sys_ioctl(request),
             mcr_sys::Syscall::Mkdir => self.sys_mkdir(request),
             mcr_sys::Syscall::Mkdirat => self.sys_mkdirat(request),
@@ -1215,6 +1220,7 @@ where
             mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
             mcr_sys::Syscall::Getcwd => self.sys_getcwd(request),
             mcr_sys::Syscall::Chdir => self.sys_chdir(request),
+            mcr_sys::Syscall::Fchdir => self.sys_fchdir(request),
             mcr_sys::Syscall::Umask => self.sys_umask(request),
             _ => return SyscallOutcome::unsupported(),
         };
@@ -2318,6 +2324,18 @@ where
     fn sys_chdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 0))?;
         self.vfs.chdir(&path).map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_fchdir(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        self.vfs.fchdir(arg_i32(request, 0)).map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_flock(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        self.vfs
+            .flock(arg_i32(request, 0), arg_u32(request, 1))
+            .map_err(vfs_errno)?;
         Ok(0)
     }
 
@@ -6951,6 +6969,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
+            mcr_sys::Syscall::SchedGetaffinity => self.dispatch_sched_getaffinity(request),
             mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
             mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
             mcr_sys::Syscall::Sysinfo => self.dispatch_sysinfo(request),
@@ -6979,9 +6998,14 @@ impl RuntimeSubsystems {
                 linux_timespec_from_system_time(mcr_win::system_time().map_err(time_errno)?)
             }
             LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_PROCESS_CPUTIME_ID
+            | LINUX_CLOCK_THREAD_CPUTIME_ID
             | LINUX_CLOCK_MONOTONIC_RAW
             | LINUX_CLOCK_MONOTONIC_COARSE
             | LINUX_CLOCK_BOOTTIME => {
+                linux_timespec_from_duration(mcr_win::monotonic_time().map_err(time_errno)?)?
+            }
+            _ if is_linux_dynamic_cpu_clock_id(clock_id) => {
                 linux_timespec_from_duration(mcr_win::monotonic_time().map_err(time_errno)?)?
             }
             _ => return Err(LinuxErrno::EINVAL),
@@ -7440,6 +7464,26 @@ impl RuntimeSubsystems {
         SyscallOutcome::success(0)
     }
 
+    fn dispatch_sched_getaffinity(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_memory_for_process(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        let outcome = outcome(self.sched_getaffinity(
+            request.context.pid,
+            request.context.tid,
+            arg(request, 0),
+            arg(request, 1),
+            arg(request, 2),
+        ));
+        if matches!(outcome.result, SyscallReturn::Success(_))
+            && let Err(errno) = self.store_selected_process_memory(pid)
+        {
+            return SyscallOutcome::errno(errno);
+        }
+        outcome
+    }
+
     fn dispatch_getrlimit(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let pid = request.context.pid;
         if let Err(errno) = self.select_memory_for_process(pid) {
@@ -7670,14 +7714,50 @@ impl RuntimeSubsystems {
         Ok(0)
     }
 
+    fn sched_getaffinity(
+        &mut self,
+        current_pid: mcr_sys::GuestPid,
+        current_tid: mcr_sys::GuestTid,
+        raw_pid: u64,
+        cpusetsize: u64,
+        mask_addr: u64,
+    ) -> Result<u64, LinuxErrno> {
+        if raw_pid != 0 {
+            let target = mcr_sys::GuestTid::try_from(raw_pid).map_err(|_| LinuxErrno::ESRCH)?;
+            if target != current_tid
+                && target != current_pid
+                && self.tasks.task(target).is_none()
+                && self.tasks.process(target).is_none()
+            {
+                return Err(LinuxErrno::ESRCH);
+            }
+        }
+        if mask_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        if cpusetsize < LINUX_CPU_AFFINITY_MASK_BYTES {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.files
+            .memory_mut()
+            .write_bytes(mask_addr, &1u64.to_le_bytes())
+            .map_err(memory_errno)?;
+        Ok(LINUX_CPU_AFFINITY_MASK_BYTES)
+    }
+
     fn membarrier(&mut self, command: u64, flags: u64, _cpu_id: u64) -> Result<u64, LinuxErrno> {
         if flags != 0 {
             return Err(LinuxErrno::EINVAL);
         }
         if command == LINUX_MEMBARRIER_CMD_QUERY {
-            return Ok(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED);
+            return Ok(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED);
         }
-        if command == LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED {
+        if matches!(
+            command,
+            LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        ) {
             return Ok(0);
         }
         Err(LinuxErrno::ENOSYS)
@@ -9589,12 +9669,26 @@ fn validate_clock_id(clock_id: u64) -> Result<(), LinuxErrno> {
     match clock_id {
         LINUX_CLOCK_REALTIME
         | LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_PROCESS_CPUTIME_ID
+        | LINUX_CLOCK_THREAD_CPUTIME_ID
         | LINUX_CLOCK_MONOTONIC_RAW
         | LINUX_CLOCK_REALTIME_COARSE
         | LINUX_CLOCK_MONOTONIC_COARSE
         | LINUX_CLOCK_BOOTTIME => Ok(()),
+        _ if is_linux_dynamic_cpu_clock_id(clock_id) => Ok(()),
         _ => Err(LinuxErrno::EINVAL),
     }
+}
+
+fn is_linux_dynamic_cpu_clock_id(clock_id: u64) -> bool {
+    const CPUCLOCK_CLOCK_MASK: u64 = 0x3;
+    const CPUCLOCK_MAX: u64 = 0x3;
+
+    if (clock_id as i64) >= 0 {
+        return false;
+    }
+    let clock = clock_id & CPUCLOCK_CLOCK_MASK;
+    clock < CPUCLOCK_MAX
 }
 
 fn write_guest_timeval(
@@ -13860,6 +13954,7 @@ mod tests {
         runtime.memory_mut().write_cstr(0x1300, "/tmp/pkg/link");
         runtime.memory_mut().write_cstr(0x1400, "../file");
         runtime.memory_mut().write_cstr(0x1500, "/tmp/pkg/renamed");
+        runtime.memory_mut().write_cstr(0x1600, "/tmp");
 
         assert_eq!(
             dispatch(&mut runtime, Syscall::Umask, [0o077, 0, 0, 0, 0, 0]),
@@ -13903,6 +13998,21 @@ mod tests {
             SyscallReturn::Success(0)
         );
         assert_eq!(runtime.vfs().fstat(3).unwrap().size, 7);
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Flock,
+                [
+                    3,
+                    u64::from(mcr_vfs::LOCK_EX | mcr_vfs::LOCK_NB),
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
 
         assert_eq!(
             dispatch(
@@ -13990,6 +14100,31 @@ mod tests {
         assert_eq!(owned.mode & 0o777, 0o600);
         assert_eq!(owned.uid, 1000);
         assert_eq!(owned.gid, 1001);
+
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Openat,
+                [
+                    AT_FDCWD as u64,
+                    0x1600,
+                    u64::from(O_RDONLY | O_DIRECTORY),
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(4)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fchdir, [4, 0, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Getcwd, [0x3000, 64, 0, 0, 0, 0]),
+            SyscallReturn::Success(0x3000)
+        );
+        assert_eq!(runtime.memory().read(0x3000, 5), b"/tmp\0");
     }
 
     #[test]
@@ -17056,6 +17191,19 @@ mod tests {
         assert_eq!(clock_getres.result, SyscallReturn::Success(0));
         assert_eq!(i64_from_guest(runtime.memory(), 0x402040), 0);
         assert_eq!(i64_from_guest(runtime.memory(), 0x402048), 1_000_000);
+        let dynamic_thread_clock = (-18i64) as u64;
+        let dynamic_clock_getres = runtime.dispatch_syscall(context(
+            Syscall::ClockGetres,
+            [dynamic_thread_clock, 0x402060, 0, 0, 0, 0],
+        ));
+        assert_eq!(dynamic_clock_getres.result, SyscallReturn::Success(0));
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402060), 0);
+        assert_eq!(i64_from_guest(runtime.memory(), 0x402068), 1_000_000);
+        let dynamic_clock_gettime = runtime.dispatch_syscall(context(
+            Syscall::ClockGettime,
+            [dynamic_thread_clock, 0x402080, 0, 0, 0, 0],
+        ));
+        assert_eq!(dynamic_clock_gettime.result, SyscallReturn::Success(0));
         assert_eq!(
             runtime
                 .dispatch_syscall(context(Syscall::ClockGetres, [99, 0x402040, 0, 0, 0, 0]))
@@ -17180,15 +17328,57 @@ mod tests {
         assert_eq!(u32_from_guest(runtime.memory(), 0x402300), 0);
         assert_eq!(u32_from_guest(runtime.memory(), 0x402304), 0);
 
+        runtime.memory_mut().write(0x402320, &[0xaa; 16]).unwrap();
+        let affinity = runtime.dispatch_syscall(context(
+            Syscall::SchedGetaffinity,
+            [0, 128, 0x402320, 0, 0, 0],
+        ));
+        assert_eq!(
+            affinity.result,
+            SyscallReturn::Success(LINUX_CPU_AFFINITY_MASK_BYTES)
+        );
+        assert_eq!(u64_from_guest(runtime.memory(), 0x402320), 1);
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402328),
+            0xaaaa_aaaa_aaaa_aaaa
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::SchedGetaffinity,
+                    [0, 4, 0x402320, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::SchedGetaffinity,
+                    [999, 128, 0x402320, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::ESRCH)
+        );
+
         assert_eq!(
             runtime
                 .dispatch_syscall(context(Syscall::Membarrier, [0, 0, 0, 0, 0, 0]))
                 .result,
-            SyscallReturn::Success(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED)
+            SyscallReturn::Success(
+                LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                    | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            )
         );
         assert_eq!(
             runtime
                 .dispatch_syscall(context(Syscall::Membarrier, [8, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Membarrier, [16, 0, 0, 0, 0, 0]))
                 .result,
             SyscallReturn::Success(0)
         );

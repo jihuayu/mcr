@@ -157,10 +157,12 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Kill, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Uname, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Fcntl, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Flock, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Ftruncate, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Getdents, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Getcwd, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Chdir, SyscallSubsystem::File),
+    SyscallDescriptor::new(Syscall::Fchdir, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Rename, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Mkdir, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Rmdir, SyscallSubsystem::File),
@@ -176,6 +178,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Tkill, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Futex, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::SchedGetaffinity, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getdents64, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::SetTidAddress, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::ClockGettime, SyscallSubsystem::Time),
@@ -689,8 +692,10 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             hex_field("arg", arg(2)),
         ],
         Syscall::Ftruncate => vec![decimal_field("fd", arg(0)), signed_field("length", arg(1))],
+        Syscall::Flock => vec![decimal_field("fd", arg(0)), hex_field("op", arg(1))],
         Syscall::Getcwd => vec![hex_field("buf", arg(0)), decimal_field("size", arg(1))],
         Syscall::Chdir => vec![hex_field("path_ptr", arg(0))],
+        Syscall::Fchdir => vec![decimal_field("fd", arg(0))],
         Syscall::Umask => vec![octal_field("mask", arg(0))],
         Syscall::Mmap => vec![
             hex_field("addr", arg(0)),
@@ -786,6 +791,11 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         Syscall::SetRobustList => {
             vec![hex_field("head", arg(0)), decimal_field("len", arg(1))]
         }
+        Syscall::SchedGetaffinity => vec![
+            signed_field("pid", arg(0)),
+            decimal_field("cpusetsize", arg(1)),
+            hex_field("mask", arg(2)),
+        ],
         Syscall::Futex => vec![
             hex_field("uaddr", arg(0)),
             hex_field("op", arg(1)),
@@ -1009,6 +1019,8 @@ mod tests {
             Syscall::Pwrite64,
             Syscall::Fsync,
             Syscall::Fdatasync,
+            Syscall::Fchdir,
+            Syscall::Flock,
         ] {
             assert_eq!(
                 syscall_descriptor(syscall).map(|descriptor| descriptor.subsystem),
@@ -1029,6 +1041,7 @@ mod tests {
             (Syscall::Fstatfs, SyscallSubsystem::File),
             (Syscall::Prctl, SyscallSubsystem::Task),
             (Syscall::ClockGetres, SyscallSubsystem::Time),
+            (Syscall::SchedGetaffinity, SyscallSubsystem::Task),
             (Syscall::Prlimit64, SyscallSubsystem::Task),
             (Syscall::Getcpu, SyscallSubsystem::Task),
             (Syscall::Membarrier, SyscallSubsystem::Task),
@@ -1074,6 +1087,12 @@ mod tests {
                 Syscall::Gettimeofday,
                 [0x2000, 0x3000, 0, 0, 0, 0],
                 &[("tv", "0x2000"), ("tz", "0x3000")][..],
+            ),
+            (Syscall::Fchdir, [5, 0, 0, 0, 0, 0], &[("fd", "5")][..]),
+            (
+                Syscall::Flock,
+                [5, 6, 0, 0, 0, 0],
+                &[("fd", "5"), ("op", "0x6")][..],
             ),
             (
                 Syscall::Getrlimit,
@@ -1143,6 +1162,11 @@ mod tests {
                 Syscall::ClockGetres,
                 [1, 0xa000, 0, 0, 0, 0],
                 &[("clockid", "1"), ("res", "0xa000")][..],
+            ),
+            (
+                Syscall::SchedGetaffinity,
+                [u64::MAX, 128, 0xa100, 0, 0, 0],
+                &[("pid", "-1"), ("cpusetsize", "128"), ("mask", "0xa100")][..],
             ),
             (
                 Syscall::Prlimit64,
