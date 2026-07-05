@@ -4230,7 +4230,7 @@ const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-const NATIVE_PATCH_CACHE_VERSION: u32 = 2;
+const NATIVE_PATCH_CACHE_VERSION: u32 = 3;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
