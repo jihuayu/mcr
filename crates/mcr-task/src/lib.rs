@@ -1728,7 +1728,7 @@ impl GuestKernel {
         if args.sig == 0 {
             return SyscallOutcome::success(0);
         }
-        if is_terminating_signal(args.sig) {
+        if self.should_terminate_for_process_signal(pid, args.sig) {
             return self.exit_group(pid, signal_exit_status(args.sig));
         }
         self.queue_process_signal(pid, args.sig);
@@ -1753,7 +1753,7 @@ impl GuestKernel {
         if args.sig == 0 {
             return SyscallOutcome::success(0);
         }
-        if is_terminating_signal(args.sig) {
+        if self.should_terminate_for_process_signal(pid, args.sig) {
             return self.exit_group(pid, signal_exit_status(args.sig));
         }
         self.queue_task_signal(tid, args.sig);
@@ -1774,11 +1774,25 @@ impl GuestKernel {
         if args.sig == 0 {
             return SyscallOutcome::success(0);
         }
-        if is_terminating_signal(args.sig) {
+        if self.should_terminate_for_process_signal(task.pid, args.sig) {
             return self.exit_group(task.pid, signal_exit_status(args.sig));
         }
         self.queue_task_signal(tid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
+    }
+
+    fn should_terminate_for_process_signal(&self, pid: GuestPid, signal: u32) -> bool {
+        if !is_terminating_signal(signal) {
+            return false;
+        }
+        if signal == LINUX_SIGKILL {
+            return true;
+        }
+        let Some(process) = self.process(pid) else {
+            return true;
+        };
+        !signal_matches_mask(signal, process.signals.blocked())
+            && process.signals.action(signal).is_none()
     }
 
     pub fn set_tid_address_current(
@@ -3249,6 +3263,67 @@ mod tests {
         assert_eq!(
             kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
             ExitState::Exited { status: 143 }
+        );
+    }
+
+    #[test]
+    fn kill_queues_blocked_sigterm_for_sigtimedwait_instead_of_exiting() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let signal_mask = 1u64 << (LINUX_SIGTERM - 1);
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigprocmask,
+                [
+                    LINUX_SIG_SETMASK as u64,
+                    signal_mask,
+                    0,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Kill,
+                [INITIAL_GUEST_PID as u64, LINUX_SIGTERM as u64, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Running
+        );
+        assert!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .pending_signals
+                .contains(&LINUX_SIGTERM)
+        );
+
+        assert_eq!(
+            kernel
+                .rt_sigtimedwait_current(
+                    INITIAL_GUEST_TID,
+                    signal_mask,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    false,
+                )
+                .result,
+            SyscallReturn::Success(u64::from(LINUX_SIGTERM))
+        );
+        assert!(
+            !kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .pending_signals
+                .contains(&LINUX_SIGTERM)
         );
     }
 
