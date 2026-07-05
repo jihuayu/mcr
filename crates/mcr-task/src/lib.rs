@@ -13,15 +13,18 @@ mod tests;
 pub use errors::TaskError;
 pub use fd::{GuestFdEntry, GuestFdTable};
 pub use host_worker_pool::{
-    DEFAULT_GUEST_TASK_QUEUE_CAPACITY, DEFAULT_GUEST_TASK_WORKERS,
-    DEFAULT_IO_COMPLETION_QUEUE_CAPACITY, DEFAULT_IO_COMPLETION_WORKERS,
-    HOST_WORKER_POOL_MAX_QUEUED_JOBS, HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPoolBoundary,
-    HostWorkerPoolCompletion, HostWorkerPoolCompletionError, HostWorkerPoolConfig,
-    HostWorkerPoolConfigError, HostWorkerPoolDiagnostics, HostWorkerPoolExecutor,
-    HostWorkerPoolJob, HostWorkerPoolJobError, HostWorkerPoolRole, HostWorkerPoolSubmission,
-    HostWorkerPoolSubmitError, HostWorkerPools,
+    HostWorkerPoolBoundary, HostWorkerPoolCompletion, HostWorkerPoolCompletionError,
+    HostWorkerPools,
 };
 pub use kernel::GuestKernel;
+pub use mcr_win::{
+    DEFAULT_GUEST_TASK_QUEUE_CAPACITY, DEFAULT_GUEST_TASK_WORKERS,
+    DEFAULT_IO_COMPLETION_QUEUE_CAPACITY, DEFAULT_IO_COMPLETION_WORKERS,
+    HOST_WORKER_POOL_MAX_QUEUED_JOBS, HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPoolConfig,
+    HostWorkerPoolConfigError, HostWorkerPoolDiagnostics, HostWorkerPoolExecutor,
+    HostWorkerPoolJob, HostWorkerPoolJobError, HostWorkerPoolRole, HostWorkerPoolSubmission,
+    HostWorkerPoolSubmitError,
+};
 pub use process::{
     CompletedWait, ExitState, GuestProcess, GuestSignalAction, SignalState, WaitedChild,
 };

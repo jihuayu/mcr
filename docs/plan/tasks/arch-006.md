@@ -1,7 +1,7 @@
 ---
 id: arch-006
 scope: architecture
-status: ready
+status: done
 depends-on: [perf-019]
 ---
 

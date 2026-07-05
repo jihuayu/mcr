@@ -6,7 +6,6 @@ rust-version.workspace = true
 
 [dependencies]
 mcr-sys.workspace = true
-mcr-task.workspace = true
 mcr-win.workspace = true
 
 [lints]

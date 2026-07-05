@@ -7,10 +7,10 @@ pub(super) use std::{
     time::Duration,
 };
 
-pub(super) use mcr_task::{HostWorkerPoolConfig, HostWorkerPoolExecutor, HostWorkerPoolRole};
 pub(super) use mcr_win::{
-    AddressFamily, HostSocketOptionName, HostSocketOptionValue, NetworkStack, SocketCompletionKind,
-    SocketEvents, SocketFastPathKind, SocketKind, SocketProtocol as HostSocketProtocol,
+    AddressFamily, HostSocketOptionName, HostSocketOptionValue, HostWorkerPoolConfig,
+    HostWorkerPoolExecutor, HostWorkerPoolRole, NetworkStack, SocketCompletionKind, SocketEvents,
+    SocketFastPathKind, SocketKind, SocketProtocol as HostSocketProtocol,
 };
 
 pub(super) use crate::*;

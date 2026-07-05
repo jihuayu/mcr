@@ -6,16 +6,13 @@ use std::{
     time::Duration,
 };
 
-use mcr_task::{
-    HostWorkerPoolConfig, HostWorkerPoolExecutor, HostWorkerPoolJobError, HostWorkerPoolRole,
-    HostWorkerPoolSubmitError,
-};
 use mcr_win::{
     AddressFamily, HostAcceptExSubmission, HostConnectExSubmission, HostErrorKind,
     HostIoCompletionPort, HostRioCapability, HostShutdown, HostSocket, HostSocketIoDirection,
-    HostSocketIoSubmission, HostSocketOptionName, HostSocketOptionValue, NetworkStack,
-    PendingHostAcceptEx, PendingHostConnectEx, PendingHostSocketIo, SocketCompletionKind,
-    SocketEvents, SocketKind, SocketProtocol as HostSocketProtocol,
+    HostSocketIoSubmission, HostSocketOptionName, HostSocketOptionValue, HostWorkerPoolConfig,
+    HostWorkerPoolExecutor, HostWorkerPoolJobError, HostWorkerPoolRole, HostWorkerPoolSubmitError,
+    NetworkStack, PendingHostAcceptEx, PendingHostConnectEx, PendingHostSocketIo,
+    SocketCompletionKind, SocketEvents, SocketKind, SocketProtocol as HostSocketProtocol,
 };
 
 use crate::{
