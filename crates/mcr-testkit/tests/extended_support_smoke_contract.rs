@@ -51,8 +51,12 @@ EOF
 "#;
 
 const MYSQL_RUN_SCRIPT: &str = r#"set -eu
-/usr/bin/mariadbd --version >/dev/null
-/usr/bin/mariadb --version >/dev/null
+base=/tmp/mcr-mysql-smoke
+rm -rf "$base"
+mkdir -p "$base"
+trap 'rm -rf "$base"' EXIT
+printf 'CREATE DATABASE mcr_smoke;\n' | /usr/bin/mariadbd --no-defaults --user=root --datadir="$base" --bootstrap --skip-grant-tables --innodb-use-native-aio=0 >/dev/null
+test -d "$base/mcr_smoke"
 echo mysql-ok
 "#;
 
@@ -80,7 +84,7 @@ const JDK_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"jdk-ok\n",
 };
 const MYSQL_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "mysql version run",
+    name: "mysql bootstrap database",
     rootfs: "mysql-rootfs",
     script: MYSQL_RUN_SCRIPT,
     stdout: b"mysql-ok\n",
