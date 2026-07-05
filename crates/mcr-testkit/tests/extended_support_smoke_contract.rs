@@ -35,10 +35,18 @@ const NODEJS_RUN_SCRIPT: &str = r#"/usr/bin/node -e 'require("fs").writeSync(1, 
 "#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
-/usr/lib/jvm/java-21-openjdk/lib/jspawnhelper 2>&1 | grep 'jspawnhelper version' >/dev/null
-test -x /usr/lib/jvm/java-21-openjdk/bin/javac
-test -x /usr/lib/jvm/java-21-openjdk/bin/java
-echo jdk-ok
+base=/tmp/mcr-jdk-smoke-$$
+mkdir -p "$base"
+trap 'rm -rf "$base"' EXIT
+cat > "$base/McrSmoke.java" <<'EOF'
+public final class McrSmoke {
+    public static void main(String[] args) {
+        System.out.println("jdk-ok");
+    }
+}
+EOF
+/usr/lib/jvm/java-21-openjdk/bin/javac -J-Xshare:off -J-XX:-UsePerfData -J-Xint "$base/McrSmoke.java"
+/usr/lib/jvm/java-21-openjdk/bin/java -Xshare:off -XX:-UsePerfData -Xint -cp "$base" McrSmoke
 "#;
 
 const MYSQL_RUN_SCRIPT: &str = r#"set -eu
@@ -65,7 +73,7 @@ const NODEJS_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"node-ok\n",
 };
 const JDK_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "jdk helper run",
+    name: "jdk compile and run",
     rootfs: "jdk-rootfs",
     script: JDK_RUN_SCRIPT,
     stdout: b"jdk-ok\n",
