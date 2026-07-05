@@ -958,6 +958,7 @@ impl GuestKernel {
                 ),
             ),
             Syscall::RtSigreturn => SyscallOutcome::success(0),
+            Syscall::RtSigtimedwait => self.rt_sigtimedwait_current(arg(request, 3)),
             Syscall::Kill => self.kill_current(KillSyscallArgs::new(
                 arg(request, 0) as i32,
                 arg(request, 1) as u32,
@@ -1593,6 +1594,14 @@ impl GuestKernel {
             }
         }
         SyscallOutcome::success(0).with_decoded_field("signal_mask", format!("{:#x}", args.set))
+    }
+
+    pub fn rt_sigtimedwait_current(&self, sigsetsize: u64) -> SyscallOutcome {
+        if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
+        }
+        SyscallOutcome::errno(LinuxErrno::EAGAIN)
+            .with_decoded_field("signal_wait", "no_pending_signal")
     }
 
     pub fn kill_current(&mut self, args: KillSyscallArgs) -> SyscallOutcome {
@@ -2968,6 +2977,28 @@ mod tests {
                     0,
                     0
                 ],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_reports_no_pending_signal_and_rejects_bad_sigset_size() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigtimedwait,
+                [0x402000, 0, 0x402100, LINUX_KERNEL_SIGSET_SIZE, 0, 0],
+            ),
+            SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        );
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::RtSigtimedwait,
+                [0x402000, 0, 0x402100, LINUX_KERNEL_SIGSET_SIZE + 1, 0, 0],
             ),
             SyscallReturn::Errno(LinuxErrno::EINVAL)
         );

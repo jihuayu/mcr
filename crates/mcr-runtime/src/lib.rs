@@ -7310,6 +7310,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
+            mcr_sys::Syscall::RtSigtimedwait => self.dispatch_rt_sigtimedwait(request),
             mcr_sys::Syscall::RtSigsuspend => self.dispatch_rt_sigsuspend(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
@@ -8630,6 +8631,33 @@ impl RuntimeSubsystems {
         }
         self.tasks
             .wait_for_signal_current(request.context.tid, arg(request, 1))
+    }
+
+    fn dispatch_rt_sigtimedwait(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.rt_sigtimedwait(request) {
+            Ok(()) => SyscallOutcome::errno(LinuxErrno::EAGAIN),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    fn rt_sigtimedwait(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let pid = request.context.pid;
+        self.select_memory_for_process(pid)?;
+        let set_addr = arg(request, 0);
+        let timeout_addr = arg(request, 2);
+        let sigsetsize = arg(request, 3);
+        if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if set_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        let _ = read_guest_u64(self.files.memory(), set_addr)?;
+        if timeout_addr != 0 {
+            let duration = read_required_timespec_duration(self.files.memory(), timeout_addr)?;
+            mcr_win::sleep_for(duration).map_err(time_errno)?;
+        }
+        Ok(())
     }
 
     fn sigaltstack(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
@@ -13357,6 +13385,41 @@ mod tests {
                 .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
                 .result,
             SyscallReturn::Errno(LinuxErrno::ENOMEM)
+        );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_returns_eagain_after_validating_inputs() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0x2u64.to_le_bytes())
+            .unwrap();
+        write_timespec(runtime.memory_mut(), 0x402100, 0, 0);
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::RtSigtimedwait,
+                    [0x402000, 0, 0x402100, 8, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::RtSigtimedwait, [0, 0, 0x402100, 8, 0, 0],))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EFAULT)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::RtSigtimedwait,
+                    [0x402000, 0, 0x402100, 9, 0, 0],
+                ))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
         );
     }
 

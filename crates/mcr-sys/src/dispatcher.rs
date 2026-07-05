@@ -99,6 +99,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::RtSigaction, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::RtSigprocmask, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::RtSigreturn, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::RtSigtimedwait, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::RtSigsuspend, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Ioctl, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pread64, SyscallSubsystem::File),
@@ -737,6 +738,12 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         | Syscall::Setsid
         | Syscall::SchedYield
         | Syscall::RtSigreturn => Vec::new(),
+        Syscall::RtSigtimedwait => vec![
+            hex_field("set", arg(0)),
+            hex_field("info", arg(1)),
+            hex_field("timeout", arg(2)),
+            decimal_field("sigsetsize", arg(3)),
+        ],
         Syscall::RtSigsuspend => vec![
             hex_field("mask", arg(0)),
             decimal_field("sigsetsize", arg(1)),
@@ -1048,6 +1055,7 @@ mod tests {
             (Syscall::Gettimeofday, SyscallSubsystem::Time),
             (Syscall::Times, SyscallSubsystem::Time),
             (Syscall::Getrlimit, SyscallSubsystem::Task),
+            (Syscall::RtSigtimedwait, SyscallSubsystem::Task),
             (Syscall::RtSigsuspend, SyscallSubsystem::Task),
             (Syscall::Getrusage, SyscallSubsystem::Task),
             (Syscall::Sysinfo, SyscallSubsystem::Task),
@@ -1172,6 +1180,16 @@ mod tests {
                     ("arg3", "0x3"),
                     ("arg4", "0x4"),
                     ("arg5", "0x5"),
+                ][..],
+            ),
+            (
+                Syscall::RtSigtimedwait,
+                [0x9e00, 0x9e80, 0x9f00, 8, 0, 0],
+                &[
+                    ("set", "0x9e00"),
+                    ("info", "0x9e80"),
+                    ("timeout", "0x9f00"),
+                    ("sigsetsize", "8"),
                 ][..],
             ),
             (
