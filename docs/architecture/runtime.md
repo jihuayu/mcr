@@ -298,6 +298,12 @@ Implementation order:
 
 Windows-specific APIs stay in `mcr-win`.
 
+Windows x86-64 is the only supported host platform. `mcr-win` must contain
+Windows backends only: the non-Windows compile-time stubs and the Linux `libc`
+backend that accumulated in this crate were added by mistake, are not a
+supported execution or test path, and are scheduled for removal in `win-002`.
+CI and smoke validation run on Windows x86-64 runners.
+
 | Adapter | Host APIs |
 |---|---|
 | Memory | `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, exception handling hooks. |

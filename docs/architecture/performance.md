@@ -74,7 +74,11 @@ sticky scheduling. Sticky scheduling is now the default policy, with
 `MCR_SCHED_STICKY=0` reserved for differential debugging. The 2026-07-04
 release rerun measured `curl https://example.com` at `485.074ms` and
 `git ls-remote` at `1872.576ms`; the direct trace reported zero scheduler
-sleeps, with remap and pipe IPC still visible for later backend work.
+sleeps, with remap and pipe IPC still visible for later backend work. The
+remap cost is now tracked as architecture debt: the single selected process
+context clones or remaps guest memory on every cross-process switch, and
+`arch-003` replaces it with per-process state ownership so scheduling switches
+references instead of memory contents.
 
 ## File And I/O Optimization
 
