@@ -1,5 +1,7 @@
 use core::fmt;
 
+use mcr_win::HostErrorKind;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LinuxErrno(u16);
 
@@ -141,6 +143,45 @@ impl LinuxErrno {
     pub const ERFKILL: Self = Self(132);
     pub const EHWPOISON: Self = Self(133);
 
+    #[allow(non_upper_case_globals)]
+    pub const AddressFamilyNotSupported: Self = Self::EAFNOSUPPORT;
+    #[allow(non_upper_case_globals)]
+    pub const AlreadyConnected: Self = Self::EISCONN;
+    #[allow(non_upper_case_globals)]
+    pub const BadFileDescriptor: Self = Self::EBADF;
+    #[allow(non_upper_case_globals)]
+    pub const BrokenPipe: Self = Self::EPIPE;
+    #[allow(non_upper_case_globals)]
+    pub const ConnectionRefused: Self = Self::ECONNREFUSED;
+    #[allow(non_upper_case_globals)]
+    pub const ConnectionReset: Self = Self::ECONNRESET;
+    #[allow(non_upper_case_globals)]
+    pub const FunctionNotImplemented: Self = Self::ENOSYS;
+    #[allow(non_upper_case_globals)]
+    pub const InvalidArgument: Self = Self::EINVAL;
+    #[allow(non_upper_case_globals)]
+    pub const NotConnected: Self = Self::ENOTCONN;
+    #[allow(non_upper_case_globals)]
+    pub const OperationAlreadyInProgress: Self = Self::EALREADY;
+    #[allow(non_upper_case_globals)]
+    pub const OperationInProgress: Self = Self::EINPROGRESS;
+    #[allow(non_upper_case_globals)]
+    pub const OperationNotSupported: Self = Self::EOPNOTSUPP;
+    #[allow(non_upper_case_globals)]
+    pub const OperationWouldBlock: Self = Self::EWOULDBLOCK;
+    #[allow(non_upper_case_globals)]
+    pub const ProtocolNotAvailable: Self = Self::ENOPROTOOPT;
+    #[allow(non_upper_case_globals)]
+    pub const ProtocolNotSupported: Self = Self::EPROTONOSUPPORT;
+    #[allow(non_upper_case_globals)]
+    pub const ProtocolWrongTypeForSocket: Self = Self::EPROTOTYPE;
+    #[allow(non_upper_case_globals)]
+    pub const Shutdown: Self = Self::ESHUTDOWN;
+    #[allow(non_upper_case_globals)]
+    pub const SocketTypeNotSupported: Self = Self::ESOCKTNOSUPPORT;
+    #[allow(non_upper_case_globals)]
+    pub const TimedOut: Self = Self::ETIMEDOUT;
+
     #[must_use]
     pub const fn new(raw: u16) -> Option<Self> {
         if raw >= 1 && raw <= Self::MAX {
@@ -153,6 +194,11 @@ impl LinuxErrno {
     #[must_use]
     pub const fn raw(self) -> u16 {
         self.0
+    }
+
+    #[must_use]
+    pub const fn code(self) -> i32 {
+        self.0 as i32
     }
 
     #[must_use]
@@ -294,6 +340,24 @@ impl LinuxErrno {
     }
 }
 
+#[must_use]
+pub const fn host_error_errno(kind: HostErrorKind) -> LinuxErrno {
+    match kind {
+        HostErrorKind::InvalidInput => LinuxErrno::EINVAL,
+        HostErrorKind::Interrupted | HostErrorKind::WouldBlock => LinuxErrno::EWOULDBLOCK,
+        HostErrorKind::TimedOut => LinuxErrno::ETIMEDOUT,
+        HostErrorKind::BrokenPipe => LinuxErrno::EPIPE,
+        HostErrorKind::Unsupported => LinuxErrno::ENOSYS,
+        HostErrorKind::Unavailable => LinuxErrno::ECONNREFUSED,
+        HostErrorKind::AccessDenied
+        | HostErrorKind::NotFound
+        | HostErrorKind::AlreadyExists
+        | HostErrorKind::OutOfMemory
+        | HostErrorKind::Poisoned
+        | HostErrorKind::Other => LinuxErrno::ECONNRESET,
+    }
+}
+
 impl fmt::Display for LinuxErrno {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name() {
@@ -305,7 +369,9 @@ impl fmt::Display for LinuxErrno {
 
 #[cfg(test)]
 mod tests {
-    use super::LinuxErrno;
+    use mcr_win::HostErrorKind;
+
+    use super::{LinuxErrno, host_error_errno};
 
     #[test]
     fn errno_accepts_linux_error_range() {
@@ -324,5 +390,28 @@ mod tests {
         assert_eq!(LinuxErrno::EWOULDBLOCK.raw(), 11);
         assert_eq!(LinuxErrno::ENOSYS.raw(), 38);
         assert_eq!(LinuxErrno::ENOTSUP.raw(), 95);
+    }
+
+    #[test]
+    fn host_error_errno_matches_legacy_socket_mapping() {
+        let expected = [
+            (HostErrorKind::AccessDenied, LinuxErrno::ECONNRESET),
+            (HostErrorKind::NotFound, LinuxErrno::ECONNRESET),
+            (HostErrorKind::AlreadyExists, LinuxErrno::ECONNRESET),
+            (HostErrorKind::InvalidInput, LinuxErrno::EINVAL),
+            (HostErrorKind::Interrupted, LinuxErrno::EWOULDBLOCK),
+            (HostErrorKind::TimedOut, LinuxErrno::ETIMEDOUT),
+            (HostErrorKind::WouldBlock, LinuxErrno::EWOULDBLOCK),
+            (HostErrorKind::BrokenPipe, LinuxErrno::EPIPE),
+            (HostErrorKind::OutOfMemory, LinuxErrno::ECONNRESET),
+            (HostErrorKind::Unsupported, LinuxErrno::ENOSYS),
+            (HostErrorKind::Poisoned, LinuxErrno::ECONNRESET),
+            (HostErrorKind::Unavailable, LinuxErrno::ECONNREFUSED),
+            (HostErrorKind::Other, LinuxErrno::ECONNRESET),
+        ];
+
+        for (kind, errno) in expected {
+            assert_eq!(host_error_errno(kind), errno, "{kind:?}");
+        }
     }
 }

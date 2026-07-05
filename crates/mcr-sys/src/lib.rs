@@ -21,7 +21,7 @@ pub use dispatcher::{
     SyscallSubsystems, SyscallTracer, TaskSyscalls, TimeSyscalls, decode_syscall_fields,
     syscall_descriptor, syscall_descriptor_by_number,
 };
-pub use errno::LinuxErrno;
+pub use errno::{LinuxErrno, host_error_errno};
 pub use fd::{
     Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, FcntlSyscallArgs, IoctlSyscallArgs,
     LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_GETPIPE_SZ,

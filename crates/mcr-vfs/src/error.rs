@@ -1,4 +1,6 @@
-use super::*;
+use std::fmt;
+
+use mcr_sys::LinuxErrno;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsError {
@@ -23,26 +25,30 @@ pub enum VfsError {
 }
 
 impl VfsError {
-    pub fn linux_errno(self) -> u16 {
+    pub const fn linux_errno(self) -> u16 {
+        self.linux_errno_value().raw()
+    }
+
+    pub const fn linux_errno_value(self) -> LinuxErrno {
         match self {
-            Self::AlreadyExists => 17,
-            Self::BadFd => 9,
-            Self::BrokenPipe => 32,
-            Self::Busy => 16,
-            Self::InvalidPath => 22,
-            Self::IsDirectory => 21,
-            Self::Loop => 40,
-            Self::NameTooLong => 36,
-            Self::NoEntry => 2,
-            Self::NotEmpty => 39,
-            Self::NoSpace => 28,
-            Self::NotSeekable => 29,
-            Self::NotSocket => 88,
-            Self::NotTerminal => 25,
-            Self::NotDirectory => 20,
-            Self::NotPermitted => 1,
-            Self::PermissionDenied => 13,
-            Self::WouldBlock => 11,
+            Self::AlreadyExists => LinuxErrno::EEXIST,
+            Self::BadFd => LinuxErrno::EBADF,
+            Self::BrokenPipe => LinuxErrno::EPIPE,
+            Self::Busy => LinuxErrno::EBUSY,
+            Self::InvalidPath => LinuxErrno::EINVAL,
+            Self::IsDirectory => LinuxErrno::EISDIR,
+            Self::Loop => LinuxErrno::ELOOP,
+            Self::NameTooLong => LinuxErrno::ENAMETOOLONG,
+            Self::NoEntry => LinuxErrno::ENOENT,
+            Self::NotEmpty => LinuxErrno::ENOTEMPTY,
+            Self::NoSpace => LinuxErrno::ENOSPC,
+            Self::NotSeekable => LinuxErrno::ESPIPE,
+            Self::NotSocket => LinuxErrno::ENOTSOCK,
+            Self::NotTerminal => LinuxErrno::ENOTTY,
+            Self::NotDirectory => LinuxErrno::ENOTDIR,
+            Self::NotPermitted => LinuxErrno::EPERM,
+            Self::PermissionDenied => LinuxErrno::EACCES,
+            Self::WouldBlock => LinuxErrno::EWOULDBLOCK,
         }
     }
 }

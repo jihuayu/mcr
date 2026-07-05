@@ -9,4 +9,5 @@ workspace = true
 
 [dependencies]
 getrandom.workspace = true
+mcr-sys.workspace = true
 mcr-win.workspace = true

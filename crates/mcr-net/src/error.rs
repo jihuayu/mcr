@@ -1,8 +1,11 @@
 use std::fmt;
 
-use mcr_win::{HostError, HostErrorKind};
+use mcr_sys::host_error_errno;
+use mcr_win::HostError;
 
 use crate::types::SocketId;
+
+pub use mcr_sys::LinuxErrno;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostIoError {
@@ -66,56 +69,6 @@ pub enum SocketOperation {
     SendMsg,
     SetSocketOption,
     Shutdown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LinuxErrno {
-    AlreadyConnected,
-    BadFileDescriptor,
-    BrokenPipe,
-    ConnectionRefused,
-    ConnectionReset,
-    FunctionNotImplemented,
-    InvalidArgument,
-    NotConnected,
-    OperationAlreadyInProgress,
-    OperationInProgress,
-    OperationWouldBlock,
-    OperationNotSupported,
-    AddressFamilyNotSupported,
-    ProtocolNotAvailable,
-    ProtocolNotSupported,
-    ProtocolWrongTypeForSocket,
-    Shutdown,
-    SocketTypeNotSupported,
-    TimedOut,
-}
-
-impl LinuxErrno {
-    #[must_use]
-    pub const fn code(self) -> i32 {
-        match self {
-            Self::AlreadyConnected => 106,
-            Self::BadFileDescriptor => 9,
-            Self::BrokenPipe => 32,
-            Self::ConnectionRefused => 111,
-            Self::ConnectionReset => 104,
-            Self::FunctionNotImplemented => 38,
-            Self::InvalidArgument => 22,
-            Self::OperationNotSupported => 95,
-            Self::NotConnected => 107,
-            Self::OperationAlreadyInProgress => 114,
-            Self::OperationInProgress => 115,
-            Self::OperationWouldBlock => 11,
-            Self::ProtocolWrongTypeForSocket => 91,
-            Self::ProtocolNotAvailable => 92,
-            Self::ProtocolNotSupported => 93,
-            Self::SocketTypeNotSupported => 94,
-            Self::AddressFamilyNotSupported => 97,
-            Self::Shutdown => 108,
-            Self::TimedOut => 110,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,19 +201,3 @@ impl fmt::Display for SocketError {
 }
 
 impl std::error::Error for SocketError {}
-const fn host_error_errno(kind: HostErrorKind) -> LinuxErrno {
-    match kind {
-        HostErrorKind::InvalidInput => LinuxErrno::InvalidArgument,
-        HostErrorKind::Interrupted | HostErrorKind::WouldBlock => LinuxErrno::OperationWouldBlock,
-        HostErrorKind::TimedOut => LinuxErrno::TimedOut,
-        HostErrorKind::BrokenPipe => LinuxErrno::BrokenPipe,
-        HostErrorKind::Unsupported => LinuxErrno::FunctionNotImplemented,
-        HostErrorKind::Unavailable => LinuxErrno::ConnectionRefused,
-        HostErrorKind::AccessDenied
-        | HostErrorKind::NotFound
-        | HostErrorKind::AlreadyExists
-        | HostErrorKind::OutOfMemory
-        | HostErrorKind::Poisoned
-        | HostErrorKind::Other => LinuxErrno::ConnectionReset,
-    }
-}

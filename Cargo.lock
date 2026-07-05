@@ -131,6 +131,7 @@ dependencies = [
 name = "mcr-net"
 version = "0.1.0"
 dependencies = [
+ "mcr-sys",
  "mcr-task",
  "mcr-win",
 ]
@@ -157,6 +158,9 @@ version = "0.1.0"
 [[package]]
 name = "mcr-sys"
 version = "0.1.0"
+dependencies = [
+ "mcr-win",
+]
 
 [[package]]
 name = "mcr-task"
@@ -182,6 +186,7 @@ name = "mcr-vfs"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "mcr-sys",
  "mcr-win",
 ]
 
