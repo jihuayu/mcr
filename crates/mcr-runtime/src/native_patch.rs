@@ -4,7 +4,7 @@ use super::*;
 pub(crate) use mcr_jit::native_patch::*;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) const FS_RELATIVE_PATCH_MATERIALIZE_LIMIT: usize = 2048;
+pub(crate) const FS_RELATIVE_PATCH_MATERIALIZE_LIMIT: usize = 65_536;
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -384,10 +384,10 @@ fn emulate_fs_absolute_mov_load(
     instruction: &NativeFaultInstruction,
 ) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
     let bytes = instruction.bytes.as_slice();
-    if bytes.first().copied() != Some(0x64) {
+    let Some(fs_index) = fs_segment_prefix_index(bytes) else {
         return Ok(None);
-    }
-    let mut index = 1usize;
+    };
+    let mut index = fs_index + 1;
     let rex = if bytes
         .get(index)
         .is_some_and(|byte| (0x40..=0x4f).contains(byte))
@@ -448,22 +448,33 @@ fn emulate_fs_absolute_sub(
     instruction: &NativeFaultInstruction,
 ) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
     let bytes = instruction.bytes.as_slice();
-    if bytes.len() != 9
-        || bytes[0] != 0x64
-        || bytes[1] != 0x48
-        || bytes[2] != 0x2b
-        || bytes[4] != 0x25
-        || bytes[3] & 0xc7 != 0x04
+    let Some(fs_index) = fs_segment_prefix_index(bytes) else {
+        return Ok(None);
+    };
+    let index = fs_index + 1;
+    if bytes.len() != fs_index + 9
+        || bytes.get(index).copied() != Some(0x48)
+        || bytes.get(index + 1).copied() != Some(0x2b)
+        || bytes.get(index + 3).copied() != Some(0x25)
+        || bytes
+            .get(index + 2)
+            .copied()
+            .is_none_or(|modrm| modrm & 0xc7 != 0x04)
     {
         return Ok(None);
     }
-    let displacement =
-        i32::from_le_bytes(bytes[5..9].try_into().expect("displacement length checked"));
+    let displacement_start = index + 4;
+    let displacement_end = displacement_start + 4;
+    let displacement = i32::from_le_bytes(
+        bytes[displacement_start..displacement_end]
+            .try_into()
+            .expect("displacement length checked"),
+    );
     let addr = fs_base.wrapping_add(displacement as i64 as u64);
     let mut rhs_bytes = [0; 8];
     memory.read(addr, &mut rhs_bytes)?;
     let rhs = u64::from_le_bytes(rhs_bytes);
-    let reg = (bytes[3] >> 3) & 0x07;
+    let reg = (bytes[index + 2] >> 3) & 0x07;
     let lhs = host_register64(&registers, reg)?;
     let result = lhs.wrapping_sub(rhs);
     set_host_register64(&mut registers, reg, result)?;
@@ -479,6 +490,15 @@ fn emulate_fs_absolute_sub(
             GuestMemoryError::InvalidAddress,
         ))?;
     Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_segment_prefix_index(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0usize;
+    while bytes.get(index).copied() == Some(0x66) {
+        index += 1;
+    }
+    (bytes.get(index).copied() == Some(0x64)).then_some(index)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]

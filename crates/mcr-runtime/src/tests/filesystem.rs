@@ -40,6 +40,41 @@ fn dispatcher_connects_openat_read_write_lseek_and_close_to_vfs() {
 }
 
 #[test]
+fn dispatcher_routes_pwrite64_without_changing_fd_offset() {
+    let mut runtime = runtime_with_sample_vfs();
+    runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+    runtime.memory_mut().write(0x2000, b"YY");
+    runtime.memory_mut().write(0x2010, b"!");
+    let fd = dispatch(
+        &mut runtime,
+        Syscall::Openat,
+        [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+    );
+    assert_eq!(fd, SyscallReturn::Success(3));
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Lseek, [3, 5, 0, 0, 0, 0]),
+        SyscallReturn::Success(5)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Pwrite64, [3, 0x2000, 2, 1, 0, 0]),
+        SyscallReturn::Success(2)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Write, [3, 0x2010, 1, 0, 0, 0]),
+        SyscallReturn::Success(1)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Lseek, [3, 0, 0, 0, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Read, [3, 0x3000, 6, 0, 0, 0]),
+        SyscallReturn::Success(6)
+    );
+    assert_eq!(runtime.memory().read(0x3000, 6), b"hYYlo!");
+}
+
+#[test]
 fn openat2_degrades_simple_open_how_to_openat() {
     let mut runtime = runtime_with_sample_vfs();
     runtime.memory_mut().write_cstr(0x1000, "/tmp/file");

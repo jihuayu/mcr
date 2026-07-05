@@ -414,6 +414,28 @@ impl VirtualFileSystem {
         Ok(count)
     }
 
+    pub fn pwrite(&mut self, fd: Fd, offset: u64, buffer: &[u8]) -> VfsResult<usize> {
+        let (inode_id, count) = {
+            let entry = self.fds.get_mut(fd)?;
+            if !entry.flags().can_write() {
+                return Err(VfsError::BadFd);
+            }
+            if !matches!(entry.file().kind(), FileKind::Regular) {
+                return Err(VfsError::BadFd);
+            }
+            let inode_id = entry.inode_id();
+            let node = self
+                .tree
+                .lookup_inode_mut(inode_id)
+                .ok_or(VfsError::NoEntry)?;
+            (inode_id, node.write_at(offset, buffer)?)
+        };
+        if count > 0 {
+            self.invalidate_inode_cache(inode_id);
+        }
+        Ok(count)
+    }
+
     pub fn lseek(&mut self, fd: Fd, offset: i64, whence: SeekWhence) -> VfsResult<u64> {
         self.fds.seek(&self.tree, fd, offset, whence)
     }
@@ -537,6 +559,10 @@ impl VirtualFileSystem {
             F_GETFL => Ok(self.fds.status_flags(fd)? as u64),
             F_SETFL => {
                 self.fds.set_status_flags(fd, arg as u32)?;
+                Ok(0)
+            }
+            F_SETLK | F_SETLKW => {
+                self.fds.get(fd)?;
                 Ok(0)
             }
             F_GETPIPE_SZ => Ok(self.fds.pipe_capacity(fd)? as u64),

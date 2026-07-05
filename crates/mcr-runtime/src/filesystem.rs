@@ -69,6 +69,7 @@ where
             mcr_sys::Syscall::Read => self.sys_read(request),
             mcr_sys::Syscall::Write => self.sys_write(request),
             mcr_sys::Syscall::Pread64 => self.sys_pread64(request),
+            mcr_sys::Syscall::Pwrite64 => self.sys_pwrite64(request),
             mcr_sys::Syscall::Readv => self.sys_readv(request),
             mcr_sys::Syscall::Writev => self.sys_writev(request),
             mcr_sys::Syscall::Close => self.sys_close(request),
@@ -737,6 +738,31 @@ where
         self.memory
             .write_bytes(addr, &buffer[..count])
             .map_err(memory_errno)?;
+        Ok(count as u64)
+    }
+
+    fn sys_pwrite64(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let fd = arg_i32(request, 0);
+        let addr = arg(request, 1);
+        let len = usize_arg(request, 2)?;
+        let offset = arg(request, 3);
+        if offset > i64::MAX as u64 {
+            return Err(LinuxErrno::EINVAL);
+        }
+
+        if let Some(buffer) = self
+            .memory
+            .borrowed_bytes(addr, len)
+            .map_err(memory_errno)?
+        {
+            let count = self.vfs.pwrite(fd, offset, buffer).map_err(vfs_errno)?;
+            return Ok(count as u64);
+        }
+        let mut buffer = vec![0; len];
+        self.memory
+            .read_bytes(addr, &mut buffer)
+            .map_err(memory_errno)?;
+        let count = self.vfs.pwrite(fd, offset, &buffer).map_err(vfs_errno)?;
         Ok(count as u64)
     }
 

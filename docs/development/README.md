@@ -189,7 +189,7 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs python-rootfs /bin/sh -c "python -V"` | Phase 2 workload matrix |
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | Phase 2 workload matrix |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | Phase 2 workload matrix |
-| `mcr run-rootfs gcc-rootfs /bin/sh -c "gcc --version"` | Extended support matrix |
+| `mcr run-rootfs gcc-rootfs /bin/sh -c "<write C source, gcc, run binary>"` | Extended support matrix |
 | `mcr run-rootfs node-rootfs /bin/sh -c "node -v"` | Extended support matrix |
 | `mcr run-rootfs jdk-rootfs /bin/sh -c "<verify java/javac and jspawnhelper presence>"` | Extended support matrix |
 | `mcr run-rootfs mysql-rootfs /bin/sh -c "mariadbd --version && mariadb --version"` | Extended support matrix |
@@ -229,7 +229,7 @@ Those tests invoke `mcr` directly as `run-rootfs`, the `alpine-rootfs` fixture,
 through the host shell.
 
 The ignored extended support matrix uses `MCR_BIN` plus the matching
-materialized package rootfs fixture. It covers GCC binary startup, Node.js
+materialized package rootfs fixture. It covers GCC compile-and-run, Node.js
 version execution, JDK java/javac and jspawnhelper presence, MariaDB
 server/client version execution, and Redis server execution. Run it explicitly with:
 

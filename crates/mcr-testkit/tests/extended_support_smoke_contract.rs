@@ -16,8 +16,19 @@ struct ExtendedSupportSmokeContract {
 }
 
 const GCC_COMPILE_SCRIPT: &str = r#"set -eu
-/usr/bin/gcc --version >/dev/null
-echo gcc-ok
+base=/tmp/mcr-gcc-smoke-$$
+mkdir -p "$base"
+trap 'rm -rf "$base"' EXIT
+cat > "$base/main.c" <<'EOF'
+#include <stdio.h>
+
+int main(void) {
+    puts("gcc-ok");
+    return 0;
+}
+EOF
+/usr/bin/gcc "$base/main.c" -o "$base/main"
+"$base/main"
 "#;
 
 const NODEJS_RUN_SCRIPT: &str = r#"set -eu
@@ -44,7 +55,7 @@ echo redis-ok
 "#;
 
 const GCC_COMPILE: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "gcc binary starts",
+    name: "gcc compile and run",
     rootfs: "gcc-rootfs",
     script: GCC_COMPILE_SCRIPT,
     stdout: b"gcc-ok\n",

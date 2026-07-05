@@ -288,6 +288,9 @@ fn fd_duplication_clones_open_file_state_and_tracks_descriptor_flags() {
         vfs.fcntl(dup, F_GETFL, 0).unwrap() as u32 & (O_APPEND | O_NONBLOCK),
         O_APPEND | O_NONBLOCK
     );
+    assert_eq!(vfs.fcntl(fd, F_SETLK, 0x1234).unwrap(), 0);
+    assert_eq!(vfs.fcntl(fd, F_SETLKW, 0x1234).unwrap(), 0);
+    assert_eq!(vfs.fcntl(99, F_SETLK, 0x1234).unwrap_err(), VfsError::BadFd);
 
     assert_eq!(vfs.dup2(fd, 1).unwrap(), 1);
     assert_eq!(vfs.dup3(fd, 11, OpenFlags::new(O_CLOEXEC)).unwrap(), 11);

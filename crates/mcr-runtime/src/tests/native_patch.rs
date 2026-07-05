@@ -813,6 +813,38 @@ fn native_fs_fault_emulates_absolute_mov64_load() {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[test]
+fn native_fs_fault_emulates_prefixed_absolute_mov64_load() {
+    let _guard = native_execution_test_guard();
+    let code = [
+        0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x0f, 0x05,
+    ];
+    let mut runtime =
+        Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &0x1234_5678_9abc_def0u64.to_le_bytes())
+        .unwrap();
+    let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+        .expect("prefixed fs-relative absolute fault instruction decodes");
+
+    let registers = emulate_fs_relative_native_fault(
+        runtime.memory(),
+        mcr_win::HostCpuRegisters {
+            rip: 0x401000,
+            ..mcr_win::HostCpuRegisters::default()
+        },
+        0x402000,
+        &instruction,
+    )
+    .unwrap()
+    .expect("instruction is emulated");
+
+    assert_eq!(registers.rax, 0x1234_5678_9abc_def0);
+    assert_eq!(registers.rip, 0x40100d);
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
 fn native_fs_fault_emulates_absolute_sub64() {
     let _guard = native_execution_test_guard();
     let code = [0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0, 0, 0, 0x0f, 0x05];
