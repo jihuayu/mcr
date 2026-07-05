@@ -42,9 +42,9 @@ use mcr_net::{
 use mcr_sys::{
     Accept4SyscallArgs, CloneSyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs,
     EventSyscalls, FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext,
-    IoctlSyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-    LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
-    LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
+    IoctlSyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_EPOLL_CLOEXEC,
+    LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP,
+    LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
     LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC,
     LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN,
     LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
@@ -2677,6 +2677,8 @@ fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, LinuxErrno> {
 
 const SOCKADDR_IN_LEN: usize = 16;
 const SOCKADDR_IN6_LEN: usize = 28;
+const SOCKADDR_UN_PATH_LEN: usize = 108;
+const SOCKADDR_UN_LEN: usize = 2 + SOCKADDR_UN_PATH_LEN;
 
 fn read_socket_address(
     memory: &impl GuestMemoryAccess,
@@ -2692,6 +2694,23 @@ fn read_socket_address(
         .read_bytes(sockaddr, &mut family)
         .map_err(memory_errno)?;
     match u32::from(u16::from_le_bytes(family)) {
+        LINUX_AF_UNIX => {
+            let read_len = (addrlen as usize).min(SOCKADDR_UN_LEN);
+            let mut bytes = [0; SOCKADDR_UN_LEN];
+            memory
+                .read_bytes(sockaddr, &mut bytes[..read_len])
+                .map_err(memory_errno)?;
+            let path = &bytes[2..read_len];
+            let path_len = match path.first() {
+                Some(0) => path.len(),
+                Some(_) => path
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(path.len()),
+                None => 0,
+            };
+            SocketAddress::unix(&path[..path_len]).map_err(net_errno)
+        }
         LINUX_AF_INET => {
             if (addrlen as usize) < SOCKADDR_IN_LEN {
                 return Err(LinuxErrno::EINVAL);
@@ -2795,6 +2814,15 @@ fn write_msghdr_namelen(
 
 fn encode_socket_address(address: SocketAddress) -> Vec<u8> {
     match address {
+        SocketAddress::Unix { path, len } => {
+            let path_len = usize::from(len);
+            let terminator_len =
+                usize::from(path_len < SOCKADDR_UN_PATH_LEN && path.first().copied() != Some(0));
+            let mut bytes = vec![0; 2 + path_len + terminator_len];
+            bytes[0..2].copy_from_slice(&(LINUX_AF_UNIX as u16).to_le_bytes());
+            bytes[2..2 + path_len].copy_from_slice(&path[..path_len]);
+            bytes
+        }
         SocketAddress::Inet { address, port } => {
             let mut bytes = vec![0; SOCKADDR_IN_LEN];
             bytes[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_le_bytes());
@@ -11233,20 +11261,20 @@ mod tests {
 
     use mcr_net::SocketState;
     use mcr_sys::{
-        GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6,
+        GuestContext, InMemorySyscallTracer, LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX,
         LINUX_CLONE_CHILD_CLEARTID, LINUX_CLONE_CHILD_SETTID, LINUX_CLONE_FILES, LINUX_CLONE_FS,
         LINUX_CLONE_PARENT_SETTID, LINUX_CLONE_SETTLS, LINUX_CLONE_SIGHAND, LINUX_CLONE_SYSVSEM,
         LINUX_CLONE_THREAD, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_EPOLL_CLOEXEC,
         LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR,
         LINUX_EPOLLET, LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLONESHOT,
-        LINUX_EPOLLOUT, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
-        LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
-        LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC, LINUX_PROT_READ,
-        LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SIGCHLD, LINUX_SO_ERROR, LINUX_SO_KEEPALIVE,
-        LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM,
-        LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET, LINUX_TCP_NODELAY, Syscall,
-        SyscallArgs, SyscallEnterEvent, SyscallExitEvent, SyscallRegisters, SyscallReturn,
-        SyscallTraceEvent, TraceContext, Wait4SyscallArgs,
+        LINUX_EPOLLOUT, LINUX_IPPROTO_IP, LINUX_IPPROTO_TCP, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED,
+        LINUX_MAP_PRIVATE, LINUX_MSG_CMSG_CLOEXEC, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL,
+        LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_PROT_EXEC,
+        LINUX_PROT_READ, LINUX_PROT_WRITE, LINUX_SHUT_RDWR, LINUX_SIGCHLD, LINUX_SO_ERROR,
+        LINUX_SO_KEEPALIVE, LINUX_SO_REUSEADDR, LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC,
+        LINUX_SOCK_DGRAM, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+        LINUX_TCP_NODELAY, Syscall, SyscallArgs, SyscallEnterEvent, SyscallExitEvent,
+        SyscallRegisters, SyscallReturn, SyscallTraceEvent, TraceContext, Wait4SyscallArgs,
     };
     use mcr_task::{ARCH_SET_FS, ExitState, FutexWaitKey, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
@@ -15470,6 +15498,64 @@ mod tests {
     }
 
     #[test]
+    fn bind_listen_and_getsockname_round_trip_unix_sockaddr() {
+        let mut runtime = runtime_with_sample_vfs();
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Socket,
+                [
+                    u64::from(LINUX_AF_UNIX),
+                    u64::from(LINUX_SOCK_STREAM),
+                    u64::from(LINUX_IPPROTO_IP),
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            SyscallReturn::Success(3)
+        );
+        let address = unix_sockaddr(b"/tmp/mysql.sock");
+        runtime.memory_mut().write(0x2000, &address);
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Bind,
+                [3, 0x2000, address.len() as u64, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch_network(&mut runtime, Syscall::Listen, [3, 128, 0, 0, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+
+        runtime.memory_mut().write(0x2100, &[0xaa; SOCKADDR_UN_LEN]);
+        runtime
+            .memory_mut()
+            .write(0x2200, &(SOCKADDR_UN_LEN as u32).to_le_bytes());
+        assert_eq!(
+            dispatch_network(
+                &mut runtime,
+                Syscall::Getsockname,
+                [3, 0x2100, 0x2200, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+
+        assert_eq!(u32_at(runtime.memory(), 0x2200), address.len() as u32);
+        assert_eq!(runtime.memory().read(0x2100, address.len()), address);
+        assert_eq!(
+            runtime
+                .sockets()
+                .socket(SocketId::new(1).unwrap())
+                .unwrap()
+                .state(),
+            SocketState::Listening(SocketAddress::unix(b"/tmp/mysql.sock").unwrap())
+        );
+    }
+
+    #[test]
     fn accept4_creates_socket_fd_and_writes_peer_sockaddr() {
         let transport = runtime_socket_transport();
         let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
@@ -16279,6 +16365,13 @@ mod tests {
         bytes[4..8].copy_from_slice(&flowinfo.to_le_bytes());
         bytes[8..24].copy_from_slice(&address);
         bytes[24..28].copy_from_slice(&scope_id.to_le_bytes());
+        bytes
+    }
+
+    fn unix_sockaddr(path: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 2 + path.len() + 1];
+        bytes[0..2].copy_from_slice(&(LINUX_AF_UNIX as u16).to_le_bytes());
+        bytes[2..2 + path.len()].copy_from_slice(path);
         bytes
     }
 
