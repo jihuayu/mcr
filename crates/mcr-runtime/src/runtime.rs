@@ -1086,7 +1086,18 @@ where
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-const WINDOWS_EXCEPTION_ACCESS_VIOLATION: u32 = 0xc000_0005;
+pub(crate) const WINDOWS_EXCEPTION_ACCESS_VIOLATION: u32 = 0xc000_0005;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) const WINDOWS_EXCEPTION_PRIVILEGED_INSTRUCTION: u32 = 0xc000_0096;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) const fn native_fault_delivers_sigsegv(signal: u32) -> bool {
+    matches!(
+        signal,
+        WINDOWS_EXCEPTION_ACCESS_VIOLATION | WINDOWS_EXCEPTION_PRIVILEGED_INSTRUCTION
+    )
+}
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -1226,7 +1237,7 @@ where
             if let mcr_win::NativeExecutionError::GuestFault {
                 signal, address, ..
             } = &error
-                && *signal as u32 == WINDOWS_EXCEPTION_ACCESS_VIOLATION
+                && native_fault_delivers_sigsegv(*signal as u32)
                 && let Some(step) = try_deliver_native_guest_fault_signal(
                     dispatcher,
                     tid,

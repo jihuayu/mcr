@@ -63,3 +63,15 @@ fn rt_signal_frame_enters_handler_and_restores_modified_context() {
     assert_eq!(restored.registers.rbx, 0x22);
     assert_eq!(restored.registers.fs_base, 0x700000);
 }
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn windows_native_access_and_privileged_faults_deliver_sigsegv() {
+    assert!(crate::runtime::native_fault_delivers_sigsegv(
+        crate::runtime::WINDOWS_EXCEPTION_ACCESS_VIOLATION
+    ));
+    assert!(crate::runtime::native_fault_delivers_sigsegv(
+        crate::runtime::WINDOWS_EXCEPTION_PRIVILEGED_INSTRUCTION
+    ));
+    assert!(!crate::runtime::native_fault_delivers_sigsegv(0xc000_001d));
+}
