@@ -12,6 +12,7 @@ pub struct RuntimeDiagnostics {
     last_syscall: Option<DiagnosticSyscall>,
     in_flight_syscall: Option<DiagnosticSyscall>,
     native_execution_enabled: bool,
+    perf: RuntimePerfDiagnostics,
 }
 
 impl RuntimeDiagnostics {
@@ -31,6 +32,7 @@ impl RuntimeDiagnostics {
             subsystems.native_execution_enabled(),
         );
         diagnostics.worker_pools = subsystems.host_worker_pool_diagnostics().to_vec();
+        diagnostics.perf = subsystems.perf_diagnostics();
         diagnostics
     }
 
@@ -63,6 +65,7 @@ impl RuntimeDiagnostics {
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
             in_flight_syscall: in_flight_syscall(events),
             native_execution_enabled,
+            perf: RuntimePerfDiagnostics::default(),
         }
     }
 
@@ -109,6 +112,11 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub const fn native_execution_enabled(&self) -> bool {
         self.native_execution_enabled
+    }
+
+    #[must_use]
+    pub const fn perf(&self) -> RuntimePerfDiagnostics {
+        self.perf
     }
 
     #[must_use]

@@ -48,6 +48,7 @@ pub use memory::{
     MIN_GUEST_ADDRESS,
 };
 pub(crate) use native_patch::*;
+pub use perf::RuntimePerfDiagnostics;
 pub(crate) use perf::RuntimePerfSummary;
 pub use run_rootfs::{RunRootfsConfig, RunRootfsError, RunRootfsOutput, run_rootfs};
 pub use runtime::{

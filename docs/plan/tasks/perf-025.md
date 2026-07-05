@@ -1,7 +1,7 @@
 ---
 id: perf-025
 scope: syscall-performance
-status: ready
+status: done
 depends-on: [perf-015]
 ---
 

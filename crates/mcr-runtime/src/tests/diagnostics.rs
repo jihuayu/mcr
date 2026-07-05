@@ -102,6 +102,43 @@ fn diagnostics_capture_image_vmas_and_last_syscall() {
 }
 
 #[test]
+fn diagnostics_capture_interpreted_block_fallback_counters() {
+    let mut runtime = RuntimeWithTracer::with_diagnostics(test_program_with_entry_code(
+        "/bin/app",
+        0x401000,
+        &[
+            0x0f, 0x05, // syscall
+        ],
+    ))
+    .unwrap();
+    let rsp = runtime
+        .kernel()
+        .task(INITIAL_GUEST_TID)
+        .unwrap()
+        .regs()
+        .rsp();
+    runtime
+        .kernel_mut()
+        .task_mut(INITIAL_GUEST_TID)
+        .unwrap()
+        .set_regs(GprState::with_syscall_registers(
+            0x401000,
+            rsp,
+            Syscall::ExitGroup.number().raw(),
+            [0, 0, 0, 0, 0, 0],
+        ));
+
+    runtime
+        .dispatch_guest_execution()
+        .expect("guest syscall block executes");
+
+    let perf = runtime.diagnostics().perf();
+    assert_eq!(perf.interpreted_block_fallback_count(), 1);
+    assert_eq!(perf.interpreted_blocks_decoded(), 1);
+    assert!(perf.interpreted_block_bytes_read() >= 2);
+}
+
+#[test]
 fn stall_diagnostic_identifies_guest_wait_futex() {
     let runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     let events = vec![syscall_enter_event(

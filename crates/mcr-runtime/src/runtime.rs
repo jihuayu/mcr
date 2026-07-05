@@ -618,6 +618,23 @@ impl mcr_jit::GuestMemoryOperandAccess for ReadOnlyGuestMemory<'_> {
     }
 }
 
+const MAX_GUEST_BLOCK_BYTES: usize = 4096;
+
+fn read_interpreted_guest_block(
+    subsystems: &mut RuntimeSubsystems,
+    pid: mcr_sys::GuestPid,
+    rip: u64,
+) -> Result<Vec<u8>, GuestExecutionError> {
+    let block = {
+        let memory = subsystems
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        read_guest_block(memory, rip, MAX_GUEST_BLOCK_BYTES)?
+    };
+    subsystems.perf_record_interpreted_block_fallback(block.len(), 1);
+    Ok(block)
+}
+
 pub(crate) fn try_dispatch_pending_fork_exec_child_task<T>(
     dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
     tid: mcr_sys::GuestTid,
@@ -628,8 +645,6 @@ pub(crate) fn try_dispatch_pending_fork_exec_child_task<T>(
 where
     T: SyscallTracer,
 {
-    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
-
     let fs_base = dispatcher
         .subsystems()
         .tasks()
@@ -637,6 +652,7 @@ where
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
         .fs_base();
+    let interpreted_block_len;
     let trap = {
         let Some(memory) = dispatcher.subsystems().memory_for_process(pid) else {
             dispatcher
@@ -646,6 +662,7 @@ where
             return Ok(None);
         };
         let block = read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?;
+        interpreted_block_len = block.len();
         let mut read_only_memory = ReadOnlyGuestMemory { memory };
         SameIsaExecutionCore::new().execute_to_syscall_trap_with_memory(
             GuestBlock::new(&block, before_rip),
@@ -653,6 +670,9 @@ where
             &mut read_only_memory,
         )
     };
+    dispatcher
+        .subsystems_mut()
+        .perf_record_interpreted_block_fallback(interpreted_block_len, 1);
     let Ok(trap) = trap else {
         dispatcher
             .subsystems_mut()
@@ -722,8 +742,6 @@ pub(crate) fn dispatch_guest_task_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
-    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
-
     let task = dispatcher
         .subsystems()
         .tasks()
@@ -767,13 +785,7 @@ where
         return dispatch_native_guest_task_with_dispatcher(dispatcher, tid, pid, gpr, before_rip);
     }
 
-    let block = {
-        let memory = dispatcher
-            .subsystems()
-            .memory_for_process(pid)
-            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-        read_guest_block(memory, before_rip, MAX_GUEST_BLOCK_BYTES)?
-    };
+    let block = read_interpreted_guest_block(dispatcher.subsystems_mut(), pid, before_rip)?;
     let fs_base = dispatcher
         .subsystems()
         .tasks()
@@ -854,15 +866,7 @@ pub(crate) fn dispatch_interpreted_guest_task_from_registers<T>(
 where
     T: SyscallTracer,
 {
-    const MAX_GUEST_BLOCK_BYTES: usize = 4096;
-
-    let block = {
-        let memory = dispatcher
-            .subsystems()
-            .memory_for_process(pid)
-            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-        read_guest_block(memory, registers.rip, MAX_GUEST_BLOCK_BYTES)?
-    };
+    let block = read_interpreted_guest_block(dispatcher.subsystems_mut(), pid, registers.rip)?;
     let trap = {
         let memory = dispatcher
             .subsystems_mut()

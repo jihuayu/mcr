@@ -303,6 +303,14 @@ impl SyscallDispatchResult {
 }
 
 pub trait SyscallTracer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn records_decoded_fields(&self) -> bool {
+        self.enabled()
+    }
+
     fn record(&mut self, event: SyscallTraceEvent);
 }
 
@@ -310,6 +318,10 @@ pub trait SyscallTracer {
 pub struct NoopSyscallTracer;
 
 impl SyscallTracer for NoopSyscallTracer {
+    fn enabled(&self) -> bool {
+        false
+    }
+
     fn record(&mut self, _event: SyscallTraceEvent) {}
 }
 
@@ -456,14 +468,21 @@ where
         }
 
         let Some(descriptor) = syscall_descriptor(request.syscall) else {
-            let event = UnsupportedSyscallEvent::new(request.context, request.number, request.args)
-                .with_decoded_fields(decode_syscall_fields(request.syscall, request.args));
+            if !self.tracer.enabled() {
+                return SyscallDispatchResult::from_return(SyscallReturn::unsupported());
+            }
+            let mut event =
+                UnsupportedSyscallEvent::new(request.context, request.number, request.args);
+            if self.tracer.records_decoded_fields() {
+                event =
+                    event.with_decoded_fields(decode_syscall_fields(request.syscall, request.args));
+            }
             let result = event.result;
             self.tracer.record(SyscallTraceEvent::Unsupported(event));
             return SyscallDispatchResult::from_return(result);
         };
 
-        let decoded = decode_syscall_fields(request.syscall, request.args);
+        let decoded = self.trace_decoded_fields(request.syscall, request.args);
         self.record_enter(&request, decoded.clone());
 
         let outcome = match descriptor.subsystem {
@@ -487,13 +506,24 @@ where
             return None;
         }
 
-        let decoded = decode_syscall_fields(request.syscall, request.args);
+        let decoded = self.trace_decoded_fields(request.syscall, request.args);
         self.record_enter(request, decoded.clone());
         let outcome = self.subsystems.dispatch_fast_task(request);
         Some(self.record_outcome(request, decoded, outcome))
     }
 
+    fn trace_decoded_fields(&self, syscall: Syscall, args: SyscallArgs) -> Vec<TraceField> {
+        if self.tracer.records_decoded_fields() {
+            decode_syscall_fields(syscall, args)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn record_enter(&mut self, request: &SyscallRequest, decoded: Vec<TraceField>) {
+        if !self.tracer.enabled() {
+            return;
+        }
         self.tracer
             .record(SyscallTraceEvent::Enter(SyscallEnterEvent {
                 context: request.context,
@@ -510,8 +540,13 @@ where
         mut outcome: SyscallOutcome,
     ) -> SyscallDispatchResult {
         let result = outcome.result;
+        if !self.tracer.enabled() {
+            return SyscallDispatchResult::from_return(result);
+        }
         let mut exit_decoded = decoded;
-        exit_decoded.append(&mut outcome.decoded);
+        if self.tracer.records_decoded_fields() {
+            exit_decoded.append(&mut outcome.decoded);
+        }
 
         if outcome.is_unsupported() {
             self.tracer.record(SyscallTraceEvent::Unsupported(
@@ -956,7 +991,7 @@ mod tests {
     use super::{
         EventSyscalls, FileSyscalls, GuestContext, InMemorySyscallTracer, MemorySyscalls,
         NetworkSyscalls, SYSCALL_DISPATCH_TABLE, SyscallDispatcher, SyscallOutcome, SyscallRequest,
-        SyscallSubsystem, TaskSyscalls, TimeSyscalls, syscall_descriptor,
+        SyscallSubsystem, SyscallTracer, TaskSyscalls, TimeSyscalls, syscall_descriptor,
     };
     use crate::abi::SyscallRegisters;
     use crate::errno::LinuxErrno;
@@ -1240,6 +1275,21 @@ mod tests {
     impl EventSyscalls for RecordingSubsystems {}
 
     #[derive(Default)]
+    struct EventOnlyTracer {
+        events: Vec<SyscallTraceEvent>,
+    }
+
+    impl SyscallTracer for EventOnlyTracer {
+        fn records_decoded_fields(&self) -> bool {
+            false
+        }
+
+        fn record(&mut self, event: SyscallTraceEvent) {
+            self.events.push(event);
+        }
+    }
+
+    #[derive(Default)]
     struct FastTaskSubsystems {
         fast_task_syscalls: Vec<Syscall>,
         task_syscalls: Vec<Syscall>,
@@ -1315,6 +1365,36 @@ mod tests {
                 assert!(event.host_error.is_none());
             }
             other => panic!("expected exit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatcher_skips_decoded_fields_when_tracer_does_not_consume_them() {
+        let registers = SyscallRegisters {
+            rax: Syscall::Write.number().raw(),
+            rdi: 1,
+            rsi: 0x2000,
+            rdx: 12,
+            rip: 0x401234,
+            ..SyscallRegisters::default()
+        };
+        let mut dispatcher = SyscallDispatcher::with_tracer(
+            RecordingSubsystems::default(),
+            EventOnlyTracer::default(),
+        );
+
+        let result = dispatcher.dispatch(GuestContext::new(77, 78, registers));
+
+        assert_eq!(result.result, SyscallReturn::Success(12));
+        match dispatcher.tracer().events.as_slice() {
+            [
+                SyscallTraceEvent::Enter(enter),
+                SyscallTraceEvent::Exit(exit),
+            ] => {
+                assert!(enter.decoded.is_empty());
+                assert!(exit.decoded.is_empty());
+            }
+            other => panic!("expected enter and exit events, got {other:?}"),
         }
     }
 

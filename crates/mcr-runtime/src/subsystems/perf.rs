@@ -56,6 +56,19 @@ impl RuntimeSubsystems {
         self.perf_summary.record_fd_wakeups(count);
     }
 
+    pub(crate) fn perf_record_interpreted_block_fallback(
+        &mut self,
+        bytes_read: usize,
+        blocks_decoded: u64,
+    ) {
+        self.perf_summary
+            .record_interpreted_block_fallback(bytes_read, blocks_decoded);
+    }
+
+    pub(crate) const fn perf_diagnostics(&self) -> RuntimePerfDiagnostics {
+        self.perf_summary.diagnostics()
+    }
+
     pub(crate) fn perf_record_pipe_io(
         &mut self,
         syscall: mcr_sys::Syscall,

@@ -30,17 +30,17 @@ pub(crate) struct RuntimePerfSummary {
     select_count: u64,
     wait4_count: u64,
     futex_count: u64,
+    interpreted_block_fallback_count: u64,
+    interpreted_block_bytes_read: u64,
+    interpreted_blocks_decoded: u64,
 }
 
 impl RuntimePerfSummary {
     pub(crate) fn begin_run(&mut self) {
-        self.enabled = std::env::var_os(PERF_SUMMARY_TRACE_ENV).is_some();
-        if !self.enabled {
-            return;
-        }
+        let enabled = std::env::var_os(PERF_SUMMARY_TRACE_ENV).is_some();
         *self = Self {
-            enabled: true,
-            run_started_at: Some(Instant::now()),
+            enabled,
+            run_started_at: enabled.then(Instant::now),
             ..Self::default()
         };
     }
@@ -179,6 +179,29 @@ impl RuntimePerfSummary {
         self.pipe_wakeup_count = self.pipe_wakeup_count.saturating_add(count);
     }
 
+    pub(crate) fn record_interpreted_block_fallback(
+        &mut self,
+        bytes_read: usize,
+        blocks_decoded: u64,
+    ) {
+        self.interpreted_block_fallback_count =
+            self.interpreted_block_fallback_count.saturating_add(1);
+        self.interpreted_block_bytes_read = self
+            .interpreted_block_bytes_read
+            .saturating_add(bytes_read as u64);
+        self.interpreted_blocks_decoded = self
+            .interpreted_blocks_decoded
+            .saturating_add(blocks_decoded);
+    }
+
+    pub(crate) const fn diagnostics(&self) -> RuntimePerfDiagnostics {
+        RuntimePerfDiagnostics {
+            interpreted_block_fallback_count: self.interpreted_block_fallback_count,
+            interpreted_block_bytes_read: self.interpreted_block_bytes_read,
+            interpreted_blocks_decoded: self.interpreted_blocks_decoded,
+        }
+    }
+
     pub(crate) fn finish_run(&mut self) {
         if !self.enabled {
             return;
@@ -228,6 +251,36 @@ impl RuntimePerfSummary {
             self.wait4_count,
             self.futex_count
         );
+        eprintln!(
+            "mcr perf-summary: interpreted_block_fallback_count={} interpreted_block_bytes_read={} interpreted_blocks_decoded={}",
+            self.interpreted_block_fallback_count,
+            self.interpreted_block_bytes_read,
+            self.interpreted_blocks_decoded
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimePerfDiagnostics {
+    interpreted_block_fallback_count: u64,
+    interpreted_block_bytes_read: u64,
+    interpreted_blocks_decoded: u64,
+}
+
+impl RuntimePerfDiagnostics {
+    #[must_use]
+    pub const fn interpreted_block_fallback_count(self) -> u64 {
+        self.interpreted_block_fallback_count
+    }
+
+    #[must_use]
+    pub const fn interpreted_block_bytes_read(self) -> u64 {
+        self.interpreted_block_bytes_read
+    }
+
+    #[must_use]
+    pub const fn interpreted_blocks_decoded(self) -> u64 {
+        self.interpreted_blocks_decoded
     }
 }
 
