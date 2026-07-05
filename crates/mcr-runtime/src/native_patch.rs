@@ -264,6 +264,8 @@ pub(crate) fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> O
 
     if syscall_number == mcr_sys::Syscall::Read.number().raw()
         || syscall_number == mcr_sys::Syscall::Readv.number().raw()
+        || syscall_number == mcr_sys::Syscall::EpollWait.number().raw()
+        || syscall_number == mcr_sys::Syscall::EpollPwait2.number().raw()
     {
         Some((fd, false))
     } else if syscall_number == mcr_sys::Syscall::Write.number().raw()

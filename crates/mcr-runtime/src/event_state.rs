@@ -245,6 +245,11 @@ impl EpollRegistry {
     pub(crate) fn cached_watches(&mut self, id: u64) -> Result<Arc<[EpollWatch]>, LinuxErrno> {
         Ok(self.instance_mut(id)?.cached_watches())
     }
+
+    pub(crate) fn watches(&self, id: u64) -> Result<Vec<EpollWatch>, LinuxErrno> {
+        let instance = self.instances.get(&id).ok_or(LinuxErrno::EBADF)?;
+        Ok(instance.watches.values().cloned().collect())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

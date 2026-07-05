@@ -167,7 +167,12 @@ pub enum RunRootfsError {
     },
     Vfs(mcr_vfs::VfsError),
     Linux(LinuxErrno),
-    GuestRun(Box<crate::GuestRunError>),
+    GuestRun {
+        error: Box<crate::GuestRunError>,
+        diagnostic: Option<crate::RuntimeStallDiagnostic>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     UnsupportedProgram(String),
     UnsupportedApplet(String),
     UnsupportedShell(String),
@@ -199,9 +204,19 @@ impl fmt::Display for RunRootfsError {
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Vfs(error) => write!(formatter, "{error}"),
             Self::Linux(errno) => write!(formatter, "guest runtime error: {errno}"),
-            Self::GuestRun(error) => {
+            Self::GuestRun {
+                error,
+                diagnostic,
+                stdout,
+                stderr,
+            } => {
                 write!(formatter, "guest runtime error: {error}")?;
-                write_native_fault_details(formatter, error)
+                write_native_fault_details(formatter, error)?;
+                if let Some(diagnostic) = diagnostic {
+                    write!(formatter, "\nruntime diagnostic: {diagnostic}")?;
+                }
+                write_guest_stdio_snapshot(formatter, "stdout", stdout)?;
+                write_guest_stdio_snapshot(formatter, "stderr", stderr)
             }
             Self::UnsupportedProgram(program) => {
                 write!(formatter, "unsupported MVP program `{program}`")
@@ -221,7 +236,7 @@ impl std::error::Error for RunRootfsError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Vfs(error) => Some(error),
-            Self::GuestRun(error) => Some(error),
+            Self::GuestRun { error, .. } => Some(error),
             Self::Linux(_) => None,
             Self::InvalidGuestPath(_)
             | Self::InvalidUtf8(_)
@@ -282,6 +297,18 @@ fn write_native_fault_details(
         )?;
     }
     Ok(())
+}
+
+fn write_guest_stdio_snapshot(
+    formatter: &mut fmt::Formatter<'_>,
+    stream: &str,
+    bytes: &[u8],
+) -> fmt::Result {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let rendered = String::from_utf8_lossy(bytes);
+    write!(formatter, "\nguest {stream}:\n{rendered}")
 }
 
 fn native_fault_details(
@@ -392,7 +419,15 @@ pub fn run_rootfs(config: RunRootfsConfig) -> Result<RunRootfsOutput, RunRootfsE
         Err(error) if config.mvp_emulator() && error.linux_errno() == LinuxErrno::ENOEXEC => {
             dispatch_mvp_program(&mut vfs, &config.program, &config.args)
         }
-        Err(error) => Err(RunRootfsError::GuestRun(Box::new(error))),
+        Err(error) => Err(RunRootfsError::GuestRun {
+            diagnostic: Some(crate::RuntimeStallDiagnostic::capture_runtime(
+                runtime.dispatcher.subsystems(),
+                runtime.dispatcher.tracer().events(),
+            )),
+            stdout: runtime.vfs().stdout_snapshot(),
+            stderr: runtime.vfs().stderr_snapshot(),
+            error: Box::new(error),
+        }),
     }
 }
 

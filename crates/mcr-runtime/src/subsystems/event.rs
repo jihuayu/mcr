@@ -594,6 +594,9 @@ impl RuntimeSubsystems {
         let watches = self.events.epolls.cached_watches(epoll_id)?;
 
         let mut ready = self.epoll_ready_events(&watches, maxevents, Some(Duration::ZERO))?;
+        if ready.is_empty() && timeout.is_none() {
+            return Err(LinuxErrno::EAGAIN);
+        }
         if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {
             ready = self.epoll_ready_events(&watches, maxevents, timeout)?;
         }

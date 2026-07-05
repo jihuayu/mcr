@@ -640,6 +640,37 @@ fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno>
     })
 }
 
+fn fd_wait_ready_or_epoll(
+    fds: &FdTable,
+    epolls: &EpollRegistry,
+    fd: Fd,
+    write: bool,
+) -> Result<bool, LinuxErrno> {
+    if !write && let Ok(epoll_id) = fds.epoll_id_for_fd(fd) {
+        return epoll_fd_wait_ready(fds, epolls, epoll_id);
+    }
+    fd_wait_ready(fds, fd, write)
+}
+
+fn epoll_fd_wait_ready(
+    fds: &FdTable,
+    epolls: &EpollRegistry,
+    epoll_id: u64,
+) -> Result<bool, LinuxErrno> {
+    for watch in epolls.watches(epoll_id)? {
+        let poll_events = epoll_events_to_poll_events(watch.events);
+        let revents = match fds.poll_readiness(&mcr_vfs::PathTree::new(), watch.fd) {
+            Ok(readiness) => poll_revents_from_vfs(readiness, poll_events),
+            Err(VfsError::BadFd) => LINUX_POLLERR | LINUX_POLLHUP,
+            Err(error) => return Err(vfs_errno(error)),
+        };
+        if poll_revents_to_epoll_events(revents, watch.events) != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
     SocketEvents {
         readable: events & LINUX_POLL_READ_NORMAL != 0,

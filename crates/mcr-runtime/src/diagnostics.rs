@@ -305,18 +305,20 @@ impl fmt::Display for RuntimeStallDiagnostic {
         if let Some(syscall) = &self.in_flight_syscall {
             write!(
                 formatter,
-                "; in-flight syscall={}({}) rip=0x{:x}",
+                "; in-flight syscall={}({}) args={} rip=0x{:x}",
                 syscall.name(),
                 syscall.number(),
+                syscall_args_display(syscall.args()),
                 syscall.rip()
             )?;
         }
         if let Some(syscall) = &self.last_syscall {
             write!(
                 formatter,
-                "; last syscall={}({}) result={:?}",
+                "; last syscall={}({}) args={} result={:?}",
                 syscall.name(),
                 syscall.number(),
+                syscall_args_display(syscall.args()),
                 syscall.result()
             )?;
         }
@@ -326,6 +328,13 @@ impl fmt::Display for RuntimeStallDiagnostic {
             self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks, self.futex_wait_tasks
         )
     }
+}
+
+fn syscall_args_display(args: [u64; 6]) -> String {
+    format!(
+        "[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+        args[0], args[1], args[2], args[3], args[4], args[5]
+    )
 }
 
 fn readiness_syscall_name(name: &str) -> bool {

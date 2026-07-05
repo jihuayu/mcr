@@ -587,6 +587,7 @@ impl RuntimeSubsystems {
         let selected_pid = self.process.selected_fds_pid;
         let selected_fds = self.files.vfs().fds();
         let process_fds = &self.process.fds;
+        let epolls = &self.events.epolls;
         let tasks = &mut self.process.tasks;
         let resumed = tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
@@ -594,7 +595,7 @@ impl RuntimeSubsystems {
             } else {
                 process_fds.get(&pid)
             };
-            fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
+            fds.and_then(|fds| fd_wait_ready_or_epoll(fds, epolls, fd, write).ok())
                 .unwrap_or(true)
         });
         self.perf_record_fd_wakeups(resumed);

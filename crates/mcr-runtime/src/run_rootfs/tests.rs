@@ -305,7 +305,7 @@ fn run_rootfs_does_not_use_mvp_emulator_by_default() {
     .expect_err("synthetic busybox should not fall back to the MVP emulator by default");
 
     match &error {
-        RunRootfsError::GuestRun(error) => {
+        RunRootfsError::GuestRun { error, .. } => {
             assert_ne!(error.linux_errno(), LinuxErrno::ENOSYS);
         }
         other => panic!("expected detailed guest runtime error, got {other:?}"),
@@ -314,7 +314,8 @@ fn run_rootfs_does_not_use_mvp_emulator_by_default() {
 
 #[test]
 fn guest_run_error_reports_native_fault_registers() {
-    let error = RunRootfsError::GuestRun(Box::new(crate::GuestRunError::GuestExecution(
+    let error = RunRootfsError::GuestRun {
+        error: Box::new(crate::GuestRunError::GuestExecution(
             crate::GuestExecutionError::Execution(mcr_jit::ExecutionError::NativeFault {
                 signal: -1073741819,
                 rip: 0x7000_004d_5305,
@@ -339,7 +340,11 @@ fn guest_run_error_reports_native_fault_registers() {
                     value: 0x7000_004d_1234,
                 }],
             }),
-        )));
+        )),
+        diagnostic: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
     let rendered = error.to_string();
 
     assert!(rendered.contains("fault registers:"));

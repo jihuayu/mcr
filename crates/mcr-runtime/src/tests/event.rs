@@ -551,6 +551,60 @@ fn eventfd2_allocates_counter_fd_for_event_wakeups() {
 }
 
 #[test]
+fn epoll_wait_infinite_timeout_blocks_until_eventfd_ready() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Eventfd2, [0, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(3)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(4)
+    );
+    write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 0x77);
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::EpollCtl,
+                [4, u64::from(LINUX_EPOLL_CTL_ADD), 3, 0x402100, 0, 0],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+
+    let would_block = runtime.dispatch_syscall(context(
+        Syscall::EpollWait,
+        [4, 0x402200, 4, u64::MAX, 0, 0],
+    ));
+    assert_eq!(would_block.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+
+    runtime
+        .memory_mut()
+        .write(0x402300, &1u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Write, [3, 0x402300, 8, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(8)
+    );
+    let ready = runtime.dispatch_syscall(context(
+        Syscall::EpollWait,
+        [4, 0x402200, 4, u64::MAX, 0, 0],
+    ));
+    assert_eq!(ready.result, SyscallReturn::Success(1));
+    assert_eq!(
+        epoll_event_from_memory(runtime.memory(), 0x402200),
+        (LINUX_EPOLLIN, 0x77)
+    );
+}
+
+#[test]
 fn epoll_wait_reports_pipe_readiness_level_triggered() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     assert_eq!(
