@@ -1,7 +1,7 @@
 ---
 id: arch-001
 scope: architecture
-status: ready
+status: done
 depends-on: [mem-001]
 ---
 

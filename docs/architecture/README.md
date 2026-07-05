@@ -31,7 +31,8 @@ Runtime manager
 | Scope | Owns | Delegates |
 |---|---|---|
 | Runtime manager | Container lifetime, rootfs mount, initial process creation, smoke harness entrypoints. | ELF loading, syscall dispatch, subsystem state. |
-| ELF and memory | ELF64 parsing, segment mapping, initial stack, auxv, guest TLS inputs, guest VMAs. | Host memory allocation and protection to Windows adapter. |
+| ELF loader | ELF64 parsing, segment mapping plan, initial stack, auxv, guest TLS inputs. | Guest memory mapping to `mcr-memory`; host memory allocation and protection to Windows adapter. |
+| Guest memory | Guest VMAs, mmap/mprotect/brk, memory access, libc intrinsic memory routines, runtime clone/COW strategies. | Host memory allocation and protection to Windows adapter. |
 | JIT and trampoline | Basic block decode, same-ISA re-emission, syscall interception, register context bridge. | Linux syscall behavior to syscall dispatcher. |
 | Syscall dispatcher | Syscall table, Linux ABI structs, errno mapping, argument validation, dispatch tracing. | File, process, network, and sync behavior to owned subsystems. |
 | VFS | Linux path semantics, rootfs jail, virtual inode model, fd table, metadata sidecar, procfs/devfs nodes. | Host file operations to Windows file adapter. |
@@ -49,6 +50,7 @@ Current deviations from this map are tracked in
 |---|---|
 | `mcr-cli` | User-facing `mcr run-rootfs` and smoke commands. |
 | `mcr-runtime` | Container/session lifecycle and subsystem wiring. |
+| `mcr-memory` | Guest memory manager, VMAs, mmap/mprotect/brk, COW clone strategies, and guest memory access traits. |
 | `mcr-elf` | ELF loader, initial stack, auxv, guest TLS setup inputs, and guest memory map setup. |
 | `mcr-jit` | x86-64 decode/rewrite, syscall trampoline, register context bridge. |
 | `mcr-sys` | Syscall table, ABI structs, errno, dispatcher traits, syscall trace events. |
@@ -111,7 +113,7 @@ The BuildKit adapter must use the same `mcr-runtime`, `mcr-snapshot`, and `mcr-i
 | Guest PID/TID namespace | `mcr-task` | Host process IDs are never exposed as guest IDs. |
 | Guest fd table | `mcr-vfs` | File, pipe, socket, proc, and dev descriptors share one guest fd namespace. |
 | Guest inode IDs | `mcr-vfs` | Host paths are storage backends, not inode identity. |
-| Guest memory map | `mcr-elf` initially, then runtime memory manager | VMAs are Linux concepts mapped onto host memory allocations. |
+| Guest memory map | `mcr-memory` | VMAs are Linux concepts mapped onto host memory allocations; `mcr-elf` supplies the initial image plan. |
 | Guest FS base | `mcr-task` and execution core | `arch_prctl` updates per-task guest TLS state; host Rust TLS is not guest truth. |
 | Syscall ABI table | `mcr-sys` | Syscall numbers, argument decoding, and errno conversion live here. |
 | Socket readiness | `mcr-net` | Exposes the documented level-trigger readiness subset over host Winsock/readiness helpers; IOCP is a later performance backend, not the guest-visible model. |
@@ -131,7 +133,7 @@ socket contracts stable.
 
 | Debt | Planned fix | Task |
 |---|---|---|
-| `mcr-runtime` owns subsystem internals (guest memory manager, native patch pipeline, file/network syscall bodies, poll/select decode) instead of only lifecycle and wiring. | Extract the guest memory manager into `mcr-memory` and thin runtime modules back to wiring. | `arch-001` |
+| `mcr-runtime` owns subsystem internals (native patch pipeline, file/network syscall bodies, poll/select decode) instead of only lifecycle and wiring. | Guest memory manager extracted to `mcr-memory`; continue thinning runtime modules back to wiring. | `arch-001` |
 | `RuntimeSubsystems` aggregates 20+ unrelated state fields as one god-object. | Split into cohesive process-table, native-execution, and event state groups. | `arch-002` |
 | One global "selected" process context; switching guest processes clones or remaps the whole `GuestMemory` and fd table. | Per-process state ownership so scheduling switches references, not memory contents. | `arch-003` |
 | Guest ABI struct codecs (`pollfd`, iovec, sockaddr, `timespec`) are duplicated across runtime modules, and runtime re-implements ELF program-header parsing next to `mcr-elf`. | One guest ABI codec layer owned by `mcr-sys`; runtime reuses `mcr-elf` for ELF views. | `arch-004` |

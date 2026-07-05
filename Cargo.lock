@@ -128,6 +128,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcr-memory"
+version = "0.1.0"
+dependencies = [
+ "mcr-elf",
+ "mcr-jit",
+ "mcr-sys",
+ "mcr-win",
+]
+
+[[package]]
 name = "mcr-net"
 version = "0.1.0"
 dependencies = [
@@ -142,6 +152,7 @@ version = "0.1.0"
 dependencies = [
  "mcr-elf",
  "mcr-jit",
+ "mcr-memory",
  "mcr-net",
  "mcr-snapshot",
  "mcr-sys",

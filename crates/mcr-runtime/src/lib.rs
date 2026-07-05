@@ -1,7 +1,6 @@
 #![allow(clippy::result_large_err)]
 //! Runtime errors preserve native fault diagnostics and guest register snapshots.
 
-mod access;
 mod build_run;
 mod diagnostics;
 mod event_state;
@@ -30,7 +29,6 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
-pub use access::{GuestMemoryAccess, GuestMemoryAccessError};
 pub use build_run::{
     BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
 };
@@ -45,8 +43,9 @@ pub use filesystem::RuntimeFileSystem;
 pub(crate) use linux_abi::*;
 pub use memory::{
     DEFAULT_LIBC_STRLEN_MAX, DEFAULT_MMAP_BASE, GUEST_ADDRESS_SPACE_END, GUEST_PAGE_SIZE,
-    GuestBrkOutcome, GuestLibcIntrinsic, GuestLibcIntrinsicError, GuestMemory, GuestMemoryError,
-    GuestMemoryProtection, GuestVma, GuestVmaKind, MIN_GUEST_ADDRESS,
+    GuestBrkOutcome, GuestLibcIntrinsic, GuestLibcIntrinsicError, GuestMemory, GuestMemoryAccess,
+    GuestMemoryAccessError, GuestMemoryError, GuestMemoryProtection, GuestVma, GuestVmaKind,
+    MIN_GUEST_ADDRESS,
 };
 pub(crate) use native_patch::*;
 pub(crate) use perf::RuntimePerfSummary;

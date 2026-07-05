@@ -5,6 +5,7 @@ members = [
     "crates/mcr-elf",
     "crates/mcr-image",
     "crates/mcr-jit",
+    "crates/mcr-memory",
     "crates/mcr-net",
     "crates/mcr-runtime",
     "crates/mcr-snapshot",
@@ -28,6 +29,7 @@ mcr-cli = { path = "crates/mcr-cli" }
 mcr-elf = { path = "crates/mcr-elf" }
 mcr-image = { path = "crates/mcr-image" }
 mcr-jit = { path = "crates/mcr-jit" }
+mcr-memory = { path = "crates/mcr-memory" }
 mcr-net = { path = "crates/mcr-net" }
 mcr-runtime = { path = "crates/mcr-runtime" }
 mcr-snapshot = { path = "crates/mcr-snapshot" }
