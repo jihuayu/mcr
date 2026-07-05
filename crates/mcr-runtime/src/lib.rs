@@ -10295,21 +10295,24 @@ fn write_zeroed(
 }
 
 fn write_guest_sysinfo(memory: &mut impl GuestMemoryAccess, addr: u64) -> Result<(), LinuxErrno> {
+    const TOTAL_RAM_BYTES: u64 = 512 * 1024 * 1024;
+    const FREE_RAM_BYTES: u64 = 256 * 1024 * 1024;
+
     let mut bytes = [0; 112];
     bytes[0..8].copy_from_slice(&3600i64.to_le_bytes());
     bytes[8..16].copy_from_slice(&0u64.to_le_bytes());
     bytes[16..24].copy_from_slice(&0u64.to_le_bytes());
     bytes[24..32].copy_from_slice(&0u64.to_le_bytes());
-    bytes[32..40].copy_from_slice(&(512 * 1024 * 1024u64).to_le_bytes());
-    bytes[40..48].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
-    bytes[48..56].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
+    bytes[32..40].copy_from_slice(&TOTAL_RAM_BYTES.to_le_bytes());
+    bytes[40..48].copy_from_slice(&FREE_RAM_BYTES.to_le_bytes());
+    bytes[48..56].copy_from_slice(&FREE_RAM_BYTES.to_le_bytes());
     bytes[56..64].copy_from_slice(&0u64.to_le_bytes());
     bytes[64..72].copy_from_slice(&0u64.to_le_bytes());
     bytes[72..80].copy_from_slice(&(32u64 * 1024).to_le_bytes());
     bytes[80..82].copy_from_slice(&1u16.to_le_bytes());
-    bytes[88..96].copy_from_slice(&(512 * 1024 * 1024u64).to_le_bytes());
-    bytes[96..104].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
-    bytes[104..108].copy_from_slice(&(4096u32).to_le_bytes());
+    bytes[88..96].copy_from_slice(&TOTAL_RAM_BYTES.to_le_bytes());
+    bytes[96..104].copy_from_slice(&FREE_RAM_BYTES.to_le_bytes());
+    bytes[104..108].copy_from_slice(&1u32.to_le_bytes());
     memory.write_bytes(addr, &bytes).map_err(memory_errno)
 }
 
@@ -17835,6 +17838,7 @@ mod tests {
             512 * 1024 * 1024
         );
         assert_eq!(u16_from_guest(runtime.memory(), 0x402350), 1);
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402368), 1);
     }
 
     #[test]
