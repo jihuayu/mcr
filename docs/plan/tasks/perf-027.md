@@ -1,7 +1,7 @@
 ---
 id: perf-027
 scope: runtime-performance
-status: ready
+status: done
 depends-on: [perf-015]
 ---
 
@@ -57,3 +57,11 @@ cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
   state so the waiter registry is not rebuilt twice.
 - Record before/after `MCR_TRACE_PERF_SUMMARY=1` runs for the shell pipeline
   and `git ls-remote` workloads per the promoted-performance-task rules.
+
+## Result
+
+- `GuestKernel` now maintains runnable, child-wait, fd-wait, and futex-wait
+  indexes as task states change, so scheduler readiness queries no longer scan
+  every task.
+- Runtime fd waiter resume now uses split borrows over selected and parked
+  process fd tables instead of cloning fd tables on each scheduler iteration.

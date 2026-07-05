@@ -513,11 +513,12 @@ impl RuntimeSubsystems {
 
     pub(crate) fn resume_fd_waiters(&mut self) {
         let selected_pid = self.process.selected_fds_pid;
-        let selected_fds = self.files.vfs().fds().clone();
-        let process_fds = self.process.fds.clone();
-        let resumed = self.process.tasks.resume_fd_waiters(|pid, fd, write| {
+        let selected_fds = self.files.vfs().fds();
+        let process_fds = &self.process.fds;
+        let tasks = &mut self.process.tasks;
+        let resumed = tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
-                Some(&selected_fds)
+                Some(selected_fds)
             } else {
                 process_fds.get(&pid)
             };

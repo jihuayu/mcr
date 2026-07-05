@@ -132,7 +132,7 @@ impl GuestKernel {
                 exit_state: ExitState::Running,
             },
         );
-        self.tasks.insert(child_tid, child_task);
+        self.insert_task(child_task);
         self.process_mut(parent_pid)
             .ok_or(TaskError::UnknownPid(parent_pid))?
             .children
@@ -162,8 +162,8 @@ impl GuestKernel {
                 if let Some(child_task) = self.task_mut(child_tid) {
                     child_task.regs = child_task.regs.with_syscall_return(child_return_rip, 0);
                 }
-                if block_parent_for_vfork && let Some(parent_task) = self.task_mut(tid) {
-                    parent_task.state = TaskState::WaitingForVfork { child_pid };
+                if block_parent_for_vfork {
+                    self.set_task_state(tid, TaskState::WaitingForVfork { child_pid });
                 }
                 SyscallOutcome::success(u64::from(child_pid))
                     .with_decoded_field("guest_pid", child_pid.to_string())
@@ -196,8 +196,8 @@ impl GuestKernel {
                 if let Some(child_task) = self.task_mut(child_tid) {
                     child_task.regs = child_regs;
                 }
-                if block_parent_for_vfork && let Some(parent_task) = self.task_mut(tid) {
-                    parent_task.state = TaskState::WaitingForVfork { child_pid };
+                if block_parent_for_vfork {
+                    self.set_task_state(tid, TaskState::WaitingForVfork { child_pid });
                 }
                 SyscallOutcome::success(u64::from(child_pid))
                     .with_decoded_field("guest_pid", child_pid.to_string())
@@ -230,12 +230,17 @@ impl GuestKernel {
         let Some(parent_pid) = self.process(child_pid).and_then(GuestProcess::parent) else {
             return;
         };
-        for task in self.tasks.values_mut() {
-            if task.pid == parent_pid
-                && matches!(task.state, TaskState::WaitingForVfork { child_pid: waiting_pid } if waiting_pid == child_pid)
-            {
-                task.state = TaskState::Runnable;
-            }
+        let waiting_tids = self
+            .tasks
+            .values()
+            .filter_map(|task| {
+                (task.pid == parent_pid
+                    && matches!(task.state, TaskState::WaitingForVfork { child_pid: waiting_pid } if waiting_pid == child_pid))
+                .then_some(task.tid)
+            })
+            .collect::<Vec<_>>();
+        for tid in waiting_tids {
+            self.set_task_state(tid, TaskState::Runnable);
         }
     }
 
@@ -276,7 +281,7 @@ impl GuestKernel {
             child_task.tls.fs_base = args.tls;
         }
 
-        self.tasks.insert(child_tid, child_task);
+        self.insert_task(child_task);
 
         SyscallOutcome::success(u64::from(child_tid))
             .with_decoded_field("guest_tid", child_tid.to_string())

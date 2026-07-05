@@ -49,7 +49,8 @@ impl GuestKernel {
                     return SyscallOutcome::errno(LinuxErrno::ESRCH);
                 };
                 task.regs = task.regs.with_syscall_return(return_rip, task.regs.rax());
-                task.state = TaskState::WaitingForChild { args };
+                let _ = task;
+                self.set_task_state(tid, TaskState::WaitingForChild { args });
                 SyscallOutcome::success(0).with_decoded_field("task_blocked", "wait4")
             }
             Err(error) => error.into_outcome(),
@@ -58,24 +59,19 @@ impl GuestKernel {
 
     #[must_use]
     pub fn runnable_tids(&self) -> Vec<GuestTid> {
-        self.tasks
-            .values()
-            .filter(|task| matches!(task.state, TaskState::Runnable))
-            .map(|task| task.tid)
-            .collect()
+        self.runnable_tids.iter().copied().collect()
     }
 
     pub fn resume_waiting_tasks(&mut self) -> Vec<CompletedWait> {
         let waiting_tasks: Vec<(GuestTid, GuestPid, Wait4SyscallArgs)> = self
-            .tasks
-            .values()
-            .filter_map(|task| match task.state {
-                TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
-                TaskState::Runnable
-                | TaskState::WaitingForVfork { .. }
-                | TaskState::WaitingForFd { .. }
-                | TaskState::WaitingForFutex { .. }
-                | TaskState::Exited { .. } => None,
+            .child_wait_tids
+            .iter()
+            .filter_map(|tid| {
+                let task = self.tasks.get(tid)?;
+                match task.state {
+                    TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
+                    _ => None,
+                }
             })
             .collect();
         let mut completed = Vec::new();
@@ -88,8 +84,8 @@ impl GuestKernel {
                 task.regs = task
                     .regs
                     .with_syscall_return(task.regs.rip(), u64::from(waited.pid()));
-                task.state = TaskState::Runnable;
             }
+            self.set_task_state(tid, TaskState::Runnable);
             completed.push(CompletedWait::new(tid, parent_pid, args, waited));
         }
         completed
@@ -101,9 +97,9 @@ impl GuestKernel {
         fd: i32,
         write: bool,
     ) -> Result<(), TaskError> {
-        let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
-        task.state = TaskState::WaitingForFd { fd, write };
-        Ok(())
+        self.set_task_state(tid, TaskState::WaitingForFd { fd, write })
+            .map(|_| ())
+            .ok_or(TaskError::UnknownTid(tid))
     }
 
     pub fn resume_fd_waiters<F>(&mut self, mut ready: F) -> usize
@@ -111,11 +107,15 @@ impl GuestKernel {
         F: FnMut(GuestPid, i32, bool) -> bool,
     {
         let mut resumed = 0;
-        for task in self.tasks.values_mut() {
+        let waiting_tids = self.fd_wait_tids.iter().copied().collect::<Vec<_>>();
+        for tid in waiting_tids {
+            let Some(task) = self.tasks.get(&tid) else {
+                continue;
+            };
             if let TaskState::WaitingForFd { fd, write } = task.state
                 && ready(task.pid, fd, write)
             {
-                task.state = TaskState::Runnable;
+                self.set_task_state(tid, TaskState::Runnable);
                 resumed += 1;
             }
         }
@@ -127,9 +127,9 @@ impl GuestKernel {
         tid: GuestTid,
         key: FutexWaitKey,
     ) -> Result<(), TaskError> {
-        let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
-        task.state = TaskState::WaitingForFutex { key };
-        Ok(())
+        self.set_task_state(tid, TaskState::WaitingForFutex { key })
+            .map(|_| ())
+            .ok_or(TaskError::UnknownTid(tid))
     }
 
     pub fn wake_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
@@ -139,14 +139,23 @@ impl GuestKernel {
         }
 
         let mut resumed = 0;
-        for task in self.tasks.values_mut() {
-            if matches!(task.state, TaskState::WaitingForFutex { key: wait_key } if wait_key == key)
+        let waiting_tids = self
+            .futex_wait_tids
+            .get(&key)
+            .map(|waiters| waiters.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for tid in waiting_tids {
+            let Some(task) = self.tasks.get(&tid) else {
+                continue;
+            };
+            if !matches!(task.state, TaskState::WaitingForFutex { key: wait_key } if wait_key == key)
             {
-                task.state = TaskState::Runnable;
-                resumed += 1;
-                if resumed == limit {
-                    break;
-                }
+                continue;
+            }
+            self.set_task_state(tid, TaskState::Runnable);
+            resumed += 1;
+            if resumed == limit {
+                break;
             }
         }
         resumed
@@ -216,7 +225,14 @@ impl GuestKernel {
             ExitState::Running => return Err(TaskError::WouldBlock),
         };
 
-        self.tasks.retain(|_, task| task.pid != child_pid);
+        let child_tids = self
+            .tasks
+            .values()
+            .filter_map(|task| (task.pid == child_pid).then_some(task.tid))
+            .collect::<Vec<_>>();
+        for tid in child_tids {
+            self.remove_task(tid);
+        }
         self.processes.remove(&child_pid);
         self.process_mut(parent_pid)
             .ok_or(TaskError::UnknownPid(parent_pid))?

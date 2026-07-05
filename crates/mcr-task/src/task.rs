@@ -3,7 +3,7 @@ use mcr_sys::{GuestAddress, GuestPid, GuestTid, Wait4SyscallArgs};
 
 use crate::{GprState, TlsState};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FutexWaitKey {
     pid: Option<GuestPid>,
     uaddr: GuestAddress,

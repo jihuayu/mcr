@@ -38,9 +38,10 @@ impl GuestKernel {
         let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
         task.regs = GprState::new(entrypoint, stack_pointer);
         task.tls = TlsState::new();
-        task.state = TaskState::Runnable;
         task.robust_list = None;
         task.clear_child_tid = None;
+        let _ = task;
+        self.set_task_state(tid, TaskState::Runnable);
 
         self.resume_vfork_parent(pid);
         Ok(())

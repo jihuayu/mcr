@@ -16,8 +16,9 @@ impl GuestKernel {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
 
-        task.state = TaskState::Exited { status };
         let pid = task.pid;
+        let _ = task;
+        self.set_task_state(tid, TaskState::Exited { status });
 
         let all_exited = self
             .tasks
@@ -41,8 +42,13 @@ impl GuestKernel {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         }
 
-        for task in self.tasks.values_mut().filter(|task| task.pid == pid) {
-            task.state = TaskState::Exited { status };
+        let tids = self
+            .tasks
+            .values()
+            .filter_map(|task| (task.pid == pid).then_some(task.tid))
+            .collect::<Vec<_>>();
+        for tid in tids {
+            self.set_task_state(tid, TaskState::Exited { status });
         }
         if let Some(process) = self.processes.get_mut(&pid) {
             process.exit_state = ExitState::Exited { status };
