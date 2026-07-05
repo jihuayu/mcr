@@ -9,7 +9,8 @@ use super::{
     DEFAULT_INTERPRETER_LOAD_BASE, DEFAULT_POSITION_INDEPENDENT_EXECUTABLE_BASE, ElfObjectType,
     ElfValidationError, GuestImageError, GuestVma, GuestVmaKind, InitialStackConfig,
     InitialStackError, SegmentPermissions, auxv, build_guest_memory_image,
-    build_guest_memory_image_with_interpreter, build_initial_stack, is_elf64, parse_load_plan,
+    build_guest_memory_image_with_interpreter, build_initial_stack, elf64_program_header_views,
+    is_elf64, parse_load_plan,
 };
 
 #[test]
@@ -77,6 +78,29 @@ fn parses_static_executable_load_plan() {
     );
     assert_eq!(program_headers.entry_count(), 2);
     assert_eq!(program_headers.virtual_address(), None);
+}
+
+#[test]
+fn exposes_lenient_program_header_views_for_runtime_file_mappings() {
+    let elf = Elf64Builder::new()
+        .entrypoint(0x401000)
+        .program_header(Elf64ProgramHeader::load(
+            TEST_PF_R | TEST_PF_X,
+            0x1000,
+            0x401000,
+            0x20,
+            0x40,
+        ))
+        .data_at(0x1000, vec![0xcc; 0x20])
+        .build();
+
+    let headers = elf64_program_header_views(&elf).expect("program headers should parse");
+
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].is_load());
+    assert_eq!(headers[0].offset(), 0x1000);
+    assert_eq!(headers[0].file_size(), 0x20);
+    assert_eq!(headers[0].memory_size(), 0x40);
 }
 
 #[test]

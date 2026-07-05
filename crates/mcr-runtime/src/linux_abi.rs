@@ -19,17 +19,6 @@ pub(crate) fn io_slices_mut(buffers: &mut [Vec<u8>]) -> Vec<IoSliceMut<'_>> {
         .collect()
 }
 
-pub(crate) fn iovec_output_buffers(iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
-    iovecs
-        .iter()
-        .map(|iovec| {
-            usize::try_from(iovec.iov_len)
-                .map(|len| vec![0; len])
-                .map_err(|_| LinuxErrno::EINVAL)
-        })
-        .collect()
-}
-
 pub(crate) fn outcome(result: Result<u64, LinuxErrno>) -> SyscallOutcome {
     match result {
         Ok(value) => SyscallOutcome::success(value),
@@ -140,10 +129,6 @@ pub(crate) fn vfs_errno(error: VfsError) -> LinuxErrno {
     LinuxErrno::new(error.linux_errno()).unwrap_or(LinuxErrno::EINVAL)
 }
 
-pub(crate) fn memory_errno(_error: GuestMemoryAccessError) -> LinuxErrno {
-    LinuxErrno::EFAULT
-}
-
 pub(crate) fn time_errno(error: mcr_win::HostError) -> LinuxErrno {
     host_sync_errno(error.kind())
 }
@@ -193,25 +178,6 @@ pub(crate) fn sync_proc_self(
     }
 }
 
-pub(crate) fn read_msghdr(
-    memory: &impl GuestMemoryAccess,
-    addr: u64,
-) -> Result<LinuxMsghdr, LinuxErrno> {
-    let mut bytes = [0; 56];
-    memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
-    Ok(LinuxMsghdr {
-        msg_name: u64::from_le_bytes(bytes[0..8].try_into().expect("msg_name")),
-        msg_namelen: u32::from_le_bytes(bytes[8..12].try_into().expect("msg_namelen")),
-        __pad1: u32::from_le_bytes(bytes[12..16].try_into().expect("pad1")),
-        msg_iov: u64::from_le_bytes(bytes[16..24].try_into().expect("msg_iov")),
-        msg_iovlen: u64::from_le_bytes(bytes[24..32].try_into().expect("msg_iovlen")),
-        msg_control: u64::from_le_bytes(bytes[32..40].try_into().expect("msg_control")),
-        msg_controllen: u64::from_le_bytes(bytes[40..48].try_into().expect("msg_controllen")),
-        msg_flags: u32::from_le_bytes(bytes[48..52].try_into().expect("msg_flags")),
-        __pad2: u32::from_le_bytes(bytes[52..56].try_into().expect("pad2")),
-    })
-}
-
 pub(crate) fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, LinuxErrno> {
     let mut bytes = Vec::new();
     for entry in entries {
@@ -220,53 +186,15 @@ pub(crate) fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, Linu
     Ok(bytes)
 }
 
-pub(crate) const SOCKADDR_IN_LEN: usize = 16;
-pub(crate) const SOCKADDR_IN6_LEN: usize = 28;
+pub(crate) const SOCKADDR_IN_LEN: usize = LINUX_SOCKADDR_IN_LEN;
+pub(crate) const SOCKADDR_IN6_LEN: usize = LINUX_SOCKADDR_IN6_LEN;
 
 pub(crate) fn read_socket_address(
     memory: &impl GuestMemoryAccess,
     sockaddr: u64,
     addrlen: u32,
 ) -> Result<SocketAddress, LinuxErrno> {
-    if addrlen < 2 {
-        return Err(LinuxErrno::EINVAL);
-    }
-
-    let mut family = [0; 2];
-    memory
-        .read_bytes(sockaddr, &mut family)
-        .map_err(memory_errno)?;
-    match u32::from(u16::from_le_bytes(family)) {
-        LINUX_AF_INET => {
-            if (addrlen as usize) < SOCKADDR_IN_LEN {
-                return Err(LinuxErrno::EINVAL);
-            }
-            let mut bytes = [0; SOCKADDR_IN_LEN];
-            memory
-                .read_bytes(sockaddr, &mut bytes)
-                .map_err(memory_errno)?;
-            Ok(SocketAddress::inet(
-                bytes[4..8].try_into().expect("IPv4 address length"),
-                u16::from_be_bytes([bytes[2], bytes[3]]),
-            ))
-        }
-        LINUX_AF_INET6 => {
-            if (addrlen as usize) < SOCKADDR_IN6_LEN {
-                return Err(LinuxErrno::EINVAL);
-            }
-            let mut bytes = [0; SOCKADDR_IN6_LEN];
-            memory
-                .read_bytes(sockaddr, &mut bytes)
-                .map_err(memory_errno)?;
-            Ok(SocketAddress::inet6(
-                bytes[8..24].try_into().expect("IPv6 address length"),
-                u16::from_be_bytes([bytes[2], bytes[3]]),
-                u32::from_le_bytes(bytes[4..8].try_into().expect("flowinfo length")),
-                u32::from_le_bytes(bytes[24..28].try_into().expect("scope_id length")),
-            ))
-        }
-        _ => Err(LinuxErrno::EAFNOSUPPORT),
-    }
+    mcr_sys::read_socket_address(memory, sockaddr, addrlen).map(socket_address_from_linux)
 }
 
 pub(crate) fn write_socket_address(
@@ -275,18 +203,12 @@ pub(crate) fn write_socket_address(
     addrlen_addr: u64,
     address: SocketAddress,
 ) -> Result<(), LinuxErrno> {
-    let encoded = encode_socket_address(address);
-    let addrlen = read_guest_u32(memory, addrlen_addr)? as usize;
-    let write_len = addrlen.min(encoded.len());
-    if write_len > 0 {
-        memory
-            .write_bytes(sockaddr, &encoded[..write_len])
-            .map_err(memory_errno)?;
-    }
-    let actual_len = u32::try_from(encoded.len()).expect("sockaddr length fits socklen_t");
-    memory
-        .write_bytes(addrlen_addr, &actual_len.to_le_bytes())
-        .map_err(memory_errno)
+    mcr_sys::write_socket_address(
+        memory,
+        sockaddr,
+        addrlen_addr,
+        socket_address_to_linux(address),
+    )
 }
 
 pub(crate) fn write_optional_socket_address(
@@ -301,7 +223,12 @@ pub(crate) fn write_optional_socket_address(
     if addrlen_addr == 0 {
         return Err(LinuxErrno::EFAULT);
     }
-    write_socket_address(memory, sockaddr, addrlen_addr, address)
+    mcr_sys::write_optional_socket_address(
+        memory,
+        sockaddr,
+        addrlen_addr,
+        socket_address_to_linux(address),
+    )
 }
 
 pub(crate) fn write_socket_address_to_msghdr_name(
@@ -311,56 +238,36 @@ pub(crate) fn write_socket_address_to_msghdr_name(
     addrlen: u32,
     address: SocketAddress,
 ) -> Result<(), LinuxErrno> {
-    if sockaddr == 0 {
-        return Ok(());
-    }
-
-    let encoded = encode_socket_address(address);
-    let write_len = (addrlen as usize).min(encoded.len());
-    if write_len > 0 {
-        memory
-            .write_bytes(sockaddr, &encoded[..write_len])
-            .map_err(memory_errno)?;
-    }
-    let actual_len = u32::try_from(encoded.len()).expect("sockaddr length fits socklen_t");
-    memory
-        .write_bytes(msghdr + 8, &actual_len.to_le_bytes())
-        .map_err(memory_errno)
+    mcr_sys::write_socket_address_to_msghdr_name(
+        memory,
+        msghdr,
+        sockaddr,
+        addrlen,
+        socket_address_to_linux(address),
+    )
 }
 
-pub(crate) fn write_msghdr_namelen(
-    memory: &mut impl GuestMemoryAccess,
-    msghdr: u64,
-    namelen: u32,
-) -> Result<(), LinuxErrno> {
-    memory
-        .write_bytes(msghdr + 8, &namelen.to_le_bytes())
-        .map_err(memory_errno)
-}
-
-pub(crate) fn encode_socket_address(address: SocketAddress) -> Vec<u8> {
+fn socket_address_from_linux(address: LinuxSocketAddress) -> SocketAddress {
     match address {
-        SocketAddress::Inet { address, port } => {
-            let mut bytes = vec![0; SOCKADDR_IN_LEN];
-            bytes[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_le_bytes());
-            bytes[2..4].copy_from_slice(&port.to_be_bytes());
-            bytes[4..8].copy_from_slice(&address);
-            bytes
-        }
+        LinuxSocketAddress::Inet { address, port } => SocketAddress::inet(address, port),
+        LinuxSocketAddress::Inet6 {
+            address,
+            port,
+            flowinfo,
+            scope_id,
+        } => SocketAddress::inet6(address, port, flowinfo, scope_id),
+    }
+}
+
+fn socket_address_to_linux(address: SocketAddress) -> LinuxSocketAddress {
+    match address {
+        SocketAddress::Inet { address, port } => LinuxSocketAddress::inet(address, port),
         SocketAddress::Inet6 {
             address,
             port,
             flowinfo,
             scope_id,
-        } => {
-            let mut bytes = vec![0; SOCKADDR_IN6_LEN];
-            bytes[0..2].copy_from_slice(&(LINUX_AF_INET6 as u16).to_le_bytes());
-            bytes[2..4].copy_from_slice(&port.to_be_bytes());
-            bytes[4..8].copy_from_slice(&flowinfo.to_le_bytes());
-            bytes[8..24].copy_from_slice(&address);
-            bytes[24..28].copy_from_slice(&scope_id.to_le_bytes());
-            bytes
-        }
+        } => LinuxSocketAddress::inet6(address, port, flowinfo, scope_id),
     }
 }
 

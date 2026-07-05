@@ -1,7 +1,7 @@
 ---
 id: arch-004
 scope: architecture
-status: ready
+status: done
 depends-on: [abi-001]
 ---
 

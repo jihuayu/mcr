@@ -1,4 +1,5 @@
 pub mod abi;
+pub mod codec;
 pub mod dispatcher;
 pub mod errno;
 pub mod fd;
@@ -13,6 +14,18 @@ pub use abi::{
     GuestAddress, GuestPid, GuestTid, LINUX_DIRENT64_NAME_OFFSET, LINUX_UTSNAME_FIELD_LEN,
     LinuxDirent64Header, LinuxIovec, LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxTimespec,
     LinuxUtsname, SyscallArgs, SyscallRegisters,
+};
+pub use codec::{
+    GuestMemoryAccess, GuestMemoryAccessError, LINUX_IOV_MAX, LINUX_MAX_C_STRING_LEN,
+    LINUX_MAX_SELECT_FDS, LINUX_MAX_VECTOR_ITEMS, LINUX_SELECT_FD_BITS, LINUX_SOCKADDR_IN_LEN,
+    LINUX_SOCKADDR_IN6_LEN, LinuxSelectInterest, LinuxSocketAddress, encode_socket_address,
+    iovec_output_buffers, memory_errno, read_guest_c_bytes, read_guest_i64, read_guest_timespec,
+    read_guest_u32, read_guest_u64, read_guest_vector, read_iovec_buffers, read_iovecs,
+    read_msghdr, read_pollfd, read_required_timespec_duration, read_select_interests,
+    read_select_timeout, read_socket_address, select_fd_set_contains, select_fd_set_len,
+    select_nfds, write_guest_timespec, write_guest_u32, write_iovec_buffers, write_msghdr_flags,
+    write_msghdr_namelen, write_optional_socket_address, write_pollfd_revents, write_select_fd_set,
+    write_socket_address, write_socket_address_to_msghdr_name, write_zeroed,
 };
 pub use dispatcher::{
     EventSyscalls, FileSyscalls, GuestContext, InMemorySyscallTracer, MemorySyscalls,

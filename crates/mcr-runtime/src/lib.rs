@@ -59,13 +59,16 @@ pub(crate) use runtime::{
     dispatch_guest_task_with_dispatcher, dispatch_native_libc_intrinsic_task,
 };
 pub(crate) use runtime::{guest_execution_errno, run_guest_until_exit_with_diagnostic_step_limit};
+pub(crate) use subsystems::EPOLL_EVENT_SIZE;
 pub use subsystems::RuntimeSubsystems;
-pub(crate) use subsystems::{EPOLL_EVENT_SIZE, MAX_SELECT_FDS, POLLFD_SIZE, SELECT_FD_BITS};
 pub use tracing::RuntimeDiagnosticsTracer;
 #[cfg(test)]
 pub(crate) use tracing::{RUNTIME_DIAGNOSTICS_EVENT_DRAIN, RUNTIME_DIAGNOSTICS_EVENT_LIMIT};
 
-use mcr_elf::{GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind, SegmentPermissions};
+use mcr_elf::{
+    Elf64ProgramHeaderView, GuestVma as ElfGuestVma, GuestVmaKind as ElfGuestVmaKind,
+    SegmentPermissions, elf64_program_header_entry_view, elf64_program_header_table_view,
+};
 use mcr_jit::{
     ExecutionError, GuestBlock, GuestRegisters, LinearInstructionScanner, NativeFaultInstruction,
     NativeFaultStackWord, SameIsaExecutionCore,
@@ -77,18 +80,25 @@ use mcr_net::{
 use mcr_sys::{
     Accept4SyscallArgs, CloneSyscallArgs, Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs,
     EventSyscalls, FcntlSyscallArgs, FileSyscalls, FutexSyscallArgs, GuestContext,
-    IoctlSyscallArgs, LINUX_AF_INET, LINUX_AF_INET6, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-    LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
-    LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG,
-    LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC,
-    LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN,
-    LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM,
-    LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxMsghdr, LinuxPollfd, LinuxStat, LinuxStatx,
+    IoctlSyscallArgs, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
+    LINUX_EPOLL_CTL_MOD, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT,
+    LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
+    LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
+    LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
+    LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_SOCKADDR_IN_LEN,
+    LINUX_SOCKADDR_IN6_LEN, LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxPollfd,
+    LinuxSelectInterest as SelectInterest, LinuxSocketAddress, LinuxStat, LinuxStatx,
     LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
     NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
     SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
     SockoptSyscallArgs, SyscallDispatchResult, SyscallDispatcher, SyscallOutcome, SyscallRequest,
     SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
+    iovec_output_buffers, memory_errno, read_guest_c_bytes, read_guest_i64, read_guest_timespec,
+    read_guest_u32, read_guest_u64, read_guest_vector, read_iovec_buffers, read_iovecs,
+    read_msghdr, read_pollfd, read_required_timespec_duration, read_select_interests,
+    read_select_timeout, select_fd_set_contains, select_nfds, write_guest_timespec,
+    write_guest_u32, write_iovec_buffers, write_msghdr_flags, write_msghdr_namelen,
+    write_pollfd_revents, write_select_fd_set, write_zeroed,
 };
 use mcr_task::{
     CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
@@ -209,15 +219,6 @@ pub(crate) mod test_support {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SelectInterest {
-    fd: Fd,
-    events: i16,
-    read: bool,
-    write: bool,
-    exceptional: bool,
-}
-
 #[derive(Default)]
 struct SelectReadyFds {
     read: Vec<Fd>,
@@ -265,14 +266,14 @@ fn zero_elf_load_bss_tail(vfs: &VirtualFileSystem, fd: Fd, mapped_offset: u64, b
     };
 
     for header in headers {
-        if header.kind != ELF_PT_LOAD || header.mem_size <= header.file_size {
+        if !header.is_load() || header.memory_size() <= header.file_size() {
             continue;
         }
 
-        let Some(tail_start) = header.offset.checked_add(header.file_size) else {
+        let Some(tail_start) = header.offset().checked_add(header.file_size()) else {
             continue;
         };
-        let Some(tail_end) = header.offset.checked_add(header.mem_size) else {
+        let Some(tail_end) = header.offset().checked_add(header.memory_size()) else {
             continue;
         };
         let overlap_start = tail_start.max(mapped_offset);
@@ -287,69 +288,32 @@ fn zero_elf_load_bss_tail(vfs: &VirtualFileSystem, fd: Fd, mapped_offset: u64, b
     }
 }
 
-#[derive(Debug)]
-struct Elf64ProgramHeaderView {
-    kind: u32,
-    offset: u64,
-    file_size: u64,
-    mem_size: u64,
-}
-
-const ELF_HEADER_LEN: usize = 64;
-const ELF_PROGRAM_HEADER_MIN_LEN: usize = 56;
-const ELF_PT_LOAD: u32 = 1;
-const MAX_ELF_PROGRAM_HEADERS: usize = 1024;
-const MAX_ELF_PROGRAM_HEADER_LEN: usize = 4096;
-
 fn read_elf64_program_headers(
     vfs: &VirtualFileSystem,
     fd: Fd,
 ) -> Option<Vec<Elf64ProgramHeaderView>> {
-    let mut elf_header = [0; ELF_HEADER_LEN];
-    if vfs.pread(fd, 0, &mut elf_header).ok()? < ELF_HEADER_LEN {
+    let elf_header_len = mcr_elf::ELF64_HEADER_SIZE as usize;
+    let mut elf_header = [0; mcr_elf::ELF64_HEADER_SIZE as usize];
+    if vfs.pread(fd, 0, &mut elf_header).ok()? < elf_header_len {
         return None;
     }
-    if elf_header.get(0..4) != Some(b"\x7fELF") || elf_header[4] != 2 || elf_header[5] != 1 {
-        return None;
-    }
+    let table = elf64_program_header_table_view(&elf_header)?;
 
-    let ph_offset = le_u64(&elf_header[32..40]);
-    let ph_entry_size = usize::from(le_u16(&elf_header[54..56]));
-    let ph_count = usize::from(le_u16(&elf_header[56..58]));
-    if !(ELF_PROGRAM_HEADER_MIN_LEN..=MAX_ELF_PROGRAM_HEADER_LEN).contains(&ph_entry_size)
-        || ph_count > MAX_ELF_PROGRAM_HEADERS
-    {
-        return None;
-    }
-
-    let mut headers = Vec::with_capacity(ph_count);
-    let mut ph_bytes = vec![0; ph_entry_size];
-    for index in 0..ph_count {
-        let entry_offset = ph_offset.checked_add((index * ph_entry_size) as u64)?;
-        if vfs.pread(fd, entry_offset, &mut ph_bytes).ok()? < ELF_PROGRAM_HEADER_MIN_LEN {
+    let mut headers = Vec::with_capacity(table.entry_count());
+    let mut ph_bytes = vec![0; table.entry_size()];
+    for index in 0..table.entry_count() {
+        let entry_offset = table
+            .file_offset()
+            .checked_add((index * table.entry_size()) as u64)?;
+        if vfs.pread(fd, entry_offset, &mut ph_bytes).ok()?
+            < mcr_elf::ELF64_PROGRAM_HEADER_MIN_VIEW_SIZE
+        {
             return None;
         }
-        headers.push(Elf64ProgramHeaderView {
-            kind: le_u32(&ph_bytes[0..4]),
-            offset: le_u64(&ph_bytes[8..16]),
-            file_size: le_u64(&ph_bytes[32..40]),
-            mem_size: le_u64(&ph_bytes[40..48]),
-        });
+        headers.push(elf64_program_header_entry_view(&ph_bytes)?);
     }
 
     Some(headers)
-}
-
-fn le_u16(bytes: &[u8]) -> u16 {
-    u16::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
-}
-
-fn le_u32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
-}
-
-fn le_u64(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes.try_into().expect("slice length checked by caller"))
 }
 
 fn poll_timeout(raw: u64) -> Result<Option<Duration>, LinuxErrno> {
@@ -403,30 +367,6 @@ fn resolve_utimensat_time(
     }
 }
 
-fn read_required_timespec_duration(
-    memory: &impl GuestMemoryAccess,
-    addr: u64,
-) -> Result<Duration, LinuxErrno> {
-    let timespec = read_guest_timespec(memory, addr)?;
-    if timespec.tv_sec < 0 || !(0..1_000_000_000).contains(&timespec.tv_nsec) {
-        return Err(LinuxErrno::EINVAL);
-    }
-    Ok(Duration::new(
-        timespec.tv_sec as u64,
-        timespec.tv_nsec as u32,
-    ))
-}
-
-fn read_guest_timespec(
-    memory: &impl GuestMemoryAccess,
-    addr: u64,
-) -> Result<LinuxTimespec, LinuxErrno> {
-    Ok(LinuxTimespec {
-        tv_sec: read_guest_i64(memory, addr)?,
-        tv_nsec: read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?,
-    })
-}
-
 fn read_open_how(
     memory: &impl GuestMemoryAccess,
     addr: u64,
@@ -478,22 +418,6 @@ fn encode_linux_uname(uts: &LinuxUtsname) -> [u8; std::mem::size_of::<LinuxUtsna
         offset += field.len();
     }
     bytes
-}
-
-fn write_guest_timespec(
-    memory: &mut impl GuestMemoryAccess,
-    addr: u64,
-    timespec: LinuxTimespec,
-) -> Result<(), LinuxErrno> {
-    memory
-        .write_bytes(addr, &timespec.tv_sec.to_le_bytes())
-        .map_err(memory_errno)?;
-    memory
-        .write_bytes(
-            addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?,
-            &timespec.tv_nsec.to_le_bytes(),
-        )
-        .map_err(memory_errno)
 }
 
 fn validate_clock_id(clock_id: u64) -> Result<(), LinuxErrno> {
@@ -589,16 +513,6 @@ fn read_guest_rlimit(memory: &impl GuestMemoryAccess, addr: u64) -> Result<(u64,
     ))
 }
 
-fn write_zeroed(
-    memory: &mut impl GuestMemoryAccess,
-    addr: u64,
-    len: usize,
-) -> Result<(), LinuxErrno> {
-    memory
-        .write_bytes(addr, &vec![0; len])
-        .map_err(memory_errno)
-}
-
 fn write_guest_sysinfo(memory: &mut impl GuestMemoryAccess, addr: u64) -> Result<(), LinuxErrno> {
     let mut bytes = [0; 112];
     bytes[0..8].copy_from_slice(&3600i64.to_le_bytes());
@@ -616,151 +530,6 @@ fn write_guest_sysinfo(memory: &mut impl GuestMemoryAccess, addr: u64) -> Result
     bytes[96..104].copy_from_slice(&(256 * 1024 * 1024u64).to_le_bytes());
     bytes[104..108].copy_from_slice(&(4096u32).to_le_bytes());
     memory.write_bytes(addr, &bytes).map_err(memory_errno)
-}
-
-fn read_pollfd(memory: &impl GuestMemoryAccess, addr: u64) -> Result<LinuxPollfd, LinuxErrno> {
-    let mut bytes = [0; POLLFD_SIZE];
-    memory.read_bytes(addr, &mut bytes).map_err(memory_errno)?;
-    Ok(LinuxPollfd {
-        fd: i32::from_le_bytes(bytes[0..4].try_into().expect("pollfd fd")),
-        events: i16::from_le_bytes(bytes[4..6].try_into().expect("pollfd events")),
-        revents: i16::from_le_bytes(bytes[6..8].try_into().expect("pollfd revents")),
-    })
-}
-
-fn write_pollfd_revents(
-    memory: &mut impl GuestMemoryAccess,
-    addr: u64,
-    revents: i16,
-) -> Result<(), LinuxErrno> {
-    memory
-        .write_bytes(
-            addr.checked_add(6).ok_or(LinuxErrno::EFAULT)?,
-            &revents.to_le_bytes(),
-        )
-        .map_err(memory_errno)
-}
-
-fn select_nfds(raw: u64) -> Result<usize, LinuxErrno> {
-    let signed = raw as i64;
-    if signed < 0 {
-        return Err(LinuxErrno::EINVAL);
-    }
-    let nfds = usize::try_from(signed).map_err(|_| LinuxErrno::EINVAL)?;
-    if nfds > MAX_SELECT_FDS {
-        return Err(LinuxErrno::EINVAL);
-    }
-    Ok(nfds)
-}
-
-fn read_select_timeout(
-    memory: &impl GuestMemoryAccess,
-    addr: u64,
-) -> Result<Option<Duration>, LinuxErrno> {
-    if addr == 0 {
-        return Ok(None);
-    }
-    let tv_sec = read_guest_i64(memory, addr)?;
-    let tv_usec = read_guest_i64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?;
-    if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
-        return Err(LinuxErrno::EINVAL);
-    }
-    Ok(Some(Duration::new(
-        tv_sec as u64,
-        u32::try_from(tv_usec * 1_000).map_err(|_| LinuxErrno::EINVAL)?,
-    )))
-}
-
-fn read_select_interests(
-    memory: &impl GuestMemoryAccess,
-    nfds: usize,
-    readfds_addr: u64,
-    writefds_addr: u64,
-    exceptfds_addr: u64,
-) -> Result<Vec<SelectInterest>, LinuxErrno> {
-    let mut interests = Vec::new();
-    for fd in 0..nfds {
-        let read = select_fd_set_contains(memory, readfds_addr, fd)?;
-        let write = select_fd_set_contains(memory, writefds_addr, fd)?;
-        let exceptional = select_fd_set_contains(memory, exceptfds_addr, fd)?;
-        if !read && !write && !exceptional {
-            continue;
-        }
-        let mut events = 0;
-        if read {
-            events |= LINUX_POLLIN | LINUX_POLLRDNORM;
-        }
-        if write {
-            events |= LINUX_POLLOUT | LINUX_POLLWRNORM;
-        }
-        if exceptional {
-            events |= LINUX_POLLPRI;
-        }
-        interests.push(SelectInterest {
-            fd: i32::try_from(fd).map_err(|_| LinuxErrno::EINVAL)?,
-            events,
-            read,
-            write,
-            exceptional,
-        });
-    }
-    Ok(interests)
-}
-
-fn select_fd_set_contains(
-    memory: &impl GuestMemoryAccess,
-    set_addr: u64,
-    fd: usize,
-) -> Result<bool, LinuxErrno> {
-    if set_addr == 0 {
-        return Ok(false);
-    }
-    let word_addr = select_fd_word_addr(set_addr, fd)?;
-    let word = read_guest_u64(memory, word_addr)?;
-    Ok(word & select_fd_bit(fd) != 0)
-}
-
-fn write_select_fd_set(
-    memory: &mut impl GuestMemoryAccess,
-    set_addr: u64,
-    nfds: usize,
-    fds: &[Fd],
-) -> Result<(), LinuxErrno> {
-    if set_addr == 0 {
-        return Ok(());
-    }
-    write_zeroed(memory, set_addr, select_fd_set_len(nfds)?)?;
-    for fd in fds {
-        if *fd < 0 {
-            continue;
-        }
-        let fd = usize::try_from(*fd).map_err(|_| LinuxErrno::EINVAL)?;
-        if fd >= nfds {
-            continue;
-        }
-        let word_addr = select_fd_word_addr(set_addr, fd)?;
-        let word = read_guest_u64(memory, word_addr)? | select_fd_bit(fd);
-        memory
-            .write_bytes(word_addr, &word.to_le_bytes())
-            .map_err(memory_errno)?;
-    }
-    Ok(())
-}
-
-fn select_fd_set_len(nfds: usize) -> Result<usize, LinuxErrno> {
-    nfds.checked_add(SELECT_FD_BITS - 1)
-        .map(|bits| bits / SELECT_FD_BITS * 8)
-        .ok_or(LinuxErrno::EINVAL)
-}
-
-fn select_fd_word_addr(set_addr: u64, fd: usize) -> Result<u64, LinuxErrno> {
-    set_addr
-        .checked_add(((fd / SELECT_FD_BITS) * 8) as u64)
-        .ok_or(LinuxErrno::EFAULT)
-}
-
-fn select_fd_bit(fd: usize) -> u64 {
-    1u64 << (fd % SELECT_FD_BITS)
 }
 
 fn read_epoll_event(
@@ -990,82 +759,6 @@ fn read_futex_timeout(
         return Err(LinuxErrno::EINVAL);
     }
     Ok(Some(Duration::new(tv_sec as u64, tv_nsec as u32)))
-}
-
-fn read_guest_u32(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u32, LinuxErrno> {
-    let mut bytes = [0; 4];
-    memory
-        .read_bytes(addr, &mut bytes)
-        .map_err(|_| LinuxErrno::EFAULT)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn write_guest_u32(
-    memory: &mut impl GuestMemoryAccess,
-    addr: u64,
-    value: u32,
-) -> Result<(), LinuxErrno> {
-    memory
-        .write_bytes(addr, &value.to_le_bytes())
-        .map_err(|_| LinuxErrno::EFAULT)
-}
-
-fn read_guest_i64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<i64, LinuxErrno> {
-    let mut bytes = [0; 8];
-    memory
-        .read_bytes(addr, &mut bytes)
-        .map_err(|_| LinuxErrno::EFAULT)?;
-    Ok(i64::from_le_bytes(bytes))
-}
-
-fn read_guest_u64(memory: &impl GuestMemoryAccess, addr: u64) -> Result<u64, LinuxErrno> {
-    let mut bytes = [0; 8];
-    memory
-        .read_bytes(addr, &mut bytes)
-        .map_err(|_| LinuxErrno::EFAULT)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_guest_c_bytes(memory: &impl GuestMemoryAccess, addr: u64) -> Result<Vec<u8>, LinuxErrno> {
-    const MAX_C_STRING_LEN: usize = 4096;
-    let mut bytes = Vec::new();
-    for offset in 0..MAX_C_STRING_LEN {
-        let mut byte = [0];
-        memory
-            .read_bytes(
-                addr.checked_add(offset as u64).ok_or(LinuxErrno::EFAULT)?,
-                &mut byte,
-            )
-            .map_err(|_| LinuxErrno::EFAULT)?;
-        if byte[0] == 0 {
-            return Ok(bytes);
-        }
-        bytes.push(byte[0]);
-    }
-    Err(LinuxErrno::ENAMETOOLONG)
-}
-
-fn read_guest_vector(
-    memory: &impl GuestMemoryAccess,
-    vector_addr: u64,
-) -> Result<Vec<Vec<u8>>, LinuxErrno> {
-    const MAX_VECTOR_ITEMS: usize = 4096;
-    if vector_addr == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut values = Vec::new();
-    for index in 0..MAX_VECTOR_ITEMS {
-        let item_addr = vector_addr
-            .checked_add((index * 8) as u64)
-            .ok_or(LinuxErrno::EFAULT)?;
-        let ptr = read_guest_u64(memory, item_addr)?;
-        if ptr == 0 {
-            return Ok(values);
-        }
-        values.push(read_guest_c_bytes(memory, ptr)?);
-    }
-    Err(LinuxErrno::E2BIG)
 }
 
 fn guest_bytes_to_path(bytes: &[u8]) -> Result<String, LinuxErrno> {

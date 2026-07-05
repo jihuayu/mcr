@@ -3,6 +3,7 @@ mod image;
 mod parser;
 mod plan;
 mod stack;
+mod view;
 
 #[cfg(test)]
 mod tests;
@@ -52,4 +53,10 @@ pub use plan::{
 };
 pub use stack::{
     AuxiliaryVectorEntry, InitialStack, InitialStackConfig, InitialStackError, build_initial_stack,
+};
+pub use view::{
+    ELF64_PROGRAM_HEADER_MAX_VIEW_COUNT, ELF64_PROGRAM_HEADER_MAX_VIEW_SIZE,
+    ELF64_PROGRAM_HEADER_MIN_VIEW_SIZE, ELF64_PT_LOAD, Elf64ProgramHeaderTableView,
+    Elf64ProgramHeaderView, elf64_program_header_entry_view, elf64_program_header_table_view,
+    elf64_program_header_views,
 };

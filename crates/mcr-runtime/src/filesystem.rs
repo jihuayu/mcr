@@ -414,9 +414,7 @@ where
             }
             self.recv_connected_into_iovecs(socket_id, &iovecs)?
         };
-        self.memory
-            .write_bytes(args.msg + 48, &0u32.to_le_bytes())
-            .map_err(memory_errno)?;
+        write_msghdr_flags(&mut self.memory, args.msg, 0)?;
         Ok(total)
     }
 
@@ -1194,39 +1192,11 @@ where
     }
 
     fn read_iovecs(&self, addr: u64, count: usize) -> Result<Vec<LinuxIovec>, LinuxErrno> {
-        const IOV_MAX: usize = 1024;
-        if count > IOV_MAX {
-            return Err(LinuxErrno::EINVAL);
-        }
-
-        let mut iovecs = Vec::with_capacity(count);
-        for index in 0..count {
-            let item_addr = addr
-                .checked_add((index * 16) as u64)
-                .ok_or(LinuxErrno::EFAULT)?;
-            let mut bytes = [0; 16];
-            self.memory
-                .read_bytes(item_addr, &mut bytes)
-                .map_err(memory_errno)?;
-            iovecs.push(LinuxIovec {
-                iov_base: u64::from_le_bytes(bytes[0..8].try_into().expect("slice len")),
-                iov_len: u64::from_le_bytes(bytes[8..16].try_into().expect("slice len")),
-            });
-        }
-        Ok(iovecs)
+        read_iovecs(&self.memory, addr, count)
     }
 
     fn read_iovec_buffers(&self, iovecs: &[LinuxIovec]) -> Result<Vec<Vec<u8>>, LinuxErrno> {
-        let mut buffers = Vec::with_capacity(iovecs.len());
-        for iovec in iovecs {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let mut buffer = vec![0; len];
-            self.memory
-                .read_bytes(iovec.iov_base, &mut buffer)
-                .map_err(memory_errno)?;
-            buffers.push(buffer);
-        }
-        Ok(buffers)
+        read_iovec_buffers(&self.memory, iovecs)
     }
 
     fn write_iovec_buffers(
@@ -1235,22 +1205,7 @@ where
         buffers: &[Vec<u8>],
         bytes_written: usize,
     ) -> Result<(), LinuxErrno> {
-        let mut consumed = 0usize;
-        for (iovec, buffer) in iovecs.iter().zip(buffers) {
-            let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
-            let remaining = bytes_written.saturating_sub(consumed);
-            let write_len = len.min(remaining);
-            if write_len > 0 {
-                self.memory
-                    .write_bytes(iovec.iov_base, &buffer[..write_len])
-                    .map_err(memory_errno)?;
-            }
-            consumed += write_len;
-            if consumed >= bytes_written {
-                break;
-            }
-        }
-        Ok(())
+        write_iovec_buffers(&mut self.memory, iovecs, buffers, bytes_written)
     }
 
     fn recv_connected_into_iovecs(

@@ -319,5 +319,3 @@ impl RuntimeSubsystems {
 
 pub(crate) const POLLFD_SIZE: usize = std::mem::size_of::<LinuxPollfd>();
 pub(crate) const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<LinuxEpollEvent>();
-pub(crate) const SELECT_FD_BITS: usize = 64;
-pub(crate) const MAX_SELECT_FDS: usize = 4096;
