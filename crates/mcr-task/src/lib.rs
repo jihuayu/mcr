@@ -1420,6 +1420,34 @@ impl GuestKernel {
         resumed
     }
 
+    pub fn wake_and_requeue_futex_waiters(
+        &mut self,
+        from: FutexWaitKey,
+        to: FutexWaitKey,
+        wake_limit: u32,
+        requeue_limit: u32,
+    ) -> (usize, usize) {
+        let wake_limit = usize::try_from(wake_limit).unwrap_or(usize::MAX);
+        let requeue_limit = usize::try_from(requeue_limit).unwrap_or(usize::MAX);
+        let mut woken = 0;
+        let mut requeued = 0;
+        for task in self.tasks.values_mut() {
+            if !matches!(task.state, TaskState::WaitingForFutex { key } if key == from) {
+                continue;
+            }
+            if woken < wake_limit {
+                task.state = TaskState::Runnable;
+                woken += 1;
+            } else if requeued < requeue_limit {
+                task.state = TaskState::WaitingForFutex { key: to };
+                requeued += 1;
+            } else {
+                break;
+            }
+        }
+        (woken, requeued)
+    }
+
     pub fn rt_sigaction_current(
         &mut self,
         tid: GuestTid,

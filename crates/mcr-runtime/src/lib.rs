@@ -127,6 +127,13 @@ const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
 const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
+const LINUX_FUTEX_REQUEUE: u32 = 3;
+const LINUX_FUTEX_CMP_REQUEUE: u32 = 4;
+const LINUX_FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const LINUX_ROBUST_LIST_FUTEX_OFFSET: u64 = 8;
+const LINUX_ROBUST_LIST_PENDING_OFFSET: u64 = 16;
+const LINUX_ROBUST_LIST_LIMIT: usize = 2048;
 const LINUX_SS_DISABLE: u32 = 2;
 const LINUX_SS_AUTODISARM: u32 = 1 << 31;
 const LINUX_SS_SUPPORTED_FLAGS: u32 = LINUX_SS_DISABLE | LINUX_SS_AUTODISARM;
@@ -370,7 +377,7 @@ struct EpollInstance {
     watches: BTreeMap<Fd, EpollWatch>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct EpollRegistry {
     next_id: u64,
     instances: BTreeMap<u64, EpollInstance>,
@@ -3676,6 +3683,37 @@ where
     dispatcher
         .subsystems_mut()
         .perf_record_syscall(syscall_registers.syscall());
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        && let Some((fd, write)) = blocking_fd_wait(
+            dispatcher.subsystems().files.vfs().fds(),
+            syscall_registers.rax,
+            syscall_registers.rdi,
+        )
+    {
+        dispatcher
+            .subsystems_mut()
+            .tasks
+            .block_task_for_fd(tid, fd, write)
+            .map_err(|_| GuestExecutionError::MissingTask(tid))?;
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        let blocked_regs = gpr_from_registers(trap.registers());
+        task.set_regs(blocked_regs);
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            blocked_regs.rip(),
+            blocked_regs.rax(),
+            task.state(),
+        ));
+    }
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
@@ -3755,6 +3793,37 @@ where
         .subsystems_mut()
         .perf_record_syscall(syscall_registers.syscall());
     let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+        && let Some((fd, write)) = blocking_fd_wait(
+            dispatcher.subsystems().files.vfs().fds(),
+            syscall_registers.rax,
+            syscall_registers.rdi,
+        )
+    {
+        dispatcher
+            .subsystems_mut()
+            .tasks
+            .block_task_for_fd(tid, fd, write)
+            .map_err(|_| GuestExecutionError::MissingTask(tid))?;
+        let task = dispatcher
+            .subsystems_mut()
+            .tasks
+            .task_mut(tid)
+            .ok_or(GuestExecutionError::MissingTask(tid))?;
+        let blocked_regs = gpr_from_registers(trap.registers());
+        task.set_regs(blocked_regs);
+        return Ok(GuestExecutionStep::new(
+            tid,
+            before_rip,
+            blocked_regs.rip(),
+            blocked_regs.rax(),
+            task.state(),
+        ));
+    }
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
@@ -3870,6 +3939,42 @@ where
             if let Some(instruction) = fault_instruction.as_ref() {
                 host_step_trace(format_args!(
                     "runtime native-fault pid={pid} tid={tid} {instruction}"
+                ));
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if matches!(&error, mcr_win::NativeExecutionError::GuestFault { .. })
+                && let Some(instruction) = fault_instruction.as_ref()
+                && let Some(registers) = emulate_fs_relative_native_fault(
+                    memory,
+                    native_registers,
+                    fs_base,
+                    instruction,
+                )?
+            {
+                host_step_trace(format_args!(
+                    "runtime native-fs-emulate pid={pid} tid={tid} rip=0x{:016x} next=0x{:016x}",
+                    native_registers.rip, registers.rip
+                ));
+                dispatcher.subsystems_mut().set_native_fp(
+                    tid,
+                    mcr_win::HostFloatingPointState {
+                        xmm: registers.xmm,
+                        mxcsr: registers.mxcsr,
+                    },
+                );
+                let gpr = gpr_from_registers(guest_registers_from_host(registers));
+                let task = dispatcher
+                    .subsystems_mut()
+                    .tasks
+                    .task_mut(tid)
+                    .ok_or(GuestExecutionError::MissingTask(tid))?;
+                task.set_regs(gpr);
+                return Ok(GuestExecutionStep::new(
+                    tid,
+                    before_rip,
+                    gpr.rip(),
+                    gpr.rax(),
+                    task.state(),
                 ));
             }
             #[cfg(all(windows, target_arch = "x86_64"))]
@@ -5112,15 +5217,17 @@ fn fs_relative_patch_sites(
                 patch: original,
                 materialized: false,
             });
-        } else if previous_fs_base != 0
-            && let Some((prefix_len, original)) =
-                fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
-        {
-            patches.push(FsRelativePatchSite {
-                address: instruction.rip + prefix_len as u64,
-                patch: original,
-                materialized: true,
-            });
+        } else {
+            if previous_fs_base != 0
+                && let Some((prefix_len, original)) =
+                    fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
+            {
+                patches.push(FsRelativePatchSite {
+                    address: instruction.rip + prefix_len as u64,
+                    patch: original,
+                    materialized: true,
+                });
+            }
         }
     }
 
@@ -5312,6 +5419,10 @@ fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> Option<(Fd, 
         || syscall_number == mcr_sys::Syscall::Writev.number().raw()
     {
         Some((fd, true))
+    } else if syscall_number == mcr_sys::Syscall::EpollWait.number().raw()
+        || syscall_number == mcr_sys::Syscall::EpollPwait2.number().raw()
+    {
+        Some((fd, false))
     } else {
         None
     }
@@ -5380,6 +5491,30 @@ fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultSt
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn native_fault_is_unrewritten_fs_relative(instruction: &NativeFaultInstruction) -> bool {
     instruction.fs_relative_memory_operand
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_relative_native_fault(
+    memory: &GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    if instruction.bytes.as_slice() != [0x64, 0x8b, 0x00] {
+        return Ok(None);
+    }
+
+    let addr = fs_base.wrapping_add(registers.rax);
+    let mut value = [0; 4];
+    memory.read(addr, &mut value)?;
+    registers.rax = u64::from(u32::from_le_bytes(value));
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
 }
 
 fn read_guest_block(
@@ -8061,6 +8196,9 @@ impl RuntimeSubsystems {
         exit_group: bool,
     ) -> Result<(), LinuxErrno> {
         if !exit_group {
+            if let Some(robust_list) = self.tasks.task(tid).and_then(GuestTask::robust_list) {
+                self.wake_robust_list(pid, tid, robust_list)?;
+            }
             if let Some(clear_child_tid) = self
                 .tasks
                 .task_mut(tid)
@@ -8089,6 +8227,60 @@ impl RuntimeSubsystems {
         }
     }
 
+    fn wake_robust_list(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        head: u64,
+    ) -> Result<(), LinuxErrno> {
+        let futex_offset = read_guest_i64(
+            self.files.memory(),
+            head.checked_add(LINUX_ROBUST_LIST_FUTEX_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?;
+        let pending = read_guest_u64(
+            self.files.memory(),
+            head.checked_add(LINUX_ROBUST_LIST_PENDING_OFFSET)
+                .ok_or(LinuxErrno::EFAULT)?,
+        )?;
+        self.wake_robust_futex_node(pid, tid, pending, futex_offset)?;
+
+        let mut node = read_guest_u64(self.files.memory(), head)?;
+        for _ in 0..LINUX_ROBUST_LIST_LIMIT {
+            if node == 0 || node == head {
+                return Ok(());
+            }
+            self.wake_robust_futex_node(pid, tid, node, futex_offset)?;
+            node = read_guest_u64(self.files.memory(), node)?;
+        }
+        Ok(())
+    }
+
+    fn wake_robust_futex_node(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        node: u64,
+        futex_offset: i64,
+    ) -> Result<(), LinuxErrno> {
+        if node == 0 {
+            return Ok(());
+        }
+        let futex_addr = robust_futex_addr(node, futex_offset).ok_or(LinuxErrno::EFAULT)?;
+        let value = read_guest_u32(self.files.memory(), futex_addr)?;
+        if value & LINUX_FUTEX_TID_MASK != tid {
+            return Ok(());
+        }
+        let owner_died = (value & !LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED;
+        write_guest_u32(self.files.memory_mut(), futex_addr, owner_died)?;
+        self.store_selected_process_memory(pid)?;
+        self.tasks
+            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, true), 1);
+        self.tasks
+            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, false), 1);
+        Ok(())
+    }
+
     fn resume_waiting_tasks(&mut self) -> Result<Vec<CompletedWait>, LinuxErrno> {
         let completed = self.tasks.resume_waiting_tasks();
         for wait in &completed {
@@ -8103,13 +8295,14 @@ impl RuntimeSubsystems {
         let selected_pid = self.selected_fds_pid;
         let selected_fds = self.files.vfs().fds().clone();
         let process_fds = self.process_fds.clone();
+        let epolls = self.epolls.clone();
         let resumed = self.tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
                 Some(&selected_fds)
             } else {
                 process_fds.get(&pid)
             };
-            fds.and_then(|fds| fd_wait_ready(fds, fd, write).ok())
+            fds.and_then(|fds| fd_wait_ready_with_epolls(fds, &epolls, fd, write).ok())
                 .unwrap_or(true)
         });
         self.perf_record_fd_wakeups(resumed);
@@ -8502,6 +8695,14 @@ impl RuntimeSubsystems {
         match args.command() {
             LINUX_FUTEX_WAIT => self.futex_wait(pid, tid, args),
             LINUX_FUTEX_WAKE => SyscallOutcome::success(self.futex_wake(pid, args)),
+            LINUX_FUTEX_REQUEUE => match self.futex_requeue(pid, args, false) {
+                Ok(count) => SyscallOutcome::success(count),
+                Err(errno) => SyscallOutcome::errno(errno),
+            },
+            LINUX_FUTEX_CMP_REQUEUE => match self.futex_requeue(pid, args, true) {
+                Ok(count) => SyscallOutcome::success(count),
+                Err(errno) => SyscallOutcome::errno(errno),
+            },
             _ => SyscallOutcome::errno(LinuxErrno::EINVAL),
         }
     }
@@ -8537,6 +8738,30 @@ impl RuntimeSubsystems {
     fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
         self.tasks.wake_futex_waiters(key, args.val) as u64
+    }
+
+    fn futex_requeue(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        args: FutexSyscallArgs,
+        compare: bool,
+    ) -> Result<u64, LinuxErrno> {
+        if args.uaddr2 % 4 != 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if compare {
+            let value = read_guest_u32(self.files.memory(), args.uaddr)?;
+            if value != args.val3 {
+                return Err(LinuxErrno::EAGAIN);
+            }
+        }
+        let from = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        let to = FutexWaitKey::new(pid, args.uaddr2, args.is_private());
+        let requeue_limit = u32::try_from(args.timeout).unwrap_or(u32::MAX);
+        let (woken, requeued) =
+            self.tasks
+                .wake_and_requeue_futex_waiters(from, to, args.val, requeue_limit);
+        Ok((woken + requeued) as u64)
     }
 
     fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -8960,6 +9185,9 @@ impl RuntimeSubsystems {
         let mut ready = self.epoll_ready_events(&watches, maxevents, Some(Duration::ZERO))?;
         if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {
             ready = self.epoll_ready_events(&watches, maxevents, timeout)?;
+        }
+        if ready.is_empty() && timeout.is_none() {
+            return Err(LinuxErrno::EAGAIN);
         }
 
         for (index, event) in ready.iter().enumerate() {
@@ -9659,6 +9887,46 @@ fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno>
     } else {
         readiness.readable || readiness.hang_up || readiness.error
     })
+}
+
+fn fd_wait_ready_with_epolls(
+    fds: &FdTable,
+    epolls: &EpollRegistry,
+    fd: Fd,
+    write: bool,
+) -> Result<bool, LinuxErrno> {
+    if !write && let Ok(epoll_id) = fds.epoll_id_for_fd(fd) {
+        return epoll_fd_ready(fds, epolls, epoll_id);
+    }
+    fd_wait_ready(fds, fd, write)
+}
+
+fn robust_futex_addr(node: u64, futex_offset: i64) -> Option<u64> {
+    if futex_offset >= 0 {
+        node.checked_add(futex_offset as u64)
+    } else {
+        node.checked_sub(futex_offset.unsigned_abs())
+    }
+}
+
+fn epoll_fd_ready(
+    fds: &FdTable,
+    epolls: &EpollRegistry,
+    epoll_id: u64,
+) -> Result<bool, LinuxErrno> {
+    let instance = epolls.instance(epoll_id)?;
+    for watch in instance.watches.values() {
+        let poll_events = epoll_events_to_poll_events(watch.events);
+        let revents = match fds.poll_readiness(&mcr_vfs::PathTree::new(), watch.fd) {
+            Ok(readiness) => poll_revents_from_vfs(readiness, poll_events),
+            Err(VfsError::BadFd) => LINUX_POLLERR | LINUX_POLLHUP,
+            Err(error) => return Err(vfs_errno(error)),
+        };
+        if poll_revents_to_epoll_events(revents, watch.events) != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
@@ -10819,6 +11087,53 @@ mod tests {
         assert_eq!(
             runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
             TaskState::Runnable
+        );
+    }
+
+    #[test]
+    fn futex_requeue_wakes_then_moves_waiters_to_second_key() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_SYSVSEM;
+        let first = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+        let second = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+        assert_eq!(first.result, SyscallReturn::Success(2));
+        assert_eq!(second.result, SyscallReturn::Success(3));
+        runtime
+            .kernel_mut()
+            .block_task_for_futex(2, FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true))
+            .unwrap();
+        runtime
+            .kernel_mut()
+            .block_task_for_futex(3, FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true))
+            .unwrap();
+
+        let requeued = runtime.dispatch_syscall(context(
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG),
+                1,
+                1,
+                0x402004,
+                0,
+            ],
+        ));
+
+        assert_eq!(requeued.result, SyscallReturn::Success(2));
+        assert_eq!(
+            runtime.kernel().task(2).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            runtime.kernel().task(3).unwrap().state(),
+            TaskState::WaitingForFutex {
+                key: FutexWaitKey::new(INITIAL_GUEST_PID, 0x402004, true)
+            }
         );
     }
 
@@ -11996,6 +12311,7 @@ mod tests {
         let mut vfs = sample_vfs();
         let blocking = vfs.eventfd(0, OpenFlags::new(0)).unwrap();
         let nonblocking = vfs.eventfd(0, OpenFlags::new(mcr_vfs::O_NONBLOCK)).unwrap();
+        let epoll = vfs.insert_epoll(1, OpenFlags::new(0)).unwrap();
 
         assert_eq!(
             blocking_fd_wait(vfs.fds(), Syscall::Read.number().raw(), blocking as u64),
@@ -12004,6 +12320,14 @@ mod tests {
         assert_eq!(
             blocking_fd_wait(vfs.fds(), Syscall::Read.number().raw(), nonblocking as u64),
             None
+        );
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::EpollWait.number().raw(), epoll as u64),
+            Some((epoll, false))
+        );
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::EpollPwait2.number().raw(), epoll as u64),
+            Some((epoll, false))
         );
     }
 
@@ -12067,6 +12391,68 @@ mod tests {
         let still_ready =
             runtime.dispatch_syscall(context(Syscall::EpollWait, [5, 0x402200, 4, 0, 0, 0]));
         assert_eq!(still_ready.result, SyscallReturn::Success(1));
+    }
+
+    #[test]
+    fn epoll_wait_infinite_timeout_defers_until_watched_fd_ready() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+        let write_fd = i32_from_memory(runtime.memory(), 0x402004);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(5)
+        );
+        write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 0x72);
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::EpollCtl,
+                    [
+                        5,
+                        u64::from(LINUX_EPOLL_CTL_ADD),
+                        read_fd as u64,
+                        0x402100,
+                        0,
+                        0,
+                    ],
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+
+        let deferred = runtime.dispatch_syscall(context(
+            Syscall::EpollWait,
+            [5, 0x402200, 4, u64::MAX, 0, 0],
+        ));
+        assert_eq!(deferred.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+
+        runtime.memory_mut().write(0x402300, b"x").unwrap();
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Write,
+                    [write_fd as u64, 0x402300, 1, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(1)
+        );
+        let ready = runtime.dispatch_syscall(context(
+            Syscall::EpollWait,
+            [5, 0x402200, 4, u64::MAX, 0, 0],
+        ));
+        assert_eq!(ready.result, SyscallReturn::Success(1));
+        assert_eq!(
+            epoll_event_from_memory(runtime.memory(), 0x402200),
+            (LINUX_EPOLLIN, 0x72)
+        );
     }
 
     #[test]
@@ -17766,6 +18152,37 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
+    fn native_fs_fault_emulates_register_relative_mov_load() {
+        let _guard = native_execution_test_guard();
+        let code = [0x64, 0x8b, 0x00, 0x0f, 0x05];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402004, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("fs-relative register fault instruction decodes");
+
+        let registers = emulate_fs_relative_native_fault(
+            runtime.memory(),
+            mcr_win::HostCpuRegisters {
+                rax: 4,
+                rip: 0x401000,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            0x402000,
+            &instruction,
+        )
+        .unwrap()
+        .expect("instruction is emulated");
+
+        assert_eq!(registers.rax, 0x1234_5678);
+        assert_eq!(registers.rip, 0x401003);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
     fn native_patch_cache_skips_new_zero_base_fs_patch_work() {
         assert_eq!(
             fs_relative_patch_work(0, 0, 0, 45_171, 0),
@@ -18031,6 +18448,90 @@ mod tests {
             TaskState::Runnable
         );
         assert_eq!(u32_from_guest(runtime.memory(), clear_child_tid), 0);
+    }
+
+    #[test]
+    fn thread_exit_marks_robust_futex_owner_died_and_wakes_waiter() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD;
+        let exiting = runtime.kernel_mut().clone_current(
+            INITIAL_GUEST_TID,
+            mcr_sys::CloneSyscallArgs::new(flags, 0, 0, 0, 0),
+        );
+        let SyscallReturn::Success(exiting_tid) = exiting.result else {
+            panic!("thread clone should succeed: {exiting:?}");
+        };
+        let waiter = runtime.kernel_mut().clone_current(
+            INITIAL_GUEST_TID,
+            mcr_sys::CloneSyscallArgs::new(flags, 0, 0, 0, 0),
+        );
+        let SyscallReturn::Success(waiter_tid) = waiter.result else {
+            panic!("waiter thread clone should succeed: {waiter:?}");
+        };
+        const FUTEX_WAITERS: u32 = 0x8000_0000;
+        let head = 0x402000u64;
+        let node = 0x402100u64;
+        let futex_addr = node + 8;
+        runtime
+            .memory_mut()
+            .write(head, &node.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(head + 8, &8i64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(head + 16, &0u64.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(node, &head.to_le_bytes())
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(
+                futex_addr,
+                &(FUTEX_WAITERS | exiting_tid as u32).to_le_bytes(),
+            )
+            .unwrap();
+        runtime.kernel_mut().set_robust_list_current(
+            exiting_tid as mcr_sys::GuestTid,
+            mcr_sys::SetRobustListSyscallArgs::new(head, mcr_sys::LINUX_ROBUST_LIST_HEAD_SIZE),
+        );
+        runtime
+            .kernel_mut()
+            .block_task_for_futex(
+                waiter_tid as mcr_sys::GuestTid,
+                FutexWaitKey::new(INITIAL_GUEST_PID, futex_addr, true),
+            )
+            .unwrap();
+
+        let exit = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            exiting_tid as mcr_sys::GuestTid,
+            Syscall::Exit,
+            [0, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exit.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(waiter_tid as mcr_sys::GuestTid)
+                .unwrap()
+                .state(),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            u32_from_guest(runtime.memory(), futex_addr),
+            FUTEX_WAITERS | LINUX_FUTEX_OWNER_DIED
+        );
     }
 
     #[test]
