@@ -270,7 +270,7 @@ impl RuntimeStallDiagnostic {
             child_wait_tasks,
             futex_wait_tasks,
             task_states: diagnostics.tasks().to_vec(),
-            recent_syscalls: recent_completed_syscalls(diagnostics, 8),
+            recent_syscalls: recent_completed_syscalls(diagnostics, 32),
         }
     }
 
@@ -380,10 +380,11 @@ fn write_task_state_summary(
             .map_or(String::new(), |addr| format!(" robust_list=0x{addr:x}"));
         write!(
             formatter,
-            "pid={} tid={} rip=0x{:x}{}{} {}",
+            "pid={} tid={} rip=0x{:x} fs_base=0x{:x}{}{} {}",
             task.pid(),
             task.tid(),
             task.rip(),
+            task.fs_base(),
             clear_child_tid,
             robust_list,
             diagnostic_task_state_display(task.state())
@@ -597,6 +598,7 @@ pub struct DiagnosticTask {
     pid: mcr_sys::GuestPid,
     tid: mcr_sys::GuestTid,
     rip: u64,
+    fs_base: u64,
     clear_child_tid: Option<u64>,
     robust_list: Option<u64>,
     state: DiagnosticTaskState,
@@ -609,6 +611,7 @@ impl DiagnosticTask {
             pid: task.pid(),
             tid: task.tid(),
             rip: task.regs().rip(),
+            fs_base: task.tls().fs_base(),
             clear_child_tid: task.clear_child_tid(),
             robust_list: task.robust_list(),
             state: DiagnosticTaskState::from_task_state(task.state()),
@@ -628,6 +631,11 @@ impl DiagnosticTask {
     #[must_use]
     pub const fn rip(&self) -> u64 {
         self.rip
+    }
+
+    #[must_use]
+    pub const fn fs_base(&self) -> u64 {
+        self.fs_base
     }
 
     #[must_use]
