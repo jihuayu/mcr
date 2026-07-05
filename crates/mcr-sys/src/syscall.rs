@@ -53,6 +53,7 @@ pub enum Syscall {
     RtSigaction,
     RtSigprocmask,
     RtSigreturn,
+    RtSigsuspend,
     Ioctl,
     Pread64,
     Pwrite64,
@@ -192,6 +193,7 @@ impl Syscall {
     pub const RT_SIGACTION: SyscallNumber = SyscallNumber::new(13);
     pub const RT_SIGPROCMASK: SyscallNumber = SyscallNumber::new(14);
     pub const RT_SIGRETURN: SyscallNumber = SyscallNumber::new(15);
+    pub const RT_SIGSUSPEND: SyscallNumber = SyscallNumber::new(130);
     pub const IOCTL: SyscallNumber = SyscallNumber::new(16);
     pub const PREAD64: SyscallNumber = SyscallNumber::new(17);
     pub const PWRITE64: SyscallNumber = SyscallNumber::new(18);
@@ -329,6 +331,7 @@ impl Syscall {
             13 => Self::RtSigaction,
             14 => Self::RtSigprocmask,
             15 => Self::RtSigreturn,
+            130 => Self::RtSigsuspend,
             16 => Self::Ioctl,
             17 => Self::Pread64,
             18 => Self::Pwrite64,
@@ -473,6 +476,7 @@ impl Syscall {
             Self::RtSigaction => Self::RT_SIGACTION,
             Self::RtSigprocmask => Self::RT_SIGPROCMASK,
             Self::RtSigreturn => Self::RT_SIGRETURN,
+            Self::RtSigsuspend => Self::RT_SIGSUSPEND,
             Self::Ioctl => Self::IOCTL,
             Self::Pread64 => Self::PREAD64,
             Self::Pwrite64 => Self::PWRITE64,
@@ -615,6 +619,7 @@ impl Syscall {
             Self::RtSigaction => "rt_sigaction",
             Self::RtSigprocmask => "rt_sigprocmask",
             Self::RtSigreturn => "rt_sigreturn",
+            Self::RtSigsuspend => "rt_sigsuspend",
             Self::Ioctl => "ioctl",
             Self::Pread64 => "pread64",
             Self::Pwrite64 => "pwrite64",
@@ -782,6 +787,11 @@ mod tests {
             (Syscall::SYSINFO, Syscall::Sysinfo, "sysinfo"),
             (Syscall::GETPGID, Syscall::Getpgid, "getpgid"),
             (Syscall::GETSID, Syscall::Getsid, "getsid"),
+            (
+                Syscall::RT_SIGSUSPEND,
+                Syscall::RtSigsuspend,
+                "rt_sigsuspend",
+            ),
             (Syscall::SIGALTSTACK, Syscall::Sigaltstack, "sigaltstack"),
             (Syscall::STATFS, Syscall::Statfs, "statfs"),
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),

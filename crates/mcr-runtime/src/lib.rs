@@ -959,9 +959,9 @@ impl DiagnosticTaskState {
     pub const fn from_task_state(state: TaskState) -> Self {
         match state {
             TaskState::Runnable => Self::Runnable,
-            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. } => {
-                Self::WaitingForChild
-            }
+            TaskState::WaitingForChild { .. }
+            | TaskState::WaitingForVfork { .. }
+            | TaskState::WaitingForSignal => Self::WaitingForChild,
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
             TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
             TaskState::Exited { status } => Self::Exited { status },
@@ -3396,7 +3396,10 @@ where
                 .resume_waiting_tasks()
                 .map_err(|errno| GuestRunError::WaitResume { errno })?;
             dispatcher.subsystems_mut().resume_futex_timeouts();
-            dispatcher.subsystems_mut().resume_fd_waiters();
+            dispatcher
+                .subsystems_mut()
+                .resume_fd_waiters()
+                .map_err(|errno| GuestRunError::WaitResume { errno })?;
             let mut runnable_tids = if sticky_scheduler {
                 last_dispatched_tid
                     .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
@@ -3414,6 +3417,13 @@ where
             }
             if runnable_tids.is_empty() {
                 dispatcher.subsystems_mut().perf_record_no_runnable();
+                let resumed = dispatcher
+                    .subsystems_mut()
+                    .wait_for_fd_waiter()
+                    .map_err(|errno| GuestRunError::WaitResume { errno })?;
+                if resumed > 0 {
+                    continue;
+                }
                 return Err(GuestRunError::NoRunnableTasks {
                     diagnostic: capture_diagnostic(dispatcher),
                 });
@@ -4212,6 +4222,7 @@ where
             task.state(),
             TaskState::WaitingForChild { .. }
                 | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForSignal
                 | TaskState::WaitingForFutex { .. }
         );
         let final_regs = if task.regs() == gpr || blocked_after_syscall {
@@ -5537,6 +5548,8 @@ fn blocking_fd_wait(fds: &FdTable, syscall_number: u64, fd: u64) -> Option<(Fd, 
         Some((fd, true))
     } else if syscall_number == mcr_sys::Syscall::EpollWait.number().raw()
         || syscall_number == mcr_sys::Syscall::EpollPwait2.number().raw()
+        || syscall_number == mcr_sys::Syscall::Accept.number().raw()
+        || syscall_number == mcr_sys::Syscall::Accept4.number().raw()
     {
         Some((fd, false))
     } else {
@@ -7293,6 +7306,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
+            mcr_sys::Syscall::RtSigsuspend => self.dispatch_rt_sigsuspend(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
             mcr_sys::Syscall::SchedGetaffinity => self.dispatch_sched_getaffinity(request),
@@ -8606,6 +8620,14 @@ impl RuntimeSubsystems {
         }
     }
 
+    fn dispatch_rt_sigsuspend(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        if let Err(errno) = self.select_process_context(request.context.pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        self.tasks
+            .wait_for_signal_current(request.context.tid, arg(request, 1))
+    }
+
     fn sigaltstack(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
         let pid = request.context.pid;
         let tid = request.context.tid;
@@ -8710,10 +8732,14 @@ impl RuntimeSubsystems {
         }
         self.futex_timeouts.remove(&tid);
 
+        let parent_pid = self.tasks.process(pid).and_then(GuestProcess::parent);
         let process_exited = matches!(
             self.tasks.process(pid).map(GuestProcess::exit_state),
             Some(ExitState::Exited { .. })
         );
+        if process_exited && let Some(parent_pid) = parent_pid {
+            self.tasks.wake_signal_waiters(parent_pid);
+        }
         if exit_group || process_exited {
             self.drop_native_fp_for_process(pid);
             self.drop_process_resources(pid)
@@ -8809,21 +8835,65 @@ impl RuntimeSubsystems {
         woken.len()
     }
 
-    fn resume_fd_waiters(&mut self) {
-        let selected_pid = self.selected_fds_pid;
-        let selected_fds = self.files.vfs().fds().clone();
-        let process_fds = self.process_fds.clone();
-        let epolls = self.epolls.clone();
-        let resumed = self.tasks.resume_fd_waiters(|pid, fd, write| {
-            let fds = if pid == selected_pid {
-                Some(&selected_fds)
-            } else {
-                process_fds.get(&pid)
-            };
-            fds.and_then(|fds| fd_wait_ready_with_epolls(fds, &epolls, fd, write).ok())
-                .unwrap_or(true)
-        });
+    fn resume_fd_waiters(&mut self) -> Result<usize, LinuxErrno> {
+        let resumed = self.resume_fd_waiters_with_blocking_index(None)?;
         self.perf_record_fd_wakeups(resumed);
+        Ok(resumed)
+    }
+
+    fn wait_for_fd_waiter(&mut self) -> Result<usize, LinuxErrno> {
+        let blocking_index = self.blocking_fd_waiter_index();
+        let resumed = self.resume_fd_waiters_with_blocking_index(blocking_index)?;
+        self.perf_record_fd_wakeups(resumed);
+        Ok(resumed)
+    }
+
+    fn resume_fd_waiters_with_blocking_index(
+        &mut self,
+        blocking_index: Option<usize>,
+    ) -> Result<usize, LinuxErrno> {
+        let waiters = self.tasks.fd_waiters();
+        let mut resumed = 0usize;
+        for (index, (tid, pid, fd, write)) in waiters.into_iter().enumerate() {
+            let timeout = if blocking_index == Some(index) {
+                None
+            } else {
+                Some(Duration::ZERO)
+            };
+            if self.fd_waiter_ready(pid, fd, write, timeout)? && self.tasks.resume_fd_waiter(tid) {
+                resumed += 1;
+            }
+        }
+        Ok(resumed)
+    }
+
+    fn blocking_fd_waiter_index(&self) -> Option<usize> {
+        self.tasks
+            .fd_waiters()
+            .into_iter()
+            .position(|(_, pid, fd, _)| self.fd_wait_can_host_block(pid, fd))
+    }
+
+    fn fd_wait_can_host_block(&self, pid: mcr_sys::GuestPid, fd: Fd) -> bool {
+        self.fd_table_for_process(pid)
+            .is_some_and(|fds| fds.socket_id_for_fd(fd).is_ok() || fds.epoll_id_for_fd(fd).is_ok())
+    }
+
+    fn fd_waiter_ready(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        fd: Fd,
+        write: bool,
+        timeout: Option<Duration>,
+    ) -> Result<bool, LinuxErrno> {
+        self.select_fds_for_process(pid)?;
+        let events = if write { LINUX_POLLOUT } else { LINUX_POLLIN };
+        let revents = self.poll_fd_revents(fd, events, timeout)?;
+        Ok(if write {
+            select_revents_writable(revents)
+        } else {
+            select_revents_readable(revents)
+        })
     }
 
     fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
@@ -10434,55 +10504,12 @@ fn poll_revents_from_vfs(readiness: FdReadiness, events: i16) -> i16 {
 const LINUX_POLL_READ_NORMAL: i16 = LINUX_POLLIN | LINUX_POLLRDNORM;
 const LINUX_POLL_WRITE_NORMAL: i16 = LINUX_POLLOUT | LINUX_POLLWRNORM;
 
-fn fd_wait_ready(fds: &FdTable, fd: Fd, write: bool) -> Result<bool, LinuxErrno> {
-    let readiness = fds
-        .poll_readiness(&mcr_vfs::PathTree::new(), fd)
-        .map_err(vfs_errno)?;
-    Ok(if write {
-        readiness.writable || readiness.hang_up || readiness.error
-    } else {
-        readiness.readable || readiness.hang_up || readiness.error
-    })
-}
-
-fn fd_wait_ready_with_epolls(
-    fds: &FdTable,
-    epolls: &EpollRegistry,
-    fd: Fd,
-    write: bool,
-) -> Result<bool, LinuxErrno> {
-    if !write && let Ok(epoll_id) = fds.epoll_id_for_fd(fd) {
-        return epoll_fd_ready(fds, epolls, epoll_id);
-    }
-    fd_wait_ready(fds, fd, write)
-}
-
 fn robust_futex_addr(node: u64, futex_offset: i64) -> Option<u64> {
     if futex_offset >= 0 {
         node.checked_add(futex_offset as u64)
     } else {
         node.checked_sub(futex_offset.unsigned_abs())
     }
-}
-
-fn epoll_fd_ready(
-    fds: &FdTable,
-    epolls: &EpollRegistry,
-    epoll_id: u64,
-) -> Result<bool, LinuxErrno> {
-    let instance = epolls.instance(epoll_id)?;
-    for watch in instance.watches.values() {
-        let poll_events = epoll_events_to_poll_events(watch.events);
-        let revents = match fds.poll_readiness(&mcr_vfs::PathTree::new(), watch.fd) {
-            Ok(readiness) => poll_revents_from_vfs(readiness, poll_events),
-            Err(VfsError::BadFd) => LINUX_POLLERR | LINUX_POLLHUP,
-            Err(error) => return Err(vfs_errno(error)),
-        };
-        if poll_revents_to_epoll_events(revents, watch.events) != 0 {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn poll_interest_to_socket_events(events: i16) -> SocketEvents {
@@ -12895,6 +12922,7 @@ mod tests {
         let blocking = vfs.eventfd(0, OpenFlags::new(0)).unwrap();
         let nonblocking = vfs.eventfd(0, OpenFlags::new(mcr_vfs::O_NONBLOCK)).unwrap();
         let epoll = vfs.insert_epoll(1, OpenFlags::new(0)).unwrap();
+        let listener = vfs.insert_socket(2, OpenFlags::new(0)).unwrap();
 
         assert_eq!(
             blocking_fd_wait(vfs.fds(), Syscall::Read.number().raw(), blocking as u64),
@@ -12911,6 +12939,14 @@ mod tests {
         assert_eq!(
             blocking_fd_wait(vfs.fds(), Syscall::EpollPwait2.number().raw(), epoll as u64),
             Some((epoll, false))
+        );
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::Accept.number().raw(), listener as u64),
+            Some((listener, false))
+        );
+        assert_eq!(
+            blocking_fd_wait(vfs.fds(), Syscall::Accept4.number().raw(), listener as u64),
+            Some((listener, false))
         );
     }
 
@@ -13268,6 +13304,47 @@ mod tests {
                 .dispatch_syscall(context(Syscall::Sigaltstack, [0x402000, 0, 0, 0, 0, 0]))
                 .result,
             SyscallReturn::Errno(LinuxErrno::ENOMEM)
+        );
+    }
+
+    #[test]
+    fn rt_sigsuspend_blocks_and_wakes_with_eintr_after_validating_sigset_size() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::RtSigsuspend, [0x402000, 8, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForSignal
+        );
+        assert_eq!(
+            runtime
+                .dispatcher
+                .subsystems_mut()
+                .tasks
+                .wake_signal_waiters(INITIAL_GUEST_PID),
+            1
+        );
+        assert_eq!(
+            SyscallReturn::decode_rax(
+                runtime
+                    .kernel()
+                    .task(INITIAL_GUEST_TID)
+                    .unwrap()
+                    .regs()
+                    .rax()
+            ),
+            SyscallReturn::Errno(LinuxErrno::EINTR)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::RtSigsuspend, [0x402000, 16, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Errno(LinuxErrno::EINVAL)
         );
     }
 

@@ -99,6 +99,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::RtSigaction, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::RtSigprocmask, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::RtSigreturn, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::RtSigsuspend, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Ioctl, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pread64, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Pwrite64, SyscallSubsystem::File),
@@ -736,6 +737,10 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         | Syscall::Setsid
         | Syscall::SchedYield
         | Syscall::RtSigreturn => Vec::new(),
+        Syscall::RtSigsuspend => vec![
+            hex_field("mask", arg(0)),
+            decimal_field("sigsetsize", arg(1)),
+        ],
         Syscall::Setuid | Syscall::Setgid => vec![decimal_field("id", arg(0))],
         Syscall::Setreuid | Syscall::Setregid => {
             vec![decimal_field("rid", arg(0)), decimal_field("eid", arg(1))]
@@ -1043,6 +1048,7 @@ mod tests {
             (Syscall::Gettimeofday, SyscallSubsystem::Time),
             (Syscall::Times, SyscallSubsystem::Time),
             (Syscall::Getrlimit, SyscallSubsystem::Task),
+            (Syscall::RtSigsuspend, SyscallSubsystem::Task),
             (Syscall::Getrusage, SyscallSubsystem::Task),
             (Syscall::Sysinfo, SyscallSubsystem::Task),
             (Syscall::Getpgid, SyscallSubsystem::Task),
@@ -1167,6 +1173,11 @@ mod tests {
                     ("arg4", "0x4"),
                     ("arg5", "0x5"),
                 ][..],
+            ),
+            (
+                Syscall::RtSigsuspend,
+                [0x9f00, 8, 0, 0, 0, 0],
+                &[("mask", "0x9f00"), ("sigsetsize", "8")][..],
             ),
             (
                 Syscall::ClockGetres,

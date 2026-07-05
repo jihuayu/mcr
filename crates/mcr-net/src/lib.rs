@@ -915,6 +915,67 @@ impl WinHostSocketHandle {
         }
     }
 
+    fn complete_pending_iocp_packet(
+        &mut self,
+        packet: mcr_win::HostIoCompletionPacket,
+    ) -> Result<SocketEvents, HostIoError> {
+        let mut readiness = SocketEvents::default();
+        let mut packet = Some(packet);
+        if let Some(pending) = self.pending_accept.take() {
+            let current = packet.expect("completion packet is present");
+            if pending.matches_completion(current) {
+                match pending.complete_from_packet(current) {
+                    Ok((socket, peer)) => {
+                        self.accepted_fast_path = Some((socket, SocketAddress::from(peer)));
+                        readiness.readable = true;
+                    }
+                    Err(error) => {
+                        self.accept_error = Some(HostIoError::from(error));
+                        readiness.readable = true;
+                        readiness.error = true;
+                    }
+                }
+                packet = None;
+            } else {
+                self.pending_accept = Some(pending);
+                packet = Some(current);
+            }
+        }
+        if let Some(current) = packet
+            && let Some(pending) = self.pending_connect.take()
+        {
+            if pending.matches_completion(current) {
+                match pending.complete_from_packet(current) {
+                    Ok(()) => {
+                        self.connect_completed = true;
+                        readiness.writable = true;
+                    }
+                    Err(error) => {
+                        self.connect_error = Some(HostIoError::from(error));
+                        readiness.writable = true;
+                        readiness.error = true;
+                    }
+                }
+                packet = None;
+            } else {
+                self.pending_connect = Some(pending);
+                packet = Some(current);
+            }
+        }
+        if let Some(current) = packet
+            && let Some(pending) = self.pending_recv.take()
+        {
+            if pending.matches_completion(current) {
+                let submission = pending.complete_from_packet(current);
+                self.apply_recv_submission(submission)?;
+                merge_socket_events(&mut readiness, self.recv_completion_kind().readiness());
+            } else {
+                self.pending_recv = Some(pending);
+            }
+        }
+        Ok(readiness)
+    }
+
     fn submit_send_fast_path(&mut self, buffer: &[u8]) -> Result<Option<usize>, HostIoError> {
         if !self.can_use_iocp_send() || buffer.is_empty() {
             return Ok(None);
@@ -1065,7 +1126,8 @@ impl HostSocketHandle for WinHostSocketHandle {
         if self.pending_accept.is_some() {
             return Ok(SocketAcceptFastPath::Pending);
         }
-        if self.completion_port.is_none()
+        if !self.spec.flags.nonblocking
+            || self.completion_port.is_none()
             || self.spec.socket_type != SocketType::Stream
             || self.spec.effective_protocol() != SocketProtocol::Tcp
         {
@@ -1121,6 +1183,7 @@ impl HostSocketHandle for WinHostSocketHandle {
         address: SocketAddress,
     ) -> Result<SocketConnectFastPath, HostIoError> {
         if self.pending_connect.is_some()
+            || !self.spec.flags.nonblocking
             || self.completion_port.is_none()
             || self.spec.socket_type != SocketType::Stream
             || self.spec.effective_protocol() != SocketProtocol::Tcp
@@ -1281,7 +1344,31 @@ impl HostSocketHandle for WinHostSocketHandle {
     ) -> Result<SocketEvents, HostIoError> {
         let mut readiness = SocketEvents::default();
         let mut fallback_interest = interest;
-        if interest.readable && self.can_use_iocp_recv() {
+        let wait_accept = interest.readable && self.pending_accept.is_some();
+        let wait_connect = interest.writable && self.pending_connect.is_some();
+        if (wait_accept || wait_connect)
+            && let Some(port) = self.completion_port.as_ref().cloned()
+        {
+            if wait_accept {
+                fallback_interest.readable = false;
+            }
+            if wait_connect {
+                fallback_interest.writable = false;
+            }
+            loop {
+                let Some(packet) = port.get(timeout).map_err(HostIoError::from)? else {
+                    break;
+                };
+                let update = self.complete_pending_iocp_packet(packet)?;
+                merge_socket_events(&mut readiness, update);
+                let accept_ready = !wait_accept || readiness.readable || readiness.error;
+                let connect_ready = !wait_connect || readiness.writable || readiness.error;
+                if (accept_ready && connect_ready) || timeout.is_some() {
+                    break;
+                }
+            }
+        }
+        if fallback_interest.readable && self.can_use_iocp_recv() {
             fallback_interest.readable = false;
             self.submit_recv_fast_path()?;
             if !self.has_recv_readiness()

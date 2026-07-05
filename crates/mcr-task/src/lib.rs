@@ -22,7 +22,7 @@ use mcr_sys::{
     LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_KERNEL_SIGSET_SIZE, LINUX_ROBUST_LIST_HEAD_SIZE,
     LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK, LINUX_SIGCHLD, LinuxErrno, LinuxUtsname,
     RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs, SetRobustListSyscallArgs,
-    SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest, TaskSyscalls,
+    SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest, SyscallReturn, TaskSyscalls,
     TgkillSyscallArgs, TkillSyscallArgs, Wait4SyscallArgs,
 };
 
@@ -433,6 +433,7 @@ pub enum TaskState {
     Runnable,
     WaitingForChild { args: Wait4SyscallArgs },
     WaitingForVfork { child_pid: GuestPid },
+    WaitingForSignal,
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { key: FutexWaitKey },
     Exited { status: i32 },
@@ -1341,6 +1342,7 @@ impl GuestKernel {
                 TaskState::WaitingForChild { args } => Some((task.tid, task.pid, args)),
                 TaskState::Runnable
                 | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForSignal
                 | TaskState::WaitingForFd { .. }
                 | TaskState::WaitingForFutex { .. }
                 | TaskState::Exited { .. } => None,
@@ -1363,6 +1365,45 @@ impl GuestKernel {
         completed
     }
 
+    pub fn wait_for_signal_current(&mut self, tid: GuestTid, sigsetsize: u64) -> SyscallOutcome {
+        if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
+        }
+        let Some(parent_pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if self
+            .exited_waitable_child(parent_pid, -1)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return SyscallOutcome::errno(LinuxErrno::EINTR);
+        }
+        let return_rip = current_syscall_return_rip(self, tid);
+        let Some(task) = self.task_mut(tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        task.regs = task.regs.with_syscall_return(return_rip, task.regs.rax());
+        task.state = TaskState::WaitingForSignal;
+        SyscallOutcome::success(0).with_decoded_field("task_blocked", "rt_sigsuspend")
+    }
+
+    pub fn wake_signal_waiters(&mut self, pid: GuestPid) -> usize {
+        let mut woken = 0usize;
+        for task in self.tasks.values_mut().filter(|task| task.pid == pid) {
+            if matches!(task.state, TaskState::WaitingForSignal) {
+                task.regs = task.regs.with_syscall_return(
+                    task.regs.rip(),
+                    SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64(),
+                );
+                task.state = TaskState::Runnable;
+                woken += 1;
+            }
+        }
+        woken
+    }
+
     pub fn block_task_for_fd(
         &mut self,
         tid: GuestTid,
@@ -1372,6 +1413,32 @@ impl GuestKernel {
         let task = self.task_mut(tid).ok_or(TaskError::UnknownTid(tid))?;
         task.state = TaskState::WaitingForFd { fd, write };
         Ok(())
+    }
+
+    pub fn fd_waiters(&self) -> Vec<(GuestTid, GuestPid, i32, bool)> {
+        self.tasks
+            .values()
+            .filter_map(|task| match task.state {
+                TaskState::WaitingForFd { fd, write } => Some((task.tid, task.pid, fd, write)),
+                TaskState::Runnable
+                | TaskState::WaitingForChild { .. }
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForSignal
+                | TaskState::WaitingForFutex { .. }
+                | TaskState::Exited { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn resume_fd_waiter(&mut self, tid: GuestTid) -> bool {
+        let Some(task) = self.tasks.get_mut(&tid) else {
+            return false;
+        };
+        if !matches!(task.state, TaskState::WaitingForFd { .. }) {
+            return false;
+        }
+        task.state = TaskState::Runnable;
+        true
     }
 
     pub fn resume_fd_waiters<F>(&mut self, mut ready: F) -> usize
@@ -3167,6 +3234,65 @@ mod tests {
             0x7000
         );
         assert_eq!(child_signals.blocked(), 0x55);
+    }
+
+    #[test]
+    fn sigsuspend_blocks_until_signal_waiter_is_woken() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        let wait = kernel.wait_for_signal_current(INITIAL_GUEST_TID, LINUX_KERNEL_SIGSET_SIZE);
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForSignal
+        );
+
+        assert_eq!(kernel.wake_signal_waiters(INITIAL_GUEST_PID), 1);
+        let task = kernel.task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(task.state(), TaskState::Runnable);
+        assert_eq!(
+            SyscallReturn::decode_rax(task.regs().rax()),
+            SyscallReturn::Errno(LinuxErrno::EINTR)
+        );
+    }
+
+    #[test]
+    fn sigsuspend_returns_eintr_when_child_already_exited() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let child_pid = kernel.fork_child(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(
+            kernel.exit_group(child_pid, 0).result,
+            SyscallReturn::Success(0)
+        );
+
+        let wait = kernel.wait_for_signal_current(INITIAL_GUEST_TID, LINUX_KERNEL_SIGSET_SIZE);
+
+        assert_eq!(wait.result, SyscallReturn::Errno(LinuxErrno::EINTR));
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+    }
+
+    #[test]
+    fn fd_waiters_can_be_listed_and_resumed_individually() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        kernel
+            .block_task_for_fd(INITIAL_GUEST_TID, 7, false)
+            .unwrap();
+
+        assert_eq!(
+            kernel.fd_waiters(),
+            vec![(INITIAL_GUEST_TID, INITIAL_GUEST_PID, 7, false)]
+        );
+        assert!(kernel.resume_fd_waiter(INITIAL_GUEST_TID));
+        assert!(kernel.fd_waiters().is_empty());
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Runnable
+        );
+        assert!(!kernel.resume_fd_waiter(INITIAL_GUEST_TID));
     }
 
     fn dispatch_task_syscall(
