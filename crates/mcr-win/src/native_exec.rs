@@ -117,6 +117,7 @@ pub fn execute_x86_64_until_trap(
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows_x86_64 {
     use std::ffi::c_void;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicPtr, Ordering};
 
     use super::{HostCpuRegisters, NativeExecutionError};
@@ -233,6 +234,7 @@ mod windows_x86_64 {
     }
 
     static ACTIVE_STATE: AtomicPtr<NativeExecutionState> = AtomicPtr::new(std::ptr::null_mut());
+    static VECTORED_HANDLER: OnceLock<Result<usize, i32>> = OnceLock::new();
 
     core::arch::global_asm!(
         r#"
@@ -393,7 +395,7 @@ mod windows_x86_64 {
         registers: &mut HostCpuRegisters,
         fs_base: u64,
     ) -> Result<(), NativeExecutionError> {
-        let _handler = VectoredHandler::install()?;
+        ensure_vectored_handler_installed()?;
         let mut state = NativeExecutionState {
             landing_rsp: 0,
             landing_rip: 0,
@@ -425,28 +427,19 @@ mod windows_x86_64 {
         }
     }
 
-    struct VectoredHandler {
-        handle: *mut c_void,
-    }
-
-    impl VectoredHandler {
-        fn install() -> Result<Self, NativeExecutionError> {
+    fn ensure_vectored_handler_installed() -> Result<(), NativeExecutionError> {
+        match VECTORED_HANDLER.get_or_init(|| {
             // SAFETY: The handler function has the required calling convention and remains valid
             // for the process lifetime.
             let handle = unsafe { AddVectoredExceptionHandler(1, Some(native_exception_handler)) };
             if handle.is_null() {
-                return Err(NativeExecutionError::SignalHandler(0));
+                Err(0)
+            } else {
+                Ok(handle as usize)
             }
-            Ok(Self { handle })
-        }
-    }
-
-    impl Drop for VectoredHandler {
-        fn drop(&mut self) {
-            // SAFETY: `handle` was returned by `AddVectoredExceptionHandler`.
-            unsafe {
-                let _ = RemoveVectoredExceptionHandler(self.handle);
-            }
+        }) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(NativeExecutionError::SignalHandler(*error)),
         }
     }
 
@@ -533,7 +526,6 @@ mod windows_x86_64 {
             handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
         ) -> *mut c_void;
         fn GetCurrentThreadId() -> u32;
-        fn RemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     }
 }
 

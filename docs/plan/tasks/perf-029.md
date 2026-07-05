@@ -55,3 +55,9 @@ cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
   call per invocation where the level-trigger contract allows.
 - No guest-visible behavior change is allowed; the runtime syscall baseline
   and `mcr_perf_baseline` gates are the measurement.
+- Completed 2026-07-05: the `mcr-sys`/`mcr-win` checkpoint is implemented.
+  `syscall_descriptor_by_number` now direct-indexes a static descriptor index
+  built from `SYSCALL_DISPATCH_TABLE`, and Windows native execution installs
+  the VEH once per process while retaining the active-thread/state filter.
+  Runtime epoll interest-list caching and poll/select batching remain in
+  scope for a later checkpoint.

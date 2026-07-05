@@ -211,16 +211,38 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::EpollPwait2, SyscallSubsystem::Event),
 ];
 
+const SYSCALL_DESCRIPTOR_INDEX_LEN: usize = Syscall::EPOLL_PWAIT2.raw() as usize + 1;
+
+static SYSCALL_DESCRIPTOR_INDEX: [Option<usize>; SYSCALL_DESCRIPTOR_INDEX_LEN] =
+    build_syscall_descriptor_index();
+
+const fn build_syscall_descriptor_index() -> [Option<usize>; SYSCALL_DESCRIPTOR_INDEX_LEN] {
+    let mut index = [None; SYSCALL_DESCRIPTOR_INDEX_LEN];
+    let mut table_index = 0;
+
+    while table_index < SYSCALL_DISPATCH_TABLE.len() {
+        let syscall_number = SYSCALL_DISPATCH_TABLE[table_index].syscall.number().raw() as usize;
+        index[syscall_number] = Some(table_index);
+        table_index += 1;
+    }
+
+    index
+}
+
 #[must_use]
 pub fn syscall_descriptor(syscall: Syscall) -> Option<&'static SyscallDescriptor> {
-    SYSCALL_DISPATCH_TABLE
-        .iter()
-        .find(|descriptor| descriptor.syscall == syscall)
+    if matches!(syscall, Syscall::Unknown(_)) {
+        return None;
+    }
+
+    syscall_descriptor_by_number(syscall.number())
 }
 
 #[must_use]
 pub fn syscall_descriptor_by_number(number: SyscallNumber) -> Option<&'static SyscallDescriptor> {
-    syscall_descriptor(Syscall::from_number(number))
+    let number = usize::try_from(number.raw()).ok()?;
+    let table_index = SYSCALL_DESCRIPTOR_INDEX.get(number).copied().flatten()?;
+    SYSCALL_DISPATCH_TABLE.get(table_index)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -992,6 +1014,7 @@ mod tests {
         EventSyscalls, FileSyscalls, GuestContext, InMemorySyscallTracer, MemorySyscalls,
         NetworkSyscalls, SYSCALL_DISPATCH_TABLE, SyscallDispatcher, SyscallOutcome, SyscallRequest,
         SyscallSubsystem, SyscallTracer, TaskSyscalls, TimeSyscalls, syscall_descriptor,
+        syscall_descriptor_by_number,
     };
     use crate::abi::SyscallRegisters;
     use crate::errno::LinuxErrno;
@@ -1089,7 +1112,21 @@ mod tests {
                 descriptor.syscall
             );
             assert_eq!(syscall_descriptor(descriptor.syscall), Some(descriptor));
+            assert_eq!(
+                syscall_descriptor_by_number(descriptor.syscall.number()),
+                Some(descriptor)
+            );
         }
+    }
+
+    #[test]
+    fn dispatcher_table_index_rejects_unknown_numbers() {
+        assert_eq!(syscall_descriptor(Syscall::Unknown(Syscall::READ)), None);
+        assert_eq!(syscall_descriptor_by_number(SyscallNumber::new(18)), None);
+        assert_eq!(
+            syscall_descriptor_by_number(SyscallNumber::new(u64::MAX)),
+            None
+        );
     }
 
     #[test]
