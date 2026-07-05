@@ -50,9 +50,18 @@ EOF
 "#;
 
 const MYSQL_RUN_SCRIPT: &str = r#"set -eu
-/usr/bin/mariadbd --version >/dev/null
+base=/tmp/mcr-mysql-smoke-$$
+data=$base/data
+mkdir -p "$data"
+trap 'rm -rf "$base"' EXIT
+/usr/bin/mariadbd --no-defaults --verbose --help >/dev/null
 /usr/bin/mariadb --version >/dev/null
-echo mysql-ok
+/usr/bin/mariadb-embedded --no-defaults \
+  --server-arg=--datadir="$data" \
+  --server-arg=--skip-grant-tables \
+  --server-arg=--skip-innodb \
+  --server-arg=--default-storage-engine=MEMORY \
+  -N -B -e "SELECT 'mysql-ok';"
 "#;
 
 const REDIS_RUN_SCRIPT: &str = r#"set -eu
