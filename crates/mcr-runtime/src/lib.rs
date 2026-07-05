@@ -2053,6 +2053,18 @@ where
 
     fn sys_fcntl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let args = FcntlSyscallArgs::new(arg_i32(request, 0), arg_u32(request, 1), arg(request, 2));
+        if matches!(
+            args.cmd,
+            mcr_vfs::F_GETLK | mcr_vfs::F_SETLK | mcr_vfs::F_SETLKW
+        ) {
+            if args.arg == 0 {
+                return Err(LinuxErrno::EFAULT);
+            }
+            let mut flock_type = [0; 2];
+            self.memory
+                .read_bytes(args.arg, &mut flock_type)
+                .map_err(memory_errno)?;
+        }
         if args.cmd == mcr_vfs::F_SETFL
             && let Ok(socket_id) = self.socket_id_for_fd(args.fd)
         {
@@ -2060,9 +2072,16 @@ where
                 .set_nonblocking(socket_id, args.arg as u32 & mcr_vfs::O_NONBLOCK != 0)
                 .map_err(net_errno)?;
         }
-        self.vfs
+        let result = self
+            .vfs
             .fcntl(args.fd, args.cmd, args.arg)
-            .map_err(vfs_errno)
+            .map_err(vfs_errno)?;
+        if args.cmd == mcr_vfs::F_GETLK {
+            self.memory
+                .write_bytes(args.arg, &mcr_vfs::F_UNLCK.to_le_bytes())
+                .map_err(memory_errno)?;
+        }
+        Ok(result)
     }
 
     fn sys_ioctl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
@@ -13443,6 +13462,34 @@ mod tests {
             ),
             SyscallReturn::Success(u64::from(O_RDWR | O_NONBLOCK))
         );
+        runtime
+            .memory_mut()
+            .write(0x2400, &mcr_vfs::F_WRLCK.to_le_bytes());
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(mcr_vfs::F_SETLK), 0x2400, 0, 0, 0]
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(mcr_vfs::F_GETLK), 0x2400, 0, 0, 0]
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(u16_at(runtime.memory(), 0x2400), mcr_vfs::F_UNLCK as u16);
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fcntl,
+                [3, u64::from(mcr_vfs::F_SETLK), 0, 0, 0, 0]
+            ),
+            SyscallReturn::Errno(LinuxErrno::EFAULT)
+        );
 
         assert_eq!(
             dispatch(
@@ -14531,6 +14578,10 @@ mod tests {
         u32::from_le_bytes(memory.read(addr, 4).try_into().expect("slice len"))
     }
 
+    fn u16_at(memory: &TestMemory, addr: u64) -> u16 {
+        u16::from_le_bytes(memory.read(addr, 2).try_into().expect("slice len"))
+    }
+
     fn i32_at(memory: &TestMemory, addr: u64) -> i32 {
         i32::from_le_bytes(memory.read(addr, 4).try_into().expect("slice len"))
     }
@@ -14666,10 +14717,6 @@ mod tests {
         memory.read(addr, &mut events).unwrap();
         memory.read(addr + 4, &mut data).unwrap();
         (u32::from_le_bytes(events), u64::from_le_bytes(data))
-    }
-
-    fn u16_at(memory: &TestMemory, addr: u64) -> u16 {
-        u16::from_le_bytes(memory.read(addr, 2).try_into().expect("slice len"))
     }
 
     #[test]

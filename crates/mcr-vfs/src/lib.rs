@@ -30,9 +30,15 @@ pub const F_GETFD: u32 = 1;
 pub const F_SETFD: u32 = 2;
 pub const F_GETFL: u32 = 3;
 pub const F_SETFL: u32 = 4;
+pub const F_GETLK: u32 = 5;
+pub const F_SETLK: u32 = 6;
+pub const F_SETLKW: u32 = 7;
 pub const F_DUPFD_CLOEXEC: u32 = 1030;
 pub const F_SETPIPE_SZ: u32 = 1031;
 pub const F_GETPIPE_SZ: u32 = 1032;
+pub const F_RDLCK: i16 = 0;
+pub const F_WRLCK: i16 = 1;
+pub const F_UNLCK: i16 = 2;
 pub const FD_CLOEXEC: u32 = 1;
 pub const F_OK: u32 = 0;
 pub const O_ACCMODE: u32 = 0o3;
@@ -3674,6 +3680,10 @@ impl VirtualFileSystem {
                 self.fds.set_status_flags(fd, arg as u32)?;
                 Ok(0)
             }
+            F_GETLK | F_SETLK | F_SETLKW => {
+                self.fds.get(fd)?;
+                Ok(0)
+            }
             F_GETPIPE_SZ => Ok(self.fds.pipe_capacity(fd)? as u64),
             F_SETPIPE_SZ => {
                 let capacity = usize::try_from(arg).map_err(|_| VfsError::InvalidPath)?;
@@ -5036,6 +5046,10 @@ mod tests {
             vfs.fcntl(dup, F_GETFL, 0).unwrap() as u32 & (O_APPEND | O_NONBLOCK),
             O_APPEND | O_NONBLOCK
         );
+        assert_eq!(vfs.fcntl(fd, F_SETLK, 0x1000).unwrap(), 0);
+        assert_eq!(vfs.fcntl(fd, F_SETLKW, 0x1000).unwrap(), 0);
+        assert_eq!(vfs.fcntl(fd, F_GETLK, 0x1000).unwrap(), 0);
+        assert_eq!(vfs.fcntl(99, F_SETLK, 0x1000).unwrap_err(), VfsError::BadFd);
 
         assert_eq!(vfs.dup2(fd, 1).unwrap(), 1);
         assert_eq!(vfs.dup3(fd, 11, OpenFlags::new(O_CLOEXEC)).unwrap(), 11);
