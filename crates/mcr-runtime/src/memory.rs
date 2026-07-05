@@ -16,6 +16,7 @@ pub const GUEST_PAGE_SIZE: u64 = 4096;
 pub const MIN_GUEST_ADDRESS: u64 = GUEST_PAGE_SIZE;
 pub const DEFAULT_MMAP_BASE: u64 = 0x0000_7000_0000_0000;
 pub const GUEST_ADDRESS_SPACE_END: u64 = 0x0000_8000_0000_0000;
+const MMAP_HOST_CONFLICT_RETRIES: usize = 64;
 #[cfg(windows)]
 const HOST_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
 #[cfg(not(windows))]
@@ -465,14 +466,23 @@ impl GuestMemory {
         let protection = GuestMemoryProtection::from_linux(args.prot)?;
         let length = page_round_length(args.length)?;
         let kind = mmap_kind(args)?;
-        let start = self.mmap_start(args, length)?;
+        let mut start = self.mmap_start(args, length)?;
+        let mut attempts = 0usize;
 
-        if args.is_fixed() {
-            self.unmap_range(start, start + length);
+        loop {
+            if args.is_fixed() {
+                self.unmap_range(start, start + length);
+            }
+
+            match self.insert_mapping(start, length, protection, kind.clone()) {
+                Ok(()) => return Ok(start),
+                Err(error) if self.should_retry_mmap_host_conflict(args, attempts, &error) => {
+                    attempts += 1;
+                    start = self.next_retry_mmap_start(start, length)?;
+                }
+                Err(error) => return Err(error),
+            }
         }
-
-        self.insert_mapping(start, length, protection, kind)?;
-        Ok(start)
     }
 
     pub fn munmap(&mut self, args: MunmapSyscallArgs) -> Result<(), GuestMemoryError> {
@@ -943,6 +953,34 @@ impl GuestMemory {
             align_up(args.addr.max(MIN_GUEST_ADDRESS))?
         };
         self.find_free_range(hint, length)
+    }
+
+    fn should_retry_mmap_host_conflict(
+        &self,
+        args: MmapSyscallArgs,
+        attempts: usize,
+        error: &GuestMemoryError,
+    ) -> bool {
+        matches!(self.host_address_mode, HostAddressMode::FixedGuest)
+            && !args.is_fixed()
+            && !args.is_fixed_noreplace()
+            && attempts < MMAP_HOST_CONFLICT_RETRIES
+            && matches!(error, GuestMemoryError::Host(_))
+    }
+
+    fn next_retry_mmap_start(
+        &self,
+        previous_start: u64,
+        length: u64,
+    ) -> Result<u64, GuestMemoryError> {
+        let next_hint = previous_start
+            .checked_add(length)
+            .ok_or(GuestMemoryError::OutOfMemory)
+            .and_then(align_up)?;
+        if next_hint >= self.address_space_end {
+            return Err(GuestMemoryError::OutOfMemory);
+        }
+        self.find_free_range(next_hint, length)
     }
 
     fn ensure_host_allocation(
@@ -1920,7 +1958,8 @@ mod tests {
 
     use super::{
         GUEST_PAGE_SIZE, GuestLibcIntrinsic, GuestLibcIntrinsicError, GuestMemory,
-        GuestMemoryError, GuestMemoryProtection, GuestVmaKind,
+        GuestMemoryError, GuestMemoryProtection, GuestVmaKind, HOST_ALLOCATION_GRANULARITY,
+        HostAddressMode,
     };
 
     const BRK_BASE: u64 = 0x0100_0000;
@@ -1964,6 +2003,29 @@ mod tests {
         ));
 
         assert_eq!(overlap, Err(GuestMemoryError::AddressInUse));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_guest_mmap_retries_after_host_address_conflict() {
+        use mcr_win::{HostMemory, MemoryProtection};
+
+        let Ok(_reserved) = HostMemory::allocate_at(
+            MMAP_BASE as usize,
+            GUEST_PAGE_SIZE as usize,
+            MemoryProtection::NoAccess,
+        ) else {
+            return;
+        };
+        let mut memory = memory();
+        memory.host_address_mode = HostAddressMode::FixedGuest;
+
+        let mapped = memory
+            .mmap(anonymous(0, GUEST_PAGE_SIZE, LINUX_PROT_READ, 0))
+            .unwrap();
+
+        assert!(mapped >= MMAP_BASE + HOST_ALLOCATION_GRANULARITY);
+        assert_eq!(memory.vma_containing(mapped).unwrap().start(), mapped);
     }
 
     #[test]

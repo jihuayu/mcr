@@ -10238,6 +10238,7 @@ fn write_guest_timezone_utc(
 fn fixed_rlimit(resource: u64) -> Result<(u64, u64), LinuxErrno> {
     const LINUX_RLIM_INFINITY: u64 = u64::MAX;
     const SOFT_STACK_LIMIT: u64 = 8 * 1024 * 1024;
+    const ADDRESS_SPACE_LIMIT: u64 = 1024 * 1024 * 1024;
     const OPEN_FILE_LIMIT: u64 = 1024;
     match resource {
         0 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
@@ -10249,7 +10250,7 @@ fn fixed_rlimit(resource: u64) -> Result<(u64, u64), LinuxErrno> {
         6 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
         7 => Ok((OPEN_FILE_LIMIT, OPEN_FILE_LIMIT)),
         8 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
-        9 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
+        9 => Ok((ADDRESS_SPACE_LIMIT, ADDRESS_SPACE_LIMIT)),
         10 => Ok((0, 0)),
         11 => Ok((0, 0)),
         12 => Ok((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)),
@@ -17860,6 +17861,17 @@ mod tests {
         assert_eq!(prlimit64.result, SyscallReturn::Success(0));
         assert_eq!(u64_from_guest(runtime.memory(), 0x402100), 1024);
         assert_eq!(u64_from_guest(runtime.memory(), 0x402108), 1024);
+        let prlimit64_as =
+            runtime.dispatch_syscall(context(Syscall::Prlimit64, [0, 9, 0, 0x402180, 0, 0]));
+        assert_eq!(prlimit64_as.result, SyscallReturn::Success(0));
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402180),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            u64_from_guest(runtime.memory(), 0x402188),
+            1024 * 1024 * 1024
+        );
 
         runtime
             .memory_mut()
