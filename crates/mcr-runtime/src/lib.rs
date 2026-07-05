@@ -961,7 +961,8 @@ impl DiagnosticTaskState {
             TaskState::Runnable => Self::Runnable,
             TaskState::WaitingForChild { .. }
             | TaskState::WaitingForVfork { .. }
-            | TaskState::WaitingForSignal => Self::WaitingForChild,
+            | TaskState::WaitingForSignal
+            | TaskState::WaitingForSignalSet { .. } => Self::WaitingForChild,
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
             TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
             TaskState::Exited { status } => Self::Exited { status },
@@ -4227,6 +4228,7 @@ where
             TaskState::WaitingForChild { .. }
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForSignal
+                | TaskState::WaitingForSignalSet { .. }
                 | TaskState::WaitingForFutex { .. }
         );
         let final_regs = if task.regs() == gpr || blocked_after_syscall {
@@ -8635,15 +8637,17 @@ impl RuntimeSubsystems {
 
     fn dispatch_rt_sigtimedwait(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         match self.rt_sigtimedwait(request) {
-            Ok(()) => SyscallOutcome::errno(LinuxErrno::EAGAIN),
+            Ok(outcome) => outcome,
             Err(errno) => SyscallOutcome::errno(errno),
         }
     }
 
-    fn rt_sigtimedwait(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+    fn rt_sigtimedwait(&mut self, request: &SyscallRequest) -> Result<SyscallOutcome, LinuxErrno> {
         let pid = request.context.pid;
+        let tid = request.context.tid;
         self.select_memory_for_process(pid)?;
         let set_addr = arg(request, 0);
+        let info_addr = arg(request, 1);
         let timeout_addr = arg(request, 2);
         let sigsetsize = arg(request, 3);
         if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
@@ -8652,12 +8656,35 @@ impl RuntimeSubsystems {
         if set_addr == 0 {
             return Err(LinuxErrno::EFAULT);
         }
-        let _ = read_guest_u64(self.files.memory(), set_addr)?;
-        if timeout_addr != 0 {
-            let duration = read_required_timespec_duration(self.files.memory(), timeout_addr)?;
+        let signal_mask = read_guest_u64(self.files.memory(), set_addr)?;
+        let timeout = if timeout_addr == 0 {
+            None
+        } else {
+            Some(read_required_timespec_duration(
+                self.files.memory(),
+                timeout_addr,
+            )?)
+        };
+
+        let outcome =
+            self.tasks
+                .rt_sigtimedwait_current(tid, signal_mask, sigsetsize, timeout.is_none());
+        if let SyscallReturn::Success(signal) = outcome.result
+            && signal != 0
+        {
+            if info_addr != 0 {
+                write_guest_siginfo(self.files.memory_mut(), info_addr, signal as u32)?;
+                self.store_selected_process_memory(pid)?;
+            }
+            return Ok(outcome);
+        }
+        if outcome.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
+            && let Some(duration) = timeout
+            && !duration.is_zero()
+        {
             mcr_win::sleep_for(duration).map_err(time_errno)?;
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn sigaltstack(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
@@ -10731,6 +10758,19 @@ fn write_guest_u32(
 ) -> Result<(), LinuxErrno> {
     memory
         .write_bytes(addr, &value.to_le_bytes())
+        .map_err(|_| LinuxErrno::EFAULT)
+}
+
+fn write_guest_siginfo(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    signal: u32,
+) -> Result<(), LinuxErrno> {
+    const LINUX_SIGINFO_SIZE: usize = 128;
+    let mut bytes = [0u8; LINUX_SIGINFO_SIZE];
+    bytes[..4].copy_from_slice(&(signal as i32).to_le_bytes());
+    memory
+        .write_bytes(addr, &bytes)
         .map_err(|_| LinuxErrno::EFAULT)
 }
 
@@ -13420,6 +13460,59 @@ mod tests {
                 ))
                 .result,
             SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_returns_queued_signal_and_writes_siginfo() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let signal = LINUX_SIGCHLD as u32;
+        let signal_mask = 1u64 << (signal - 1);
+        runtime
+            .memory_mut()
+            .write(0x402000, &signal_mask.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::Kill,
+                    [INITIAL_GUEST_PID as u64, u64::from(signal), 0, 0, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(
+                    Syscall::RtSigtimedwait,
+                    [0x402000, 0x402100, 0, 8, 0, 0]
+                ))
+                .result,
+            SyscallReturn::Success(u64::from(signal))
+        );
+        assert_eq!(u32_from_guest(runtime.memory(), 0x402100), signal);
+    }
+
+    #[test]
+    fn rt_sigtimedwait_blocks_when_timeout_is_null() {
+        let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+        let signal = LINUX_SIGCHLD as u32;
+        let signal_mask = 1u64 << (signal - 1);
+        runtime
+            .memory_mut()
+            .write(0x402000, &signal_mask.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::RtSigtimedwait, [0x402000, 0, 0, 8, 0, 0]))
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForSignalSet { mask: signal_mask }
         );
     }
 

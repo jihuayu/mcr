@@ -434,6 +434,7 @@ pub enum TaskState {
     WaitingForChild { args: Wait4SyscallArgs },
     WaitingForVfork { child_pid: GuestPid },
     WaitingForSignal,
+    WaitingForSignalSet { mask: u64 },
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { key: FutexWaitKey },
     Exited { status: i32 },
@@ -448,6 +449,7 @@ pub struct GuestTask {
     state: TaskState,
     robust_list: Option<GuestAddress>,
     clear_child_tid: Option<GuestAddress>,
+    pending_signals: BTreeSet<u32>,
 }
 
 impl GuestTask {
@@ -460,6 +462,7 @@ impl GuestTask {
             state: TaskState::Runnable,
             robust_list: None,
             clear_child_tid: None,
+            pending_signals: BTreeSet::new(),
         }
     }
 
@@ -758,6 +761,7 @@ pub struct GuestProcess {
     image: GuestImageState,
     files: GuestFdTable,
     signals: SignalState,
+    pending_signals: BTreeSet<u32>,
     children: BTreeSet<GuestPid>,
     exit_state: ExitState,
 }
@@ -806,6 +810,11 @@ impl GuestProcess {
     #[must_use]
     pub const fn signals_mut(&mut self) -> &mut SignalState {
         &mut self.signals
+    }
+
+    #[must_use]
+    pub fn pending_signals(&self) -> &BTreeSet<u32> {
+        &self.pending_signals
     }
 
     #[must_use]
@@ -958,7 +967,9 @@ impl GuestKernel {
                 ),
             ),
             Syscall::RtSigreturn => SyscallOutcome::success(0),
-            Syscall::RtSigtimedwait => self.rt_sigtimedwait_current(arg(request, 3)),
+            Syscall::RtSigtimedwait => {
+                self.rt_sigtimedwait_current(request.context.tid, 0, arg(request, 3), false)
+            }
             Syscall::Kill => self.kill_current(KillSyscallArgs::new(
                 arg(request, 0) as i32,
                 arg(request, 1) as u32,
@@ -1169,6 +1180,7 @@ impl GuestKernel {
         child_task.pid = child_pid;
         child_task.tid = child_tid;
         child_task.state = TaskState::Runnable;
+        child_task.pending_signals.clear();
 
         self.processes.insert(
             child_pid,
@@ -1180,6 +1192,7 @@ impl GuestKernel {
                 image: parent.image,
                 files: parent.files,
                 signals: parent.signals,
+                pending_signals: BTreeSet::new(),
                 children: BTreeSet::new(),
                 exit_state: ExitState::Running,
             },
@@ -1344,6 +1357,7 @@ impl GuestKernel {
                 TaskState::Runnable
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForSignal
+                | TaskState::WaitingForSignalSet { .. }
                 | TaskState::WaitingForFd { .. }
                 | TaskState::WaitingForFutex { .. }
                 | TaskState::Exited { .. } => None,
@@ -1392,14 +1406,53 @@ impl GuestKernel {
 
     pub fn wake_signal_waiters(&mut self, pid: GuestPid) -> usize {
         let mut woken = 0usize;
-        for task in self.tasks.values_mut().filter(|task| task.pid == pid) {
-            if matches!(task.state, TaskState::WaitingForSignal) {
-                task.regs = task.regs.with_syscall_return(
-                    task.regs.rip(),
-                    SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64(),
-                );
-                task.state = TaskState::Runnable;
-                woken += 1;
+        let waiting_tasks: Vec<(GuestTid, TaskState)> = self
+            .tasks
+            .values()
+            .filter(|task| task.pid == pid)
+            .filter_map(|task| match task.state {
+                TaskState::WaitingForSignal | TaskState::WaitingForSignalSet { .. } => {
+                    Some((task.tid, task.state))
+                }
+                TaskState::Runnable
+                | TaskState::WaitingForChild { .. }
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForFd { .. }
+                | TaskState::WaitingForFutex { .. }
+                | TaskState::Exited { .. } => None,
+            })
+            .collect();
+
+        for (tid, state) in waiting_tasks {
+            match state {
+                TaskState::WaitingForSignal => {
+                    if let Some(task) = self.task_mut(tid) {
+                        task.regs = task.regs.with_syscall_return(
+                            task.regs.rip(),
+                            SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64(),
+                        );
+                        task.state = TaskState::Runnable;
+                        woken += 1;
+                    }
+                }
+                TaskState::WaitingForSignalSet { mask } => {
+                    let Some(signal) = self.take_pending_signal_for_task(tid, pid, mask) else {
+                        continue;
+                    };
+                    if let Some(task) = self.task_mut(tid) {
+                        task.regs = task
+                            .regs
+                            .with_syscall_return(task.regs.rip(), u64::from(signal));
+                        task.state = TaskState::Runnable;
+                        woken += 1;
+                    }
+                }
+                TaskState::Runnable
+                | TaskState::WaitingForChild { .. }
+                | TaskState::WaitingForVfork { .. }
+                | TaskState::WaitingForFd { .. }
+                | TaskState::WaitingForFutex { .. }
+                | TaskState::Exited { .. } => {}
             }
         }
         woken
@@ -1425,6 +1478,7 @@ impl GuestKernel {
                 | TaskState::WaitingForChild { .. }
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForSignal
+                | TaskState::WaitingForSignalSet { .. }
                 | TaskState::WaitingForFutex { .. }
                 | TaskState::Exited { .. } => None,
             })
@@ -1596,9 +1650,65 @@ impl GuestKernel {
         SyscallOutcome::success(0).with_decoded_field("signal_mask", format!("{:#x}", args.set))
     }
 
-    pub fn rt_sigtimedwait_current(&self, sigsetsize: u64) -> SyscallOutcome {
+    fn queue_process_signal(&mut self, pid: GuestPid, signal: u32) {
+        if let Some(process) = self.process_mut(pid) {
+            process.pending_signals.insert(signal);
+        }
+        self.wake_signal_waiters(pid);
+    }
+
+    fn queue_task_signal(&mut self, tid: GuestTid, signal: u32) {
+        let Some(pid) = self.task_mut(tid).map(|task| {
+            task.pending_signals.insert(signal);
+            task.pid
+        }) else {
+            return;
+        };
+        self.wake_signal_waiters(pid);
+    }
+
+    fn take_pending_signal_for_task(
+        &mut self,
+        tid: GuestTid,
+        pid: GuestPid,
+        signal_mask: u64,
+    ) -> Option<u32> {
+        if let Some(signal) = self
+            .task_mut(tid)
+            .and_then(|task| take_pending_signal(&mut task.pending_signals, signal_mask))
+        {
+            return Some(signal);
+        }
+        self.process_mut(pid)
+            .and_then(|process| take_pending_signal(&mut process.pending_signals, signal_mask))
+    }
+
+    pub fn rt_sigtimedwait_current(
+        &mut self,
+        tid: GuestTid,
+        signal_mask: u64,
+        sigsetsize: u64,
+        wait_indefinitely: bool,
+    ) -> SyscallOutcome {
         if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
             return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
+        }
+        let Some(pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if let Some(signal) = self.take_pending_signal_for_task(tid, pid, signal_mask) {
+            return SyscallOutcome::success(u64::from(signal))
+                .with_decoded_field("signal", signal.to_string());
+        }
+        if wait_indefinitely {
+            let return_rip = current_syscall_return_rip(self, tid);
+            let Some(task) = self.task_mut(tid) else {
+                return SyscallOutcome::errno(LinuxErrno::ESRCH);
+            };
+            task.regs = task.regs.with_syscall_return(return_rip, task.regs.rax());
+            task.state = TaskState::WaitingForSignalSet { mask: signal_mask };
+            return SyscallOutcome::success(0)
+                .with_decoded_field("task_blocked", "rt_sigtimedwait");
         }
         SyscallOutcome::errno(LinuxErrno::EAGAIN)
             .with_decoded_field("signal_wait", "no_pending_signal")
@@ -1621,6 +1731,7 @@ impl GuestKernel {
         if is_terminating_signal(args.sig) {
             return self.exit_group(pid, signal_exit_status(args.sig));
         }
+        self.queue_process_signal(pid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
 
@@ -1645,6 +1756,7 @@ impl GuestKernel {
         if is_terminating_signal(args.sig) {
             return self.exit_group(pid, signal_exit_status(args.sig));
         }
+        self.queue_task_signal(tid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
 
@@ -1665,6 +1777,7 @@ impl GuestKernel {
         if is_terminating_signal(args.sig) {
             return self.exit_group(task.pid, signal_exit_status(args.sig));
         }
+        self.queue_task_signal(tid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
 
@@ -1759,6 +1872,7 @@ impl GuestKernel {
                 image,
                 files: GuestFdTable::with_stdio(),
                 signals: SignalState::default(),
+                pending_signals: BTreeSet::new(),
                 children: BTreeSet::new(),
                 exit_state: ExitState::Running,
             },
@@ -1914,6 +2028,7 @@ impl GuestKernel {
         child_task.tid = child_tid;
         child_task.regs = child_regs;
         child_task.state = TaskState::Runnable;
+        child_task.pending_signals.clear();
         child_task.robust_list = None;
         child_task.clear_child_tid =
             (args.has_clone_child_cleartid() && args.child_tid != 0).then_some(args.child_tid);
@@ -2204,6 +2319,19 @@ const fn validate_signal_or_probe(signal: u32) -> Result<(), TaskError> {
     } else {
         Err(TaskError::InvalidSignal(signal))
     }
+}
+
+fn take_pending_signal(pending: &mut BTreeSet<u32>, signal_mask: u64) -> Option<u32> {
+    let signal = pending
+        .iter()
+        .copied()
+        .find(|signal| signal_matches_mask(*signal, signal_mask))?;
+    pending.remove(&signal);
+    Some(signal)
+}
+
+fn signal_matches_mask(signal: u32, signal_mask: u64) -> bool {
+    signal > 0 && signal <= LINUX_SIGNAL_COUNT && signal_mask & (1u64 << (signal - 1)) != 0
 }
 
 const fn is_terminating_signal(signal: u32) -> bool {
@@ -3001,6 +3129,86 @@ mod tests {
                 [0x402000, 0, 0x402100, LINUX_KERNEL_SIGSET_SIZE + 1, 0, 0],
             ),
             SyscallReturn::Errno(LinuxErrno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_consumes_process_signal_queued_by_kill() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let signal = LINUX_SIGCHLD as u32;
+        let signal_mask = 1u64 << (signal - 1);
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Kill,
+                [INITIAL_GUEST_PID as u64, LINUX_SIGCHLD as u64, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert!(
+            kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .pending_signals()
+                .contains(&signal)
+        );
+
+        assert_eq!(
+            kernel
+                .rt_sigtimedwait_current(
+                    INITIAL_GUEST_TID,
+                    signal_mask,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    false,
+                )
+                .result,
+            SyscallReturn::Success(u64::from(signal))
+        );
+        assert!(
+            !kernel
+                .process(INITIAL_GUEST_PID)
+                .unwrap()
+                .pending_signals()
+                .contains(&signal)
+        );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_blocks_and_tkill_wakes_matching_waiter() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let signal = LINUX_SIGCHLD as u32;
+        let signal_mask = 1u64 << (signal - 1);
+
+        assert_eq!(
+            kernel
+                .rt_sigtimedwait_current(
+                    INITIAL_GUEST_TID,
+                    signal_mask,
+                    LINUX_KERNEL_SIGSET_SIZE,
+                    true,
+                )
+                .result,
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::WaitingForSignalSet { mask: signal_mask }
+        );
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Tkill,
+                [INITIAL_GUEST_TID as u64, LINUX_SIGCHLD as u64, 0, 0, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        let task = kernel.task(INITIAL_GUEST_TID).unwrap();
+        assert_eq!(task.state(), TaskState::Runnable);
+        assert_eq!(
+            SyscallReturn::decode_rax(task.regs().rax()),
+            SyscallReturn::Success(u64::from(signal))
         );
     }
 
