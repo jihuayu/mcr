@@ -316,7 +316,7 @@ impl NetworkStack {
         entries: &mut [SocketPoll<'_>],
         timeout: Option<Duration>,
     ) -> HostResult<usize> {
-        poll_platform(entries, timeout)
+        poll_sockets(entries, timeout)
     }
 }
 
@@ -330,7 +330,7 @@ impl Drop for NetworkStack {
 }
 
 /// Owned host socket.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HostSocket {
     inner: Arc<HostSocketInner>,
 }
@@ -459,7 +459,7 @@ impl HostSocket {
         timeout: Option<Duration>,
     ) -> HostResult<SocketEvents> {
         let mut entry = [SocketPoll::new(self, interest)];
-        let _ = poll_platform(&mut entry, timeout)?;
+        let _ = poll_sockets(&mut entry, timeout)?;
         Ok(entry[0].readiness)
     }
 
@@ -501,6 +501,14 @@ impl HostSocket {
     pub fn peer_addr(&self) -> HostResult<SocketAddr> {
         socket_addr_platform(self, SocketAddressKind::Peer)
     }
+}
+
+/// Polls multiple host sockets for readiness in one platform call.
+pub fn poll_sockets(
+    entries: &mut [SocketPoll<'_>],
+    timeout: Option<Duration>,
+) -> HostResult<usize> {
+    poll_platform(entries, timeout)
 }
 
 impl Drop for HostSocketInner {

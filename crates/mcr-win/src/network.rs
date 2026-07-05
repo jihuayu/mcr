@@ -12,5 +12,5 @@ pub use model::{
 };
 pub use platform::{
     HostRioCapability, HostSocket, NetworkStack, PendingHostAcceptEx, PendingHostConnectEx,
-    PendingHostSocketIo,
+    PendingHostSocketIo, poll_sockets,
 };

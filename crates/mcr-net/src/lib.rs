@@ -16,7 +16,9 @@ pub use dns_cache::{DnsCache, DnsCacheQuery, DnsRecordType, GuestDnsConfig};
 pub use error::{HostIoError, LinuxErrno, SocketError, SocketOperation};
 pub use options::{SocketOptionName, SocketOptions};
 pub use table::GuestSocketTable;
-pub use transport::{HostSocketHandle, HostSocketTransport, NoopHostSocketTransport};
+pub use transport::{
+    HostSocketBatchPoll, HostSocketHandle, HostSocketTransport, NoopHostSocketTransport,
+};
 pub use types::{
     GuestSocket, HostSocketCompletion, ShutdownFlags, ShutdownHow, SocketAcceptFastPath,
     SocketAddress, SocketConnectFastPath, SocketConnectFastPathCompletion, SocketCreationFlags,

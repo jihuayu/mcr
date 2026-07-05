@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use mcr_win::{HostRioCapability, SocketEvents};
+use mcr_win::{HostRioCapability, HostSocket, SocketEvents};
 
 use crate::{
     error::{HostIoError, LinuxErrno},
@@ -21,6 +21,29 @@ pub trait HostSocketTransport {
         spec: SocketSpec,
         options: SocketOptions,
     ) -> Result<Box<dyn HostSocketHandle>, HostIoError>;
+}
+
+#[derive(Debug)]
+pub struct HostSocketBatchPoll {
+    socket: HostSocket,
+    interest: SocketEvents,
+}
+
+impl HostSocketBatchPoll {
+    #[must_use]
+    pub fn new(socket: HostSocket, interest: SocketEvents) -> Self {
+        Self { socket, interest }
+    }
+
+    #[must_use]
+    pub fn socket(&self) -> &HostSocket {
+        &self.socket
+    }
+
+    #[must_use]
+    pub const fn interest(&self) -> SocketEvents {
+        self.interest
+    }
 }
 
 pub trait HostSocketHandle: fmt::Debug {
@@ -107,6 +130,16 @@ pub trait HostSocketHandle: fmt::Debug {
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, HostIoError>;
+    fn prepare_batch_poll(
+        &mut self,
+        _interest: SocketEvents,
+        _timeout: Option<Duration>,
+    ) -> Result<Option<HostSocketBatchPoll>, HostIoError> {
+        Ok(None)
+    }
+    fn finish_batch_poll(&mut self, readiness: SocketEvents) -> Result<SocketEvents, HostIoError> {
+        Ok(readiness)
+    }
     fn drain_readiness_completions(
         &mut self,
         _token: SocketReadinessToken,

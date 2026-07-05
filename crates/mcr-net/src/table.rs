@@ -5,14 +5,14 @@ use std::{
     time::Duration,
 };
 
-use mcr_win::{HostRioCapability, SocketEvents};
+use mcr_win::{HostRioCapability, SocketEvents, SocketPoll, poll_sockets};
 
 use crate::{
     error::{HostIoError, LinuxErrno, SocketError, SocketOperation},
     options::{
         SocketOptionName, bool_to_socket_option, socket_option_to_bool, validate_buffer_size,
     },
-    transport::{HostSocketHandle, HostSocketTransport},
+    transport::{HostSocketBatchPoll, HostSocketHandle, HostSocketTransport},
     types::{
         GuestSocket, HostSocketCompletion, ShutdownFlags, ShutdownHow, SocketAcceptFastPath,
         SocketAddress, SocketConnectFastPath, SocketConnectFastPathCompletion, SocketDomain,
@@ -700,6 +700,91 @@ impl GuestSocketTable {
         interest: SocketEvents,
         timeout: Option<Duration>,
     ) -> Result<SocketEvents, SocketError> {
+        if let Some(readiness) = self.cached_poll_readiness(id, interest)? {
+            return Ok(readiness);
+        }
+
+        let readiness = {
+            let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
+            entry
+                .handle
+                .poll(interest, timeout)
+                .map_err(SocketError::from_host)?
+        };
+        if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
+            self.finish_nonblocking_connect(id)?;
+        }
+        Ok(readiness)
+    }
+
+    pub fn poll_many(
+        &mut self,
+        requests: &[(SocketId, SocketEvents)],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<SocketEvents>, SocketError> {
+        let mut readiness = vec![SocketEvents::default(); requests.len()];
+        let mut batch = Vec::new();
+        let mut fallback = Vec::new();
+        let mut has_ready = false;
+
+        for (index, (id, interest)) in requests.iter().copied().enumerate() {
+            if let Some(cached) = self.cached_poll_readiness(id, interest)? {
+                readiness[index] = cached;
+                has_ready = true;
+                continue;
+            }
+
+            let batch_poll = {
+                let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
+                entry
+                    .handle
+                    .prepare_batch_poll(interest, timeout)
+                    .map_err(SocketError::from_host)?
+            };
+            if let Some(batch_poll) = batch_poll {
+                batch.push((index, id, batch_poll));
+            } else {
+                fallback.push((index, id, interest));
+            }
+        }
+
+        let wait_timeout = if has_ready {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
+
+        if !batch.is_empty() {
+            self.poll_batch_requests(&batch, wait_timeout, &mut readiness)?;
+        }
+
+        let fallback_wait_index =
+            (!has_ready && batch.is_empty() && !fallback.is_empty()).then_some(0usize);
+        for (fallback_index, (result_index, id, interest)) in fallback.into_iter().enumerate() {
+            let poll_timeout = if fallback_wait_index == Some(fallback_index) {
+                timeout
+            } else {
+                Some(Duration::ZERO)
+            };
+            let polled = {
+                let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
+                entry
+                    .handle
+                    .poll(interest, poll_timeout)
+                    .map_err(SocketError::from_host)?
+            };
+            self.finish_polled_readiness(id, polled)?;
+            readiness[result_index] = polled;
+        }
+
+        Ok(readiness)
+    }
+
+    fn cached_poll_readiness(
+        &mut self,
+        id: SocketId,
+        interest: SocketEvents,
+    ) -> Result<Option<SocketEvents>, SocketError> {
         if matches!(self.socket(id)?.state, SocketState::Closed) {
             return Err(SocketError::BadSocket { id });
         }
@@ -717,24 +802,55 @@ impl GuestSocketTable {
             self.readiness_cache.apply_completion(token, completion);
         }
 
-        if let Some(readiness) = self.readiness_cache.readiness(token, interest) {
-            if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
-                self.finish_nonblocking_connect(id)?;
-            }
-            return Ok(readiness);
-        }
-
-        let readiness = {
-            let entry = self.host_entry_mut(id, SocketOperation::Poll)?;
-            entry
-                .handle
-                .poll(interest, timeout)
-                .map_err(SocketError::from_host)?
+        let Some(readiness) = self.readiness_cache.readiness(token, interest) else {
+            return Ok(None);
         };
+        self.finish_polled_readiness(id, readiness)?;
+        Ok(Some(readiness))
+    }
+
+    fn poll_batch_requests(
+        &mut self,
+        batch: &[(usize, SocketId, HostSocketBatchPoll)],
+        timeout: Option<Duration>,
+        readiness: &mut [SocketEvents],
+    ) -> Result<(), SocketError> {
+        let mut entries = batch
+            .iter()
+            .map(|(_, _, request)| SocketPoll::new(request.socket(), request.interest()))
+            .collect::<Vec<_>>();
+        let _ = poll_sockets(&mut entries, timeout)
+            .map_err(HostIoError::from)
+            .map_err(SocketError::from_host)?;
+        let polled = entries
+            .iter()
+            .map(|entry| entry.readiness)
+            .collect::<Vec<_>>();
+        drop(entries);
+
+        for ((result_index, id, _), polled) in batch.iter().zip(polled.into_iter()) {
+            let finished = {
+                let entry = self.host_entry_mut(*id, SocketOperation::Poll)?;
+                entry
+                    .handle
+                    .finish_batch_poll(polled)
+                    .map_err(SocketError::from_host)?
+            };
+            self.finish_polled_readiness(*id, finished)?;
+            readiness[*result_index] = finished;
+        }
+        Ok(())
+    }
+
+    fn finish_polled_readiness(
+        &mut self,
+        id: SocketId,
+        readiness: SocketEvents,
+    ) -> Result<(), SocketError> {
         if readiness.writable && matches!(self.socket(id)?.state, SocketState::Connecting(_)) {
             self.finish_nonblocking_connect(id)?;
         }
-        Ok(readiness)
+        Ok(())
     }
 
     pub fn require_connected_stream(&self, id: SocketId) -> Result<(), SocketError> {

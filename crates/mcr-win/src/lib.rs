@@ -46,6 +46,7 @@ pub use network::{
     HostSocketIoResult, HostSocketIoSubmission, HostSocketOptionName, HostSocketOptionValue,
     NetworkStack, PendingHostAcceptEx, PendingHostConnectEx, PendingHostSocketIo,
     SocketCompletionKind, SocketEvents, SocketFastPathKind, SocketKind, SocketPoll, SocketProtocol,
+    poll_sockets,
 };
 pub use overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,

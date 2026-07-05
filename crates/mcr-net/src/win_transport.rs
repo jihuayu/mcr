@@ -19,7 +19,7 @@ use crate::{
     error::{HostIoError, LinuxErrno},
     options::SocketOptions,
     table::merge_socket_events,
-    transport::{HostSocketHandle, HostSocketTransport},
+    transport::{HostSocketBatchPoll, HostSocketHandle, HostSocketTransport},
     types::{
         HostSocketCompletion, ShutdownHow, SocketAcceptFastPath, SocketAddress,
         SocketConnectFastPath, SocketConnectFastPathCompletion, SocketDomain, SocketProtocol,
@@ -634,6 +634,24 @@ impl HostSocketHandle for WinHostSocketHandle {
                 .map_err(HostIoError::from)?;
             merge_socket_events(&mut readiness, fallback);
         }
+        Ok(readiness)
+    }
+
+    fn prepare_batch_poll(
+        &mut self,
+        interest: SocketEvents,
+        _timeout: Option<Duration>,
+    ) -> Result<Option<HostSocketBatchPoll>, HostIoError> {
+        if interest.readable && self.can_use_iocp_recv() {
+            return Ok(None);
+        }
+        Ok(Some(HostSocketBatchPoll::new(
+            self.socket.clone(),
+            interest,
+        )))
+    }
+
+    fn finish_batch_poll(&mut self, readiness: SocketEvents) -> Result<SocketEvents, HostIoError> {
         Ok(readiness)
     }
 
