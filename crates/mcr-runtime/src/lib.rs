@@ -5000,18 +5000,18 @@ fn fs_relative_patch_sites(
         else {
             continue;
         };
-        if let Some(original) = fs_relative_original(&bytes[offset..]) {
+        if let Some((prefix_len, original)) = fs_relative_original(&bytes[offset..]) {
             patches.push(FsRelativePatchSite {
-                address: instruction.rip,
+                address: instruction.rip + prefix_len as u64,
                 patch: FsRelativePatch { original },
                 materialized: false,
             });
         } else if previous_fs_base != 0
-            && let Some(original) =
+            && let Some((prefix_len, original)) =
                 fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
         {
             patches.push(FsRelativePatchSite {
-                address: instruction.rip,
+                address: instruction.rip + prefix_len as u64,
                 patch: FsRelativePatch { original },
                 materialized: true,
             });
@@ -5022,7 +5022,9 @@ fn fs_relative_patch_sites(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_original(bytes: &[u8]) -> Option<[u8; 9]> {
+fn fs_relative_original(bytes: &[u8]) -> Option<(usize, [u8; 9])> {
+    let prefix_len = fs_relative_patch_prefix_len(bytes)?;
+    let bytes = &bytes[prefix_len..];
     if bytes.len() < 9
         || bytes[0] != 0x64
         || bytes[1] & 0xf8 != 0x48
@@ -5033,11 +5035,16 @@ fn fs_relative_original(bytes: &[u8]) -> Option<[u8; 9]> {
         return None;
     }
 
-    Some(bytes[..9].try_into().expect("slice length checked"))
+    Some((
+        prefix_len,
+        bytes[..9].try_into().expect("slice length checked"),
+    ))
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_original_from_replacement(bytes: &[u8], fs_base: u64) -> Option<[u8; 9]> {
+fn fs_relative_original_from_replacement(bytes: &[u8], fs_base: u64) -> Option<(usize, [u8; 9])> {
+    let prefix_len = fs_relative_patch_prefix_len(bytes)?;
+    let bytes = &bytes[prefix_len..];
     if fs_base == 0
         || bytes.len() < 9
         || bytes[0] & 0xf8 != 0x48
@@ -5052,17 +5059,26 @@ fn fs_relative_original_from_replacement(bytes: &[u8], fs_base: u64) -> Option<[
     let absolute = u32::from_le_bytes(bytes[4..8].try_into().expect("slice length checked"));
     let displacement = i64::from(absolute) - fs_base as i64;
     let displacement = i32::try_from(displacement).ok()?.to_le_bytes();
-    Some([
-        0x64,
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        displacement[0],
-        displacement[1],
-        displacement[2],
-        displacement[3],
-    ])
+    Some((
+        prefix_len,
+        [
+            0x64,
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            displacement[0],
+            displacement[1],
+            displacement[2],
+            displacement[3],
+        ],
+    ))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch_prefix_len(bytes: &[u8]) -> Option<usize> {
+    let prefix_len = bytes.iter().take_while(|&&byte| byte == 0x66).count();
+    (bytes.get(prefix_len).copied() == Some(0x64)).then_some(prefix_len)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -17161,6 +17177,34 @@ mod tests {
             guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
             [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
         );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_prefixed_fs_relative_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [
+            0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+        ];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [
+                0x66, 0x66, 0x66, 0x66, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x70, 0x90
+            ]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x40100d, 2), [0xcc, 0x90]);
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
