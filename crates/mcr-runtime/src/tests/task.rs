@@ -1067,6 +1067,74 @@ fn runtime_execve_loads_interpreter_from_vfs() {
 }
 
 #[test]
+fn runtime_execve_loads_shebang_script_interpreter() {
+    let mut tree = PathTree::new();
+    tree.create_dir("/bin").unwrap();
+    tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+        .unwrap();
+    tree.create_file_with_content("/bin/sh", test_program_bytes(0x501000), 0o755)
+        .unwrap();
+    tree.create_file_with_content("/bin/script", b"#!/bin/sh\nexit 0\n", 0o755)
+        .unwrap();
+    tree.mount_minimal_procfs().unwrap();
+    let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+
+    runtime
+        .memory_mut()
+        .write(0x402100, b"/bin/script\0")
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402120, b"/bin/script\0")
+        .unwrap();
+    runtime.memory_mut().write(0x402140, b"--flag\0").unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402160, b"PATH=/bin\0")
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &0x402120u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402008, &0x402140u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402010, &0u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402040, &0x402160u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402048, &0u64.to_le_bytes())
+        .unwrap();
+
+    let exec = runtime.dispatch_syscall(context(
+        Syscall::Execve,
+        [0x402100, 0x402000, 0x402040, 0, 0, 0],
+    ));
+
+    assert_eq!(exec.result, SyscallReturn::Success(0));
+    let process = runtime.kernel().process(INITIAL_GUEST_PID).unwrap();
+    let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(process.image().executable().path(), b"/bin/sh");
+    assert_eq!(
+        process.image().argv(),
+        &[
+            b"/bin/sh".to_vec(),
+            b"/bin/script".to_vec(),
+            b"--flag".to_vec()
+        ]
+    );
+    assert_eq!(process.image().envp(), &[b"PATH=/bin".to_vec()]);
+    assert_eq!(task.regs().rip(), 0x501000);
+}
+
+#[test]
 fn runtime_execve_missing_vfs_target_keeps_current_image() {
     let mut tree = PathTree::new();
     tree.create_dir("/bin").unwrap();

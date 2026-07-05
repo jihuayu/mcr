@@ -167,16 +167,54 @@ where
 }
 
 impl<M> RuntimeFileSystem<M> {
+    const SCRIPT_EXEC_RECURSION_LIMIT: usize = 4;
+
     pub fn load_guest_program(
         &mut self,
         filename: impl Into<Vec<u8>>,
         argv: impl IntoIterator<Item = Vec<u8>>,
         envp: impl IntoIterator<Item = Vec<u8>>,
     ) -> Result<GuestProgram, LinuxErrno> {
-        let filename = filename.into();
+        self.load_guest_program_inner(
+            filename.into(),
+            argv.into_iter().collect(),
+            envp.into_iter().collect(),
+            0,
+        )
+    }
+
+    fn load_guest_program_inner(
+        &mut self,
+        filename: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+        script_depth: usize,
+    ) -> Result<GuestProgram, LinuxErrno> {
         let executable = self.load_guest_executable(&filename)?;
-        let load_plan =
-            mcr_elf::parse_load_plan(executable.bytes()).map_err(|_| LinuxErrno::ENOEXEC)?;
+        let load_plan = match mcr_elf::parse_load_plan(executable.bytes()) {
+            Ok(load_plan) => load_plan,
+            Err(_) => {
+                let Some(script) = parse_script_interpreter(executable.bytes())? else {
+                    return Err(LinuxErrno::ENOEXEC);
+                };
+                if script_depth >= Self::SCRIPT_EXEC_RECURSION_LIMIT {
+                    return Err(LinuxErrno::ELOOP);
+                }
+                let mut script_argv = Vec::with_capacity(argv.len().saturating_add(2));
+                script_argv.push(script.interpreter.clone());
+                if let Some(argument) = script.argument {
+                    script_argv.push(argument);
+                }
+                script_argv.push(filename);
+                script_argv.extend(argv.into_iter().skip(1));
+                return self.load_guest_program_inner(
+                    script.interpreter,
+                    script_argv,
+                    envp,
+                    script_depth + 1,
+                );
+            }
+        };
         let mut program = GuestProgram::new(executable).with_args(argv).with_env(envp);
         if let Some(interpreter_path) = load_plan.interpreter() {
             let interpreter = self.load_guest_executable(interpreter_path.as_bytes())?;
@@ -207,6 +245,57 @@ impl<M> RuntimeFileSystem<M> {
         close_result?;
         Ok(GuestExecutable::new(path.into_bytes(), bytes))
     }
+}
+
+struct ScriptInterpreter {
+    interpreter: Vec<u8>,
+    argument: Option<Vec<u8>>,
+}
+
+fn parse_script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>, LinuxErrno> {
+    let Some(rest) = bytes.strip_prefix(b"#!") else {
+        return Ok(None);
+    };
+    let line_end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(rest.len());
+    let line = trim_script_ascii_space(&rest[..line_end]);
+    if line.is_empty() {
+        return Err(LinuxErrno::ENOEXEC);
+    }
+    let split = line.iter().position(|byte| matches!(*byte, b' ' | b'\t'));
+    let (interpreter, argument) = match split {
+        Some(index) => {
+            let interpreter = &line[..index];
+            let argument = trim_script_ascii_space(&line[index..]);
+            (
+                interpreter,
+                (!argument.is_empty()).then(|| argument.to_vec()),
+            )
+        }
+        None => (line, None),
+    };
+    if interpreter.is_empty() {
+        return Err(LinuxErrno::ENOEXEC);
+    }
+    Ok(Some(ScriptInterpreter {
+        interpreter: interpreter.to_vec(),
+        argument,
+    }))
+}
+
+fn trim_script_ascii_space(value: &[u8]) -> &[u8] {
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    let start = value
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
 }
 
 impl<M> RuntimeFileSystem<M>
