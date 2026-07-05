@@ -142,6 +142,14 @@ socket contracts stable.
 | Native patch scanning, caching, and application live in `mcr-runtime` while instruction analysis lives in `mcr-jit`. | Consolidate the native patch pipeline behind the `mcr-jit` boundary. | `arch-007` |
 | `mcr-win` carries mistakenly added non-Windows backends and stubs (including a Linux `libc` backend). | Windows x86-64 is the only supported host; delete non-Windows backends. | `win-002` |
 | Syscall trace decoding allocates on every syscall even when tracing is off, and interpreter-fallback frequency is unmeasured. | Zero-cost disabled tracing plus fallback counters before deciding on a decoded-block cache. | `perf-025` |
+| Guest I/O syscalls copy through per-call temporary buffers and read guest C-strings one byte per VMA lookup, even though guest memory is same-process host memory. | Safe borrowed guest-memory slice boundary in `mcr-memory` with the copy path as cross-VMA fallback. | `perf-026` |
+| The scheduler clones full fd tables and rescans all tasks every iteration, and fd-blocked tasks are re-polled instead of event-woken. | Split-borrow the waiter check, incremental runnable/waiter tracking, and mutation-site fd readiness events. | `perf-027` |
+| Any VFS write invalidates the whole cache via one global generation, directory listing scans every filesystem path, and deferred rootfs files fully materialize on first read. | Per-inode generations, per-directory child indexes, host handle cache, and read-through deferred files. | `perf-028` |
+| Native execution reinstalls the vectored exception handler per execution slice, syscall descriptor lookup is a linear table scan, and `epoll_wait` rebuilds its watch list per call. | Process-lifetime handler install, direct-indexed dispatch table, cached epoll interest lists, batched `WSAPoll`. | `perf-029` |
+
+The hot-path fixed costs are described in more detail in
+[Performance optimization design](performance.md) under "Hot-Path
+Constant-Cost Debt".
 
 ## Architecture Constraints
 
