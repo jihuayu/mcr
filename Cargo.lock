@@ -124,14 +124,25 @@ name = "mcr-jit"
 version = "0.1.0"
 dependencies = [
  "iced-x86",
+ "mcr-elf",
  "mcr-sys",
+]
+
+[[package]]
+name = "mcr-memory"
+version = "0.1.0"
+dependencies = [
+ "mcr-elf",
+ "mcr-jit",
+ "mcr-sys",
+ "mcr-win",
 ]
 
 [[package]]
 name = "mcr-net"
 version = "0.1.0"
 dependencies = [
- "mcr-task",
+ "mcr-sys",
  "mcr-win",
 ]
 
@@ -141,6 +152,7 @@ version = "0.1.0"
 dependencies = [
  "mcr-elf",
  "mcr-jit",
+ "mcr-memory",
  "mcr-net",
  "mcr-snapshot",
  "mcr-sys",
@@ -157,6 +169,9 @@ version = "0.1.0"
 [[package]]
 name = "mcr-sys"
 version = "0.1.0"
+dependencies = [
+ "mcr-win",
+]
 
 [[package]]
 name = "mcr-task"
@@ -165,6 +180,7 @@ dependencies = [
  "mcr-elf",
  "mcr-sys",
  "mcr-testkit",
+ "mcr-win",
 ]
 
 [[package]]
@@ -182,15 +198,13 @@ name = "mcr-vfs"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "mcr-sys",
  "mcr-win",
 ]
 
 [[package]]
 name = "mcr-win"
 version = "0.1.0"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "r-efi"

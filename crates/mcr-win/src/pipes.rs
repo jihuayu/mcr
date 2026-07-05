@@ -8,13 +8,11 @@ pub struct HostPipePair {
     writer: HostFile,
 }
 
-#[cfg(windows)]
 // SAFETY: The pipe pair owns two Windows handles. VFS serializes guest pipe
 // operations through its pipe mutex, and Windows overlapped handle ownership can
 // move across host threads without invalidating the handles.
 unsafe impl Send for HostPipePair {}
 
-#[cfg(windows)]
 // SAFETY: Shared references only expose handle operations; VFS keeps mutable
 // pipe state synchronized, and the underlying Windows handles remain valid
 // until the pair is dropped.
@@ -37,14 +35,6 @@ impl HostPipePair {
     }
 }
 
-#[cfg(not(windows))]
-fn create_overlapped_pipe_pair_platform() -> HostResult<HostPipePair> {
-    Err(crate::error::HostError::unsupported(
-        HostOperation::OpenFile,
-    ))
-}
-
-#[cfg(windows)]
 fn create_overlapped_pipe_pair_platform() -> HostResult<HostPipePair> {
     let name = unique_pipe_name();
     let name_wide = path_to_wide(&name);
@@ -101,40 +91,27 @@ fn create_overlapped_pipe_pair_platform() -> HostResult<HostPipePair> {
     })
 }
 
-#[cfg(windows)]
 fn unique_pipe_name() -> String {
     static NEXT_PIPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_PIPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!(r"\\.\pipe\mcr-{}-{id}", std::process::id())
 }
 
-#[cfg(windows)]
 fn path_to_wide(path: &str) -> Vec<u16> {
     path.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[cfg(windows)]
 const DEFAULT_PIPE_BUFFER_SIZE: u32 = 64 * 1024;
-#[cfg(windows)]
 const GENERIC_WRITE: u32 = 0x4000_0000;
-#[cfg(windows)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-#[cfg(windows)]
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-#[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
-#[cfg(windows)]
 const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
-#[cfg(windows)]
 const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
-#[cfg(windows)]
 const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
-#[cfg(windows)]
 const PIPE_WAIT: u32 = 0x0000_0000;
-#[cfg(windows)]
 const ERROR_PIPE_CONNECTED: u32 = 535;
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateNamedPipeW(
@@ -165,10 +142,8 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::HostPipePair;
-    #[cfg(windows)]
     use crate::HostIoDirection;
 
-    #[cfg(windows)]
     #[test]
     fn overlapped_pipe_pair_round_trips_bytes() {
         let pipe = HostPipePair::create_overlapped().unwrap();
@@ -191,11 +166,5 @@ mod tests {
         assert_eq!(read.direction(), HostIoDirection::Read);
         assert_eq!(read.bytes_transferred(), 4);
         assert_eq!(read.buffer(), b"pipe");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn overlapped_pipe_pair_reports_unsupported_off_windows() {
-        assert!(HostPipePair::create_overlapped().is_err());
     }
 }

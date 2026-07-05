@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-#[cfg(not(windows))]
-use crate::error::HostError;
 use crate::error::{HostOperation, HostResult};
 
 /// Result of waiting on a host address.
@@ -36,92 +34,6 @@ pub fn wake_by_address_all_u32(address: &AtomicU32) -> HostResult<()> {
     wake_by_address_all_u32_platform(address)
 }
 
-#[cfg(not(windows))]
-fn wait_on_address_u32_platform(
-    address: &AtomicU32,
-    expected: u32,
-    timeout: Option<Duration>,
-) -> HostResult<AddressWaitResult> {
-    let cell = wait_cell(address);
-    let guard = cell.lock.lock().map_err(|_| {
-        HostError::new(HostOperation::WaitOnAddress, crate::HostErrorKind::Poisoned)
-    })?;
-
-    if address.load(Ordering::SeqCst) != expected {
-        return Ok(AddressWaitResult::ValueChanged);
-    }
-
-    match timeout {
-        Some(timeout) => {
-            let (_guard, timeout_result) = cell
-                .condvar
-                .wait_timeout_while(guard, timeout, |_| {
-                    address.load(Ordering::SeqCst) == expected
-                })
-                .map_err(|_| {
-                    HostError::new(HostOperation::WaitOnAddress, crate::HostErrorKind::Poisoned)
-                })?;
-            if timeout_result.timed_out() && address.load(Ordering::SeqCst) == expected {
-                Ok(AddressWaitResult::TimedOut)
-            } else if address.load(Ordering::SeqCst) != expected {
-                Ok(AddressWaitResult::ValueChanged)
-            } else {
-                Ok(AddressWaitResult::Woken)
-            }
-        }
-        None => {
-            let _guard = cell
-                .condvar
-                .wait_while(guard, |_| address.load(Ordering::SeqCst) == expected)
-                .map_err(|_| {
-                    HostError::new(HostOperation::WaitOnAddress, crate::HostErrorKind::Poisoned)
-                })?;
-            Ok(AddressWaitResult::ValueChanged)
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn wake_by_address_single_u32_platform(address: &AtomicU32) -> HostResult<()> {
-    wait_cell(address).condvar.notify_one();
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn wake_by_address_all_u32_platform(address: &AtomicU32) -> HostResult<()> {
-    wait_cell(address).condvar.notify_all();
-    Ok(())
-}
-
-#[cfg(not(windows))]
-struct WaitCell {
-    lock: std::sync::Mutex<()>,
-    condvar: std::sync::Condvar,
-}
-
-#[cfg(not(windows))]
-fn wait_cell(address: &AtomicU32) -> std::sync::Arc<WaitCell> {
-    static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<WaitCell>>>,
-    > = std::sync::OnceLock::new();
-
-    let registry = REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut registry = match registry.lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    registry
-        .entry(address.as_ptr() as usize)
-        .or_insert_with(|| {
-            std::sync::Arc::new(WaitCell {
-                lock: std::sync::Mutex::new(()),
-                condvar: std::sync::Condvar::new(),
-            })
-        })
-        .clone()
-}
-
-#[cfg(windows)]
 fn wait_on_address_u32_platform(
     address: &AtomicU32,
     expected: u32,
@@ -158,7 +70,6 @@ fn wait_on_address_u32_platform(
     }
 }
 
-#[cfg(windows)]
 fn wake_by_address_single_u32_platform(address: &AtomicU32) -> HostResult<()> {
     // SAFETY: AtomicU32 exposes a stable pointer to the u32 storage for address wakes.
     unsafe {
@@ -167,7 +78,6 @@ fn wake_by_address_single_u32_platform(address: &AtomicU32) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn wake_by_address_all_u32_platform(address: &AtomicU32) -> HostResult<()> {
     // SAFETY: AtomicU32 exposes a stable pointer to the u32 storage for address wakes.
     unsafe {
@@ -176,7 +86,6 @@ fn wake_by_address_all_u32_platform(address: &AtomicU32) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn duration_to_millis(duration: Duration) -> u32 {
     if duration.is_zero() {
         return 0;
@@ -186,10 +95,8 @@ fn duration_to_millis(duration: Duration) -> u32 {
     millis.min(u128::from(u32::MAX)) as u32
 }
 
-#[cfg(windows)]
 const INFINITE: u32 = u32::MAX;
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn WaitOnAddress(

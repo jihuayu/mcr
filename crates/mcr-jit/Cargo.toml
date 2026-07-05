@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 iced-x86 = "1"
+mcr-elf.workspace = true
 mcr-sys.workspace = true
 
 [lints]

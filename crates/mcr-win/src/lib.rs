@@ -7,6 +7,7 @@
 pub mod clocks;
 pub mod error;
 pub mod files;
+mod host_worker_pool;
 pub mod iocp;
 pub mod memory;
 pub mod native_exec;
@@ -25,6 +26,14 @@ pub use files::{
     FileAccess, FileCreation, FileOptions, FileShare, HostFile, RenameMode, create_hard_link,
     create_symlink_file, delete_file, rename_file, replace_file,
 };
+pub use host_worker_pool::{
+    DEFAULT_GUEST_TASK_QUEUE_CAPACITY, DEFAULT_GUEST_TASK_WORKERS,
+    DEFAULT_IO_COMPLETION_QUEUE_CAPACITY, DEFAULT_IO_COMPLETION_WORKERS,
+    HOST_WORKER_POOL_MAX_QUEUED_JOBS, HOST_WORKER_POOL_MAX_WORKERS, HostWorkerPoolConfig,
+    HostWorkerPoolConfigError, HostWorkerPoolDiagnostics, HostWorkerPoolExecutor,
+    HostWorkerPoolJob, HostWorkerPoolJobError, HostWorkerPoolRole, HostWorkerPoolSubmission,
+    HostWorkerPoolSubmitError,
+};
 pub use iocp::{HostIoCompletionPacket, HostIoCompletionPort};
 pub use memory::{HostFileMapping, HostMemory, MemoryProtection};
 pub use native_exec::{
@@ -37,6 +46,7 @@ pub use network::{
     HostSocketIoResult, HostSocketIoSubmission, HostSocketOptionName, HostSocketOptionValue,
     NetworkStack, PendingHostAcceptEx, PendingHostConnectEx, PendingHostSocketIo,
     SocketCompletionKind, SocketEvents, SocketFastPathKind, SocketKind, SocketPoll, SocketProtocol,
+    poll_sockets,
 };
 pub use overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
