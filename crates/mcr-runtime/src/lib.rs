@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 //! Runtime errors preserve native fault diagnostics and guest register snapshots.
 
+mod access;
 mod build_run;
 mod diagnostics;
 mod event_state;
@@ -28,6 +29,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
+pub use access::RuntimeMemoryAccess;
 pub use build_run::{
     BuildRunCommand, BuildRunError, BuildRunResult, BuildRunSpec, execute_build_run,
 };

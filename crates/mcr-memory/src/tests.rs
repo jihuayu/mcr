@@ -75,6 +75,80 @@ fn mmap_fixed_replaces_overlapping_mapping() {
 }
 
 #[test]
+fn borrowed_slices_require_one_contiguous_vma_and_matching_protection() {
+    let mut memory = memory();
+    let addr = memory
+        .mmap(anonymous(
+            0,
+            GUEST_PAGE_SIZE * 2,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            0,
+        ))
+        .unwrap();
+    memory.write(addr, b"abcdef").unwrap();
+
+    assert_eq!(memory.slice(addr + 1, 3).unwrap().unwrap(), b"bcd");
+    memory
+        .slice_mut(addr + 2, 2)
+        .unwrap()
+        .unwrap()
+        .copy_from_slice(b"XY");
+    let mut bytes = [0; 6];
+    memory.read(addr, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"abXYef");
+
+    memory
+        .mprotect(MprotectSyscallArgs {
+            addr: addr + GUEST_PAGE_SIZE,
+            length: GUEST_PAGE_SIZE,
+            prot: LINUX_PROT_READ,
+        })
+        .unwrap();
+
+    assert!(
+        memory
+            .slice(addr + GUEST_PAGE_SIZE - 2, 4)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        memory.slice_mut(addr + GUEST_PAGE_SIZE, 1),
+        Err(GuestMemoryError::AccessDenied)
+    );
+}
+
+#[test]
+fn read_c_string_scans_vma_bounded_chunks_across_mappings() {
+    let mut memory = memory();
+    let addr = memory
+        .mmap(anonymous(
+            0,
+            GUEST_PAGE_SIZE * 2,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            0,
+        ))
+        .unwrap();
+    let start = addr + GUEST_PAGE_SIZE - 2;
+    memory.write(start, b"ab").unwrap();
+    memory.write(addr + GUEST_PAGE_SIZE, b"cd\0").unwrap();
+    memory
+        .mprotect(MprotectSyscallArgs {
+            addr: addr + GUEST_PAGE_SIZE,
+            length: GUEST_PAGE_SIZE,
+            prot: LINUX_PROT_READ,
+        })
+        .unwrap();
+
+    let text = crate::GuestMemoryAccess::read_c_string(&memory, start, 8).unwrap();
+
+    assert_eq!(text, "abcd");
+    assert_eq!(
+        crate::GuestMemoryAccess::read_c_string(&memory, start, 4),
+        Err(crate::GuestMemoryAccessError::Fault)
+    );
+}
+
+#[test]
 fn intrinsic_memory_primitives_preserve_guest_access_rules_and_overlap() {
     let mut memory = memory();
     let addr = memory

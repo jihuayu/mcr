@@ -592,6 +592,107 @@ impl GuestMemory {
         self.write_guest(address, bytes)
     }
 
+    pub fn slice(&self, address: u64, len: usize) -> Result<Option<&[u8]>, GuestMemoryError> {
+        self.guest_slice(address, len, AccessKind::Read)
+    }
+
+    pub fn slice_mut(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<Option<&mut [u8]>, GuestMemoryError> {
+        let length = u64::try_from(len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let end = checked_raw_range(address, length)?;
+        if len == 0 {
+            return Ok(Some(&mut []));
+        }
+        let vma = self
+            .vma_containing(address)
+            .cloned()
+            .ok_or(GuestMemoryError::NotMapped)?;
+        AccessKind::Write.check(vma.protection)?;
+        if end > vma.end {
+            return Ok(None);
+        }
+
+        self.ensure_guest_page_range_unique(address, end)?;
+        let vma = self
+            .vma_containing(address)
+            .cloned()
+            .ok_or(GuestMemoryError::NotMapped)?;
+        let offset = guest_slice_offset(&vma, address)?;
+        let slice_end = offset
+            .checked_add(len)
+            .ok_or(GuestMemoryError::RegionTooLarge)?;
+        Ok(Some(
+            &mut self
+                .allocation_memory_mut(vma.allocation_id)?
+                .as_mut_slice()[offset..slice_end],
+        ))
+    }
+
+    fn guest_slice(
+        &self,
+        address: u64,
+        len: usize,
+        access: AccessKind,
+    ) -> Result<Option<&[u8]>, GuestMemoryError> {
+        let length = u64::try_from(len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+        let end = checked_raw_range(address, length)?;
+        if len == 0 {
+            return Ok(Some(&[]));
+        }
+        let vma = self
+            .vma_containing(address)
+            .ok_or(GuestMemoryError::NotMapped)?;
+        access.check(vma.protection)?;
+        if end > vma.end {
+            return Ok(None);
+        }
+        let allocation = self
+            .allocations
+            .get(&vma.allocation_id)
+            .expect("VMA references live allocation");
+        let offset = guest_slice_offset(vma, address)?;
+        let slice_end = offset
+            .checked_add(len)
+            .ok_or(GuestMemoryError::RegionTooLarge)?;
+        Ok(Some(&allocation.memory.as_slice()[offset..slice_end]))
+    }
+
+    pub fn read_c_string_bytes(
+        &self,
+        address: u64,
+        max_len: usize,
+    ) -> Result<Vec<u8>, GuestMemoryError> {
+        let mut bytes = Vec::new();
+        let mut cursor = address;
+        while bytes.len() < max_len {
+            let vma = self
+                .vma_containing(cursor)
+                .ok_or(GuestMemoryError::NotMapped)?;
+            AccessKind::Read.check(vma.protection)?;
+            let remaining = max_len - bytes.len();
+            let chunk_len = usize::try_from((vma.end - cursor).min(remaining as u64))
+                .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+            if chunk_len == 0 {
+                break;
+            }
+            let chunk = self
+                .guest_slice(cursor, chunk_len, AccessKind::Read)?
+                .expect("chunk is bounded by one readable VMA");
+            if let Some(nul) = chunk.iter().position(|byte| *byte == 0) {
+                bytes.extend_from_slice(&chunk[..nul]);
+                return Ok(bytes);
+            }
+            bytes.extend_from_slice(chunk);
+            cursor = cursor
+                .checked_add(chunk_len as u64)
+                .ok_or(GuestMemoryError::InvalidLength)?;
+        }
+        Err(GuestMemoryError::InvalidLength)
+    }
+
     pub fn patch_code(&mut self, address: u64, bytes: &[u8]) -> Result<Vec<u8>, GuestMemoryError> {
         let end = checked_raw_range(address, bytes.len() as u64)?;
         let vma = self
@@ -1398,6 +1499,11 @@ impl GuestMemory {
             })
             .collect()
     }
+}
+
+fn guest_slice_offset(vma: &GuestVma, address: u64) -> Result<usize, GuestMemoryError> {
+    usize::try_from(vma.allocation_offset + (address - vma.start))
+        .map_err(|_| GuestMemoryError::RegionTooLarge)
 }
 
 fn allocate_guest_host_memory_at(

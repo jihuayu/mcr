@@ -60,7 +60,7 @@ impl<M> RuntimeFileSystem<M> {
 
 impl<M> FileSyscalls for RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let result = match request.syscall {
@@ -121,7 +121,7 @@ where
 
 impl<M> FileSyscalls for &mut RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     fn dispatch_file(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         RuntimeFileSystem::dispatch_file(self, request)
@@ -130,7 +130,7 @@ where
 
 impl<M> NetworkSyscalls for RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         let result = match request.syscall {
@@ -157,7 +157,7 @@ where
 
 impl<M> NetworkSyscalls for &mut RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     fn dispatch_network(&mut self, request: &SyscallRequest) -> SyscallOutcome {
         RuntimeFileSystem::dispatch_network(self, request)
@@ -209,7 +209,7 @@ impl<M> RuntimeFileSystem<M> {
 
 impl<M> RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     pub(crate) fn read_guest_vector(&self, vector_addr: u64) -> Result<Vec<Vec<u8>>, LinuxErrno> {
         read_guest_vector(&self.memory, vector_addr)
@@ -289,16 +289,30 @@ where
         let socket_id = self.socket_id_for_fd(args.fd)?;
         validate_send_message_flags(args.flags, SocketOperation::Send)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
-        let mut buffer = vec![0; len];
-        self.memory
-            .read_bytes(args.buf, &mut buffer)
-            .map_err(memory_errno)?;
-        let count = if args.sockaddr != 0 || args.addrlen != 0 {
-            let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
-            let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
-            self.sockets.send_to(socket_id, &buffer, address)
+        let count = if let Some(buffer) = self
+            .memory
+            .borrowed_bytes(args.buf, len)
+            .map_err(memory_errno)?
+        {
+            if args.sockaddr != 0 || args.addrlen != 0 {
+                let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
+                let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
+                self.sockets.send_to(socket_id, buffer, address)
+            } else {
+                self.sockets.send_connected(socket_id, buffer)
+            }
         } else {
-            self.sockets.send_connected(socket_id, &buffer)
+            let mut buffer = vec![0; len];
+            self.memory
+                .read_bytes(args.buf, &mut buffer)
+                .map_err(memory_errno)?;
+            if args.sockaddr != 0 || args.addrlen != 0 {
+                let addrlen = u32::try_from(args.addrlen).map_err(|_| LinuxErrno::EINVAL)?;
+                let address = read_socket_address(&self.memory, args.sockaddr, addrlen)?;
+                self.sockets.send_to(socket_id, &buffer, address)
+            } else {
+                self.sockets.send_connected(socket_id, &buffer)
+            }
         }
         .map_err(net_errno)?;
         Ok(count as u64)
@@ -316,6 +330,16 @@ where
         let socket_id = self.socket_id_for_fd(args.fd)?;
         validate_recv_message_flags(args.flags, SocketOperation::Recv)?;
         let len = usize::try_from(args.len).map_err(|_| LinuxErrno::EINVAL)?;
+        if args.sockaddr == 0
+            && args.addrlen == 0
+            && let Ok(Some(buffer)) = self.memory.borrowed_bytes_mut(args.buf, len)
+        {
+            let count = self
+                .sockets
+                .recv_connected(socket_id, buffer)
+                .map_err(net_errno)?;
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
         let count = if args.sockaddr != 0 || args.addrlen != 0 {
             let (count, address) = self
@@ -532,9 +556,57 @@ where
     }
 }
 
+fn iovecs_are_borrowable<M>(memory: &M, iovecs: &[LinuxIovec]) -> bool
+where
+    M: RuntimeMemoryAccess,
+{
+    iovecs.iter().all(|iovec| {
+        let Ok(len) = usize::try_from(iovec.iov_len) else {
+            return false;
+        };
+        matches!(memory.borrowed_bytes(iovec.iov_base, len), Ok(Some(_)))
+    })
+}
+
+fn iovecs_are_borrowable_mut<M>(memory: &mut M, iovecs: &[LinuxIovec]) -> bool
+where
+    M: RuntimeMemoryAccess,
+{
+    for iovec in iovecs {
+        let Ok(len) = usize::try_from(iovec.iov_len) else {
+            return false;
+        };
+        if !matches!(memory.borrowed_bytes_mut(iovec.iov_base, len), Ok(Some(_))) {
+            return false;
+        }
+    }
+    true
+}
+
+fn borrowed_iovec_slices<'a, M>(
+    memory: &'a M,
+    iovecs: &[LinuxIovec],
+) -> Result<Option<Vec<IoSlice<'a>>>, LinuxErrno>
+where
+    M: RuntimeMemoryAccess,
+{
+    let mut slices = Vec::with_capacity(iovecs.len());
+    for iovec in iovecs {
+        let len = usize::try_from(iovec.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+        let Some(bytes) = memory
+            .borrowed_bytes(iovec.iov_base, len)
+            .map_err(memory_errno)?
+        else {
+            return Ok(None);
+        };
+        slices.push(IoSlice::new(bytes));
+    }
+    Ok(Some(slices))
+}
+
 impl<M> RuntimeFileSystem<M>
 where
-    M: GuestMemoryAccess,
+    M: RuntimeMemoryAccess,
 {
     fn sys_openat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let dirfd = arg_i32(request, 0);
@@ -579,8 +651,19 @@ where
         let fd = arg_i32(request, 0);
         let addr = arg(request, 1);
         let len = usize_arg(request, 2)?;
+        let socket_id = self.socket_id_for_fd_or_none(fd)?;
+        if let Ok(Some(buffer)) = self.memory.borrowed_bytes_mut(addr, len) {
+            let count = if let Some(socket_id) = socket_id {
+                self.sockets
+                    .recv_connected(socket_id, buffer)
+                    .map_err(net_errno)?
+            } else {
+                self.vfs.read(fd, buffer).map_err(vfs_errno)?
+            };
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
-        let count = if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+        let count = if let Some(socket_id) = socket_id {
             self.sockets
                 .recv_connected(socket_id, &mut buffer)
                 .map_err(net_errno)?
@@ -597,11 +680,31 @@ where
         let fd = arg_i32(request, 0);
         let addr = arg(request, 1);
         let len = usize_arg(request, 2)?;
+        if let Some(buffer) = self
+            .memory
+            .borrowed_bytes(addr, len)
+            .map_err(memory_errno)?
+        {
+            let socket_id = match self.vfs.socket_id_for_fd(fd) {
+                Ok(raw) => SocketId::new(raw),
+                Err(VfsError::NotSocket) => None,
+                Err(error) => return Err(vfs_errno(error)),
+            };
+            let count = if let Some(socket_id) = socket_id {
+                self.sockets
+                    .send_connected(socket_id, buffer)
+                    .map_err(net_errno)?
+            } else {
+                self.vfs.write(fd, buffer).map_err(vfs_errno)?
+            };
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
         self.memory
             .read_bytes(addr, &mut buffer)
             .map_err(memory_errno)?;
-        let count = if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+        let socket_id = self.socket_id_for_fd_or_none(fd)?;
+        let count = if let Some(socket_id) = socket_id {
             self.sockets
                 .send_connected(socket_id, &buffer)
                 .map_err(net_errno)?
@@ -625,6 +728,10 @@ where
             return Err(LinuxErrno::EINVAL);
         }
 
+        if let Ok(Some(buffer)) = self.memory.borrowed_bytes_mut(addr, len) {
+            let count = self.vfs.pread(fd, offset, buffer).map_err(vfs_errno)?;
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
         let count = self.vfs.pread(fd, offset, &mut buffer).map_err(vfs_errno)?;
         self.memory
@@ -639,11 +746,30 @@ where
         if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
             return self.recv_connected_into_iovecs(socket_id, &iov);
         }
-        if self
+        let regular_fast_path = self
             .vfs
             .can_regular_readv_fast_path(fd)
-            .map_err(vfs_errno)?
-        {
+            .map_err(vfs_errno)?;
+        if iovecs_are_borrowable_mut(&mut self.memory, &iov) {
+            let mut total = 0u64;
+            for item in iov {
+                let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                let count = {
+                    let buffer = self
+                        .memory
+                        .borrowed_bytes_mut(item.iov_base, len)
+                        .map_err(memory_errno)?
+                        .expect("iovec borrowability was preflighted");
+                    self.vfs.read(fd, buffer).map_err(vfs_errno)?
+                };
+                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+                if count < len {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        if regular_fast_path {
             let mut buffers = iovec_output_buffers(&iov)?;
             let count = self
                 .vfs
@@ -674,6 +800,13 @@ where
         let fd = arg_i32(request, 0);
         let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
         if let Some(socket_id) = self.socket_id_for_fd_or_none(fd)? {
+            if let Some(slices) = borrowed_iovec_slices(&self.memory, &iov)? {
+                let count = self
+                    .sockets
+                    .send_connected_vectored(socket_id, &slices)
+                    .map_err(net_errno)?;
+                return Ok(count as u64);
+            }
             let buffers = self.read_iovec_buffers(&iov)?;
             let slices = io_slices(&buffers);
             let count = self
@@ -682,11 +815,30 @@ where
                 .map_err(net_errno)?;
             return Ok(count as u64);
         }
-        if self
+        let regular_fast_path = self
             .vfs
             .can_regular_writev_fast_path(fd)
-            .map_err(vfs_errno)?
-        {
+            .map_err(vfs_errno)?;
+        if iovecs_are_borrowable(&self.memory, &iov) {
+            let mut total = 0u64;
+            for item in iov {
+                let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+                let count = {
+                    let buffer = self
+                        .memory
+                        .borrowed_bytes(item.iov_base, len)
+                        .map_err(memory_errno)?
+                        .expect("iovec borrowability was preflighted");
+                    self.vfs.write(fd, buffer).map_err(vfs_errno)?
+                };
+                total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+                if count < len {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        if regular_fast_path {
             let buffers = self.read_iovec_buffers(&iov)?;
             let count = self
                 .vfs
@@ -858,6 +1010,10 @@ where
     fn sys_readlink(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 0))?;
         let len = usize_arg(request, 2)?;
+        if let Ok(Some(buffer)) = self.memory.borrowed_bytes_mut(arg(request, 1), len) {
+            let count = self.vfs.readlink(&path, buffer).map_err(vfs_errno)?;
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
         let count = self.vfs.readlink(&path, &mut buffer).map_err(vfs_errno)?;
         self.memory
@@ -869,6 +1025,13 @@ where
     fn sys_readlinkat(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let path = self.read_path(arg(request, 1))?;
         let len = usize_arg(request, 3)?;
+        if let Ok(Some(buffer)) = self.memory.borrowed_bytes_mut(arg(request, 2), len) {
+            let count = self
+                .vfs
+                .readlinkat(arg_i32(request, 0), &path, buffer)
+                .map_err(vfs_errno)?;
+            return Ok(count as u64);
+        }
         let mut buffer = vec![0; len];
         let count = self
             .vfs

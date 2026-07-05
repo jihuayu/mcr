@@ -110,6 +110,8 @@ impl GuestMemoryAccess for TestMemory {
     }
 }
 
+impl RuntimeMemoryAccess for TestMemory {}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TestSocketTransport {
     state: Rc<RefCell<TestSocketState>>,

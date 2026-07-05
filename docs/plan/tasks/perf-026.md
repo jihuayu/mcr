@@ -1,7 +1,7 @@
 ---
 id: perf-026
 scope: syscall-performance
-status: ready
+status: done
 depends-on: [arch-001]
 ---
 
@@ -39,6 +39,12 @@ cargo test -p mcr-vfs perf_baseline -- --ignored --nocapture
 
 ## Notes
 
+- Implemented in `mcr-memory` with safe direct slice APIs that return
+  borrowed host slices for single-VMA ranges and `None` for cross-VMA ranges.
+- Runtime file and socket read/write paths now try the borrowed-slice path first
+  on contiguous guest ranges and retain the existing Vec copy path as fallback.
+- Guest C-string reads in `GuestMemory` now scan by readable VMA chunks instead
+  of issuing one guest memory lookup per byte.
 - Today `sys_read`, `sys_write`, `sys_pread64`, `sys_readv`, `sys_writev`, and
   the readlink paths allocate `vec![0; len]` and copy
   guest -> Vec -> backend -> Vec -> guest on every call

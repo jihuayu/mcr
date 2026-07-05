@@ -18,6 +18,17 @@ impl crate::GuestMemoryAccess for GuestMemory {
         self.write(addr, buffer)
             .map_err(|_| crate::GuestMemoryAccessError::Fault)
     }
+
+    fn read_c_string(
+        &self,
+        addr: u64,
+        max_len: usize,
+    ) -> Result<String, crate::GuestMemoryAccessError> {
+        let bytes = self
+            .read_c_string_bytes(addr, max_len)
+            .map_err(|_| crate::GuestMemoryAccessError::Fault)?;
+        String::from_utf8(bytes).map_err(|_| crate::GuestMemoryAccessError::Fault)
+    }
 }
 
 impl mcr_jit::GuestMemoryOperandAccess for GuestMemory {
