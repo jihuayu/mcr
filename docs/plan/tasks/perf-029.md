@@ -1,7 +1,7 @@
 ---
 id: perf-029
 scope: syscall-performance
-status: ready
+status: done
 depends-on: [perf-025]
 ---
 
@@ -59,5 +59,7 @@ cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
   `syscall_descriptor_by_number` now direct-indexes a static descriptor index
   built from `SYSCALL_DISPATCH_TABLE`, and Windows native execution installs
   the VEH once per process while retaining the active-thread/state filter.
-  Runtime epoll interest-list caching and poll/select batching remain in
-  scope for a later checkpoint.
+- Runtime epoll instances now cache their cloned watch list and invalidate it
+  only on `epoll_ctl` mutations, removing the per-`epoll_wait` map clone.
+- Socket poll/select batching remains a follow-up below the `mcr-net`
+  transport boundary because the current trait exposes per-handle polling.

@@ -464,31 +464,21 @@ impl RuntimeSubsystems {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
                 validate_epoll_events(event.events)?;
                 let instance = self.events.epolls.instance_mut(epoll_id)?;
-                if instance.watches.contains_key(&fd) {
-                    return Err(LinuxErrno::EEXIST);
-                }
-                instance.watches.insert(
+                instance.insert_watch(EpollWatch {
                     fd,
-                    EpollWatch {
-                        fd,
-                        events: event.events,
-                        data: event.data,
-                    },
-                );
+                    events: event.events,
+                    data: event.data,
+                })?;
             }
             LINUX_EPOLL_CTL_MOD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
                 validate_epoll_events(event.events)?;
                 let instance = self.events.epolls.instance_mut(epoll_id)?;
-                let watch = instance.watches.get_mut(&fd).ok_or(LinuxErrno::ENOENT)?;
-                watch.events = event.events;
-                watch.data = event.data;
+                instance.update_watch(fd, event.events, event.data)?;
             }
             LINUX_EPOLL_CTL_DEL => {
                 let instance = self.events.epolls.instance_mut(epoll_id)?;
-                if instance.watches.remove(&fd).is_none() {
-                    return Err(LinuxErrno::ENOENT);
-                }
+                instance.remove_watch(fd)?;
             }
             _ => return Err(LinuxErrno::EINVAL),
         }
@@ -507,14 +497,7 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
         let epoll_id = self.files.vfs().epoll_id_for_fd(epfd).map_err(vfs_errno)?;
-        let watches = self
-            .events
-            .epolls
-            .instance(epoll_id)?
-            .watches
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let watches = self.events.epolls.cached_watches(epoll_id)?;
 
         let mut ready = self.epoll_ready_events(&watches, maxevents, Some(Duration::ZERO))?;
         if ready.is_empty() && !matches!(timeout, Some(duration) if duration.is_zero()) {

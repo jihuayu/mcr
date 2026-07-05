@@ -165,6 +165,59 @@ pub(crate) struct EpollWatch {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EpollInstance {
     pub(crate) watches: BTreeMap<Fd, EpollWatch>,
+    cached_watches: Option<Arc<[EpollWatch]>>,
+    watch_generation: u64,
+    cached_watch_generation: u64,
+}
+
+impl EpollInstance {
+    pub(crate) fn insert_watch(&mut self, watch: EpollWatch) -> Result<(), LinuxErrno> {
+        if self.watches.contains_key(&watch.fd) {
+            return Err(LinuxErrno::EEXIST);
+        }
+        self.watches.insert(watch.fd, watch);
+        self.bump_watch_generation();
+        Ok(())
+    }
+
+    pub(crate) fn update_watch(
+        &mut self,
+        fd: Fd,
+        events: u32,
+        data: u64,
+    ) -> Result<(), LinuxErrno> {
+        let watch = self.watches.get_mut(&fd).ok_or(LinuxErrno::ENOENT)?;
+        watch.events = events;
+        watch.data = data;
+        self.bump_watch_generation();
+        Ok(())
+    }
+
+    pub(crate) fn remove_watch(&mut self, fd: Fd) -> Result<(), LinuxErrno> {
+        if self.watches.remove(&fd).is_none() {
+            return Err(LinuxErrno::ENOENT);
+        }
+        self.bump_watch_generation();
+        Ok(())
+    }
+
+    pub(crate) fn cached_watches(&mut self) -> Arc<[EpollWatch]> {
+        if self.cached_watch_generation != self.watch_generation {
+            self.cached_watches = None;
+        }
+        if let Some(watches) = self.cached_watches.as_ref() {
+            return watches.clone();
+        }
+        let watches: Arc<[EpollWatch]> = self.watches.values().cloned().collect::<Vec<_>>().into();
+        self.cached_watch_generation = self.watch_generation;
+        self.cached_watches = Some(watches.clone());
+        watches
+    }
+
+    fn bump_watch_generation(&mut self) {
+        self.watch_generation = self.watch_generation.wrapping_add(1);
+        self.cached_watches = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -185,12 +238,12 @@ impl EpollRegistry {
         self.instances.remove(&id);
     }
 
-    pub(crate) fn instance(&self, id: u64) -> Result<&EpollInstance, LinuxErrno> {
-        self.instances.get(&id).ok_or(LinuxErrno::EBADF)
-    }
-
     pub(crate) fn instance_mut(&mut self, id: u64) -> Result<&mut EpollInstance, LinuxErrno> {
         self.instances.get_mut(&id).ok_or(LinuxErrno::EBADF)
+    }
+
+    pub(crate) fn cached_watches(&mut self, id: u64) -> Result<Arc<[EpollWatch]>, LinuxErrno> {
+        Ok(self.instance_mut(id)?.cached_watches())
     }
 }
 
