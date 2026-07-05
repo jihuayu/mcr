@@ -4096,7 +4096,27 @@ struct ExecutableNativePatches {
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FsRelativePatch {
-    original: [u8; 9],
+    original: [u8; FS_RELATIVE_PATCH_MAX_LEN],
+    len: u8,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl FsRelativePatch {
+    fn new(original: &[u8]) -> Option<Self> {
+        if original.is_empty() || original.len() > FS_RELATIVE_PATCH_MAX_LEN {
+            return None;
+        }
+        let mut bytes = [0; FS_RELATIVE_PATCH_MAX_LEN];
+        bytes[..original.len()].copy_from_slice(original);
+        Some(Self {
+            original: bytes,
+            len: original.len() as u8,
+        })
+    }
+
+    fn original_bytes(&self) -> &[u8] {
+        &self.original[..self.len as usize]
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -4267,12 +4287,17 @@ const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-const NATIVE_PATCH_CACHE_VERSION: u32 = 3;
+const NATIVE_PATCH_CACHE_VERSION: u32 = 5;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
 const MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+const FS_RELATIVE_PATCH_MAX_LEN: usize = 10;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -4509,7 +4534,8 @@ fn encode_native_patch_metadata(
         push_cache_u32(&mut bytes, metadata.fs_relative_patches.len() as u32);
         for (address, patch) in &metadata.fs_relative_patches {
             push_cache_u64(&mut bytes, cache_relative_offset(*address, base)?);
-            bytes.extend_from_slice(&patch.original);
+            bytes.push(patch.len);
+            bytes.extend_from_slice(patch.original_bytes());
         }
     }
     #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -4562,12 +4588,23 @@ fn decode_native_patch_metadata(
     let fs_count = reader.read_u32()?;
     for _ in 0..fs_count {
         let address = cache_absolute_address(reader.read_u64()?, base)?;
-        let original = reader.read_array::<9>()?;
+        let len = usize::from(reader.read_u8()?);
+        if len == 0 || len > FS_RELATIVE_PATCH_MAX_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid native fs-relative patch length",
+            ));
+        }
+        let original = reader.read_slice(len)?;
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
-            metadata
-                .fs_relative_patches
-                .insert(address, FsRelativePatch { original });
+            let patch = FsRelativePatch::new(original).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid native fs-relative patch bytes",
+                )
+            })?;
+            metadata.fs_relative_patches.insert(address, patch);
         }
         #[cfg(not(all(windows, target_arch = "x86_64")))]
         {
@@ -4634,6 +4671,10 @@ impl<'a> NativePatchMetadataReader<'a> {
 
     fn read_u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        Ok(self.read_array::<1>()?[0])
     }
 
     fn read_u64(&mut self) -> io::Result<u64> {
@@ -5003,12 +5044,11 @@ fn apply_fs_relative_patch_entries(
         "runtime fs-relative-patch apply start patches={} fs_base=0x{fs_base:016x}",
         patch_count
     ));
-    memory.patch_code_fixed(patches.into_iter().map(|(address, patch)| {
-        (
-            address,
-            fs_relative_replacement(patch.original, fs_base).unwrap_or(patch.original),
-        )
-    }))?;
+    for (address, patch) in patches {
+        let replacement = fs_relative_replacement(patch, fs_base)
+            .unwrap_or_else(|| patch.original_bytes().to_vec());
+        memory.patch_code(address, &replacement)?;
+    }
     host_step_trace(format_args!(
         "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
         patch_count,
@@ -5051,7 +5091,7 @@ fn fs_relative_patch_sites(
         if let Some((prefix_len, original)) = fs_relative_original(&bytes[offset..]) {
             patches.push(FsRelativePatchSite {
                 address: instruction.rip + prefix_len as u64,
-                patch: FsRelativePatch { original },
+                patch: original,
                 materialized: false,
             });
         } else if previous_fs_base != 0
@@ -5060,7 +5100,7 @@ fn fs_relative_patch_sites(
         {
             patches.push(FsRelativePatchSite {
                 address: instruction.rip + prefix_len as u64,
-                patch: FsRelativePatch { original },
+                patch: original,
                 materialized: true,
             });
         }
@@ -5070,57 +5110,91 @@ fn fs_relative_patch_sites(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_original(bytes: &[u8]) -> Option<(usize, [u8; 9])> {
+fn fs_relative_original(bytes: &[u8]) -> Option<(usize, FsRelativePatch)> {
     let prefix_len = fs_relative_patch_prefix_len(bytes)?;
     let bytes = &bytes[prefix_len..];
-    if bytes.len() < 9
-        || bytes[0] != 0x64
-        || bytes[1] & 0xf8 != 0x48
-        || !matches!(bytes[2], 0x8b | 0x2b)
-        || bytes[3] & 0xc7 != 0x04
-        || bytes[4] != 0x25
-    {
+    if bytes.len() < 9 || bytes[0] != 0x64 {
+        return None;
+    }
+    let shape = fs_relative_patch_body_shape(&bytes[1..])?;
+    let len = 1 + shape.body_len;
+    if bytes.len() < len {
         return None;
     }
 
-    Some((
-        prefix_len,
-        bytes[..9].try_into().expect("slice length checked"),
-    ))
+    Some((prefix_len, FsRelativePatch::new(&bytes[..len])?))
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_original_from_replacement(bytes: &[u8], fs_base: u64) -> Option<(usize, [u8; 9])> {
-    let prefix_len = fs_relative_patch_prefix_len(bytes)?;
+fn fs_relative_original_from_replacement(
+    bytes: &[u8],
+    fs_base: u64,
+) -> Option<(usize, FsRelativePatch)> {
+    let prefix_len = fs_relative_replacement_prefix_len(bytes);
     let bytes = &bytes[prefix_len..];
-    if fs_base == 0
-        || bytes.len() < 9
-        || bytes[0] & 0xf8 != 0x48
-        || !matches!(bytes[1], 0x8b | 0x2b)
-        || bytes[2] & 0xc7 != 0x04
-        || bytes[3] != 0x25
-        || bytes[8] != 0x90
-    {
+    if fs_base == 0 {
         return None;
     }
 
-    let absolute = u32::from_le_bytes(bytes[4..8].try_into().expect("slice length checked"));
+    let shape = fs_relative_patch_body_shape(bytes)?;
+    if bytes.len() <= shape.body_len || bytes[shape.body_len] != 0x90 {
+        return None;
+    }
+    let displacement_offset = shape.displacement_offset;
+    let displacement_end = displacement_offset + 4;
+    let absolute = u32::from_le_bytes(
+        bytes[displacement_offset..displacement_end]
+            .try_into()
+            .expect("slice length checked"),
+    );
     let displacement = i64::from(absolute) - fs_base as i64;
     let displacement = i32::try_from(displacement).ok()?.to_le_bytes();
-    Some((
-        prefix_len,
-        [
-            0x64,
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-            displacement[0],
-            displacement[1],
-            displacement[2],
-            displacement[3],
-        ],
-    ))
+    let mut original = Vec::with_capacity(1 + shape.body_len);
+    original.push(0x64);
+    original.extend_from_slice(&bytes[..displacement_offset]);
+    original.extend_from_slice(&displacement);
+    original.extend_from_slice(&bytes[displacement_end..shape.body_len]);
+    Some((prefix_len, FsRelativePatch::new(&original)?))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_replacement_prefix_len(bytes: &[u8]) -> usize {
+    bytes.iter().take_while(|&&byte| byte == 0x66).count()
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct FsRelativePatchBodyShape {
+    displacement_offset: usize,
+    body_len: usize,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_patch_body_shape(bytes: &[u8]) -> Option<FsRelativePatchBodyShape> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    if (bytes[0] & 0xf8 == 0x48 && matches!(bytes[1], 0x8b | 0x2b))
+        || (bytes[0] == 0x0f && matches!(bytes[1], 0xb6 | 0xb7))
+    {
+        (bytes[2] & 0xc7 == 0x04 && bytes[3] == 0x25).then_some(FsRelativePatchBodyShape {
+            displacement_offset: 4,
+            body_len: 8,
+        })
+    } else if bytes.len() >= 9
+        && bytes[0] & 0xf8 == 0x48
+        && bytes[1] == 0x83
+        && bytes[2] & 0xc7 == 0x04
+        && bytes[2] & 0x38 == 0x38
+        && bytes[3] == 0x25
+    {
+        Some(FsRelativePatchBodyShape {
+            displacement_offset: 4,
+            body_len: 9,
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -5130,12 +5204,23 @@ fn fs_relative_patch_prefix_len(bytes: &[u8]) -> Option<usize> {
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_replacement(original: [u8; 9], fs_base: u64) -> Option<[u8; 9]> {
+fn fs_relative_replacement(patch: FsRelativePatch, fs_base: u64) -> Option<Vec<u8>> {
     if fs_base == 0 {
         return None;
     }
+    let original = patch.original_bytes();
+    if original.first().copied() != Some(0x64) {
+        return None;
+    }
+    let shape = fs_relative_patch_body_shape(&original[1..])?;
+    let displacement_offset = 1 + shape.displacement_offset;
+    let displacement_end = displacement_offset + 4;
 
-    let displacement = i32::from_le_bytes([original[5], original[6], original[7], original[8]]);
+    let displacement = i32::from_le_bytes(
+        original[displacement_offset..displacement_end]
+            .try_into()
+            .expect("slice length checked"),
+    );
     let absolute = if displacement >= 0 {
         fs_base.checked_add(displacement as u64)?
     } else {
@@ -5146,17 +5231,12 @@ fn fs_relative_replacement(original: [u8; 9], fs_base: u64) -> Option<[u8; 9]> {
     }
 
     let absolute = (absolute as u32).to_le_bytes();
-    Some([
-        original[1],
-        original[2],
-        original[3],
-        original[4],
-        absolute[0],
-        absolute[1],
-        absolute[2],
-        absolute[3],
-        0x90,
-    ])
+    let mut replacement = Vec::with_capacity(original.len());
+    replacement.extend_from_slice(&original[1..displacement_offset]);
+    replacement.extend_from_slice(&absolute);
+    replacement.extend_from_slice(&original[displacement_end..]);
+    replacement.resize(original.len(), 0x90);
+    Some(replacement)
 }
 
 #[cfg(any(
@@ -17145,9 +17225,7 @@ mod tests {
             #[cfg(all(windows, target_arch = "x86_64"))]
             fs_relative_patches: BTreeMap::from([(
                 0x401200,
-                FsRelativePatch {
-                    original: [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0],
-                },
+                FsRelativePatch::new(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]).unwrap(),
             )]),
         };
 
@@ -17166,9 +17244,7 @@ mod tests {
             loaded.fs_relative_patches,
             BTreeMap::from([(
                 0x601200,
-                FsRelativePatch {
-                    original: [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0],
-                },
+                FsRelativePatch::new(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]).unwrap(),
             )])
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -17368,6 +17444,63 @@ mod tests {
             guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
             [0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x10, 0x70, 0x90]
         );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_movzx_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x0f, 0xb6, 0x04, 0x25, 0x58, 0xfe, 0xff, 0xff];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x0f, 0xb6, 0x04, 0x25, 0x58, 0xfe, 0xff, 0x6f, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+        assert_eq!(
+            fs_relative_original_from_replacement(
+                &[0x0f, 0xb6, 0x04, 0x25, 0x58, 0xfe, 0xff, 0x6f, 0x90],
+                0x7000_0000,
+            )
+            .unwrap()
+            .1,
+            FsRelativePatch::new(&fs_load).unwrap()
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_cmp_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_cmp = [0x64, 0x48, 0x83, 0x3c, 0x25, 0xe0, 0xff, 0xff, 0xff, 0x00];
+        let mut code = fs_cmp.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_cmp.len()),
+            [0x48, 0x83, 0x3c, 0x25, 0xe0, 0xff, 0xff, 0x6f, 0x00, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x40100a, 2), [0xcc, 0x90]);
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
