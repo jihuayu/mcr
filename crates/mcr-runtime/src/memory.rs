@@ -16,6 +16,10 @@ pub const GUEST_PAGE_SIZE: u64 = 4096;
 pub const MIN_GUEST_ADDRESS: u64 = GUEST_PAGE_SIZE;
 pub const DEFAULT_MMAP_BASE: u64 = 0x0000_7000_0000_0000;
 pub const GUEST_ADDRESS_SPACE_END: u64 = 0x0000_8000_0000_0000;
+#[cfg(windows)]
+const HOST_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+#[cfg(not(windows))]
+const HOST_ALLOCATION_GRANULARITY: u64 = GUEST_PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GuestMemoryProtection {
@@ -309,18 +313,18 @@ impl GuestMemory {
     }
 
     pub fn try_clone_runtime(&self) -> Result<Self, GuestMemoryError> {
-        self.try_clone_runtime_with_allocator(true, |allocation| {
-            HostMemory::allocate(allocation.memory.len(), MemoryProtection::ReadWrite)
+        self.try_clone_runtime_with_allocator(true, |allocation, protection| {
+            HostMemory::allocate(allocation.memory.len(), protection)
                 .map_err(GuestMemoryError::Host)
         })
     }
 
     pub fn try_clone_runtime_at_guest_addresses(&self) -> Result<Self, GuestMemoryError> {
-        self.try_clone_runtime_with_allocator(false, |allocation| {
+        self.try_clone_runtime_with_allocator(false, |allocation, protection| {
             allocate_guest_host_memory_at(
                 allocation.guest_start,
                 allocation.memory.len(),
-                MemoryProtection::ReadWrite,
+                protection,
                 HostAddressMode::FixedGuest,
             )
         })
@@ -351,7 +355,10 @@ impl GuestMemory {
     fn try_clone_runtime_with_allocator(
         &self,
         allow_readonly_sharing: bool,
-        mut allocate: impl FnMut(&GuestAllocation) -> Result<HostMemory, GuestMemoryError>,
+        mut allocate: impl FnMut(
+            &GuestAllocation,
+            MemoryProtection,
+        ) -> Result<HostMemory, GuestMemoryError>,
     ) -> Result<Self, GuestMemoryError> {
         let mut allocations = BTreeMap::new();
         for (allocation_id, allocation) in &self.allocations {
@@ -366,13 +373,7 @@ impl GuestMemory {
                 continue;
             }
             let ranges = self.allocation_protection_ranges(*allocation_id)?;
-            let mut source_guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
-            let mut memory = allocate(allocation)?;
-            memory
-                .as_mut_slice()
-                .copy_from_slice(allocation.memory.as_slice());
-            source_guard.restore()?;
-            apply_allocation_protections(&memory, &ranges)?;
+            let memory = clone_allocation_memory(allocation, &ranges, &mut allocate)?;
             allocations.insert(
                 *allocation_id,
                 GuestAllocation {
@@ -412,21 +413,15 @@ impl GuestMemory {
         }
 
         let ranges = self.allocation_protection_ranges(allocation_id)?;
-        let (guest_start, len, bytes) = {
-            let mut guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
-            let bytes = allocation.memory.as_slice().to_vec();
-            guard.restore()?;
-            (allocation.guest_start, allocation.memory.len(), bytes)
-        };
-
-        let mut memory = allocate_guest_host_memory_at(
-            guest_start,
-            len,
-            MemoryProtection::ReadWrite,
-            self.host_address_mode,
-        )?;
-        memory.as_mut_slice().copy_from_slice(&bytes);
-        apply_allocation_protections(&memory, &ranges)?;
+        let memory =
+            clone_allocation_memory(allocation, &ranges, &mut |allocation, protection| {
+                allocate_guest_host_memory_at(
+                    allocation.guest_start,
+                    allocation.memory.len(),
+                    protection,
+                    self.host_address_mode,
+                )
+            })?;
         self.allocations
             .get_mut(&allocation_id)
             .expect("allocation existence was checked")
@@ -702,23 +697,27 @@ impl GuestMemory {
             .cloned()
             .ok_or(GuestMemoryError::NotMapped)?;
         let ranges = self.allocation_protection_ranges(vma.allocation_id)?;
+        let allocation_offset = usize::try_from(vma.allocation_offset + (address - vma.start))
+            .map_err(|_| GuestMemoryError::RegionTooLarge)?;
         let allocation = self
             .allocations
             .get(&vma.allocation_id)
             .expect("VMA references live allocation");
         allocation
             .memory
-            .protect(MemoryProtection::ReadWrite)
+            .protect_range(allocation_offset, bytes.len(), MemoryProtection::ReadWrite)
             .map_err(GuestMemoryError::Host)?;
-        let allocation_offset = usize::try_from(vma.allocation_offset + (address - vma.start))
-            .map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        let patch_end = allocation_offset
+        allocation_offset
             .checked_add(bytes.len())
             .ok_or(GuestMemoryError::RegionTooLarge)?;
-        let old = allocation.memory.as_slice()[allocation_offset..patch_end].to_vec();
+        let mut old = vec![0; bytes.len()];
+        allocation
+            .memory
+            .copy_to_slice(allocation_offset, &mut old)
+            .map_err(GuestMemoryError::Host)?;
         self.allocation_memory_mut(vma.allocation_id)?
-            .as_mut_slice()[allocation_offset..patch_end]
-            .copy_from_slice(bytes);
+            .copy_from_slice(allocation_offset, bytes)
+            .map_err(GuestMemoryError::Host)?;
         let allocation = self
             .allocations
             .get(&vma.allocation_id)
@@ -774,22 +773,24 @@ impl GuestMemory {
 
         for (allocation_id, patches) in planned {
             let ranges = self.allocation_protection_ranges(allocation_id)?;
-            let allocation = self
-                .allocations
-                .get(&allocation_id)
-                .expect("VMA references live allocation");
-            allocation
-                .memory
-                .protect(MemoryProtection::ReadWrite)
-                .map_err(GuestMemoryError::Host)?;
             for patch in patches {
-                let patch_end = patch
+                patch
                     .allocation_offset
                     .checked_add(N)
                     .ok_or(GuestMemoryError::RegionTooLarge)?;
-                self.allocation_memory_mut(allocation_id)?.as_mut_slice()
-                    [patch.allocation_offset..patch_end]
-                    .copy_from_slice(&patch.bytes);
+                {
+                    let allocation = self
+                        .allocations
+                        .get(&allocation_id)
+                        .expect("VMA references live allocation");
+                    allocation
+                        .memory
+                        .protect_range(patch.allocation_offset, N, MemoryProtection::ReadWrite)
+                        .map_err(GuestMemoryError::Host)?;
+                }
+                self.allocation_memory_mut(allocation_id)?
+                    .copy_from_slice(patch.allocation_offset, &patch.bytes)
+                    .map_err(GuestMemoryError::Host)?;
             }
             let allocation = self
                 .allocations
@@ -861,21 +862,21 @@ impl GuestMemory {
         let len = usize::try_from(vma.len()).map_err(|_| GuestMemoryError::RegionTooLarge)?;
         let offset =
             usize::try_from(vma.allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        let bytes = {
-            let ranges = self.allocation_protection_ranges(vma.allocation_id)?;
-            let mut guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
-            let bytes = allocation.memory.as_slice()[offset..offset + len].to_vec();
-            guard.restore()?;
-            bytes
-        };
 
         let mut memory = allocate_guest_host_memory_at(
             vma.start,
             len,
-            MemoryProtection::ReadWrite,
+            MemoryProtection::NoAccess,
             self.host_address_mode,
         )?;
-        memory.as_mut_slice().copy_from_slice(&bytes);
+        if vma.protection.read || vma.protection.write || vma.protection.execute {
+            memory
+                .protect_range(0, len, MemoryProtection::ReadWrite)
+                .map_err(GuestMemoryError::Host)?;
+            memory
+                .copy_from_memory(0, &allocation.memory, offset, len)
+                .map_err(GuestMemoryError::Host)?;
+        }
         memory
             .protect(vma.protection.to_host())
             .map_err(GuestMemoryError::Host)?;
@@ -948,6 +949,7 @@ impl GuestMemory {
         &mut self,
         start: u64,
         length: u64,
+        initial_protection: MemoryProtection,
     ) -> Result<(u64, u64), GuestMemoryError> {
         let end = checked_raw_range(start, length)?;
         if let Some((allocation_id, allocation)) = self
@@ -998,7 +1000,7 @@ impl GuestMemory {
         let memory = allocate_guest_host_memory_at(
             guest_start,
             len,
-            MemoryProtection::ReadWrite,
+            initial_protection,
             self.host_address_mode,
         )?;
         let allocation_id = self.next_allocation_id;
@@ -1103,11 +1105,14 @@ impl GuestMemory {
             return Err(GuestMemoryError::AddressInUse);
         }
 
-        let (allocation_id, allocation_offset) = self.ensure_host_allocation(start, length)?;
+        let (allocation_id, allocation_offset) =
+            self.ensure_host_allocation(start, length, protection.to_host())?;
         let offset =
             usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
         let len = usize::try_from(length).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        self.zero_allocation_range(allocation_id, allocation_offset, len)?;
+        if protection.read || protection.write || protection.execute {
+            self.zero_allocation_range(allocation_id, allocation_offset, len)?;
+        }
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -1138,7 +1143,7 @@ impl GuestMemory {
     ) -> Result<(), GuestMemoryError> {
         let offset =
             usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        let end = offset
+        offset
             .checked_add(len)
             .ok_or(GuestMemoryError::RegionTooLarge)?;
         let ranges = self.allocation_protection_ranges(allocation_id)?;
@@ -1150,11 +1155,13 @@ impl GuestMemory {
                 .expect("new mapping references live allocation");
             allocation
                 .memory
-                .protect(MemoryProtection::ReadWrite)
+                .protect_range(offset, len, MemoryProtection::ReadWrite)
                 .map_err(GuestMemoryError::Host)?;
         }
         {
-            self.allocation_memory_mut(allocation_id)?.as_mut_slice()[offset..end].fill(0);
+            self.allocation_memory_mut(allocation_id)?
+                .fill_range(offset, len, 0)
+                .map_err(GuestMemoryError::Host)?;
         }
         let allocation = self
             .allocations
@@ -1179,12 +1186,14 @@ impl GuestMemory {
         if bytes.len() != len {
             return Err(GuestMemoryError::InvalidLength);
         }
-        let (allocation_id, allocation_offset) = self.ensure_host_allocation(start, length)?;
+        let (allocation_id, allocation_offset) =
+            self.ensure_host_allocation(start, length, MemoryProtection::ReadWrite)?;
         self.ensure_allocation_unique(allocation_id)?;
         let offset =
             usize::try_from(allocation_offset).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        self.allocation_memory_mut(allocation_id)?.as_mut_slice()[offset..offset + len]
-            .copy_from_slice(bytes);
+        self.allocation_memory_mut(allocation_id)?
+            .copy_from_slice(offset, bytes)
+            .map_err(GuestMemoryError::Host)?;
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -1223,6 +1232,7 @@ impl GuestMemory {
             mapped_end
                 .checked_sub(self.brk_base)
                 .ok_or(GuestMemoryError::InvalidAddress)?,
+            MemoryProtection::ReadWrite,
         )?;
         let zero_start = old_mapped_end.max(self.brk_base);
         if zero_start < mapped_end {
@@ -1320,7 +1330,7 @@ impl GuestMemory {
     }
 
     fn find_free_range(&self, hint: u64, length: u64) -> Result<u64, GuestMemoryError> {
-        let mut candidate = align_up(hint)?;
+        let mut candidate = align_up_to(hint, HOST_ALLOCATION_GRANULARITY)?;
         if candidate < MIN_GUEST_ADDRESS {
             candidate = MIN_GUEST_ADDRESS;
         }
@@ -1331,7 +1341,7 @@ impl GuestMemory {
                 return Ok(candidate);
             }
             if candidate < vma.end {
-                candidate = align_up(vma.end)?;
+                candidate = align_up_to(vma.end, HOST_ALLOCATION_GRANULARITY)?;
             }
         }
 
@@ -1435,12 +1445,16 @@ impl GuestMemory {
             let allocation = self
                 .allocations
                 .get(&vma.allocation_id)
-                .expect("VMA references live allocation");
+                .ok_or(GuestMemoryError::NotMapped)?;
             let allocation_offset = usize::try_from(vma.allocation_offset + (cursor - vma.start))
                 .map_err(|_| GuestMemoryError::RegionTooLarge)?;
-            destination[copied..copied + chunk_len].copy_from_slice(
-                &allocation.memory.as_slice()[allocation_offset..allocation_offset + chunk_len],
-            );
+            allocation
+                .memory
+                .copy_to_slice(
+                    allocation_offset,
+                    &mut destination[copied..copied + chunk_len],
+                )
+                .map_err(GuestMemoryError::Host)?;
             cursor += chunk_len as u64;
             copied += chunk_len;
         }
@@ -1466,8 +1480,8 @@ impl GuestMemory {
             let allocation_offset = usize::try_from(vma.allocation_offset + (cursor - vma.start))
                 .map_err(|_| GuestMemoryError::RegionTooLarge)?;
             self.allocation_memory_mut(vma.allocation_id)?
-                .as_mut_slice()[allocation_offset..allocation_offset + chunk_len]
-                .copy_from_slice(&bytes[copied..copied + chunk_len]);
+                .copy_from_slice(allocation_offset, &bytes[copied..copied + chunk_len])
+                .map_err(GuestMemoryError::Host)?;
             cursor += chunk_len as u64;
             copied += chunk_len;
         }
@@ -1492,6 +1506,30 @@ impl GuestMemory {
             })
             .collect()
     }
+}
+
+fn clone_allocation_memory(
+    allocation: &GuestAllocation,
+    ranges: &[AllocationProtectionRange],
+    allocate: &mut impl FnMut(
+        &GuestAllocation,
+        MemoryProtection,
+    ) -> Result<HostMemory, GuestMemoryError>,
+) -> Result<HostMemory, GuestMemoryError> {
+    let mut memory = allocate(allocation, MemoryProtection::NoAccess)?;
+    for range in ranges {
+        if !range.protection.read && !range.protection.write && !range.protection.execute {
+            continue;
+        }
+        memory
+            .protect_range(range.offset, range.len, MemoryProtection::ReadWrite)
+            .map_err(GuestMemoryError::Host)?;
+        memory
+            .copy_from_memory(range.offset, &allocation.memory, range.offset, range.len)
+            .map_err(GuestMemoryError::Host)?;
+    }
+    apply_allocation_protections(&memory, ranges)?;
+    Ok(memory)
 }
 
 fn allocate_guest_host_memory_at(
@@ -1533,11 +1571,6 @@ fn allocate_fixed_guest_host_memory(
 }
 
 fn host_allocation_range(start: u64, length: u64) -> Result<(u64, u64), GuestMemoryError> {
-    #[cfg(windows)]
-    const HOST_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
-    #[cfg(not(windows))]
-    const HOST_ALLOCATION_GRANULARITY: u64 = GUEST_PAGE_SIZE;
-
     let end = checked_raw_range(start, length)?;
     let guest_start = align_down_to(start, HOST_ALLOCATION_GRANULARITY);
     let guest_end = align_up_to(end, HOST_ALLOCATION_GRANULARITY)?;
@@ -1931,6 +1964,35 @@ mod tests {
         ));
 
         assert_eq!(overlap, Err(GuestMemoryError::AddressInUse));
+    }
+
+    #[test]
+    fn noaccess_reservation_can_be_remapped_and_written() {
+        let mut memory = memory();
+        let reserved = memory
+            .mmap(anonymous(0, 4 * GUEST_PAGE_SIZE, 0, 0))
+            .unwrap();
+        let mut buf = [0];
+
+        assert_eq!(
+            memory.read(reserved, &mut buf),
+            Err(GuestMemoryError::AccessDenied)
+        );
+
+        let mapped = memory
+            .mmap(anonymous(
+                reserved + GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_FIXED,
+            ))
+            .unwrap();
+
+        memory.write(mapped, b"ok").unwrap();
+        let mut out = [0; 2];
+        memory.read(mapped, &mut out).unwrap();
+
+        assert_eq!(out, *b"ok");
     }
 
     #[test]

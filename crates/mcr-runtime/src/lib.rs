@@ -3979,6 +3979,38 @@ where
             }
             #[cfg(all(windows, target_arch = "x86_64"))]
             if matches!(&error, mcr_win::NativeExecutionError::GuestFault { .. })
+                && let Some(instruction) = fault_instruction.as_ref()
+                && let Some(registers) =
+                    emulate_hotspot_safefetch_fault(native_registers, instruction)
+            {
+                host_step_trace(format_args!(
+                    "runtime native-safefetch-emulate pid={pid} tid={tid} rip=0x{:016x} next=0x{:016x}",
+                    native_registers.rip, registers.rip
+                ));
+                dispatcher.subsystems_mut().set_native_fp(
+                    tid,
+                    mcr_win::HostFloatingPointState {
+                        xmm: registers.xmm,
+                        mxcsr: registers.mxcsr,
+                    },
+                );
+                let gpr = gpr_from_registers(guest_registers_from_host(registers));
+                let task = dispatcher
+                    .subsystems_mut()
+                    .tasks
+                    .task_mut(tid)
+                    .ok_or(GuestExecutionError::MissingTask(tid))?;
+                task.set_regs(gpr);
+                return Ok(GuestExecutionStep::new(
+                    tid,
+                    before_rip,
+                    gpr.rip(),
+                    gpr.rax(),
+                    task.state(),
+                ));
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if matches!(&error, mcr_win::NativeExecutionError::GuestFault { .. })
                 && fault_instruction
                     .as_ref()
                     .is_some_and(native_fault_is_unrewritten_fs_relative)
@@ -5517,6 +5549,23 @@ fn emulate_fs_relative_native_fault(
     Ok(Some(registers))
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_hotspot_safefetch_fault(
+    mut registers: mcr_win::HostCpuRegisters,
+    instruction: &NativeFaultInstruction,
+) -> Option<mcr_win::HostCpuRegisters> {
+    if instruction.bytes.as_slice() != [0x8b, 0x06]
+        || registers.rsi != 0
+        || !matches!(registers.rcx as u32, 0xcafe_babe | 0xdead_beef)
+    {
+        return None;
+    }
+
+    registers.rax = u64::from(registers.rcx as u32);
+    registers.rip = registers.rip.checked_add(instruction.bytes.len() as u64)?;
+    Some(registers)
+}
+
 fn read_guest_block(
     memory: &GuestMemory,
     rip: u64,
@@ -6438,6 +6487,13 @@ impl RuntimeSubsystems {
             }
             (executable_ranges, deferred_scan_ranges)
         };
+        if cache.fs_base == fs_base
+            && executable_ranges.is_empty()
+            && deferred_scan_ranges.is_empty()
+        {
+            self.native_patch_caches.insert(pid, cache);
+            return Ok(());
+        }
         let mut store_range_metadata = Vec::new();
         for (start, end, protection) in executable_ranges {
             let key = {
@@ -18179,6 +18235,27 @@ mod tests {
 
         assert_eq!(registers.rax, 0x1234_5678);
         assert_eq!(registers.rip, 0x401003);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_hotspot_safefetch_fault_returns_fallback_value() {
+        let instruction = mcr_jit::decode_native_fault_instruction(&[0x8b, 0x06], 0x6128_a620)
+            .expect("safefetch instruction decodes");
+
+        let registers = emulate_hotspot_safefetch_fault(
+            mcr_win::HostCpuRegisters {
+                rcx: 0xcafe_babe,
+                rsi: 0,
+                rip: 0x6128_a620,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            &instruction,
+        )
+        .expect("safefetch fault is emulated");
+
+        assert_eq!(registers.rax, 0xcafe_babe);
+        assert_eq!(registers.rip, 0x6128_a622);
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

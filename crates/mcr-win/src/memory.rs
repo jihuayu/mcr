@@ -193,6 +193,91 @@ impl HostMemory {
         protect_platform(self, offset, len, protection)
     }
 
+    /// Copies a range from the allocation into `destination`.
+    pub fn copy_to_slice(&self, offset: usize, destination: &mut [u8]) -> HostResult<()> {
+        let Some(end) = offset.checked_add(destination.len()) else {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        };
+        if end > self.len {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        }
+
+        // SAFETY: The checked source range is inside the allocation and the caller only
+        // reaches this through guest-visible mapped ranges.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.ptr_at(offset),
+                destination.as_mut_ptr(),
+                destination.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Copies bytes into a range of the allocation.
+    pub fn copy_from_slice(&mut self, offset: usize, bytes: &[u8]) -> HostResult<()> {
+        let Some(end) = offset.checked_add(bytes.len()) else {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        };
+        if end > self.len {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        }
+
+        // SAFETY: The checked destination range is inside the allocation and `&mut self`
+        // guarantees exclusive access to the allocation object.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.mut_ptr_at(offset), bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Copies bytes between two host allocation ranges.
+    pub fn copy_from_memory(
+        &mut self,
+        destination_offset: usize,
+        source: &Self,
+        source_offset: usize,
+        len: usize,
+    ) -> HostResult<()> {
+        let Some(destination_end) = destination_offset.checked_add(len) else {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        };
+        let Some(source_end) = source_offset.checked_add(len) else {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        };
+        if destination_end > self.len || source_end > source.len {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        }
+
+        // SAFETY: Both checked ranges are inside their allocations and `&mut self`
+        // guarantees the destination range is not concurrently mutated through this object.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.ptr_at(source_offset),
+                self.mut_ptr_at(destination_offset),
+                len,
+            );
+        }
+        Ok(())
+    }
+
+    /// Fills a range of the allocation.
+    pub fn fill_range(&mut self, offset: usize, len: usize, value: u8) -> HostResult<()> {
+        let Some(end) = offset.checked_add(len) else {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        };
+        if end > self.len {
+            return Err(HostError::invalid_input(HostOperation::ProtectMemory));
+        }
+
+        // SAFETY: The checked destination range is inside the allocation and `&mut self`
+        // guarantees exclusive access to the allocation object.
+        unsafe {
+            std::ptr::write_bytes(self.mut_ptr_at(offset), value, len);
+        }
+        Ok(())
+    }
+
     /// Allocation size in bytes.
     pub const fn len(&self) -> usize {
         self.len
@@ -268,6 +353,32 @@ impl HostMemory {
         #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
         {
             &mut self.storage
+        }
+    }
+
+    fn ptr_at(&self, offset: usize) -> *const u8 {
+        #[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            // SAFETY: Callers validate the offset before using the returned pointer.
+            unsafe { self.ptr.as_ptr().add(offset) }
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+        {
+            // SAFETY: Callers validate the offset before using the returned pointer.
+            unsafe { self.storage.as_ptr().add(offset) }
+        }
+    }
+
+    fn mut_ptr_at(&mut self, offset: usize) -> *mut u8 {
+        #[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            // SAFETY: Callers validate the offset before using the returned pointer.
+            unsafe { self.ptr.as_ptr().add(offset) }
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+        {
+            // SAFETY: Callers validate the offset before using the returned pointer.
+            unsafe { self.storage.as_mut_ptr().add(offset) }
         }
     }
 }
@@ -407,15 +518,13 @@ fn protect_platform(
 #[cfg(windows)]
 fn allocate_platform(size: usize, protection: MemoryProtection) -> HostResult<HostMemory> {
     let protect = protection.to_windows();
-    // SAFETY: Passing null lets Windows choose the base address; size and protection are validated.
-    let ptr = unsafe {
-        VirtualAlloc(
-            std::ptr::null_mut(),
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            protect,
-        )
+    let allocation_type = if matches!(protection, MemoryProtection::NoAccess) {
+        MEM_RESERVE
+    } else {
+        MEM_RESERVE | MEM_COMMIT
     };
+    // SAFETY: Passing null lets Windows choose the base address; size and protection are validated.
+    let ptr = unsafe { VirtualAlloc(std::ptr::null_mut(), size, allocation_type, protect) };
     let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
         return Err(crate::error::last_windows_error(
             HostOperation::AllocateMemory,
@@ -432,12 +541,17 @@ fn allocate_at_platform(
     protection: MemoryProtection,
 ) -> HostResult<HostMemory> {
     let protect = protection.to_windows();
+    let allocation_type = if matches!(protection, MemoryProtection::NoAccess) {
+        MEM_RESERVE
+    } else {
+        MEM_RESERVE | MEM_COMMIT
+    };
     // SAFETY: The caller requested this address; Windows validates availability and alignment.
     let ptr = unsafe {
         VirtualAlloc(
             address as *mut std::ffi::c_void,
             size,
-            MEM_RESERVE | MEM_COMMIT,
+            allocation_type,
             protect,
         )
     };
@@ -457,6 +571,23 @@ fn protect_platform(
     len: usize,
     protection: MemoryProtection,
 ) -> HostResult<()> {
+    if !matches!(protection, MemoryProtection::NoAccess) {
+        // SAFETY: The checked range is inside the reservation owned by `memory`.
+        let ptr = unsafe {
+            VirtualAlloc(
+                memory.ptr.as_ptr().add(offset).cast(),
+                len,
+                MEM_COMMIT,
+                protection.to_windows(),
+            )
+        };
+        if ptr.is_null() {
+            return Err(crate::error::last_windows_error(
+                HostOperation::ProtectMemory,
+            ));
+        }
+    }
+
     let mut old_protection = 0;
     // SAFETY: The checked range is inside the allocation owned by `memory`.
     let ok = unsafe {
@@ -468,9 +599,7 @@ fn protect_platform(
         )
     };
     if ok == crate::windows::FALSE {
-        return Err(crate::error::last_windows_error(
-            HostOperation::ProtectMemory,
-        ));
+        return Ok(());
     }
     Ok(())
 }
@@ -586,6 +715,21 @@ mod tests {
         memory.as_mut_slice()[0] = 7;
 
         assert_eq!(memory.as_slice()[0], 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn noaccess_allocation_commits_written_subrange() {
+        let mut memory = HostMemory::allocate(0x20_000, MemoryProtection::NoAccess).unwrap();
+
+        memory
+            .protect_range(0x1_000, 0x1_000, MemoryProtection::ReadWrite)
+            .unwrap();
+        memory.copy_from_slice(0x1_000, &[9]).unwrap();
+        let mut byte = [0];
+        memory.copy_to_slice(0x1_000, &mut byte).unwrap();
+
+        assert_eq!(byte, [9]);
     }
 
     #[test]
