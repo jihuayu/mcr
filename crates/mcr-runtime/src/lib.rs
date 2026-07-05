@@ -4272,6 +4272,11 @@ const NATIVE_PATCH_CACHE_VERSION: u32 = 3;
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
+const MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -4693,6 +4698,12 @@ fn native_patch_metadata_from_patches(patches: &ExecutableNativePatches) -> Nati
             .map(|site| (site.address, site.patch))
             .collect(),
     }
+}
+
+fn should_defer_native_patch_scan(vma: &GuestVma) -> bool {
+    matches!(vma.kind(), GuestVmaKind::Anonymous)
+        && vma.protection().execute
+        && vma.len() > MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES
 }
 
 fn find_executable_native_patches(
@@ -6143,14 +6154,31 @@ impl RuntimeSubsystems {
             }
         }
 
-        let executable_ranges = self
-            .memory_for_process(pid)
-            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
-            .vmas()
-            .filter(|vma| vma.protection().execute)
-            .filter(|vma| !range_is_covered(vma.start(), vma.end(), &cache.scanned_ranges))
-            .map(|vma| (vma.start(), vma.end(), vma.protection()))
-            .collect::<Vec<_>>();
+        let (executable_ranges, deferred_scan_ranges) = {
+            let memory = self
+                .memory_for_process(pid)
+                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+            let mut executable_ranges = Vec::new();
+            let mut deferred_scan_ranges = Vec::new();
+            for vma in memory
+                .vmas()
+                .filter(|vma| vma.protection().execute)
+                .filter(|vma| !range_is_covered(vma.start(), vma.end(), &cache.scanned_ranges))
+            {
+                if should_defer_native_patch_scan(vma) {
+                    let start = vma.start();
+                    let end = vma.end();
+                    let len = vma.len();
+                    host_step_trace(format_args!(
+                        "runtime native-patch-scan defer range=[0x{start:016x}..0x{end:016x}) reason=large-anonymous-executable bytes={len}"
+                    ));
+                    deferred_scan_ranges.push((start, end));
+                    continue;
+                }
+                executable_ranges.push((vma.start(), vma.end(), vma.protection()));
+            }
+            (executable_ranges, deferred_scan_ranges)
+        };
         let mut store_range_metadata = Vec::new();
         for (start, end, protection) in executable_ranges {
             let key = {
@@ -6172,7 +6200,8 @@ impl RuntimeSubsystems {
             }
         }
 
-        let scanned_ranges = cache.scanned_ranges.clone();
+        let mut scanned_ranges = cache.scanned_ranges.clone();
+        scanned_ranges.extend(deferred_scan_ranges);
         let scanned_metadata;
         let guest_task_worker_pool = self.guest_task_worker_pool.clone();
         host_step_trace(format_args!(
@@ -16866,6 +16895,66 @@ mod tests {
             mcr_task::HostWorkerPoolRole::GuestTaskExecution
         );
         assert!(pool.diagnostics().submitted_jobs() >= 1);
+    }
+
+    #[test]
+    fn native_patch_cache_defers_large_anonymous_executable_ranges() {
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &[0xc3])).unwrap();
+        let pid = INITIAL_GUEST_PID;
+        let length = MAX_NATIVE_PATCH_ANONYMOUS_EXEC_SCAN_BYTES + 17 * GUEST_PAGE_SIZE;
+        let start = runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0,
+                length,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime.memory_mut().write(start, &[0x0f, 0x05]).unwrap();
+        let tail_start = start + GUEST_PAGE_SIZE;
+        let tail_vma = runtime
+            .memory()
+            .vmas()
+            .find(|vma| vma.start() == tail_start)
+            .unwrap();
+        assert!(
+            should_defer_native_patch_scan(tail_vma),
+            "large VMA tail should qualify for deferred native patch scanning: {tail_vma:?}"
+        );
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0)
+            .unwrap();
+
+        assert_eq!(guest_bytes(runtime.memory(), start, 2), [0xcc, 0x90]);
+        let tail_range = (tail_start, start + length);
+        assert!(
+            !runtime
+                .dispatcher
+                .subsystems()
+                .native_image_patch_metadata
+                .values()
+                .any(|entry| entry.metadata.scanned_ranges.contains(&tail_range)),
+            "large anonymous executable tails should not be hashed or stored as patch metadata"
+        );
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems()
+                .native_patch_caches
+                .get(&pid)
+                .unwrap()
+                .scanned_ranges
+                .iter()
+                .any(|(range_start, range_end)| *range_start == tail_start
+                    && *range_end == start + length)
+        );
     }
 
     #[test]
