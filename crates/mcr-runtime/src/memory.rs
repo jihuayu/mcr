@@ -783,21 +783,60 @@ impl GuestMemory {
 
         for (allocation_id, patches) in planned {
             let ranges = self.allocation_protection_ranges(allocation_id)?;
+            let allocation_len = self
+                .allocations
+                .get(&allocation_id)
+                .expect("VMA references live allocation")
+                .memory
+                .len();
+            let allocation_len_u64 =
+                u64::try_from(allocation_len).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+            let mut protection_spans = Vec::new();
+            for patch in &patches {
+                let patch_start = u64::try_from(patch.allocation_offset)
+                    .map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                let patch_end = patch
+                    .allocation_offset
+                    .checked_add(N)
+                    .ok_or(GuestMemoryError::RegionTooLarge)?;
+                let patch_end =
+                    u64::try_from(patch_end).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                let span_start = align_down_to(patch_start, GUEST_PAGE_SIZE);
+                let span_end = align_up_to(patch_end, GUEST_PAGE_SIZE)?.min(allocation_len_u64);
+                let span_start =
+                    usize::try_from(span_start).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                let span_end =
+                    usize::try_from(span_end).map_err(|_| GuestMemoryError::RegionTooLarge)?;
+                protection_spans.push((span_start, span_end));
+            }
+            protection_spans.sort_unstable();
+            let mut merged_spans: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in protection_spans {
+                if let Some((_, merged_end)) = merged_spans.last_mut()
+                    && start <= *merged_end
+                {
+                    *merged_end = (*merged_end).max(end);
+                    continue;
+                }
+                merged_spans.push((start, end));
+            }
+            {
+                let allocation = self
+                    .allocations
+                    .get(&allocation_id)
+                    .expect("VMA references live allocation");
+                for (start, end) in merged_spans {
+                    allocation
+                        .memory
+                        .protect_range(start, end - start, MemoryProtection::ReadWrite)
+                        .map_err(GuestMemoryError::Host)?;
+                }
+            }
             for patch in patches {
                 patch
                     .allocation_offset
                     .checked_add(N)
                     .ok_or(GuestMemoryError::RegionTooLarge)?;
-                {
-                    let allocation = self
-                        .allocations
-                        .get(&allocation_id)
-                        .expect("VMA references live allocation");
-                    allocation
-                        .memory
-                        .protect_range(patch.allocation_offset, N, MemoryProtection::ReadWrite)
-                        .map_err(GuestMemoryError::Host)?;
-                }
                 self.allocation_memory_mut(allocation_id)?
                     .copy_from_slice(patch.allocation_offset, &patch.bytes)
                     .map_err(GuestMemoryError::Host)?;

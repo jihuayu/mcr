@@ -3957,9 +3957,19 @@ where
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
         .fs_base();
-    host_step_trace(format_args!(
-        "runtime native-step start pid={pid} tid={tid} rip=0x{before_rip:016x} fs_base=0x{fs_base:016x}"
-    ));
+    if host_step_trace_enabled() {
+        let executable = dispatcher
+            .subsystems()
+            .tasks
+            .process(pid)
+            .map(|process| {
+                String::from_utf8_lossy(process.image().executable().path()).into_owned()
+            })
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        host_step_trace(format_args!(
+            "runtime native-step start pid={pid} tid={tid} exe={executable} rip=0x{before_rip:016x} fs_base=0x{fs_base:016x}"
+        ));
+    }
     {
         let memory = dispatcher
             .subsystems_mut()
@@ -4372,6 +4382,9 @@ enum FsRelativePatchWork {
     New,
     All,
 }
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const FS_RELATIVE_PATCH_MATERIALIZE_LIMIT: usize = 2048;
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -5159,23 +5172,32 @@ fn apply_native_patch_metadata(
     memory: &mut GuestMemory,
     fs_base: u64,
     metadata: &NativePatchMetadata,
-) -> Result<(), GuestExecutionError> {
+) -> Result<bool, GuestExecutionError> {
     apply_executable_syscall_patches(memory, &metadata.syscall_patches)?;
     #[cfg(all(windows, target_arch = "x86_64"))]
-    apply_fs_relative_patch_entries(
-        memory,
-        fs_base,
-        metadata.fs_relative_patches.len(),
-        metadata
-            .fs_relative_patches
-            .iter()
-            .map(|(&address, &patch)| (address, patch)),
-    )?;
+    {
+        if should_materialize_fs_relative_patches(metadata.fs_relative_patches.len()) {
+            apply_fs_relative_patch_entries(
+                memory,
+                fs_base,
+                metadata.fs_relative_patches.len(),
+                metadata
+                    .fs_relative_patches
+                    .iter()
+                    .map(|(&address, &patch)| (address, patch)),
+            )?;
+            return Ok(!metadata.fs_relative_patches.is_empty());
+        }
+        host_step_trace(format_args!(
+            "runtime fs-relative-patch materialize skipped patches={} reason=large-patch-set",
+            metadata.fs_relative_patches.len()
+        ));
+    }
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
         let _ = fs_base;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn metadata_for_ranges(
@@ -5268,6 +5290,11 @@ fn fs_relative_patch_work(
     } else {
         FsRelativePatchWork::None
     }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const fn should_materialize_fs_relative_patches(patch_count: usize) -> bool {
+    patch_count <= FS_RELATIVE_PATCH_MATERIALIZE_LIMIT
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -5636,7 +5663,12 @@ fn emulate_fs_relative_native_fault(
     instruction: &NativeFaultInstruction,
 ) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
     if instruction.bytes.as_slice() != [0x64, 0x8b, 0x00] {
-        return Ok(None);
+        if let Some(registers) =
+            emulate_fs_absolute_mov_load(memory, registers, fs_base, instruction)?
+        {
+            return Ok(Some(registers));
+        }
+        return emulate_fs_absolute_sub(memory, registers, fs_base, instruction);
     }
 
     let addr = fs_base.wrapping_add(registers.rax);
@@ -5650,6 +5682,203 @@ fn emulate_fs_relative_native_fault(
             GuestMemoryError::InvalidAddress,
         ))?;
     Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_absolute_mov_load(
+    memory: &GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let bytes = instruction.bytes.as_slice();
+    if bytes.first().copied() != Some(0x64) {
+        return Ok(None);
+    }
+    let mut index = 1usize;
+    let rex = if bytes
+        .get(index)
+        .is_some_and(|byte| (0x40..=0x4f).contains(byte))
+    {
+        let rex = bytes[index];
+        index += 1;
+        rex
+    } else {
+        0
+    };
+    if bytes.get(index).copied() != Some(0x8b) {
+        return Ok(None);
+    }
+    let Some(&modrm) = bytes.get(index + 1) else {
+        return Ok(None);
+    };
+    let Some(&sib) = bytes.get(index + 2) else {
+        return Ok(None);
+    };
+    if modrm & 0xc7 != 0x04 || sib != 0x25 {
+        return Ok(None);
+    }
+    let displacement_start = index + 3;
+    let displacement_end = displacement_start + 4;
+    let Some(displacement_bytes) = bytes.get(displacement_start..displacement_end) else {
+        return Ok(None);
+    };
+    let displacement = i32::from_le_bytes(
+        displacement_bytes
+            .try_into()
+            .expect("displacement length checked"),
+    );
+    let addr = fs_base.wrapping_add(displacement as i64 as u64);
+    let reg = ((modrm >> 3) & 0x07) | if rex & 0x04 != 0 { 8 } else { 0 };
+    if rex & 0x08 != 0 {
+        let mut value = [0; 8];
+        memory.read(addr, &mut value)?;
+        set_host_register64(&mut registers, reg, u64::from_le_bytes(value))?;
+    } else {
+        let mut value = [0; 4];
+        memory.read(addr, &mut value)?;
+        set_host_register64(&mut registers, reg, u64::from(u32::from_le_bytes(value)))?;
+    }
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_absolute_sub(
+    memory: &GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let bytes = instruction.bytes.as_slice();
+    if bytes.len() != 9
+        || bytes[0] != 0x64
+        || bytes[1] != 0x48
+        || bytes[2] != 0x2b
+        || bytes[4] != 0x25
+        || bytes[3] & 0xc7 != 0x04
+    {
+        return Ok(None);
+    }
+    let displacement =
+        i32::from_le_bytes(bytes[5..9].try_into().expect("displacement length checked"));
+    let addr = fs_base.wrapping_add(displacement as i64 as u64);
+    let mut rhs_bytes = [0; 8];
+    memory.read(addr, &mut rhs_bytes)?;
+    let rhs = u64::from_le_bytes(rhs_bytes);
+    let reg = (bytes[3] >> 3) & 0x07;
+    let lhs = host_register64(&registers, reg)?;
+    let result = lhs.wrapping_sub(rhs);
+    set_host_register64(&mut registers, reg, result)?;
+    apply_sub_flags64(&mut registers, lhs, rhs, result);
+    host_step_trace(format_args!(
+        "runtime native-fs-sub-emulate rip=0x{:016x} lhs=0x{lhs:016x} rhs=0x{rhs:016x} result=0x{result:016x} rflags=0x{:016x}",
+        instruction.rip, registers.rflags
+    ));
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn host_register64(
+    registers: &mcr_win::HostCpuRegisters,
+    index: u8,
+) -> Result<u64, GuestExecutionError> {
+    match index {
+        0 => Ok(registers.rax),
+        1 => Ok(registers.rcx),
+        2 => Ok(registers.rdx),
+        3 => Ok(registers.rbx),
+        4 => Ok(registers.rsp),
+        5 => Ok(registers.rbp),
+        6 => Ok(registers.rsi),
+        7 => Ok(registers.rdi),
+        8 => Ok(registers.r8),
+        9 => Ok(registers.r9),
+        10 => Ok(registers.r10),
+        11 => Ok(registers.r11),
+        12 => Ok(registers.r12),
+        13 => Ok(registers.r13),
+        14 => Ok(registers.r14),
+        15 => Ok(registers.r15),
+        _ => Err(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        )),
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn set_host_register64(
+    registers: &mut mcr_win::HostCpuRegisters,
+    index: u8,
+    value: u64,
+) -> Result<(), GuestExecutionError> {
+    match index {
+        0 => registers.rax = value,
+        1 => registers.rcx = value,
+        2 => registers.rdx = value,
+        3 => registers.rbx = value,
+        4 => registers.rsp = value,
+        5 => registers.rbp = value,
+        6 => registers.rsi = value,
+        7 => registers.rdi = value,
+        8 => registers.r8 = value,
+        9 => registers.r9 = value,
+        10 => registers.r10 = value,
+        11 => registers.r11 = value,
+        12 => registers.r12 = value,
+        13 => registers.r13 = value,
+        14 => registers.r14 = value,
+        15 => registers.r15 = value,
+        _ => {
+            return Err(GuestExecutionError::Memory(
+                GuestMemoryError::InvalidAddress,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn apply_sub_flags64(registers: &mut mcr_win::HostCpuRegisters, lhs: u64, rhs: u64, result: u64) {
+    const CF: u64 = 0x001;
+    const PF: u64 = 0x004;
+    const AF: u64 = 0x010;
+    const ZF: u64 = 0x040;
+    const SF: u64 = 0x080;
+    const OF: u64 = 0x800;
+    const STATUS_MASK: u64 = CF | PF | AF | ZF | SF | OF;
+
+    let mut flags = registers.rflags & !STATUS_MASK;
+    if lhs < rhs {
+        flags |= CF;
+    }
+    if (result as u8).count_ones() % 2 == 0 {
+        flags |= PF;
+    }
+    if (lhs ^ rhs ^ result) & 0x10 != 0 {
+        flags |= AF;
+    }
+    if result == 0 {
+        flags |= ZF;
+    }
+    if result & (1 << 63) != 0 {
+        flags |= SF;
+    }
+    if ((lhs ^ rhs) & (lhs ^ result) & (1 << 63)) != 0 {
+        flags |= OF;
+    }
+    registers.rflags = flags;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -6798,6 +7027,7 @@ impl RuntimeSubsystems {
         let patch_start = Instant::now();
         let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
         let mut store_image_metadata = None;
+        let mut fs_relative_materialized_this_call = false;
         let image_patch_ranges = self.native_image_patch_ranges.get(&pid).cloned();
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
             cache.image_metadata_checked = true;
@@ -6810,7 +7040,8 @@ impl RuntimeSubsystems {
                         let memory = self
                             .memory_for_process_mut(pid)
                             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-                        apply_native_patch_metadata(memory, fs_base, &metadata)?;
+                        fs_relative_materialized_this_call |=
+                            apply_native_patch_metadata(memory, fs_base, &metadata)?;
                     }
                     cache.merge_metadata(&metadata);
                 } else if let Some(ranges) = image_patch_ranges.clone() {
@@ -6849,7 +7080,13 @@ impl RuntimeSubsystems {
             }
             (executable_ranges, deferred_scan_ranges)
         };
-        if cache.fs_base == fs_base
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let fs_relative_cache_ready = cache.fs_base == fs_base
+            || (cache.fs_base == 0
+                && !should_materialize_fs_relative_patches(cache.fs_relative_patches.len()));
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        let fs_relative_cache_ready = cache.fs_base == fs_base;
+        if fs_relative_cache_ready
             && executable_ranges.is_empty()
             && deferred_scan_ranges.is_empty()
         {
@@ -6869,7 +7106,8 @@ impl RuntimeSubsystems {
                     let memory = self
                         .memory_for_process_mut(pid)
                         .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
-                    apply_native_patch_metadata(memory, fs_base, &metadata)?;
+                    fs_relative_materialized_this_call |=
+                        apply_native_patch_metadata(memory, fs_base, &metadata)?;
                 }
                 cache.merge_metadata(&metadata);
             } else {
@@ -6881,6 +7119,7 @@ impl RuntimeSubsystems {
         scanned_ranges.extend(deferred_scan_ranges);
         let scanned_metadata;
         let guest_task_worker_pool = self.guest_task_worker_pool.clone();
+        let mut materialized_fs_base = fs_base;
         host_step_trace(format_args!(
             "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
             scanned_ranges.len()
@@ -6914,17 +7153,57 @@ impl RuntimeSubsystems {
                         }
                     }
                 }
-                match fs_relative_patch_work(
-                    cache.fs_base,
-                    fs_base,
-                    cached_fs_patch_count,
-                    new_unmaterialized_fs_patch_addresses.len(),
-                    new_materialized_fs_patch_addresses.len(),
-                ) {
-                    FsRelativePatchWork::All => {
+                if should_materialize_fs_relative_patches(cache.fs_relative_patches.len()) {
+                    match fs_relative_patch_work(
+                        cache.fs_base,
+                        fs_base,
+                        cached_fs_patch_count,
+                        new_unmaterialized_fs_patch_addresses.len(),
+                        new_materialized_fs_patch_addresses.len(),
+                    ) {
+                        FsRelativePatchWork::All => {
+                            apply_fs_relative_patch_entries(
+                                memory,
+                                fs_base,
+                                cache.fs_relative_patches.len(),
+                                cache
+                                    .fs_relative_patches
+                                    .iter()
+                                    .map(|(&address, &patch)| (address, patch)),
+                            )?;
+                        }
+                        FsRelativePatchWork::New => {
+                            apply_fs_relative_patch_entries(
+                                memory,
+                                fs_base,
+                                new_unmaterialized_fs_patch_addresses.len(),
+                                new_unmaterialized_fs_patch_addresses.iter().filter_map(
+                                    |address| {
+                                        cache
+                                            .fs_relative_patches
+                                            .get(address)
+                                            .map(|&patch| (*address, patch))
+                                    },
+                                ),
+                            )?;
+                        }
+                        FsRelativePatchWork::None
+                            if !new_unmaterialized_fs_patch_addresses.is_empty()
+                                || !new_materialized_fs_patch_addresses.is_empty() =>
+                        {
+                            host_step_trace(format_args!(
+                                "runtime fs-relative-patch apply skipped patches={} fs_base=0x{fs_base:016x}",
+                                new_unmaterialized_fs_patch_addresses.len()
+                                    + new_materialized_fs_patch_addresses.len()
+                            ));
+                        }
+                        FsRelativePatchWork::None => {}
+                    }
+                } else {
+                    if cache.fs_base != 0 || fs_relative_materialized_this_call {
                         apply_fs_relative_patch_entries(
                             memory,
-                            fs_base,
+                            0,
                             cache.fs_relative_patches.len(),
                             cache
                                 .fs_relative_patches
@@ -6932,32 +7211,11 @@ impl RuntimeSubsystems {
                                 .map(|(&address, &patch)| (address, patch)),
                         )?;
                     }
-                    FsRelativePatchWork::New => {
-                        apply_fs_relative_patch_entries(
-                            memory,
-                            fs_base,
-                            new_unmaterialized_fs_patch_addresses.len(),
-                            new_unmaterialized_fs_patch_addresses
-                                .iter()
-                                .filter_map(|address| {
-                                    cache
-                                        .fs_relative_patches
-                                        .get(address)
-                                        .map(|&patch| (*address, patch))
-                                }),
-                        )?;
-                    }
-                    FsRelativePatchWork::None
-                        if !new_unmaterialized_fs_patch_addresses.is_empty()
-                            || !new_materialized_fs_patch_addresses.is_empty() =>
-                    {
-                        host_step_trace(format_args!(
-                            "runtime fs-relative-patch apply skipped patches={} fs_base=0x{fs_base:016x}",
-                            new_unmaterialized_fs_patch_addresses.len()
-                                + new_materialized_fs_patch_addresses.len()
-                        ));
-                    }
-                    FsRelativePatchWork::None => {}
+                    host_step_trace(format_args!(
+                        "runtime fs-relative-patch materialize skipped patches={} fs_base=0x{fs_base:016x} reason=large-patch-set",
+                        cache.fs_relative_patches.len()
+                    ));
+                    materialized_fs_base = 0;
                 }
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -6998,7 +7256,7 @@ impl RuntimeSubsystems {
             .filter(|vma| vma.protection().execute)
             .map(|vma| (vma.start(), vma.end()))
             .collect::<Vec<_>>();
-        cache.fs_base = fs_base;
+        cache.fs_base = materialized_fs_base;
         cache.scanned_ranges = scanned_now;
         host_step_trace(format_args!(
             "runtime native-patch-cache done pid={pid} ranges={} elapsed_ms={}",
@@ -19317,6 +19575,72 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
+    fn native_patch_cache_keeps_large_fs_relative_sets_unmaterialized() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+        let mut code = Vec::new();
+        for _ in 0..=FS_RELATIVE_PATCH_MATERIALIZE_LIMIT {
+            code.extend_from_slice(&fs_load);
+        }
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let load_len = ((code.len() as u64) + 0xfff) & !0xfff;
+        let program = GuestProgram::new(GuestExecutable::new(
+            b"/bin/app".to_vec(),
+            Elf64Builder::new()
+                .entrypoint(0x401000)
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_X,
+                    0x1000,
+                    0x401000,
+                    load_len,
+                    load_len,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R | PF_W,
+                    0x2000 + load_len,
+                    0x401000 + load_len,
+                    0x08,
+                    0x100,
+                ))
+                .program_header(Elf64ProgramHeader::load(
+                    PF_R,
+                    0,
+                    0x402000 + load_len,
+                    0x100,
+                    0x100,
+                ))
+                .data_at(0x1000, code)
+                .data_at(0x2000 + load_len, vec![0; 0x08])
+                .build(),
+        ));
+        let mut runtime = Runtime::new(program).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            fs_load
+        );
+        let cache = runtime
+            .dispatcher
+            .subsystems()
+            .native_patch_caches
+            .get(&pid)
+            .unwrap();
+        assert_eq!(cache.fs_base, 0);
+        assert_eq!(
+            cache.fs_relative_patches.len(),
+            FS_RELATIVE_PATCH_MATERIALIZE_LIMIT + 1
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
     fn native_patch_cache_keeps_high_fs_relative_original_for_fault_fallback() {
         let _guard = native_execution_test_guard();
         let fs_load = [0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0];
@@ -19388,6 +19712,70 @@ mod tests {
 
         assert_eq!(registers.rax, 0x1234_5678);
         assert_eq!(registers.rip, 0x401003);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_fs_fault_emulates_absolute_mov64_load() {
+        let _guard = native_execution_test_guard();
+        let code = [0x64, 0x48, 0x8b, 0x0c, 0x25, 0, 0, 0, 0, 0x0f, 0x05];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402000, &0x1234_5678_9abc_def0u64.to_le_bytes())
+            .unwrap();
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("fs-relative absolute fault instruction decodes");
+
+        let registers = emulate_fs_relative_native_fault(
+            runtime.memory(),
+            mcr_win::HostCpuRegisters {
+                rip: 0x401000,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            0x402000,
+            &instruction,
+        )
+        .unwrap()
+        .expect("instruction is emulated");
+
+        assert_eq!(registers.rcx, 0x1234_5678_9abc_def0);
+        assert_eq!(registers.rip, 0x401009);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_fs_fault_emulates_absolute_sub64() {
+        let _guard = native_execution_test_guard();
+        let code = [0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0, 0, 0, 0x0f, 0x05];
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        runtime
+            .memory_mut()
+            .write(0x402028, &0x42u64.to_le_bytes())
+            .unwrap();
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("fs-relative sub fault instruction decodes");
+
+        let registers = emulate_fs_relative_native_fault(
+            runtime.memory(),
+            mcr_win::HostCpuRegisters {
+                rax: 0x42,
+                rflags: 0x202,
+                rip: 0x401000,
+                ..mcr_win::HostCpuRegisters::default()
+            },
+            0x402000,
+            &instruction,
+        )
+        .unwrap()
+        .expect("instruction is emulated");
+
+        assert_eq!(registers.rax, 0);
+        assert_eq!(registers.rip, 0x401009);
+        assert_ne!(registers.rflags & 0x40, 0);
+        assert_eq!(registers.rflags & 0x01, 0);
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
