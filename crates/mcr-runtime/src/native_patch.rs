@@ -352,7 +352,7 @@ pub(crate) fn native_fault_is_unrewritten_fs_relative(
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) fn emulate_fs_relative_native_fault(
-    memory: &GuestMemory,
+    memory: &mut GuestMemory,
     mut registers: mcr_win::HostCpuRegisters,
     fs_base: u64,
     instruction: &NativeFaultInstruction,
@@ -372,6 +372,15 @@ pub(crate) fn emulate_fs_relative_native_fault(
     }
 
     if let Some(registers) = emulate_fs_absolute_mov_load(memory, registers, fs_base, instruction)?
+    {
+        return Ok(Some(registers));
+    }
+    if let Some(registers) =
+        emulate_fs_absolute_movzx_load(memory, registers, fs_base, instruction)?
+    {
+        return Ok(Some(registers));
+    }
+    if let Some(registers) = emulate_fs_absolute_mov_store(memory, registers, fs_base, instruction)?
     {
         return Ok(Some(registers));
     }
@@ -433,6 +442,140 @@ fn emulate_fs_absolute_mov_load(
         memory.read(addr, &mut value)?;
         set_host_register64(&mut registers, reg, u64::from(u32::from_le_bytes(value)))?;
     }
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_absolute_movzx_load(
+    memory: &GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let bytes = instruction.bytes.as_slice();
+    let Some(fs_index) = fs_segment_prefix_index(bytes) else {
+        return Ok(None);
+    };
+    let mut index = fs_index + 1;
+    let rex = if bytes
+        .get(index)
+        .is_some_and(|byte| (0x40..=0x4f).contains(byte))
+    {
+        let rex = bytes[index];
+        index += 1;
+        rex
+    } else {
+        0
+    };
+    if bytes.get(index).copied() != Some(0x0f) {
+        return Ok(None);
+    }
+    let Some(opcode) = bytes.get(index + 1).copied() else {
+        return Ok(None);
+    };
+    let value_len = match opcode {
+        0xb6 => 1,
+        0xb7 => 2,
+        _ => return Ok(None),
+    };
+    let Some(&modrm) = bytes.get(index + 2) else {
+        return Ok(None);
+    };
+    let Some(&sib) = bytes.get(index + 3) else {
+        return Ok(None);
+    };
+    if modrm & 0xc7 != 0x04 || sib != 0x25 {
+        return Ok(None);
+    }
+    let displacement_start = index + 4;
+    let displacement_end = displacement_start + 4;
+    let Some(displacement_bytes) = bytes.get(displacement_start..displacement_end) else {
+        return Ok(None);
+    };
+    let displacement = i32::from_le_bytes(
+        displacement_bytes
+            .try_into()
+            .expect("displacement length checked"),
+    );
+    let addr = fs_base.wrapping_add(displacement as i64 as u64);
+    let mut value = [0; 2];
+    memory.read(addr, &mut value[..value_len])?;
+    let value = match value_len {
+        1 => u64::from(value[0]),
+        2 => u64::from(u16::from_le_bytes(value)),
+        _ => unreachable!("movzx size is matched above"),
+    };
+    let reg = ((modrm >> 3) & 0x07) | if rex & 0x04 != 0 { 8 } else { 0 };
+    set_host_register64(&mut registers, reg, value)?;
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_absolute_mov_store(
+    memory: &mut GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let bytes = instruction.bytes.as_slice();
+    let Some(fs_index) = fs_segment_prefix_index(bytes) else {
+        return Ok(None);
+    };
+    let mut index = fs_index + 1;
+    let rex = if bytes
+        .get(index)
+        .is_some_and(|byte| (0x40..=0x4f).contains(byte))
+    {
+        let rex = bytes[index];
+        index += 1;
+        rex
+    } else {
+        0
+    };
+    let Some(opcode) = bytes.get(index).copied() else {
+        return Ok(None);
+    };
+    let value_len = match opcode {
+        0x88 => 1,
+        0x89 if rex & 0x08 != 0 => 8,
+        0x89 => 4,
+        _ => return Ok(None),
+    };
+    let Some(&modrm) = bytes.get(index + 1) else {
+        return Ok(None);
+    };
+    let Some(&sib) = bytes.get(index + 2) else {
+        return Ok(None);
+    };
+    if modrm & 0xc7 != 0x04 || sib != 0x25 {
+        return Ok(None);
+    }
+    let displacement_start = index + 3;
+    let displacement_end = displacement_start + 4;
+    let Some(displacement_bytes) = bytes.get(displacement_start..displacement_end) else {
+        return Ok(None);
+    };
+    let displacement = i32::from_le_bytes(
+        displacement_bytes
+            .try_into()
+            .expect("displacement length checked"),
+    );
+    let addr = fs_base.wrapping_add(displacement as i64 as u64);
+    let reg = ((modrm >> 3) & 0x07) | if rex & 0x04 != 0 { 8 } else { 0 };
+    let value = host_register64(&registers, reg)?.to_le_bytes();
+    memory.write(addr, &value[..value_len])?;
     registers.rip = registers
         .rip
         .checked_add(instruction.bytes.len() as u64)
