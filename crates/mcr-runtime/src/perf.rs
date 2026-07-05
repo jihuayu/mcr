@@ -15,6 +15,9 @@ pub(crate) struct RuntimePerfSummary {
     pid_switch_count: u64,
     same_pid_switch_count: u64,
     cross_pid_switch_count: u64,
+    context_memory_switch_count: u64,
+    context_memory_clone_count: u64,
+    context_fd_switch_count: u64,
     remap_samples_us: Vec<u128>,
     clone_count: u64,
     vfork_clone_count: u64,
@@ -141,6 +144,18 @@ impl RuntimePerfSummary {
         }
     }
 
+    pub(crate) fn record_context_memory_switch(&mut self) {
+        self.context_memory_switch_count = self.context_memory_switch_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_context_memory_clone(&mut self) {
+        self.context_memory_clone_count = self.context_memory_clone_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_context_fd_switch(&mut self) {
+        self.context_fd_switch_count = self.context_fd_switch_count.saturating_add(1);
+    }
+
     pub(crate) fn record_clone_to_exec(&mut self, elapsed: Duration) {
         if self.enabled {
             self.clone_to_exec_samples_us.push(elapsed.as_micros());
@@ -199,6 +214,9 @@ impl RuntimePerfSummary {
             interpreted_block_fallback_count: self.interpreted_block_fallback_count,
             interpreted_block_bytes_read: self.interpreted_block_bytes_read,
             interpreted_blocks_decoded: self.interpreted_blocks_decoded,
+            context_memory_switch_count: self.context_memory_switch_count,
+            context_memory_clone_count: self.context_memory_clone_count,
+            context_fd_switch_count: self.context_fd_switch_count,
         }
     }
 
@@ -224,6 +242,12 @@ impl RuntimePerfSummary {
         eprintln!(
             "mcr perf-summary: pid_switch_count={} same_pid_switch_count={} cross_pid_switch_count={}",
             self.pid_switch_count, self.same_pid_switch_count, self.cross_pid_switch_count
+        );
+        eprintln!(
+            "mcr perf-summary: context_memory_switch_count={} context_memory_clone_count={} context_fd_switch_count={}",
+            self.context_memory_switch_count,
+            self.context_memory_clone_count,
+            self.context_fd_switch_count
         );
         eprintln!(
             "mcr perf-summary: remap_count={} remap_total_us={} remap_avg_us={} remap_p50_us={} remap_p95_us={}",
@@ -265,6 +289,9 @@ pub struct RuntimePerfDiagnostics {
     interpreted_block_fallback_count: u64,
     interpreted_block_bytes_read: u64,
     interpreted_blocks_decoded: u64,
+    context_memory_switch_count: u64,
+    context_memory_clone_count: u64,
+    context_fd_switch_count: u64,
 }
 
 impl RuntimePerfDiagnostics {
@@ -281,6 +308,21 @@ impl RuntimePerfDiagnostics {
     #[must_use]
     pub const fn interpreted_blocks_decoded(self) -> u64 {
         self.interpreted_blocks_decoded
+    }
+
+    #[must_use]
+    pub const fn context_memory_switch_count(self) -> u64 {
+        self.context_memory_switch_count
+    }
+
+    #[must_use]
+    pub const fn context_memory_clone_count(self) -> u64 {
+        self.context_memory_clone_count
+    }
+
+    #[must_use]
+    pub const fn context_fd_switch_count(self) -> u64 {
+        self.context_fd_switch_count
     }
 }
 

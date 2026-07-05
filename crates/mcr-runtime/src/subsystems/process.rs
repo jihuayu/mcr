@@ -29,24 +29,16 @@ impl RuntimeSubsystems {
         if self.native.enabled {
             return self.select_native_memory_for_process(pid);
         }
-        if self
-            .process
-            .tasks
-            .process(self.process.selected_memory_pid)
-            .is_some()
-        {
-            let selected = self
-                .files
-                .memory()
-                .try_clone_runtime()
-                .map_err(|error| error.errno())?;
-            self.process
-                .memory
-                .insert(self.process.selected_memory_pid, selected);
-        }
+        let selected_pid = self.process.selected_memory_pid;
         let memory = self.process.memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
-        *self.files.memory_mut() = memory;
+        if self.process.tasks.process(selected_pid).is_some() {
+            let selected = std::mem::replace(self.files.memory_mut(), memory);
+            self.process.memory.insert(selected_pid, selected);
+        } else {
+            *self.files.memory_mut() = memory;
+        }
         self.process.selected_memory_pid = pid;
+        self.perf_record_context_memory_switch();
         Ok(())
     }
 
@@ -71,6 +63,7 @@ impl RuntimeSubsystems {
         let result = (|| {
             let selected_pid = self.process.selected_memory_pid;
             let selected_snapshot = if self.process.tasks.process(selected_pid).is_some() {
+                self.perf_record_context_memory_clone();
                 Some(
                     self.files
                         .memory()
@@ -267,20 +260,14 @@ impl RuntimeSubsystems {
         if pid == self.process.selected_fds_pid {
             return Ok(());
         }
-        if self
-            .process
-            .tasks
-            .process(self.process.selected_fds_pid)
-            .is_some()
-        {
-            let selected = self.files.vfs().fds().clone();
-            self.process
-                .fds
-                .insert(self.process.selected_fds_pid, selected);
-        }
+        let selected_pid = self.process.selected_fds_pid;
         let fds = self.process.fds.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
-        self.files.vfs_mut().replace_fds(fds);
+        let selected = self.files.vfs_mut().replace_fds(fds);
+        if self.process.tasks.process(selected_pid).is_some() {
+            self.process.fds.insert(selected_pid, selected);
+        }
         self.process.selected_fds_pid = pid;
+        self.perf_record_context_fd_switch();
         Ok(())
     }
 

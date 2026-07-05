@@ -48,6 +48,18 @@ impl RuntimeSubsystems {
         self.perf_summary.record_remap(elapsed);
     }
 
+    pub(crate) fn perf_record_context_memory_switch(&mut self) {
+        self.perf_summary.record_context_memory_switch();
+    }
+
+    pub(crate) fn perf_record_context_memory_clone(&mut self) {
+        self.perf_summary.record_context_memory_clone();
+    }
+
+    pub(crate) fn perf_record_context_fd_switch(&mut self) {
+        self.perf_summary.record_context_fd_switch();
+    }
+
     pub(crate) fn perf_record_clone_to_exec(&mut self, elapsed: Duration) {
         self.perf_summary.record_clone_to_exec(elapsed);
     }

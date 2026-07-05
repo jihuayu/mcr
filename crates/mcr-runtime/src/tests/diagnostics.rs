@@ -139,6 +139,26 @@ fn diagnostics_capture_interpreted_block_fallback_counters() {
 }
 
 #[test]
+fn diagnostics_capture_flexible_context_switches_without_memory_clones() {
+    let mut runtime =
+        RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+    runtime.memory_mut().write(0x402000, b"child").unwrap();
+
+    let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+    assert_eq!(fork.result, SyscallReturn::Success(2));
+    let child_write =
+        runtime.dispatch_syscall(context_for(2, 2, Syscall::Write, [1, 0x402000, 5, 0, 0, 0]));
+    assert_eq!(child_write.result, SyscallReturn::Success(5));
+    let parent_write = runtime.dispatch_syscall(context(Syscall::Write, [1, 0x402000, 5, 0, 0, 0]));
+    assert_eq!(parent_write.result, SyscallReturn::Success(5));
+
+    let perf = runtime.diagnostics().perf();
+    assert_eq!(perf.context_memory_switch_count(), 2);
+    assert_eq!(perf.context_fd_switch_count(), 2);
+    assert_eq!(perf.context_memory_clone_count(), 0);
+}
+
+#[test]
 fn stall_diagnostic_identifies_guest_wait_futex() {
     let runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     let events = vec![syscall_enter_event(
