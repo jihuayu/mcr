@@ -263,6 +263,28 @@ fn set_tid_address_returns_current_guest_tid() {
 }
 
 #[test]
+fn sched_getaffinity_reports_single_guest_cpu_mask() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime.memory_mut().write(0x402000, &[0xaa; 16]).unwrap();
+
+    let affinity = runtime.dispatch_syscall(context(
+        Syscall::SchedGetaffinity,
+        [0, 16, 0x402000, 0, 0, 0],
+    ));
+    let missing = runtime.dispatch_syscall(context(
+        Syscall::SchedGetaffinity,
+        [99, 16, 0x402000, 0, 0, 0],
+    ));
+
+    assert_eq!(affinity.result, SyscallReturn::Success(0));
+    let mut mask = [0xaa; 16];
+    runtime.memory().read(0x402000, &mut mask).unwrap();
+    assert_eq!(mask[0], 1);
+    assert!(mask[1..].iter().all(|byte| *byte == 0));
+    assert_eq!(missing.result, SyscallReturn::Errno(LinuxErrno::ESRCH));
+}
+
+#[test]
 fn runtime_dispatches_fork_child_exit_and_wait4() {
     let mut runtime = Runtime::new(test_program("/bin/parent", 0x401000)).unwrap();
 

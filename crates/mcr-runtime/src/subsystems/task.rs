@@ -48,6 +48,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::RtSigtimedwait => self.dispatch_rt_sigtimedwait(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
+            mcr_sys::Syscall::SchedGetaffinity => self.dispatch_sched_getaffinity(request),
             mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
             mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
             mcr_sys::Syscall::Sysinfo => self.dispatch_sysinfo(request),
@@ -502,6 +503,51 @@ impl RuntimeSubsystems {
         }
 
         self.store_selected_process_memory(pid)
+    }
+
+    pub(crate) fn dispatch_sched_getaffinity(
+        &mut self,
+        request: &SyscallRequest,
+    ) -> SyscallOutcome {
+        match self.sched_getaffinity(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    pub(crate) fn sched_getaffinity(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        const MAX_CPUSET_BYTES: usize = 4096;
+
+        let requested_tid = arg(request, 0);
+        let cpusetsize = usize_arg(request, 1)?;
+        let mask_addr = arg(request, 2);
+        if cpusetsize == 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if cpusetsize > MAX_CPUSET_BYTES {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if mask_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        if requested_tid != 0
+            && self
+                .process
+                .tasks
+                .task(requested_tid as mcr_sys::GuestTid)
+                .is_none()
+        {
+            return Err(LinuxErrno::ESRCH);
+        }
+
+        self.select_memory_for_process(request.context.pid)?;
+        let mut mask = vec![0; cpusetsize];
+        mask[0] = 1;
+        self.files
+            .memory_mut()
+            .write_bytes(mask_addr, &mask)
+            .map_err(memory_errno)?;
+        self.store_selected_process_memory(request.context.pid)
     }
 
     pub(crate) fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
