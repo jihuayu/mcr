@@ -126,6 +126,7 @@ const LINUX_PR_GET_THP_DISABLE: u64 = 42;
 const LINUX_PR_SET_VMA: u64 = 0x5356_4d41;
 const LINUX_PR_SET_VMA_ANON_NAME: u64 = 0;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+const LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 1 << 3;
 const LINUX_SS_DISABLE: u32 = 2;
 const LINUX_SS_AUTODISARM: u32 = 1 << 31;
 const LINUX_SS_SUPPORTED_FLAGS: u32 = LINUX_SS_DISABLE | LINUX_SS_AUTODISARM;
@@ -7277,6 +7278,9 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
         if command == LINUX_MEMBARRIER_CMD_QUERY {
+            return Ok(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED);
+        }
+        if command == LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED {
             return Ok(0);
         }
         Err(LinuxErrno::ENOSYS)
@@ -16463,6 +16467,12 @@ mod tests {
         assert_eq!(
             runtime
                 .dispatch_syscall(context(Syscall::Membarrier, [0, 0, 0, 0, 0, 0]))
+                .result,
+            SyscallReturn::Success(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED)
+        );
+        assert_eq!(
+            runtime
+                .dispatch_syscall(context(Syscall::Membarrier, [8, 0, 0, 0, 0, 0]))
                 .result,
             SyscallReturn::Success(0)
         );
