@@ -3424,6 +3424,10 @@ where
                 if resumed > 0 {
                     continue;
                 }
+                let resumed = dispatcher.subsystems_mut().wait_for_futex_timeout();
+                if resumed > 0 {
+                    continue;
+                }
                 return Err(GuestRunError::NoRunnableTasks {
                     diagnostic: capture_diagnostic(dispatcher),
                 });
@@ -8811,13 +8815,14 @@ impl RuntimeSubsystems {
         Ok(completed)
     }
 
-    fn resume_futex_timeouts(&mut self) {
+    fn resume_futex_timeouts(&mut self) -> usize {
         let now = Instant::now();
         let expired = self
             .futex_timeouts
             .iter()
             .filter_map(|(tid, deadline)| (*deadline <= now).then_some(*tid))
             .collect::<Vec<_>>();
+        let resumed = expired.len();
         for tid in expired {
             self.futex_timeouts.remove(&tid);
             let _ = self.tasks.resume_futex_waiter_with_return(
@@ -8825,6 +8830,18 @@ impl RuntimeSubsystems {
                 SyscallReturn::errno(LinuxErrno::ETIMEDOUT).encode_u64(),
             );
         }
+        resumed
+    }
+
+    fn wait_for_futex_timeout(&mut self) -> usize {
+        let Some(deadline) = self.futex_timeouts.values().min().copied() else {
+            return 0;
+        };
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
+        self.resume_futex_timeouts()
     }
 
     fn wake_guest_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
@@ -8887,6 +8904,9 @@ impl RuntimeSubsystems {
         timeout: Option<Duration>,
     ) -> Result<bool, LinuxErrno> {
         self.select_fds_for_process(pid)?;
+        if !write && self.files.vfs().epoll_id_for_fd(fd).is_ok() {
+            return self.epoll_fd_has_ready_event(fd, timeout);
+        }
         let events = if write { LINUX_POLLOUT } else { LINUX_POLLIN };
         let revents = self.poll_fd_revents(fd, events, timeout)?;
         Ok(if write {
@@ -9796,6 +9816,22 @@ impl RuntimeSubsystems {
             write_epoll_event(self.files.memory_mut(), event_addr, *event)?;
         }
         Ok(ready.len() as u64)
+    }
+
+    fn epoll_fd_has_ready_event(
+        &mut self,
+        epfd: Fd,
+        timeout: Option<Duration>,
+    ) -> Result<bool, LinuxErrno> {
+        let epoll_id = self.files.vfs().epoll_id_for_fd(epfd).map_err(vfs_errno)?;
+        let watches = self
+            .epolls
+            .instance(epoll_id)?
+            .watches
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(!self.epoll_ready_events(&watches, 1, timeout)?.is_empty())
     }
 
     fn epoll_ready_events(
@@ -11970,7 +12006,10 @@ mod tests {
         ));
 
         assert_eq!(wait.result, SyscallReturn::Success(0));
-        runtime.dispatcher.subsystems_mut().resume_futex_timeouts();
+        assert_eq!(
+            runtime.dispatcher.subsystems_mut().wait_for_futex_timeout(),
+            1
+        );
         let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
         assert_eq!(task.state(), TaskState::Runnable);
         assert_eq!(
@@ -12024,7 +12063,10 @@ mod tests {
 
         assert_eq!(invalid.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
         assert_eq!(timed_out.result, SyscallReturn::Success(0));
-        runtime.dispatcher.subsystems_mut().resume_futex_timeouts();
+        assert_eq!(
+            runtime.dispatcher.subsystems_mut().wait_for_futex_timeout(),
+            1
+        );
         let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
         assert_eq!(task.state(), TaskState::Runnable);
         assert_eq!(
@@ -13062,6 +13104,13 @@ mod tests {
                 ))
                 .result,
             SyscallReturn::Success(1)
+        );
+        assert!(
+            runtime
+                .dispatcher
+                .subsystems_mut()
+                .fd_waiter_ready(INITIAL_GUEST_PID, 5, false, Some(Duration::ZERO))
+                .unwrap()
         );
         let ready = runtime.dispatch_syscall(context(
             Syscall::EpollWait,
