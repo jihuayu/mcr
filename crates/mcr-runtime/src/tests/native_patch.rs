@@ -940,6 +940,37 @@ fn native_fs_fault_emulates_absolute_cmp64_imm8() {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[test]
+fn native_fs_fault_emulates_absolute_cmp8_imm8() {
+    let _guard = native_execution_test_guard();
+    let code = [
+        0x64, 0x80, 0x3c, 0x25, 0x58, 0xff, 0xff, 0xff, 0x00, 0x0f, 0x05,
+    ];
+    let mut runtime =
+        Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+    runtime.memory_mut().write(0x402158, &[0]).unwrap();
+    let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+        .expect("fs-relative cmp imm8 fault instruction decodes");
+
+    let registers = emulate_fs_relative_native_fault(
+        runtime.memory_mut(),
+        mcr_win::HostCpuRegisters {
+            rflags: 0x202,
+            rip: 0x401000,
+            ..mcr_win::HostCpuRegisters::default()
+        },
+        0x402200,
+        &instruction,
+    )
+    .unwrap()
+    .expect("instruction is emulated");
+
+    assert_eq!(registers.rip, 0x401009);
+    assert_ne!(registers.rflags & 0x40, 0);
+    assert_eq!(registers.rflags & 0x01, 0);
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
 fn native_fs_fault_emulates_absolute_sub64() {
     let _guard = native_execution_test_guard();
     let code = [0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0, 0, 0, 0x0f, 0x05];

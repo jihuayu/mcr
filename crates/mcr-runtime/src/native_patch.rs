@@ -611,7 +611,10 @@ fn emulate_fs_absolute_cmp_imm8(
     } else {
         0
     };
-    if bytes.get(index).copied() != Some(0x83) {
+    let Some(opcode) = bytes.get(index).copied() else {
+        return Ok(None);
+    };
+    if !matches!(opcode, 0x80 | 0x83) {
         return Ok(None);
     }
     let Some(&modrm) = bytes.get(index + 1) else {
@@ -637,20 +640,32 @@ fn emulate_fs_absolute_cmp_imm8(
             .expect("displacement length checked"),
     );
     let addr = fs_base.wrapping_add(displacement as i64 as u64);
-    if rex & 0x08 != 0 {
-        let mut lhs_bytes = [0; 8];
-        memory.read(addr, &mut lhs_bytes)?;
-        let lhs = u64::from_le_bytes(lhs_bytes);
-        let rhs = (imm8 as i8 as i64) as u64;
-        let result = lhs.wrapping_sub(rhs);
-        apply_sub_flags64(&mut registers, lhs, rhs, result);
-    } else {
-        let mut lhs_bytes = [0; 4];
-        memory.read(addr, &mut lhs_bytes)?;
-        let lhs = u32::from_le_bytes(lhs_bytes);
-        let rhs = imm8 as i8 as i32 as u32;
-        let result = lhs.wrapping_sub(rhs);
-        apply_sub_flags32(&mut registers, lhs, rhs, result);
+    match opcode {
+        0x80 => {
+            let mut lhs_bytes = [0; 1];
+            memory.read(addr, &mut lhs_bytes)?;
+            let lhs = lhs_bytes[0];
+            let rhs = imm8;
+            let result = lhs.wrapping_sub(rhs);
+            apply_sub_flags8(&mut registers, lhs, rhs, result);
+        }
+        0x83 if rex & 0x08 != 0 => {
+            let mut lhs_bytes = [0; 8];
+            memory.read(addr, &mut lhs_bytes)?;
+            let lhs = u64::from_le_bytes(lhs_bytes);
+            let rhs = (imm8 as i8 as i64) as u64;
+            let result = lhs.wrapping_sub(rhs);
+            apply_sub_flags64(&mut registers, lhs, rhs, result);
+        }
+        0x83 => {
+            let mut lhs_bytes = [0; 4];
+            memory.read(addr, &mut lhs_bytes)?;
+            let lhs = u32::from_le_bytes(lhs_bytes);
+            let rhs = imm8 as i8 as i32 as u32;
+            let result = lhs.wrapping_sub(rhs);
+            apply_sub_flags32(&mut registers, lhs, rhs, result);
+        }
+        _ => unreachable!("opcode was checked"),
     }
     registers.rip = registers
         .rip
@@ -809,6 +824,38 @@ fn apply_sub_flags64(registers: &mut mcr_win::HostCpuRegisters, lhs: u64, rhs: u
         flags |= SF;
     }
     if ((lhs ^ rhs) & (lhs ^ result) & (1 << 63)) != 0 {
+        flags |= OF;
+    }
+    registers.rflags = flags;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn apply_sub_flags8(registers: &mut mcr_win::HostCpuRegisters, lhs: u8, rhs: u8, result: u8) {
+    const CF: u64 = 0x001;
+    const PF: u64 = 0x004;
+    const AF: u64 = 0x010;
+    const ZF: u64 = 0x040;
+    const SF: u64 = 0x080;
+    const OF: u64 = 0x800;
+    const STATUS_MASK: u64 = CF | PF | AF | ZF | SF | OF;
+
+    let mut flags = registers.rflags & !STATUS_MASK;
+    if lhs < rhs {
+        flags |= CF;
+    }
+    if result.count_ones() % 2 == 0 {
+        flags |= PF;
+    }
+    if (lhs ^ rhs ^ result) & 0x10 != 0 {
+        flags |= AF;
+    }
+    if result == 0 {
+        flags |= ZF;
+    }
+    if result & (1 << 7) != 0 {
+        flags |= SF;
+    }
+    if ((lhs ^ rhs) & (lhs ^ result) & (1 << 7)) != 0 {
         flags |= OF;
     }
     registers.rflags = flags;
