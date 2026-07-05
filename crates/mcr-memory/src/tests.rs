@@ -79,6 +79,36 @@ fn fixed_guest_mmap_retries_after_host_address_conflict() {
     assert_eq!(memory.vma_containing(mapped).unwrap().start(), mapped);
 }
 
+#[cfg(windows)]
+#[test]
+fn fixed_guest_brk_growth_failure_preserves_existing_heap_allocation() {
+    use mcr_win::{HostMemory, MemoryProtection};
+
+    const HOST_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+
+    let mut memory = memory();
+    memory.host_address_mode = HostAddressMode::FixedGuest;
+    let first_end = BRK_BASE + HOST_ALLOCATION_GRANULARITY;
+    assert!(memory.set_brk(first_end).error.is_none());
+    memory.write(BRK_BASE, b"heap").unwrap();
+
+    let Ok(_reserved) = HostMemory::allocate_at(
+        first_end as usize,
+        HOST_ALLOCATION_GRANULARITY as usize,
+        MemoryProtection::NoAccess,
+    ) else {
+        return;
+    };
+
+    let growth = memory.set_brk(first_end + HOST_ALLOCATION_GRANULARITY);
+
+    assert!(growth.error.is_some());
+    assert_eq!(growth.current, first_end);
+    let mut bytes = [0; 4];
+    memory.read(BRK_BASE, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"heap");
+}
+
 #[test]
 fn mmap_fixed_replaces_overlapping_mapping() {
     let mut memory = memory();

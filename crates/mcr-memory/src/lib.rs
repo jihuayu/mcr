@@ -160,6 +160,13 @@ impl GuestAllocation {
     }
 }
 
+struct SavedAllocation {
+    allocation_id: u64,
+    guest_start: u64,
+    bytes: Vec<u8>,
+    ranges: Vec<AllocationProtectionRange>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuestMemoryError {
     InvalidAddress,
@@ -1068,11 +1075,6 @@ impl GuestMemory {
         guest_end: u64,
         allocation_ids: Vec<u64>,
     ) -> Result<(u64, u64), GuestMemoryError> {
-        struct SavedAllocation {
-            guest_start: u64,
-            bytes: Vec<u8>,
-        }
-
         let mut saved = Vec::new();
         for allocation_id in &allocation_ids {
             let ranges = self.allocation_protection_ranges(*allocation_id)?;
@@ -1080,13 +1082,34 @@ impl GuestMemory {
                 .allocations
                 .get(allocation_id)
                 .expect("allocation id collected from map");
-            let mut guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
+            let bytes = {
+                let mut guard = AllocationProtectionGuard::new(&allocation.memory, &ranges)?;
+                let bytes = allocation.memory.as_slice().to_vec();
+                guard.restore()?;
+                bytes
+            };
             saved.push(SavedAllocation {
+                allocation_id: *allocation_id,
                 guest_start: allocation.guest_start,
-                bytes: allocation.memory.as_slice().to_vec(),
+                bytes,
+                ranges,
             });
-            guard.restore()?;
         }
+        let replacement_ranges = self
+            .vmas
+            .values()
+            .filter(|vma| allocation_ids.contains(&vma.allocation_id))
+            .map(|vma| {
+                Ok(AllocationProtectionRange {
+                    offset: usize::try_from(vma.start - guest_start)
+                        .map_err(|_| GuestMemoryError::RegionTooLarge)?,
+                    len: usize::try_from(vma.len())
+                        .map_err(|_| GuestMemoryError::RegionTooLarge)?,
+                    protection: vma.protection,
+                })
+            })
+            .collect::<Result<Vec<_>, GuestMemoryError>>()?;
+
         for allocation_id in &allocation_ids {
             self.allocations.remove(allocation_id);
         }
@@ -1096,13 +1119,19 @@ impl GuestMemory {
             .ok_or(GuestMemoryError::InvalidAddress)?;
         let len =
             usize::try_from(allocation_length).map_err(|_| GuestMemoryError::RegionTooLarge)?;
-        let mut memory = allocate_guest_host_memory_at(
+        let mut memory = match allocate_guest_host_memory_at(
             guest_start,
             len,
             MemoryProtection::ReadWrite,
             self.host_address_mode,
-        )?;
-        for allocation in saved {
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                self.restore_saved_allocations(&saved)?;
+                return Err(error);
+            }
+        };
+        for allocation in &saved {
             let offset = usize::try_from(allocation.guest_start - guest_start)
                 .map_err(|_| GuestMemoryError::RegionTooLarge)?;
             memory.as_mut_slice()[offset..offset + allocation.bytes.len()]
@@ -1121,19 +1150,46 @@ impl GuestMemory {
                 memory: Arc::new(memory),
             },
         );
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .expect("replacement allocation was inserted");
+        if let Err(error) = apply_allocation_protections(&allocation.memory, &replacement_ranges) {
+            self.allocations.remove(&allocation_id);
+            self.restore_saved_allocations(&saved)?;
+            return Err(error);
+        }
         for vma in self.vmas.values_mut() {
             if allocation_ids.contains(&vma.allocation_id) {
                 vma.allocation_id = allocation_id;
                 vma.allocation_offset = vma.start - guest_start;
             }
         }
-        let ranges = self.allocation_protection_ranges(allocation_id)?;
-        let allocation = self
-            .allocations
-            .get(&allocation_id)
-            .expect("replacement allocation was inserted");
-        apply_allocation_protections(&allocation.memory, &ranges)?;
         Ok((allocation_id, requested_start - guest_start))
+    }
+
+    fn restore_saved_allocations(
+        &mut self,
+        saved: &[SavedAllocation],
+    ) -> Result<(), GuestMemoryError> {
+        for allocation in saved {
+            let mut memory = allocate_guest_host_memory_at(
+                allocation.guest_start,
+                allocation.bytes.len(),
+                MemoryProtection::ReadWrite,
+                self.host_address_mode,
+            )?;
+            memory.as_mut_slice().copy_from_slice(&allocation.bytes);
+            apply_allocation_protections(&memory, &allocation.ranges)?;
+            self.allocations.insert(
+                allocation.allocation_id,
+                GuestAllocation {
+                    guest_start: allocation.guest_start,
+                    memory: Arc::new(memory),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn insert_mapping(
