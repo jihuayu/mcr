@@ -654,7 +654,7 @@ mod tests {
 
         assert_eq!(job.submission(), HostWorkerPoolSubmission::Queued);
         assert_eq!(job.recv_timeout(Duration::from_secs(2)), Ok(42));
-        let diagnostics = executor.diagnostics();
+        let diagnostics = wait_for_completed_jobs(&executor, 1);
         assert_eq!(diagnostics.submitted_jobs(), 1);
         assert_eq!(diagnostics.completed_jobs(), 1);
         executor.shutdown();
@@ -677,7 +677,7 @@ mod tests {
             job.recv_timeout(Duration::from_secs(2)),
             Err(HostWorkerPoolJobError::Panicked)
         );
-        assert_eq!(executor.diagnostics().completed_jobs(), 1);
+        assert_eq!(wait_for_completed_jobs(&executor, 1).completed_jobs(), 1);
         executor.shutdown();
     }
 
