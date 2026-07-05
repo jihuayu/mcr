@@ -3181,7 +3181,9 @@ pub enum GuestRunError {
         tid: mcr_sys::GuestTid,
         state: TaskState,
     },
-    NoRunnableTasks,
+    NoRunnableTasks {
+        diagnostic: RuntimeStallDiagnostic,
+    },
     WaitResume {
         errno: LinuxErrno,
     },
@@ -3199,7 +3201,7 @@ impl GuestRunError {
             Self::MissingInitialProcess
             | Self::MissingInitialTask
             | Self::InitialTaskNotRunnable { .. }
-            | Self::NoRunnableTasks => LinuxErrno::ESRCH,
+            | Self::NoRunnableTasks { .. } => LinuxErrno::ESRCH,
             Self::WaitResume { errno } => *errno,
             Self::StepLimitExceeded { .. } => LinuxErrno::ETIMEDOUT,
             Self::GuestExecution(error) => error.linux_errno(),
@@ -3218,7 +3220,9 @@ impl fmt::Display for GuestRunError {
                     "initial guest task {tid} is not runnable: {state:?}"
                 )
             }
-            Self::NoRunnableTasks => write!(formatter, "no runnable guest tasks remain"),
+            Self::NoRunnableTasks { diagnostic } => {
+                write!(formatter, "no runnable guest tasks remain: {diagnostic}")
+            }
             Self::WaitResume { errno } => {
                 write!(formatter, "failed to resume waiting guest task: {errno}")
             }
@@ -3260,8 +3264,8 @@ fn run_guest_until_exit_with_dispatcher<T>(
 where
     T: SyscallTracer,
 {
-    run_guest_until_exit_loop(dispatcher, None, |_| {
-        unreachable!("step-limit diagnostic is only captured when a limit is set")
+    run_guest_until_exit_loop(dispatcher, None, |dispatcher| {
+        RuntimeStallDiagnostic::capture_runtime(dispatcher.subsystems(), &[])
     })
 }
 
@@ -3319,7 +3323,9 @@ where
             }
             if runnable_tids.is_empty() {
                 dispatcher.subsystems_mut().perf_record_no_runnable();
-                return Err(GuestRunError::NoRunnableTasks);
+                return Err(GuestRunError::NoRunnableTasks {
+                    diagnostic: capture_diagnostic(dispatcher),
+                });
             }
             for tid in runnable_tids {
                 let Some((pid, state)) = dispatcher
@@ -9792,7 +9798,7 @@ mod tests {
         SyscallArgs, SyscallEnterEvent, SyscallExitEvent, SyscallRegisters, SyscallReturn,
         SyscallTraceEvent, TraceContext, Wait4SyscallArgs,
     };
-    use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
+    use mcr_task::{ARCH_SET_FS, ExitState, FutexWaitKey, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
     use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
 
     fn native_execution_test_guard() -> MutexGuard<'static, ()> {
@@ -17416,6 +17422,28 @@ mod tests {
 
         assert_eq!(diagnostic.kind(), RuntimeStallKind::GuestWaitFutex);
         assert_eq!(diagnostic.in_flight_syscall().unwrap().name(), "futex");
+    }
+
+    #[test]
+    fn run_until_exit_reports_no_runnable_stall_diagnostic() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        runtime
+            .kernel_mut()
+            .block_task_for_futex(
+                INITIAL_GUEST_TID,
+                FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true),
+            )
+            .unwrap();
+
+        let error = runtime.run_guest_until_exit().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("guest wait/futex stall: 1 task(s) waiting for futex wake"),
+            "{error}"
+        );
     }
 
     #[test]
