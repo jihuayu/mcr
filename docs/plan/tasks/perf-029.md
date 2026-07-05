@@ -61,5 +61,7 @@ cargo test -p mcr-runtime perf_baseline -- --ignored --nocapture
   the VEH once per process while retaining the active-thread/state filter.
 - Runtime epoll instances now cache their cloned watch list and invalidate it
   only on `epoll_ctl` mutations, removing the per-`epoll_wait` map clone.
-- Socket poll/select batching remains a follow-up below the `mcr-net`
-  transport boundary because the current trait exposes per-handle polling.
+- Socket poll/select/epoll readiness now flows through `mcr-net`
+  `GuestSocketTable::poll_many`. Windows host sockets opt into a shared
+  `poll_sockets`/`WSAPoll` path when IOCP receive state is not involved, while
+  per-handle polling remains the fallback for existing transport semantics.
