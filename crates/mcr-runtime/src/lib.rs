@@ -4287,7 +4287,7 @@ const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-const NATIVE_PATCH_CACHE_VERSION: u32 = 5;
+const NATIVE_PATCH_CACHE_VERSION: u32 = 9;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -5044,11 +5044,29 @@ fn apply_fs_relative_patch_entries(
         "runtime fs-relative-patch apply start patches={} fs_base=0x{fs_base:016x}",
         patch_count
     ));
+    let mut patches9 = Vec::new();
+    let mut patches10 = Vec::new();
     for (address, patch) in patches {
         let replacement = fs_relative_replacement(patch, fs_base)
             .unwrap_or_else(|| patch.original_bytes().to_vec());
-        memory.patch_code(address, &replacement)?;
+        match replacement.len() {
+            9 => {
+                let mut bytes = [0; 9];
+                bytes.copy_from_slice(&replacement);
+                patches9.push((address, bytes));
+            }
+            10 => {
+                let mut bytes = [0; 10];
+                bytes.copy_from_slice(&replacement);
+                patches10.push((address, bytes));
+            }
+            _ => {
+                memory.patch_code(address, &replacement)?;
+            }
+        }
     }
+    memory.patch_code_fixed(patches9)?;
+    memory.patch_code_fixed(patches10)?;
     host_step_trace(format_args!(
         "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
         patch_count,
@@ -5113,7 +5131,7 @@ fn fs_relative_patch_sites(
 fn fs_relative_original(bytes: &[u8]) -> Option<(usize, FsRelativePatch)> {
     let prefix_len = fs_relative_patch_prefix_len(bytes)?;
     let bytes = &bytes[prefix_len..];
-    if bytes.len() < 9 || bytes[0] != 0x64 {
+    if bytes.first().copied() != Some(0x64) {
         return None;
     }
     let shape = fs_relative_patch_body_shape(&bytes[1..])?;
@@ -5171,14 +5189,40 @@ struct FsRelativePatchBodyShape {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn fs_relative_patch_body_shape(bytes: &[u8]) -> Option<FsRelativePatchBodyShape> {
-    if bytes.len() < 8 {
+    if bytes.len() < 7 {
         return None;
     }
-    if (bytes[0] & 0xf8 == 0x48 && matches!(bytes[1], 0x8b | 0x2b))
-        || (bytes[0] == 0x0f && matches!(bytes[1], 0xb6 | 0xb7))
+    if bytes.len() >= 8
+        && ((bytes[0] & 0xf0 == 0x40 && matches!(bytes[1], 0x8b | 0x89 | 0x2b))
+            || (bytes[0] == 0x0f && matches!(bytes[1], 0xb6 | 0xb7)))
     {
         (bytes[2] & 0xc7 == 0x04 && bytes[3] == 0x25).then_some(FsRelativePatchBodyShape {
             displacement_offset: 4,
+            body_len: 8,
+        })
+    } else if matches!(bytes[0], 0x8b | 0x89) && bytes[1] & 0xc7 == 0x04 && bytes[2] == 0x25 {
+        Some(FsRelativePatchBodyShape {
+            displacement_offset: 3,
+            body_len: 7,
+        })
+    } else if bytes.len() >= 8
+        && matches!(bytes[0], 0x80 | 0x83)
+        && bytes[1] & 0xc7 == 0x04
+        && bytes[1] & 0x38 == 0x38
+        && bytes[2] == 0x25
+    {
+        Some(FsRelativePatchBodyShape {
+            displacement_offset: 3,
+            body_len: 8,
+        })
+    } else if bytes.len() >= 8
+        && bytes[0] == 0xc6
+        && bytes[1] & 0xc7 == 0x04
+        && bytes[1] & 0x38 == 0
+        && bytes[2] == 0x25
+    {
+        Some(FsRelativePatchBodyShape {
+            displacement_offset: 3,
             body_len: 8,
         })
     } else if bytes.len() >= 9
@@ -8016,17 +8060,20 @@ impl RuntimeSubsystems {
         tid: mcr_sys::GuestTid,
         exit_group: bool,
     ) -> Result<(), LinuxErrno> {
-        if !exit_group
-            && let Some(clear_child_tid) = self
+        if !exit_group {
+            if let Some(clear_child_tid) = self
                 .tasks
                 .task_mut(tid)
                 .and_then(GuestTask::take_clear_child_tid)
-        {
-            write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
-            self.store_selected_process_memory(pid)?;
-            self.futexes.wake(clear_child_tid, u32::MAX);
-            self.tasks
-                .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
+            {
+                write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
+                self.store_selected_process_memory(pid)?;
+                self.futexes.wake(clear_child_tid, u32::MAX);
+                self.tasks
+                    .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
+                self.tasks
+                    .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, false), u32::MAX);
+            }
         }
 
         let process_exited = matches!(
@@ -17505,6 +17552,102 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
+    fn native_patch_cache_rewrites_fs_relative_mov_store_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_store = [0x64, 0x89, 0x04, 0x25, 0x58, 0xfe, 0xff, 0xff];
+        let mut code = fs_store.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_store.len()),
+            [0x89, 0x04, 0x25, 0x58, 0xfe, 0xff, 0x6f, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401008, 2), [0xcc, 0x90]);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_rex_mov_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [0x64, 0x44, 0x8b, 0x24, 0x25, 0x50, 0xff, 0xff, 0xff];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_load.len()),
+            [0x44, 0x8b, 0x24, 0x25, 0x50, 0xff, 0xff, 0x6f, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_cmp_byte_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_cmp = [0x64, 0x80, 0x3c, 0x25, 0x58, 0xff, 0xff, 0xff, 0x00];
+        let mut code = fs_cmp.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_cmp.len()),
+            [0x80, 0x3c, 0x25, 0x58, 0xff, 0xff, 0x6f, 0x00, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_patch_cache_rewrites_fs_relative_mov_byte_immediate_tls_accesses() {
+        let _guard = native_execution_test_guard();
+        let fs_store = [0x64, 0xc6, 0x04, 0x25, 0x78, 0xff, 0xff, 0xff, 0x01];
+        let mut code = fs_store.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let mut runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+        let pid = INITIAL_GUEST_PID;
+
+        runtime
+            .dispatcher
+            .subsystems_mut()
+            .ensure_native_patch_cache(pid, 0x7000_0000)
+            .unwrap();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), 0x401000, fs_store.len()),
+            [0xc6, 0x04, 0x25, 0x78, 0xff, 0xff, 0x6f, 0x01, 0x90]
+        );
+        assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
     fn native_patch_cache_rewrites_prefixed_fs_relative_tls_accesses() {
         let _guard = native_execution_test_guard();
         let fs_load = [
@@ -17822,6 +17965,72 @@ mod tests {
                 .contains("guest wait/futex stall: 1 task(s) waiting for futex wake"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn thread_exit_clear_child_tid_wakes_shared_futex_waiter() {
+        let mut runtime =
+            RuntimeWithTracer::with_diagnostics(test_program("/bin/app", 0x401000)).unwrap();
+        let flags = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD
+            | LINUX_CLONE_CHILD_CLEARTID;
+        let clear_child_tid = 0x402000;
+        runtime
+            .memory_mut()
+            .write(clear_child_tid, &1u32.to_le_bytes())
+            .unwrap();
+        let clone = runtime.kernel_mut().clone_current(
+            INITIAL_GUEST_TID,
+            mcr_sys::CloneSyscallArgs::new(flags, 0, 0, clear_child_tid, 0),
+        );
+        let SyscallReturn::Success(exiting_tid) = clone.result else {
+            panic!("thread clone should succeed: {clone:?}");
+        };
+        let waiter = runtime.kernel_mut().clone_current(
+            INITIAL_GUEST_TID,
+            mcr_sys::CloneSyscallArgs::new(
+                LINUX_CLONE_VM
+                    | LINUX_CLONE_FS
+                    | LINUX_CLONE_FILES
+                    | LINUX_CLONE_SIGHAND
+                    | LINUX_CLONE_THREAD,
+                0,
+                0,
+                0,
+                0,
+            ),
+        );
+        let SyscallReturn::Success(waiter_tid) = waiter.result else {
+            panic!("waiter thread clone should succeed: {waiter:?}");
+        };
+        runtime
+            .kernel_mut()
+            .block_task_for_futex(
+                waiter_tid as mcr_sys::GuestTid,
+                FutexWaitKey::new(INITIAL_GUEST_PID, clear_child_tid, false),
+            )
+            .unwrap();
+
+        let exit = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            exiting_tid as mcr_sys::GuestTid,
+            Syscall::Exit,
+            [0, 0, 0, 0, 0, 0],
+        ));
+
+        assert_eq!(exit.result, SyscallReturn::Success(0));
+        assert_eq!(
+            runtime
+                .kernel()
+                .task(waiter_tid as mcr_sys::GuestTid)
+                .unwrap()
+                .state(),
+            TaskState::Runnable
+        );
+        assert_eq!(u32_from_guest(runtime.memory(), clear_child_tid), 0);
     }
 
     #[test]
