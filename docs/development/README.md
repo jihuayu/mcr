@@ -193,7 +193,7 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs node-rootfs /bin/sh -c "node -e \"console.log('node-ok')\""` | Extended support matrix |
 | `mcr run-rootfs jdk-rootfs /bin/sh -c "<javac then java>"` | Extended support matrix |
 | `mcr run-rootfs mysql-rootfs /bin/sh -c "<start mysqld and query over Unix socket>"` | Extended support matrix |
-| `mcr run-rootfs redis-rootfs /bin/sh -c "<start redis-server and query over Unix socket>"` | Extended support matrix |
+| `mcr run-rootfs redis-rootfs /bin/sh -c "redis-server --test-memory 1"` | Extended support matrix |
 
 Phase 2 shell and network contracts are opt-in. Normal `cargo test -p
 mcr-testkit` must not require network access, GitHub access, CA certificates, or
@@ -231,7 +231,7 @@ through the host shell.
 The ignored extended support matrix uses `MCR_BIN` plus the matching
 materialized package rootfs fixture. It covers gcc compile-and-run, Node.js
 script execution, JDK compile-and-run, local MySQL/MariaDB server startup and
-query, and local Redis startup and query. Run it explicitly with:
+query, and Redis server execution. Run it explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit --test extended_support_smoke_contract -- --ignored --nocapture

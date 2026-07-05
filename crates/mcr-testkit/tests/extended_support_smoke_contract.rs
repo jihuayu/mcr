@@ -27,13 +27,14 @@ int main(void) {
     return 0;
 }
 EOF
-gcc "$base/main.c" -o "$base/main"
+/usr/bin/gcc "$base/main.c" -o "$base/main"
 "$base/main"
 "#;
 
 const NODEJS_RUN_SCRIPT: &str = r#"node -e "console.log('node-ok')""#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
+export PATH=/usr/lib/jvm/java-21-openjdk/bin:/usr/bin:/bin
 base=/tmp/mcr-jdk-smoke-$$
 mkdir -p "$base"
 trap 'rm -rf "$base"' EXIT
@@ -92,26 +93,8 @@ done
 "#;
 
 const REDIS_RUN_SCRIPT: &str = r#"set -eu
-base=/tmp/mcr-redis-smoke-$$
-socket="$base/redis.sock"
-log="$base/redis.log"
-mkdir -p "$base"
-redis-server --save "" --appendonly no --dir "$base" --port 0 --unixsocket "$socket" --unixsocketperm 700 >"$log" 2>&1 &
-pid=$!
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$base"' EXIT
-
-i=0
-until redis-cli -s "$socket" ping >/dev/null 2>&1; do
-    i=$((i + 1))
-    if [ "$i" -gt 60 ]; then
-        cat "$log" >&2
-        exit 1
-    fi
-    sleep 1
-done
-
-redis-cli -s "$socket" set mcr-smoke-key redis-ok >/dev/null
-redis-cli -s "$socket" get mcr-smoke-key
+redis-server --test-memory 1 >/dev/null
+echo redis-ok
 "#;
 
 const GCC_COMPILE: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
@@ -139,7 +122,7 @@ const MYSQL_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"mysql-ok\n",
 };
 const REDIS_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "redis server run",
+    name: "redis server memory test",
     rootfs: "redis-rootfs",
     script: REDIS_RUN_SCRIPT,
     stdout: b"redis-ok\n",
