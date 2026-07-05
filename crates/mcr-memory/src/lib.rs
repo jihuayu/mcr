@@ -756,16 +756,34 @@ impl GuestMemory {
         patches: impl IntoIterator<Item = (u64, [u8; N])>,
     ) -> Result<(), GuestMemoryError> {
         let patches = patches.into_iter().collect::<Vec<_>>();
-        for (address, _) in &patches {
-            let end = checked_raw_range(*address, N as u64)?;
-            let vma = self
-                .vma_containing(*address)
-                .cloned()
-                .ok_or(GuestMemoryError::NotMapped)?;
-            if end > vma.end {
-                return Err(GuestMemoryError::InvalidLength);
+        if matches!(self.host_address_mode, HostAddressMode::FixedGuest) {
+            let mut allocation_ids = BTreeSet::new();
+            for (address, _) in &patches {
+                let end = checked_raw_range(*address, N as u64)?;
+                let vma = self
+                    .vma_containing(*address)
+                    .cloned()
+                    .ok_or(GuestMemoryError::NotMapped)?;
+                if end > vma.end {
+                    return Err(GuestMemoryError::InvalidLength);
+                }
+                allocation_ids.insert(vma.allocation_id);
             }
-            self.ensure_guest_page_range_unique(*address, end)?;
+            for allocation_id in allocation_ids {
+                self.ensure_allocation_unique(allocation_id)?;
+            }
+        } else {
+            for (address, _) in &patches {
+                let end = checked_raw_range(*address, N as u64)?;
+                let vma = self
+                    .vma_containing(*address)
+                    .cloned()
+                    .ok_or(GuestMemoryError::NotMapped)?;
+                if end > vma.end {
+                    return Err(GuestMemoryError::InvalidLength);
+                }
+                self.ensure_guest_page_range_unique(*address, end)?;
+            }
         }
 
         #[derive(Debug)]
