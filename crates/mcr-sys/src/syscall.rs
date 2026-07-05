@@ -108,6 +108,7 @@ pub enum Syscall {
     Exit,
     Wait4,
     Kill,
+    Tkill,
     Uname,
     Fcntl,
     Ftruncate,
@@ -259,6 +260,7 @@ impl Syscall {
     pub const PRCTL: SyscallNumber = SyscallNumber::new(157);
     pub const ARCH_PRCTL: SyscallNumber = SyscallNumber::new(158);
     pub const GETTID: SyscallNumber = SyscallNumber::new(186);
+    pub const TKILL: SyscallNumber = SyscallNumber::new(200);
     pub const FUTEX: SyscallNumber = SyscallNumber::new(202);
     pub const GETDENTS64: SyscallNumber = SyscallNumber::new(217);
     pub const SET_TID_ADDRESS: SyscallNumber = SyscallNumber::new(218);
@@ -391,6 +393,7 @@ impl Syscall {
             157 => Self::Prctl,
             158 => Self::ArchPrctl,
             186 => Self::Gettid,
+            200 => Self::Tkill,
             202 => Self::Futex,
             217 => Self::Getdents64,
             218 => Self::SetTidAddress,
@@ -526,6 +529,7 @@ impl Syscall {
             Self::Prctl => Self::PRCTL,
             Self::ArchPrctl => Self::ARCH_PRCTL,
             Self::Gettid => Self::GETTID,
+            Self::Tkill => Self::TKILL,
             Self::Futex => Self::FUTEX,
             Self::Getdents64 => Self::GETDENTS64,
             Self::SetTidAddress => Self::SET_TID_ADDRESS,
@@ -661,6 +665,7 @@ impl Syscall {
             Self::Prctl => "prctl",
             Self::ArchPrctl => "arch_prctl",
             Self::Gettid => "gettid",
+            Self::Tkill => "tkill",
             Self::Futex => "futex",
             Self::Getdents64 => "getdents64",
             Self::SetTidAddress => "set_tid_address",
@@ -749,6 +754,7 @@ mod tests {
             (Syscall::STATFS, Syscall::Statfs, "statfs"),
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
             (Syscall::PRCTL, Syscall::Prctl, "prctl"),
+            (Syscall::TKILL, Syscall::Tkill, "tkill"),
             (Syscall::CLOCK_GETRES, Syscall::ClockGetres, "clock_getres"),
             (Syscall::PRLIMIT64, Syscall::Prlimit64, "prlimit64"),
             (Syscall::GETCPU, Syscall::Getcpu, "getcpu"),

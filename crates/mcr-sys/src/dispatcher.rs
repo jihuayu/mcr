@@ -173,6 +173,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::Prctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::ArchPrctl, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Gettid, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::Tkill, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Futex, SyscallSubsystem::Task),
     SyscallDescriptor::new(Syscall::Getdents64, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::SetTidAddress, SyscallSubsystem::Task),
@@ -759,6 +760,7 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
         ],
         Syscall::Getrusage => vec![signed_field("who", arg(0)), hex_field("usage", arg(1))],
         Syscall::Kill => vec![signed_field("pid", arg(0)), decimal_field("sig", arg(1))],
+        Syscall::Tkill => vec![signed_field("tid", arg(0)), decimal_field("sig", arg(1))],
         Syscall::Tgkill => vec![
             signed_field("tgid", arg(0)),
             signed_field("tid", arg(1)),

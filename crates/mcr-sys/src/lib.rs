@@ -67,7 +67,8 @@ pub use task::{
     LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_ROBUST_LIST_HEAD_SIZE,
     LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK, LINUX_SIGCHLD,
     LINUX_WAIT_SUPPORTED_OPTIONS, LINUX_WNOHANG, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs,
-    SetRobustListSyscallArgs, SetTidAddressSyscallArgs, TgkillSyscallArgs, Wait4SyscallArgs,
+    SetRobustListSyscallArgs, SetTidAddressSyscallArgs, TgkillSyscallArgs, TkillSyscallArgs,
+    Wait4SyscallArgs,
 };
 pub use trace::{
     HostErrorTrace, SyscallEnterEvent, SyscallExitEvent, SyscallTraceEvent, TraceContext,

@@ -171,6 +171,19 @@ impl TgkillSyscallArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TkillSyscallArgs {
+    pub tid: i32,
+    pub sig: u32,
+}
+
+impl TkillSyscallArgs {
+    #[must_use]
+    pub const fn new(tid: i32, sig: u32) -> Self {
+        Self { tid, sig }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FutexSyscallArgs {
     pub uaddr: GuestAddress,
     pub op: u32,
@@ -311,6 +324,7 @@ mod tests {
         let mask = RtSigprocmaskSyscallArgs::new(LINUX_SIG_SETMASK, 0x3000, 0x4000, 8);
         let kill = KillSyscallArgs::new(-1, 15);
         let tgkill = TgkillSyscallArgs::new(7, 8, 9);
+        let tkill = TkillSyscallArgs::new(8, 9);
 
         assert_eq!(action.sig, 2);
         assert_eq!(action.act, 0x1000);
@@ -322,6 +336,8 @@ mod tests {
         assert_eq!(tgkill.tgid, 7);
         assert_eq!(tgkill.tid, 8);
         assert_eq!(tgkill.sig, 9);
+        assert_eq!(tkill.tid, 8);
+        assert_eq!(tkill.sig, 9);
     }
 
     #[test]

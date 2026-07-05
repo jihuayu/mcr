@@ -23,7 +23,7 @@ use mcr_sys::{
     LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK, LINUX_SIGCHLD, LinuxErrno, LinuxUtsname,
     RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs, SetRobustListSyscallArgs,
     SetTidAddressSyscallArgs, Syscall, SyscallOutcome, SyscallRequest, TaskSyscalls,
-    TgkillSyscallArgs, Wait4SyscallArgs,
+    TgkillSyscallArgs, TkillSyscallArgs, Wait4SyscallArgs,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -961,6 +961,10 @@ impl GuestKernel {
                 arg(request, 0) as i32,
                 arg(request, 1) as u32,
             )),
+            Syscall::Tkill => self.tkill_current(TkillSyscallArgs::new(
+                arg(request, 0) as i32,
+                arg(request, 1) as u32,
+            )),
             Syscall::Tgkill => self.tgkill_current(TgkillSyscallArgs::new(
                 arg(request, 0) as i32,
                 arg(request, 1) as i32,
@@ -1496,6 +1500,26 @@ impl GuestKernel {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
         if task.pid != pid {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
+        if let Err(error) = validate_signal_or_probe(args.sig) {
+            return error.into_outcome();
+        }
+        if args.sig == 0 {
+            return SyscallOutcome::success(0);
+        }
+        if is_terminating_signal(args.sig) {
+            return self.exit_task(tid, signal_exit_status(args.sig));
+        }
+        SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
+    }
+
+    pub fn tkill_current(&mut self, args: TkillSyscallArgs) -> SyscallOutcome {
+        if args.tid <= 0 {
+            return TaskError::UnsupportedSignalTarget(args.tid).into_outcome();
+        }
+        let tid = args.tid as GuestTid;
+        if self.task(tid).is_none() {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         }
         if let Err(error) = validate_signal_or_probe(args.sig) {
@@ -2909,6 +2933,24 @@ mod tests {
                     0,
                     0
                 ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Exited { status: 134 }
+        );
+    }
+
+    #[test]
+    fn tkill_sigabrt_exits_target_task() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Tkill,
+                [INITIAL_GUEST_TID as u64, LINUX_SIGABRT as u64, 0, 0, 0, 0],
             ),
             SyscallReturn::Success(0)
         );
