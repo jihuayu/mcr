@@ -299,6 +299,53 @@ fn private_futex_wait_timeout_pointer_is_validated_and_controls_timeout() {
 }
 
 #[test]
+fn private_futex_wait_finite_timeout_blocks_until_deadline() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &1u32.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402100, &0i64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402108, &1_000_000i64.to_le_bytes())
+        .unwrap();
+
+    let wait = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            0x402000,
+            u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+            1,
+            0x402100,
+            0,
+            0,
+        ],
+    ));
+
+    assert_eq!(wait.result, SyscallReturn::Success(0));
+    assert!(matches!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForFutex { .. }
+    ));
+
+    runtime
+        .dispatcher
+        .subsystems_mut()
+        .expire_next_futex_timeout();
+
+    let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(
+        task.regs().rax(),
+        SyscallReturn::Errno(LinuxErrno::ETIMEDOUT).encode_u64()
+    );
+}
+
+#[test]
 fn private_futex_registry_wake_releases_registered_waiter() {
     let mut registry = FutexRegistry::default();
     let waiter_registry = registry.clone();

@@ -80,6 +80,7 @@ impl NativeExecutionState {
 #[derive(Default)]
 pub(crate) struct EventSubsystemState {
     pub(crate) futexes: FutexRegistry,
+    pub(crate) futex_timeouts: BTreeMap<mcr_sys::GuestTid, Instant>,
     pub(crate) epolls: EpollRegistry,
     pub(crate) signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
 }

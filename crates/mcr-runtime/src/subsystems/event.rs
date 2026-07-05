@@ -94,20 +94,79 @@ impl RuntimeSubsystems {
             Ok(timeout) => timeout,
             Err(errno) => return SyscallOutcome::errno(errno),
         };
-        if timeout.is_some() {
+        if timeout.is_some_and(|duration| duration.is_zero()) {
             return SyscallOutcome::errno(LinuxErrno::ETIMEDOUT);
         }
 
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
         match self.process.tasks.block_task_for_futex(tid, key) {
-            Ok(()) => SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex"),
+            Ok(()) => {
+                if let Some(timeout) = timeout {
+                    let deadline = Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+                    self.events.futex_timeouts.insert(tid, deadline);
+                } else {
+                    self.events.futex_timeouts.remove(&tid);
+                }
+                SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex")
+            }
             Err(error) => error.into_outcome(),
         }
     }
 
     pub(crate) fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
-        self.process.tasks.wake_futex_waiters(key, args.val) as u64
+        let woken = self.process.tasks.wake_futex_waiters(key, args.val) as u64;
+        self.prune_futex_timeouts();
+        woken
+    }
+
+    pub(crate) fn resume_expired_futex_timeouts(&mut self) -> usize {
+        let now = Instant::now();
+        let expired = self
+            .events
+            .futex_timeouts
+            .iter()
+            .filter_map(|(tid, deadline)| (*deadline <= now).then_some(*tid))
+            .collect::<Vec<_>>();
+        let mut resumed = 0;
+        for tid in expired {
+            self.events.futex_timeouts.remove(&tid);
+            if self.process.tasks.timeout_futex_waiter(tid) {
+                resumed += 1;
+            }
+        }
+        self.prune_futex_timeouts();
+        resumed
+    }
+
+    pub(crate) fn expire_next_futex_timeout(&mut self) -> bool {
+        self.prune_futex_timeouts();
+        let Some(deadline) = self.events.futex_timeouts.values().min().copied() else {
+            return false;
+        };
+        let expired = self
+            .events
+            .futex_timeouts
+            .iter()
+            .filter_map(|(tid, candidate)| (*candidate <= deadline).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in expired {
+            self.events.futex_timeouts.remove(&tid);
+            self.process.tasks.timeout_futex_waiter(tid);
+        }
+        self.prune_futex_timeouts();
+        true
+    }
+
+    fn prune_futex_timeouts(&mut self) {
+        self.events.futex_timeouts.retain(|tid, _| {
+            matches!(
+                self.process.tasks.task(*tid).map(|task| task.state()),
+                Some(TaskState::WaitingForFutex { .. })
+            )
+        });
     }
 
     pub(crate) fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {

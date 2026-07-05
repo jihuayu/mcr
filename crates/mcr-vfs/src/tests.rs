@@ -1261,6 +1261,10 @@ fn writable_mutations_cover_mkdir_links_rename_and_metadata() {
     assert_eq!(after.size, 9);
     assert!(after.ctime_nsec > before.ctime_nsec);
     assert!(after.mtime_nsec > before.mtime_nsec);
+    vfs.fallocate(fd, 4, 12).unwrap();
+    assert_eq!(vfs.fstat(fd).unwrap().size, 16);
+    vfs.fallocate(fd, 1, 2).unwrap();
+    assert_eq!(vfs.fstat(fd).unwrap().size, 16);
     vfs.close(fd).unwrap();
 
     vfs.utimensat(

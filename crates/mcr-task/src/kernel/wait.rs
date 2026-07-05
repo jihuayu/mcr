@@ -1,4 +1,6 @@
-use mcr_sys::{GuestAddress, GuestPid, GuestTid, LinuxErrno, SyscallOutcome, Wait4SyscallArgs};
+use mcr_sys::{
+    GuestAddress, GuestPid, GuestTid, LinuxErrno, SyscallOutcome, SyscallReturn, Wait4SyscallArgs,
+};
 
 use super::{GuestKernel, current_syscall_return_rip};
 use crate::{
@@ -159,6 +161,22 @@ impl GuestKernel {
             }
         }
         resumed
+    }
+
+    pub fn timeout_futex_waiter(&mut self, tid: GuestTid) -> bool {
+        if !matches!(
+            self.task(tid).map(|task| task.state),
+            Some(TaskState::WaitingForFutex { .. })
+        ) {
+            return false;
+        }
+        if let Some(task) = self.task_mut(tid) {
+            task.regs = task.regs.with_syscall_return(
+                task.regs.rip(),
+                SyscallReturn::Errno(LinuxErrno::ETIMEDOUT).encode_u64(),
+            );
+        }
+        self.set_task_state(tid, TaskState::Runnable).is_some()
     }
 
     fn exited_waitable_child(

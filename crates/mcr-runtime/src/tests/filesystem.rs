@@ -868,6 +868,20 @@ fn writable_vfs_syscalls_mutate_paths_and_cwd() {
         SyscallReturn::Success(0)
     );
     assert_eq!(runtime.vfs().fstat(3).unwrap().size, 7);
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Fallocate, [3, 0, 4, 8, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(runtime.vfs().fstat(3).unwrap().size, 12);
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Fallocate, [3, 0, 1, 2, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(runtime.vfs().fstat(3).unwrap().size, 12);
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Fallocate, [3, 1, 0, 1, 0, 0]),
+        SyscallReturn::Errno(LinuxErrno::EOPNOTSUPP)
+    );
 
     assert_eq!(
         dispatch(

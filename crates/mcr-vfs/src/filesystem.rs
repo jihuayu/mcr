@@ -950,6 +950,27 @@ impl VirtualFileSystem {
         Ok(())
     }
 
+    pub fn fallocate(&mut self, fd: Fd, offset: u64, length: u64) -> VfsResult<()> {
+        let end = offset.checked_add(length).ok_or(VfsError::NoSpace)?;
+        let entry = self.fds.get(fd)?;
+        if !entry.flags().can_write() {
+            return Err(VfsError::BadFd);
+        }
+        if !matches!(entry.file().kind(), FileKind::Regular) {
+            return Err(VfsError::InvalidPath);
+        }
+        let inode_id = entry.inode_id();
+        let node = self
+            .tree
+            .lookup_inode_mut(inode_id)
+            .ok_or(VfsError::NoEntry)?;
+        if node.attr().size < end {
+            node.set_len(end)?;
+            self.invalidate_inode_cache(inode_id);
+        }
+        Ok(())
+    }
+
     fn read_from_small_cache(&self, fd: Fd, buffer: &mut [u8]) -> VfsResult<Option<usize>> {
         let entry = self.fds.get(fd)?;
         let offset = entry.offset();

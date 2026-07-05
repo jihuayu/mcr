@@ -469,6 +469,7 @@ where
                 .resume_waiting_tasks()
                 .map_err(|errno| GuestRunError::WaitResume { errno })?;
             dispatcher.subsystems_mut().resume_fd_waiters();
+            dispatcher.subsystems_mut().resume_expired_futex_timeouts();
             let mut runnable_tids = if sticky_scheduler {
                 last_dispatched_tid
                     .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
@@ -485,6 +486,9 @@ where
                     .prioritize_pending_fork_exec_tids(&mut runnable_tids);
             }
             if runnable_tids.is_empty() {
+                if dispatcher.subsystems_mut().expire_next_futex_timeout() {
+                    continue;
+                }
                 dispatcher.subsystems_mut().perf_record_no_runnable();
                 return Err(GuestRunError::NoRunnableTasks);
             }

@@ -108,6 +108,7 @@ where
             mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Fallocate => self.sys_fallocate(request),
             mcr_sys::Syscall::Chmod => self.sys_chmod(request),
             mcr_sys::Syscall::Chown => self.sys_chown(request),
             mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
@@ -1276,6 +1277,22 @@ where
         }
         self.vfs
             .ftruncate(arg_i32(request, 0), length as u64)
+            .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_fallocate(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let mode = arg_u32(request, 1);
+        if mode != 0 {
+            return Err(LinuxErrno::EOPNOTSUPP);
+        }
+        let offset = arg(request, 2) as i64;
+        let length = arg(request, 3) as i64;
+        if offset < 0 || length <= 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        self.vfs
+            .fallocate(arg_i32(request, 0), offset as u64, length as u64)
             .map_err(vfs_errno)?;
         Ok(0)
     }
