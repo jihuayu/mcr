@@ -42,6 +42,7 @@ pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
+pub const LINUX_SIGABRT: u32 = 6;
 pub const LINUX_SIGKILL: u32 = 9;
 pub const LINUX_SIGTERM: u32 = 15;
 pub const LINUX_SIGNAL_COUNT: u32 = 64;
@@ -2048,7 +2049,7 @@ const fn validate_signal_or_probe(signal: u32) -> Result<(), TaskError> {
 }
 
 const fn is_terminating_signal(signal: u32) -> bool {
-    matches!(signal, LINUX_SIGKILL | LINUX_SIGTERM)
+    matches!(signal, LINUX_SIGABRT | LINUX_SIGKILL | LINUX_SIGTERM)
 }
 
 const fn signal_exit_status(signal: u32) -> i32 {
@@ -2889,6 +2890,31 @@ mod tests {
         assert_eq!(
             kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
             ExitState::Exited { status: 137 }
+        );
+    }
+
+    #[test]
+    fn tgkill_sigabrt_exits_target_task() {
+        let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+
+        assert_eq!(
+            dispatch_task_syscall(
+                &mut kernel,
+                Syscall::Tgkill,
+                [
+                    INITIAL_GUEST_PID as u64,
+                    INITIAL_GUEST_TID as u64,
+                    LINUX_SIGABRT as u64,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(
+            kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+            TaskState::Exited { status: 134 }
         );
     }
 
