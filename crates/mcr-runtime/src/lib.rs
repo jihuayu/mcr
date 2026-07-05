@@ -16,9 +16,8 @@ mod tracing;
 
 use std::{
     collections::BTreeMap,
-    fmt, fs,
-    io::{self, IoSlice, IoSliceMut},
-    path::{Path, PathBuf},
+    fmt,
+    io::{IoSlice, IoSliceMut},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -71,8 +70,8 @@ use mcr_elf::{
     SegmentPermissions, elf64_program_header_entry_view, elf64_program_header_table_view,
 };
 use mcr_jit::{
-    ExecutionError, GuestBlock, GuestRegisters, LinearInstructionScanner, NativeFaultInstruction,
-    NativeFaultStackWord, SameIsaExecutionCore,
+    ExecutionError, GuestBlock, GuestRegisters, NativeFaultInstruction, NativeFaultStackWord,
+    SameIsaExecutionCore,
 };
 use mcr_net::{
     GuestSocketTable, HostSocketTransport, ShutdownHow, SocketAddress, SocketId, SocketOperation,

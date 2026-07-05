@@ -1,7 +1,7 @@
 ---
 id: arch-007
 scope: architecture
-status: pending
+status: done
 depends-on: [arch-002]
 ---
 
@@ -46,3 +46,11 @@ cargo ci-test
 - Guest-visible trap behavior, native fault diagnostics, and patch cache hit
   semantics must not change; this is an ownership move, not a redesign.
 - Persistent cache file format may stay as-is; document it where it lands.
+
+## Result
+
+- Native patch scan/metadata/key/cache primitives now live in
+  `mcr-jit::native_patch`; runtime keeps process cache orchestration, memory
+  access, worker-pool fallback, and host-step trace policy.
+- Persistent cache format remains version 2 and is documented next to the
+  `mcr-jit` cache constants.

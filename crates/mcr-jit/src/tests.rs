@@ -2,6 +2,11 @@ use crate::{
     BlockDecoder, BlockTerminator, DecodedFlowControl, DecodedMnemonic, ExecutionError, GuestBlock,
     GuestMemoryOperandAccess, GuestMemoryOperandError, GuestRegisters, LinearInstructionScanner,
     SameIsaExecutionCore, SyscallSite, TrampolineCore, decode_native_fault_instruction,
+    native_patch::{
+        ExecutableSyscallPatch, NativeImagePatchKey, NativePatchMetadata,
+        executable_syscall_patch_writes, load_persistent_native_patch_metadata_from_dir,
+        scan_executable_native_patch_range, store_persistent_native_patch_metadata_in_dir,
+    },
     syscall_instruction_sites,
 };
 use std::collections::BTreeMap;
@@ -74,6 +79,14 @@ impl GuestMemoryOperandAccess for TestGuestMemory {
     }
 }
 
+fn unique_native_patch_dir(name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("mcr-jit-{name}-{}-{nanos}", std::process::id()))
+}
+
 #[test]
 fn package_name_is_stable() {
     assert_eq!(crate::CRATE_NAME, "mcr-jit");
@@ -127,6 +140,57 @@ fn syscall_site_scan_skips_candidate_free_ranges() {
     let sites = syscall_instruction_sites(&[0x90; 1024], 0x401000);
 
     assert!(sites.is_empty());
+}
+
+#[test]
+fn native_patch_scan_and_syscall_write_plan_live_in_jit() {
+    let patches = scan_executable_native_patch_range(
+        0x401000,
+        0x401007,
+        vec![
+            0xe8, 0x0f, 0x05, 0xfe, 0xff, // call with 0f 05 in displacement
+            0x0f, 0x05, // real syscall instruction
+        ],
+        0,
+    );
+
+    assert_eq!(patches.scanned_ranges, [(0x401000, 0x401007)]);
+    assert_eq!(
+        patches.syscall_patches,
+        [ExecutableSyscallPatch { address: 0x401005 }]
+    );
+    assert_eq!(
+        executable_syscall_patch_writes(&patches.syscall_patches).collect::<Vec<_>>(),
+        [(0x401005, [0xcc, 0x90])]
+    );
+}
+
+#[test]
+fn native_patch_metadata_cache_round_trips_inside_jit() {
+    let dir = unique_native_patch_dir("cache-roundtrip");
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = NativeImagePatchKey {
+        hash: 0x1234,
+        executable_len: 0x2000,
+    };
+    let metadata = NativePatchMetadata {
+        scanned_ranges: vec![(0x401000, 0x402000)],
+        syscall_patches: vec![ExecutableSyscallPatch { address: 0x401123 }],
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_patches: BTreeMap::new(),
+    };
+
+    store_persistent_native_patch_metadata_in_dir(&key, &metadata, 0x400000, &dir).unwrap();
+    let loaded = load_persistent_native_patch_metadata_from_dir(&key, 0x600000, &dir)
+        .unwrap()
+        .expect("metadata should load");
+
+    assert_eq!(loaded.scanned_ranges, [(0x601000, 0x602000)]);
+    assert_eq!(
+        loaded.syscall_patches,
+        [ExecutableSyscallPatch { address: 0x601123 }]
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

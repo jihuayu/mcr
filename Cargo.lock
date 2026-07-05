@@ -124,6 +124,7 @@ name = "mcr-jit"
 version = "0.1.0"
 dependencies = [
  "iced-x86",
+ "mcr-elf",
  "mcr-sys",
 ]
 

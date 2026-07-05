@@ -4,6 +4,7 @@
 mod decoder;
 mod execution;
 mod native_fault;
+pub mod native_patch;
 mod operand_memory;
 mod registers;
 mod simple_instruction;
@@ -22,6 +23,10 @@ pub use decoder::{
 };
 pub use execution::{ExecutionError, NativeFaultStackWord, SameIsaExecutionCore};
 pub use native_fault::{NativeFaultInstruction, decode_native_fault_instruction};
+pub use native_patch::{
+    ExecutableNativePatches, ExecutableSyscallPatch, NativeImagePatchKey, NativeImagePatchRanges,
+    NativePatchCache, NativePatchMetadata, NativePatchMetadataEntry,
+};
 pub use operand_memory::{
     GuestMemoryOperandAccess, GuestMemoryOperandAccessKind, GuestMemoryOperandError,
 };
