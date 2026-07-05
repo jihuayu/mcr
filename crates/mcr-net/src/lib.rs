@@ -58,6 +58,7 @@ pub const LINUX_SHUT_WR: u32 = 1;
 pub const LINUX_SHUT_RDWR: u32 = 2;
 
 const DEFAULT_SOCKET_BUFFER_SIZE: u32 = 212_992;
+const UNIX_SOCKET_PATH_LEN: usize = 108;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SocketId(u64);
@@ -159,6 +160,7 @@ pub enum SocketConnectFastPathCompletion {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketDomain {
+    Unix,
     Inet,
     Inet6,
 }
@@ -166,13 +168,9 @@ pub enum SocketDomain {
 impl SocketDomain {
     pub fn from_linux(value: u32) -> Result<Self, SocketError> {
         match value {
+            LINUX_AF_UNIX => Ok(Self::Unix),
             LINUX_AF_INET => Ok(Self::Inet),
             LINUX_AF_INET6 => Ok(Self::Inet6),
-            LINUX_AF_UNIX => Err(SocketError::unsupported(
-                SocketOperation::CreateSocket,
-                LinuxErrno::AddressFamilyNotSupported,
-                "AF_UNIX sockets are not supported",
-            )),
             _ => Err(SocketError::unsupported(
                 SocketOperation::CreateSocket,
                 LinuxErrno::AddressFamilyNotSupported,
@@ -303,10 +301,11 @@ impl SocketSpec {
 
     #[must_use]
     pub const fn effective_protocol(self) -> SocketProtocol {
-        match (self.socket_type, self.protocol) {
-            (SocketType::Stream, SocketProtocol::Default) => SocketProtocol::Tcp,
-            (SocketType::Datagram, SocketProtocol::Default) => SocketProtocol::Udp,
-            (_, protocol) => protocol,
+        match (self.domain, self.socket_type, self.protocol) {
+            (SocketDomain::Unix, _, SocketProtocol::Default) => SocketProtocol::Default,
+            (_, SocketType::Stream, SocketProtocol::Default) => SocketProtocol::Tcp,
+            (_, SocketType::Datagram, SocketProtocol::Default) => SocketProtocol::Udp,
+            (_, _, protocol) => protocol,
         }
     }
 }
@@ -349,6 +348,10 @@ impl SocketState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketAddress {
+    Unix {
+        path: [u8; UNIX_SOCKET_PATH_LEN],
+        len: u8,
+    },
     Inet {
         address: [u8; 4],
         port: u16,
@@ -362,6 +365,33 @@ pub enum SocketAddress {
 }
 
 impl SocketAddress {
+    pub fn unix(path: &[u8]) -> Result<Self, SocketError> {
+        if path.len() > UNIX_SOCKET_PATH_LEN {
+            return Err(SocketError::invalid_input(
+                SocketOperation::Bind,
+                LinuxErrno::InvalidArgument,
+                "UNIX socket path is too long",
+            ));
+        }
+        let mut stored = [0; UNIX_SOCKET_PATH_LEN];
+        stored[..path.len()].copy_from_slice(path);
+        Ok(Self::Unix {
+            path: stored,
+            len: path
+                .len()
+                .try_into()
+                .expect("UNIX socket path length fits in u8"),
+        })
+    }
+
+    #[must_use]
+    pub fn unix_path_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Unix { path, len } => Some(&path[..usize::from(*len)]),
+            Self::Inet { .. } | Self::Inet6 { .. } => None,
+        }
+    }
+
     #[must_use]
     pub const fn inet(address: [u8; 4], port: u16) -> Self {
         Self::Inet { address, port }
@@ -380,6 +410,7 @@ impl SocketAddress {
     #[must_use]
     pub const fn domain(self) -> SocketDomain {
         match self {
+            Self::Unix { .. } => SocketDomain::Unix,
             Self::Inet { .. } => SocketDomain::Inet,
             Self::Inet6 { .. } => SocketDomain::Inet6,
         }
@@ -388,6 +419,10 @@ impl SocketAddress {
     #[must_use]
     pub const fn unspecified_for_domain(domain: SocketDomain) -> Self {
         match domain {
+            SocketDomain::Unix => Self::Unix {
+                path: [0; UNIX_SOCKET_PATH_LEN],
+                len: 0,
+            },
             SocketDomain::Inet => Self::inet([0, 0, 0, 0], 0),
             SocketDomain::Inet6 => Self::inet6([0; 16], 0, 0, 0),
         }
@@ -397,6 +432,9 @@ impl SocketAddress {
 impl From<SocketAddress> for SocketAddr {
     fn from(value: SocketAddress) -> Self {
         match value {
+            SocketAddress::Unix { .. } => {
+                panic!("AF_UNIX socket addresses cannot be converted to host TCP addresses")
+            }
             SocketAddress::Inet { address, port } => {
                 Self::new(IpAddr::V4(Ipv4Addr::from(address)), port)
             }
@@ -530,10 +568,11 @@ impl GuestSocket {
 
     #[must_use]
     pub const fn effective_protocol(&self) -> SocketProtocol {
-        match (self.socket_type, self.protocol) {
-            (SocketType::Stream, SocketProtocol::Default) => SocketProtocol::Tcp,
-            (SocketType::Datagram, SocketProtocol::Default) => SocketProtocol::Udp,
-            (_, protocol) => protocol,
+        match (self.domain, self.socket_type, self.protocol) {
+            (SocketDomain::Unix, _, SocketProtocol::Default) => SocketProtocol::Default,
+            (_, SocketType::Stream, SocketProtocol::Default) => SocketProtocol::Tcp,
+            (_, SocketType::Datagram, SocketProtocol::Default) => SocketProtocol::Udp,
+            (_, _, protocol) => protocol,
         }
     }
 
@@ -1626,8 +1665,9 @@ impl From<HostError> for HostIoError {
     }
 }
 
-const fn address_family_from_socket_domain(domain: SocketDomain) -> AddressFamily {
+fn address_family_from_socket_domain(domain: SocketDomain) -> AddressFamily {
     match domain {
+        SocketDomain::Unix => unreachable!("AF_UNIX sockets do not use host socket transport"),
         SocketDomain::Inet => AddressFamily::Inet,
         SocketDomain::Inet6 => AddressFamily::Inet6,
     }
@@ -1910,9 +1950,7 @@ impl GuestSocketTable {
         validate_address_domain(socket.domain, address)?;
         let state = socket.state;
 
-        if matches!(state, SocketState::Created)
-            && (self.transport.is_some() || self.host_handles.contains_key(&id))
-        {
+        if matches!(state, SocketState::Created) && self.socket_uses_host_transport(id)? {
             let bound = self
                 .ensure_host_entry_mut(id, SocketOperation::Bind)?
                 .handle
@@ -1959,7 +1997,7 @@ impl GuestSocketTable {
         let state = socket.state;
 
         if matches!(state, SocketState::Bound(_) | SocketState::Listening(_))
-            && (self.transport.is_some() || self.host_handles.contains_key(&id))
+            && self.socket_uses_host_transport(id)?
         {
             self.ensure_host_entry_mut(id, SocketOperation::Listen)?
                 .handle
@@ -2021,7 +2059,7 @@ impl GuestSocketTable {
             .local_address()
             .unwrap_or_else(|| SocketAddress::unspecified_for_domain(address.domain()));
 
-        if self.transport.is_some() || self.host_handles.contains_key(&id) {
+        if self.socket_uses_host_transport(id)? {
             match self.connect_host_socket(id, address) {
                 Ok((local, peer)) => {
                     self.socket_mut(id)?.state = SocketState::Connected { local, peer }
@@ -2337,6 +2375,10 @@ impl GuestSocketTable {
             return Err(SocketError::BadSocket { id });
         }
 
+        if !self.socket_uses_host_transport(id)? {
+            return Ok(SocketEvents::default());
+        }
+
         let (token, completions) = {
             let entry = self.ensure_host_entry_mut(id, SocketOperation::Poll)?;
             let token = entry.readiness_token;
@@ -2428,6 +2470,13 @@ impl GuestSocketTable {
     ) -> Result<&mut HostSocketEntry, SocketError> {
         if !self.host_handles.contains_key(&id) {
             let spec = self.socket_spec(id)?;
+            if spec.domain == SocketDomain::Unix {
+                return Err(SocketError::unsupported(
+                    operation,
+                    LinuxErrno::FunctionNotImplemented,
+                    "AF_UNIX sockets do not use host socket transport",
+                ));
+            }
             let options = self.socket(id)?.options();
             let handle = {
                 let transport = self.transport.as_ref().ok_or_else(|| {
@@ -2451,6 +2500,12 @@ impl GuestSocketTable {
             );
         }
         self.host_entry_mut(id, operation)
+    }
+
+    fn socket_uses_host_transport(&self, id: SocketId) -> Result<bool, SocketError> {
+        let socket = self.socket(id)?;
+        Ok(socket.domain != SocketDomain::Unix
+            && (self.transport.is_some() || self.host_handles.contains_key(&id)))
     }
 
     fn connect_host_socket(
@@ -3705,12 +3760,12 @@ mod tests {
         assert!(spec.flags.nonblocking);
         assert!(spec.flags.cloexec);
 
-        assert_eq!(
-            SocketSpec::from_linux(LINUX_AF_UNIX, LINUX_SOCK_STREAM, LINUX_IPPROTO_IP)
-                .expect_err("unix sockets are unsupported")
-                .linux_errno(),
-            LinuxErrno::AddressFamilyNotSupported
-        );
+        let unix = SocketSpec::from_linux(LINUX_AF_UNIX, LINUX_SOCK_STREAM, LINUX_IPPROTO_IP)
+            .expect("valid unix stream socket");
+        assert_eq!(unix.domain, SocketDomain::Unix);
+        assert_eq!(unix.socket_type, SocketType::Stream);
+        assert_eq!(unix.protocol, SocketProtocol::Default);
+        assert_eq!(unix.effective_protocol(), SocketProtocol::Default);
         assert_eq!(
             SocketSpec::from_linux(LINUX_AF_INET, LINUX_SOCK_RAW, LINUX_IPPROTO_IP)
                 .expect_err("raw sockets are unsupported")
@@ -3732,6 +3787,43 @@ mod tests {
             .expect_err("unknown flags are invalid")
             .linux_errno(),
             LinuxErrno::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn unix_stream_bind_listen_stays_guest_local() {
+        let mut table = GuestSocketTable::new();
+        let stream = table
+            .create_socket(
+                SocketDomain::Unix,
+                SocketType::Stream,
+                SocketProtocol::Default,
+            )
+            .expect("unix stream socket");
+        let address = SocketAddress::unix(b"/tmp/mcr-test.sock").expect("unix path");
+
+        assert_eq!(
+            table.socket(stream).expect("socket").effective_protocol(),
+            SocketProtocol::Default
+        );
+        table.bind(stream, address).expect("bind unix stream");
+        table.listen(stream, 128).expect("listen unix stream");
+        assert_eq!(
+            table.socket(stream).expect("socket").state(),
+            SocketState::Listening(address)
+        );
+        assert_eq!(
+            table
+                .poll(stream, SocketEvents::read(), Some(Duration::ZERO))
+                .expect("poll unix listener"),
+            SocketEvents::default()
+        );
+        assert_eq!(
+            table
+                .accept(stream)
+                .expect_err("no pending unix connection")
+                .linux_errno(),
+            LinuxErrno::OperationWouldBlock
         );
     }
 
