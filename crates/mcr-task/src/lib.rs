@@ -51,5 +51,6 @@ pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
 pub const LINUX_SIGKILL: u32 = 9;
+pub const LINUX_SIGSTOP: u32 = 19;
 pub const LINUX_SIGTERM: u32 = 15;
 pub const LINUX_SIGNAL_COUNT: u32 = 64;

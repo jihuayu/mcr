@@ -15,6 +15,82 @@ fn runtime_wires_task_syscalls_through_dispatcher() {
 }
 
 #[test]
+fn rt_sigaction_copies_guest_action_and_returns_old_action() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let first_action = 0x402000;
+    let second_action = 0x402080;
+    let old_action = 0x402100;
+    write_guest_sigaction(
+        runtime.memory_mut(),
+        first_action,
+        0x411000,
+        0x0400_0004,
+        0x422000,
+        0x20,
+    );
+    write_guest_sigaction(
+        runtime.memory_mut(),
+        second_action,
+        0x433000,
+        0x0400_0000,
+        0x444000,
+        0x40,
+    );
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigaction,
+                [
+                    mcr_task::LINUX_SIGTERM as u64,
+                    first_action,
+                    0,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    let saved = runtime
+        .kernel()
+        .process(INITIAL_GUEST_PID)
+        .unwrap()
+        .signals()
+        .action(mcr_task::LINUX_SIGTERM)
+        .unwrap();
+    assert_eq!(saved.action(), 0x411000);
+    assert_eq!(saved.flags(), 0x0400_0004);
+    assert_eq!(saved.restorer(), 0x422000);
+    assert_eq!(saved.mask(), 0x20);
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigaction,
+                [
+                    mcr_task::LINUX_SIGTERM as u64,
+                    second_action,
+                    old_action,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(u64_from_guest(runtime.memory(), old_action), 0x411000);
+    assert_eq!(
+        u64_from_guest(runtime.memory(), old_action + 8),
+        0x0400_0004
+    );
+    assert_eq!(u64_from_guest(runtime.memory(), old_action + 16), 0x422000);
+    assert_eq!(u64_from_guest(runtime.memory(), old_action + 24), 0x20);
+}
+
+#[test]
 fn rt_sigtimedwait_returns_eagain_after_validating_inputs() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     runtime
@@ -47,6 +123,20 @@ fn rt_sigtimedwait_returns_eagain_after_validating_inputs() {
             .result,
         SyscallReturn::Errno(LinuxErrno::EINVAL)
     );
+}
+
+fn write_guest_sigaction(
+    memory: &mut GuestMemory,
+    addr: u64,
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+) {
+    memory.write(addr, &handler.to_le_bytes()).unwrap();
+    memory.write(addr + 8, &flags.to_le_bytes()).unwrap();
+    memory.write(addr + 16, &restorer.to_le_bytes()).unwrap();
+    memory.write(addr + 24, &mask.to_le_bytes()).unwrap();
 }
 
 #[test]

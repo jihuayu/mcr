@@ -6,8 +6,8 @@ use mcr_sys::{
 
 use super::{GuestKernel, current_syscall_return_rip};
 use crate::{
-    ExitState, GuestSignalAction, LINUX_SIGKILL, LINUX_SIGNAL_COUNT, LINUX_SIGTERM, TaskError,
-    TaskState,
+    ExitState, GuestSignalAction, LINUX_SIGKILL, LINUX_SIGNAL_COUNT, LINUX_SIGSTOP, LINUX_SIGTERM,
+    TaskError, TaskState,
 };
 
 impl GuestKernel {
@@ -65,6 +65,19 @@ impl GuestKernel {
         tid: GuestTid,
         args: RtSigactionSyscallArgs,
     ) -> SyscallOutcome {
+        self.rt_sigaction_current_with_action(
+            tid,
+            args,
+            (args.act != 0).then(|| GuestSignalAction::new(args.act)),
+        )
+    }
+
+    pub fn rt_sigaction_current_with_action(
+        &mut self,
+        tid: GuestTid,
+        args: RtSigactionSyscallArgs,
+        action: Option<GuestSignalAction>,
+    ) -> SyscallOutcome {
         let Some(pid) = self.task(tid).map(|task| task.pid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
@@ -74,13 +87,11 @@ impl GuestKernel {
         if args.sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
             return TaskError::InvalidSigsetSize(args.sigsetsize).into_outcome();
         }
-        if args.act != 0 {
+        if let Some(action) = action {
             let Some(process) = self.process_mut(pid) else {
                 return SyscallOutcome::errno(LinuxErrno::ESRCH);
             };
-            process
-                .signals
-                .set_action(args.sig, GuestSignalAction::new(args.act));
+            process.signals.set_action(args.sig, action);
         }
         SyscallOutcome::success(0).with_decoded_field("signal", args.sig.to_string())
     }
@@ -336,7 +347,11 @@ impl GuestKernel {
 }
 
 const fn validate_signal(signal: u32) -> Result<(), TaskError> {
-    if signal > 0 && signal <= LINUX_SIGNAL_COUNT {
+    if signal > 0
+        && signal <= LINUX_SIGNAL_COUNT
+        && signal != LINUX_SIGKILL
+        && signal != LINUX_SIGSTOP
+    {
         Ok(())
     } else {
         Err(TaskError::InvalidSignal(signal))

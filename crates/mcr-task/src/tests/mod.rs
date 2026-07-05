@@ -638,6 +638,36 @@ fn rt_sigaction_saves_action_and_rejects_invalid_signal_or_sigset_size() {
             &mut kernel,
             Syscall::RtSigaction,
             [
+                LINUX_SIGKILL as u64,
+                0x8000,
+                0,
+                LINUX_KERNEL_SIGSET_SIZE,
+                0,
+                0
+            ],
+        ),
+        SyscallReturn::Errno(LinuxErrno::EINVAL)
+    );
+    assert_eq!(
+        dispatch_task_syscall(
+            &mut kernel,
+            Syscall::RtSigaction,
+            [
+                LINUX_SIGSTOP as u64,
+                0x8000,
+                0,
+                LINUX_KERNEL_SIGSET_SIZE,
+                0,
+                0
+            ],
+        ),
+        SyscallReturn::Errno(LinuxErrno::EINVAL)
+    );
+    assert_eq!(
+        dispatch_task_syscall(
+            &mut kernel,
+            Syscall::RtSigaction,
+            [
                 LINUX_SIGTERM as u64,
                 0x8000,
                 0,

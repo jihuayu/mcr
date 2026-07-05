@@ -16,17 +16,55 @@ pub enum ExitState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GuestSignalAction {
     action: GuestAddress,
+    flags: u64,
+    restorer: GuestAddress,
+    mask: u64,
 }
 
 impl GuestSignalAction {
     #[must_use]
     pub const fn new(action: GuestAddress) -> Self {
-        Self { action }
+        Self {
+            action,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_kernel_sigaction(
+        action: GuestAddress,
+        flags: u64,
+        restorer: GuestAddress,
+        mask: u64,
+    ) -> Self {
+        Self {
+            action,
+            flags,
+            restorer,
+            mask,
+        }
     }
 
     #[must_use]
     pub const fn action(self) -> GuestAddress {
         self.action
+    }
+
+    #[must_use]
+    pub const fn flags(self) -> u64 {
+        self.flags
+    }
+
+    #[must_use]
+    pub const fn restorer(self) -> GuestAddress {
+        self.restorer
+    }
+
+    #[must_use]
+    pub const fn mask(self) -> u64 {
+        self.mask
     }
 }
 

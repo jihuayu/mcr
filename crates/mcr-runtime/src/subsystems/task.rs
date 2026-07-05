@@ -1,5 +1,7 @@
 #[allow(unused_imports)]
 use super::*;
+use mcr_sys::RtSigactionSyscallArgs;
+use mcr_task::GuestSignalAction;
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
     fn supports_fast_task(&self, request: &SyscallRequest) -> bool {
@@ -44,6 +46,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
         match request.syscall {
             mcr_sys::Syscall::Futex => self.dispatch_futex(request),
             mcr_sys::Syscall::Execve => self.dispatch_execve(request),
+            mcr_sys::Syscall::RtSigaction => self.dispatch_rt_sigaction(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
             mcr_sys::Syscall::RtSigtimedwait => self.dispatch_rt_sigtimedwait(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
@@ -76,6 +79,46 @@ fn write_guest_siginfo(
     bytes[..4].copy_from_slice(&(signal as i32).to_le_bytes());
     memory
         .write_bytes(addr, &bytes)
+        .map_err(|_| LinuxErrno::EFAULT)
+}
+
+fn read_guest_sigaction(
+    memory: &impl GuestMemoryAccess,
+    addr: u64,
+) -> Result<GuestSignalAction, LinuxErrno> {
+    Ok(GuestSignalAction::from_kernel_sigaction(
+        read_guest_u64(memory, addr)?,
+        read_guest_u64(memory, addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?)?,
+        read_guest_u64(memory, addr.checked_add(16).ok_or(LinuxErrno::EFAULT)?)?,
+        read_guest_u64(memory, addr.checked_add(24).ok_or(LinuxErrno::EFAULT)?)?,
+    ))
+}
+
+fn write_guest_sigaction(
+    memory: &mut impl GuestMemoryAccess,
+    addr: u64,
+    action: GuestSignalAction,
+) -> Result<(), LinuxErrno> {
+    memory
+        .write_bytes(addr, &action.action().to_le_bytes())
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    memory
+        .write_bytes(
+            addr.checked_add(8).ok_or(LinuxErrno::EFAULT)?,
+            &action.flags().to_le_bytes(),
+        )
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    memory
+        .write_bytes(
+            addr.checked_add(16).ok_or(LinuxErrno::EFAULT)?,
+            &action.restorer().to_le_bytes(),
+        )
+        .map_err(|_| LinuxErrno::EFAULT)?;
+    memory
+        .write_bytes(
+            addr.checked_add(24).ok_or(LinuxErrno::EFAULT)?,
+            &action.mask().to_le_bytes(),
+        )
         .map_err(|_| LinuxErrno::EFAULT)
 }
 
@@ -112,6 +155,51 @@ impl RuntimeSubsystems {
             return SyscallOutcome::errno(errno);
         }
         outcome
+    }
+
+    pub(crate) fn dispatch_rt_sigaction(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.rt_sigaction(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    pub(crate) fn rt_sigaction(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let pid = request.context.pid;
+        let tid = request.context.tid;
+        self.select_memory_for_process(pid)?;
+        let args = RtSigactionSyscallArgs::new(
+            arg(request, 0) as u32,
+            arg(request, 1),
+            arg(request, 2),
+            arg(request, 3),
+        );
+        let action = if args.act == 0 {
+            None
+        } else {
+            Some(read_guest_sigaction(self.files.memory(), args.act)?)
+        };
+        let old_action = self
+            .process
+            .tasks
+            .task(tid)
+            .and_then(|task| self.process.tasks.process(task.pid()))
+            .and_then(|process| process.signals().action(args.sig))
+            .unwrap_or_default();
+        let outcome = self
+            .process
+            .tasks
+            .rt_sigaction_current_with_action(tid, args, action);
+        match outcome.result {
+            SyscallReturn::Success(_) => {
+                if args.oldact != 0 {
+                    write_guest_sigaction(self.files.memory_mut(), args.oldact, old_action)?;
+                    self.store_selected_process_memory(pid)?;
+                }
+                Ok(())
+            }
+            SyscallReturn::Errno(errno) => Err(errno),
+        }
     }
 
     pub(crate) fn dispatch_sysinfo(&mut self, request: &SyscallRequest) -> SyscallOutcome {
