@@ -73,6 +73,8 @@ impl RuntimeSubsystems {
         match args.command() {
             LINUX_FUTEX_WAIT => self.futex_wait(pid, tid, args),
             LINUX_FUTEX_WAKE => SyscallOutcome::success(self.futex_wake(pid, args)),
+            LINUX_FUTEX_REQUEUE => self.futex_requeue(pid, args, false),
+            LINUX_FUTEX_CMP_REQUEUE => self.futex_requeue(pid, args, true),
             _ => SyscallOutcome::errno(LinuxErrno::EINVAL),
         }
     }
@@ -120,6 +122,34 @@ impl RuntimeSubsystems {
         let woken = self.process.tasks.wake_futex_waiters(key, args.val) as u64;
         self.prune_futex_timeouts();
         woken
+    }
+
+    pub(crate) fn futex_requeue(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        args: FutexSyscallArgs,
+        compare: bool,
+    ) -> SyscallOutcome {
+        if args.uaddr2 % 4 != 0 {
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
+        }
+        if compare {
+            let value = match read_guest_u32(self.files.memory(), args.uaddr) {
+                Ok(value) => value,
+                Err(errno) => return SyscallOutcome::errno(errno),
+            };
+            if value != args.val3 {
+                return SyscallOutcome::errno(LinuxErrno::EAGAIN);
+            }
+        }
+        let source = FutexWaitKey::new(pid, args.uaddr, args.is_private());
+        let target = FutexWaitKey::new(pid, args.uaddr2, args.is_private());
+        let affected =
+            self.process
+                .tasks
+                .requeue_futex_waiters(source, target, args.val, args.timeout);
+        self.prune_futex_timeouts();
+        SyscallOutcome::success(affected as u64)
     }
 
     pub(crate) fn resume_expired_futex_timeouts(&mut self) -> usize {

@@ -140,6 +140,108 @@ fn futex_wait_blocks_guest_task_and_wake_resumes_it() {
 }
 
 #[test]
+fn futex_requeue_wakes_and_moves_waiters_to_target_key() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &0u32.to_le_bytes())
+        .unwrap();
+    let flags = LINUX_CLONE_VM
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SIGHAND
+        | LINUX_CLONE_THREAD
+        | LINUX_CLONE_SYSVSEM;
+
+    let clone_one = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+    let clone_two = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+    assert_eq!(clone_one.result, SyscallReturn::Success(2));
+    assert_eq!(clone_two.result, SyscallReturn::Success(3));
+
+    for tid in [2, 3] {
+        let wait = runtime.dispatch_syscall(context_for(
+            INITIAL_GUEST_PID,
+            tid,
+            Syscall::Futex,
+            [
+                0x402000,
+                u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+                0,
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(wait.result, SyscallReturn::Success(0));
+    }
+
+    let requeue = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            0x402000,
+            u64::from(LINUX_FUTEX_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG),
+            1,
+            1,
+            0x402100,
+            0,
+        ],
+    ));
+
+    assert_eq!(requeue.result, SyscallReturn::Success(2));
+    assert_eq!(
+        runtime.kernel().task(2).unwrap().state(),
+        TaskState::Runnable
+    );
+    assert_eq!(
+        runtime.kernel().task(3).unwrap().state(),
+        TaskState::WaitingForFutex {
+            key: FutexWaitKey::new(INITIAL_GUEST_PID, 0x402100, true)
+        }
+    );
+
+    let wake_target = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            0x402100,
+            u64::from(LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG),
+            1,
+            0,
+            0,
+            0,
+        ],
+    ));
+
+    assert_eq!(wake_target.result, SyscallReturn::Success(1));
+    assert_eq!(
+        runtime.kernel().task(3).unwrap().state(),
+        TaskState::Runnable
+    );
+}
+
+#[test]
+fn futex_cmp_requeue_mismatch_returns_eagain() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &1u32.to_le_bytes())
+        .unwrap();
+
+    let requeue = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            0x402000,
+            u64::from(LINUX_FUTEX_CMP_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG),
+            1,
+            1,
+            0x402100,
+            2,
+        ],
+    ));
+
+    assert_eq!(requeue.result, SyscallReturn::Errno(LinuxErrno::EAGAIN));
+}
+
+#[test]
 fn futex_unknown_command_and_unsupported_flags_return_einval() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
 

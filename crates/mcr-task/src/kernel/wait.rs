@@ -163,6 +163,42 @@ impl GuestKernel {
         resumed
     }
 
+    pub fn requeue_futex_waiters(
+        &mut self,
+        source: FutexWaitKey,
+        target: FutexWaitKey,
+        wake_limit: u32,
+        requeue_limit: u64,
+    ) -> usize {
+        let mut affected = self.wake_futex_waiters(source, wake_limit);
+        let requeue_limit = usize::try_from(requeue_limit).unwrap_or(usize::MAX);
+        if requeue_limit == 0 || source == target {
+            return affected;
+        }
+
+        let waiting_tids = self
+            .futex_wait_tids
+            .get(&source)
+            .map(|waiters| waiters.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut requeued = 0;
+        for tid in waiting_tids {
+            let Some(task) = self.tasks.get(&tid) else {
+                continue;
+            };
+            if !matches!(task.state, TaskState::WaitingForFutex { key } if key == source) {
+                continue;
+            }
+            self.set_task_state(tid, TaskState::WaitingForFutex { key: target });
+            affected += 1;
+            requeued += 1;
+            if requeued == requeue_limit {
+                break;
+            }
+        }
+        affected
+    }
+
     pub fn timeout_futex_waiter(&mut self, tid: GuestTid) -> bool {
         if !matches!(
             self.task(tid).map(|task| task.state),
