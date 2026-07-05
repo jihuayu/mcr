@@ -372,12 +372,20 @@ fn write_task_state_summary(
         if index > 0 {
             write!(formatter, ", ")?;
         }
+        let clear_child_tid = task
+            .clear_child_tid()
+            .map_or(String::new(), |addr| format!(" clear_child_tid=0x{addr:x}"));
+        let robust_list = task
+            .robust_list()
+            .map_or(String::new(), |addr| format!(" robust_list=0x{addr:x}"));
         write!(
             formatter,
-            "pid={} tid={} rip=0x{:x} {}",
+            "pid={} tid={} rip=0x{:x}{}{} {}",
             task.pid(),
             task.tid(),
             task.rip(),
+            clear_child_tid,
+            robust_list,
             diagnostic_task_state_display(task.state())
         )?;
     }
@@ -589,6 +597,8 @@ pub struct DiagnosticTask {
     pid: mcr_sys::GuestPid,
     tid: mcr_sys::GuestTid,
     rip: u64,
+    clear_child_tid: Option<u64>,
+    robust_list: Option<u64>,
     state: DiagnosticTaskState,
 }
 
@@ -599,6 +609,8 @@ impl DiagnosticTask {
             pid: task.pid(),
             tid: task.tid(),
             rip: task.regs().rip(),
+            clear_child_tid: task.clear_child_tid(),
+            robust_list: task.robust_list(),
             state: DiagnosticTaskState::from_task_state(task.state()),
         }
     }
@@ -616,6 +628,16 @@ impl DiagnosticTask {
     #[must_use]
     pub const fn rip(&self) -> u64 {
         self.rip
+    }
+
+    #[must_use]
+    pub const fn clear_child_tid(&self) -> Option<u64> {
+        self.clear_child_tid
+    }
+
+    #[must_use]
+    pub const fn robust_list(&self) -> Option<u64> {
+        self.robust_list
     }
 
     #[must_use]
