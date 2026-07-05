@@ -32,15 +32,22 @@ EOF
 "#;
 
 const NODEJS_RUN_SCRIPT: &str = r#"set -eu
-/usr/bin/node -v >/dev/null
-echo node-ok
+/usr/bin/node -e "require('fs').writeSync(1, 'node-ok\n')"
 "#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
-test -x /usr/lib/jvm/java-21-openjdk/bin/java
-test -x /usr/lib/jvm/java-21-openjdk/bin/javac
-test -x /usr/lib/jvm/java-21-openjdk/lib/jspawnhelper
-echo jdk-ok
+base=/tmp/mcr-jdk-smoke-$$
+mkdir -p "$base"
+trap 'rm -rf "$base"' EXIT
+cat > "$base/Hello.java" <<'EOF'
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("jdk-ok");
+    }
+}
+EOF
+/usr/lib/jvm/java-21-openjdk/bin/javac -J-Xint "$base/Hello.java"
+/usr/lib/jvm/java-21-openjdk/bin/java -Xint -cp "$base" Hello
 "#;
 
 const MYSQL_RUN_SCRIPT: &str = r#"set -eu
@@ -61,13 +68,13 @@ const GCC_COMPILE: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"gcc-ok\n",
 };
 const NODEJS_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "nodejs version run",
+    name: "nodejs javascript run",
     rootfs: "node-rootfs",
     script: NODEJS_RUN_SCRIPT,
     stdout: b"node-ok\n",
 };
 const JDK_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "jdk tool presence",
+    name: "jdk compile and run",
     rootfs: "jdk-rootfs",
     script: JDK_RUN_SCRIPT,
     stdout: b"jdk-ok\n",
