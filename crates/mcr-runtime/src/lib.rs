@@ -56,10 +56,10 @@ use mcr_sys::{
     SyscallReturn, SyscallTraceEvent, SyscallTracer, TimeSyscalls, TraceField,
 };
 use mcr_task::{
-    CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
-    GuestProgram, GuestTask, HostWorkerPoolConfig, HostWorkerPoolDiagnostics,
-    HostWorkerPoolExecutor, HostWorkerPoolJob, HostWorkerPoolRole, INITIAL_GUEST_PID,
-    INITIAL_GUEST_TID, TaskError, TaskState,
+    CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestImageState,
+    GuestKernel, GuestProcess, GuestProgram, GuestTask, HostWorkerPoolConfig,
+    HostWorkerPoolDiagnostics, HostWorkerPoolExecutor, HostWorkerPoolJob, HostWorkerPoolRole,
+    INITIAL_GUEST_PID, INITIAL_GUEST_TID, TaskError, TaskState,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,
@@ -5761,6 +5761,53 @@ struct FileBackedLibcIntrinsicSymbol {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileBackedNativeLibcPatchSymbol {
+    value: u64,
+    size: u64,
+    patch: NativeLibcPatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeLibcPatch {
+    ClockGettime,
+}
+
+impl NativeLibcPatch {
+    fn from_symbol_name(symbol: &str) -> Option<Self> {
+        let name = symbol.split_once('@').map_or(symbol, |(name, _)| name);
+        match name {
+            "clock_gettime" => Some(Self::ClockGettime),
+            _ => None,
+        }
+    }
+
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::ClockGettime => &NATIVE_CLOCK_GETTIME_PATCH,
+        }
+    }
+}
+
+// clock_gettime(clockid, ts): write a monotonic rdtsc-derived timespec and return 0.
+// This avoids a high-frequency native trap on runtimes that poll time during startup.
+const NATIVE_CLOCK_GETTIME_PATCH: [u8; 43] = [
+    0x48, 0x85, 0xf6, // test rsi,rsi
+    0x74, 0x20, // je fault
+    0x0f, 0x31, // rdtsc
+    0x48, 0xc1, 0xe2, 0x20, // shl rdx,32
+    0x48, 0x09, 0xd0, // or rax,rdx
+    0x48, 0xc7, 0xc1, 0x00, 0xca, 0x9a, 0x3b, // mov rcx,1_000_000_000
+    0x48, 0x31, 0xd2, // xor rdx,rdx
+    0x48, 0xf7, 0xf1, // div rcx
+    0x48, 0x89, 0x06, // mov [rsi],rax
+    0x48, 0x89, 0x56, 0x08, // mov [rsi+8],rdx
+    0x31, 0xc0, // xor eax,eax
+    0xc3, // ret
+    0xb8, 0xff, 0xff, 0xff, 0xff, // fault: mov eax,-1
+    0xc3, // ret
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ElfSectionHeader {
     section_type: u32,
     offset: u64,
@@ -5836,6 +5883,122 @@ fn parse_file_backed_libc_intrinsic_symbol(
     let name = elf_cstr(strtab, name_offset)?;
     let intrinsic = GuestLibcIntrinsic::from_symbol_name(name)?;
     Some(FileBackedLibcIntrinsicSymbol { value, intrinsic })
+}
+
+fn parse_file_backed_native_libc_patch_symbols(
+    bytes: &[u8],
+) -> Vec<FileBackedNativeLibcPatchSymbol> {
+    let Some(sections) = elf_section_headers(bytes) else {
+        return Vec::new();
+    };
+    let mut symbols = Vec::new();
+    for section in sections
+        .iter()
+        .filter(|section| section.section_type == ELF64_SHT_DYNSYM)
+    {
+        let Some(strtab) = usize::try_from(section.link)
+            .ok()
+            .and_then(|index| sections.get(index))
+            .and_then(|section| elf_range(bytes, section.offset, section.size))
+        else {
+            continue;
+        };
+        let entry_size = usize::try_from(section.entry_size)
+            .ok()
+            .filter(|size| *size >= ELF64_SYMBOL_SIZE)
+            .unwrap_or(ELF64_SYMBOL_SIZE);
+        let Some(dynsym) = elf_range(bytes, section.offset, section.size) else {
+            continue;
+        };
+        for entry in dynsym.chunks_exact(entry_size) {
+            let Some(symbol) = parse_file_backed_native_libc_patch_symbol(entry, strtab) else {
+                continue;
+            };
+            symbols.push(symbol);
+        }
+    }
+    symbols
+}
+
+fn parse_file_backed_native_libc_patch_symbol(
+    entry: &[u8],
+    strtab: &[u8],
+) -> Option<FileBackedNativeLibcPatchSymbol> {
+    let name_offset = elf_u32(entry, 0)? as usize;
+    let symbol_type = *entry.get(4)? & 0x0f;
+    if !matches!(symbol_type, ELF64_STT_FUNC | ELF64_STT_GNU_IFUNC) {
+        return None;
+    }
+    let value = elf_u64(entry, 8)?;
+    let size = elf_u64(entry, 16)?;
+    if value == 0 {
+        return None;
+    }
+    let name = elf_cstr(strtab, name_offset)?;
+    let patch = NativeLibcPatch::from_symbol_name(name)?;
+    if size < patch.bytes().len() as u64 {
+        return None;
+    }
+    Some(FileBackedNativeLibcPatchSymbol { value, size, patch })
+}
+
+fn native_libc_image_patch_symbols(image: &GuestImageState) -> Vec<(u64, NativeLibcPatch)> {
+    let mut symbols = Vec::new();
+    native_libc_image_patch_symbols_from_bytes(
+        image.executable().bytes(),
+        image.memory().executable_load_bias(),
+        &mut symbols,
+    );
+    if let (Some(interpreter), Some(loaded_interpreter)) =
+        (image.interpreter(), image.memory().interpreter())
+    {
+        native_libc_image_patch_symbols_from_bytes(
+            interpreter.bytes(),
+            loaded_interpreter.load_bias(),
+            &mut symbols,
+        );
+    }
+    symbols
+}
+
+fn native_libc_image_patch_symbols_from_bytes(
+    bytes: &[u8],
+    load_bias: u64,
+    symbols: &mut Vec<(u64, NativeLibcPatch)>,
+) {
+    for symbol in parse_file_backed_native_libc_patch_symbols(bytes) {
+        let Some(address) = load_bias.checked_add(symbol.value) else {
+            continue;
+        };
+        symbols.push((address, symbol.patch));
+    }
+}
+
+fn patch_native_libc_image_memory(
+    memory: &mut GuestMemory,
+    image: &GuestImageState,
+) -> Result<Vec<(u64, u64)>, GuestMemoryError> {
+    let mut patched_ranges = Vec::new();
+    for (address, patch) in native_libc_image_patch_symbols(image) {
+        let patch_bytes = patch.bytes();
+        let patch_len = patch_bytes.len() as u64;
+        if !native_libc_patch_range_is_executable(memory, address, patch_len) {
+            continue;
+        }
+        memory.patch_code(address, patch_bytes)?;
+        patched_ranges.push((address, patch_len));
+    }
+    Ok(patched_ranges)
+}
+
+fn native_libc_patch_range_is_executable(memory: &GuestMemory, address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len) else {
+        return false;
+    };
+    let Some(vma) = memory.vma_containing(address) else {
+        return false;
+    };
+    end <= vma.end() && vma.protection().execute
 }
 
 fn elf_load_bias_for_mapping(bytes: &[u8], file_offset: u64, mapped: u64) -> Option<u64> {
@@ -6382,6 +6545,7 @@ impl RuntimeSubsystems {
             }
         }
         self.native_execution = true;
+        self.patch_native_libc_images_for_loaded_processes();
     }
 
     #[cfg(test)]
@@ -6395,6 +6559,49 @@ impl RuntimeSubsystems {
 
     fn set_native_fp(&mut self, tid: mcr_sys::GuestTid, state: mcr_win::HostFloatingPointState) {
         self.native_fp.insert(tid, state);
+    }
+
+    fn patch_native_libc_images_for_loaded_processes(&mut self) {
+        let mut images = Vec::new();
+        if let Some(process) = self.tasks.process(self.selected_memory_pid) {
+            images.push((self.selected_memory_pid, process.image().clone()));
+        }
+        images.extend(
+            self.process_memory
+                .keys()
+                .copied()
+                .filter(|pid| *pid != self.selected_memory_pid)
+                .filter_map(|pid| {
+                    self.tasks
+                        .process(pid)
+                        .map(|process| (pid, process.image().clone()))
+                }),
+        );
+
+        for (pid, image) in images {
+            if let Err(error) = self.patch_native_libc_image_for_process(pid, &image) {
+                host_step_trace(format_args!(
+                    "runtime native-libc image patch failed pid={pid} error={error:?}"
+                ));
+            }
+        }
+    }
+
+    fn patch_native_libc_image_for_process(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        image: &GuestImageState,
+    ) -> Result<(), GuestExecutionError> {
+        let patched_ranges = {
+            let memory = self
+                .memory_for_process_mut(pid)
+                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+            patch_native_libc_image_memory(memory, image)?
+        };
+        for (address, len) in patched_ranges {
+            self.invalidate_native_patch_cache_range(pid, address, len);
+        }
+        Ok(())
     }
 
     fn host_worker_pool_diagnostics(&self) -> [HostWorkerPoolDiagnostics; 2] {
@@ -6417,6 +6624,21 @@ impl RuntimeSubsystems {
         memory.patch_code_fixed([(address, [0xcc, 0x90])])?;
         self.libc_intrinsic_patches
             .insert((pid, address), intrinsic);
+        Ok(())
+    }
+
+    fn register_native_libc_patch(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        address: u64,
+        patch: NativeLibcPatch,
+    ) -> Result<(), GuestExecutionError> {
+        let patch_bytes = patch.bytes();
+        let memory = self
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        memory.patch_code(address, patch_bytes)?;
+        self.invalidate_native_patch_cache_range(pid, address, patch_bytes.len() as u64);
         Ok(())
     }
 
@@ -7178,6 +7400,21 @@ impl RuntimeSubsystems {
                 continue;
             }
             self.register_libc_intrinsic_patch(pid, address, symbol.intrinsic)
+                .map_err(guest_execution_errno)?;
+        }
+        for symbol in parse_file_backed_native_libc_patch_symbols(&bytes) {
+            let Some(address) = load_bias.checked_add(symbol.value) else {
+                continue;
+            };
+            let patch_len = symbol.patch.bytes().len() as u64;
+            if symbol.size < patch_len {
+                continue;
+            }
+            let patch_end = address.saturating_add(patch_len);
+            if address < mapped || patch_end > mapped_end || (address - mapped) as usize >= len {
+                continue;
+            }
+            self.register_native_libc_patch(pid, address, symbol.patch)
                 .map_err(guest_execution_errno)?;
         }
         Ok(())
@@ -8748,17 +8985,18 @@ impl RuntimeSubsystems {
             .process(pid)
             .ok_or(LinuxErrno::ESRCH)?
             .image()
-            .memory()
             .clone();
+        let mut memory = self.memory_from_process_image(image.memory())?;
+        if self.native_execution {
+            patch_native_libc_image_memory(&mut memory, &image).map_err(|error| error.errno())?;
+        }
         if pid == self.selected_memory_pid {
             self.drop_selected_memory_allocations();
-            let memory = self.memory_from_process_image(&image)?;
             *self.files.memory_mut() = memory;
         } else {
-            let memory = self.memory_from_process_image(&image)?;
             self.process_memory.insert(pid, memory);
         }
-        self.set_native_image_patch_key(pid, &image);
+        self.set_native_image_patch_key(pid, image.memory());
         Ok(())
     }
 
@@ -15174,12 +15412,26 @@ mod tests {
     }
 
     fn elf_with_dynsym_memcpy() -> Vec<u8> {
+        let mut bytes = elf_with_dynsym_symbol(b"memcpy", 0x2010, 3);
+        const LOAD_OFFSET: usize = 0x1000;
+        bytes[LOAD_OFFSET + 0x10..LOAD_OFFSET + 0x13].copy_from_slice(&[0x90, 0x90, 0xc3]);
+        bytes
+    }
+
+    fn elf_with_dynsym_clock_gettime() -> Vec<u8> {
+        elf_with_dynsym_symbol(
+            b"clock_gettime",
+            0x2010,
+            NATIVE_CLOCK_GETTIME_PATCH.len() as u64,
+        )
+    }
+
+    fn elf_with_dynsym_symbol(name: &[u8], value: u64, size: u64) -> Vec<u8> {
         const PH_OFFSET: usize = 64;
         const LOAD_OFFSET: usize = 0x1000;
         const DYNSYM_OFFSET: usize = 0x2800;
         const STRTAB_OFFSET: usize = 0x2900;
         const SH_OFFSET: usize = 0x3000;
-        const MEMCPY_VADDR: u64 = 0x2010;
         let mut bytes = vec![0; SH_OFFSET + 64 * 3];
         bytes[0..4].copy_from_slice(b"\x7fELF");
         bytes[4] = 2;
@@ -15188,6 +15440,7 @@ mod tests {
         write_test_u16(&mut bytes, 16, 3);
         write_test_u16(&mut bytes, 18, 0x3e);
         write_test_u32(&mut bytes, 20, 1);
+        write_test_u64(&mut bytes, 24, value);
         write_test_u64(&mut bytes, 32, PH_OFFSET as u64);
         write_test_u64(&mut bytes, 40, SH_OFFSET as u64);
         write_test_u16(&mut bytes, 52, 64);
@@ -15205,12 +15458,13 @@ mod tests {
         write_test_u64(&mut bytes, PH_OFFSET + 40, GUEST_PAGE_SIZE);
         write_test_u64(&mut bytes, PH_OFFSET + 48, GUEST_PAGE_SIZE);
 
-        bytes[LOAD_OFFSET + 0x10..LOAD_OFFSET + 0x13].copy_from_slice(&[0x90, 0x90, 0xc3]);
-        bytes[STRTAB_OFFSET..STRTAB_OFFSET + 8].copy_from_slice(b"\0memcpy\0");
+        let strtab_len = name.len() + 2;
+        bytes[STRTAB_OFFSET] = 0;
+        bytes[STRTAB_OFFSET + 1..STRTAB_OFFSET + 1 + name.len()].copy_from_slice(name);
         write_test_u32(&mut bytes, DYNSYM_OFFSET + 24, 1);
         bytes[DYNSYM_OFFSET + 28] = 0x12;
-        write_test_u64(&mut bytes, DYNSYM_OFFSET + 32, MEMCPY_VADDR);
-        write_test_u64(&mut bytes, DYNSYM_OFFSET + 40, 3);
+        write_test_u64(&mut bytes, DYNSYM_OFFSET + 32, value);
+        write_test_u64(&mut bytes, DYNSYM_OFFSET + 40, size);
 
         let dynsym = SH_OFFSET + 64;
         write_test_u32(&mut bytes, dynsym + 4, 11);
@@ -15222,7 +15476,7 @@ mod tests {
         let strtab = SH_OFFSET + 64 * 2;
         write_test_u32(&mut bytes, strtab + 4, 3);
         write_test_u64(&mut bytes, strtab + 24, STRTAB_OFFSET as u64);
-        write_test_u64(&mut bytes, strtab + 32, 8);
+        write_test_u64(&mut bytes, strtab + 32, strtab_len as u64);
         bytes
     }
 
@@ -17779,6 +18033,20 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_native_libc_patch_symbols_parse_dynsym() {
+        let symbols = parse_file_backed_native_libc_patch_symbols(&elf_with_dynsym_clock_gettime());
+
+        assert_eq!(
+            symbols,
+            vec![FileBackedNativeLibcPatchSymbol {
+                value: 0x2010,
+                size: NATIVE_CLOCK_GETTIME_PATCH.len() as u64,
+                patch: NativeLibcPatch::ClockGettime
+            }]
+        );
+    }
+
+    #[test]
     fn executable_file_mmap_registers_libc_intrinsic_patch_from_dynsym() {
         let mut tree = PathTree::new();
         tree.create_dir("/lib").unwrap();
@@ -17832,6 +18100,122 @@ mod tests {
             Some(GuestLibcIntrinsic::Memcpy)
         );
         assert_eq!(guest_bytes(runtime.memory(), target, 3), [0xcc, 0x90, 0xc3]);
+    }
+
+    #[test]
+    fn executable_file_mmap_patches_native_clock_gettime_stub_from_dynsym() {
+        let _guard = native_execution_test_guard();
+        let mut tree = PathTree::new();
+        tree.create_dir("/lib").unwrap();
+        tree.create_file_with_content("/lib/libc.so", elf_with_dynsym_clock_gettime(), 0o755)
+            .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/app", 0x401000), tree);
+        runtime.enable_native_execution();
+        runtime
+            .memory_mut()
+            .mmap(mcr_sys::MmapSyscallArgs {
+                addr: 0x600000,
+                length: GUEST_PAGE_SIZE,
+                prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                flags: LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                fd: -1,
+                offset: 0,
+            })
+            .unwrap();
+        runtime
+            .memory_mut()
+            .write(0x600000, b"/lib/libc.so\0")
+            .unwrap();
+
+        let fd = runtime
+            .dispatch_syscall(context(
+                Syscall::Openat,
+                [AT_FDCWD as u64, 0x600000, u64::from(O_RDONLY), 0, 0, 0],
+            ))
+            .result;
+        assert_eq!(fd, SyscallReturn::Success(3));
+        let mapped = 0x700000;
+        let mmap = runtime.dispatch_syscall(context(
+            Syscall::Mmap,
+            [
+                mapped,
+                GUEST_PAGE_SIZE,
+                u64::from(LINUX_PROT_READ | LINUX_PROT_EXEC),
+                u64::from(LINUX_MAP_PRIVATE | LINUX_MAP_FIXED),
+                3,
+                0x1000,
+            ],
+        ));
+
+        assert_eq!(mmap.result, SyscallReturn::Success(mapped));
+        let target = mapped + 0x10;
+        assert_eq!(
+            guest_bytes(runtime.memory(), target, NATIVE_CLOCK_GETTIME_PATCH.len()),
+            NATIVE_CLOCK_GETTIME_PATCH
+        );
+    }
+
+    #[test]
+    fn native_execution_patches_initial_interpreter_clock_gettime_stub_from_dynsym() {
+        let _guard = native_execution_test_guard();
+        let program = GuestProgram::new(GuestExecutable::new(
+            "/bin/dynamic",
+            dynamic_program_bytes("/lib/ld-musl-x86_64.so.1"),
+        ))
+        .with_interpreter(GuestExecutable::new(
+            "/lib/ld-musl-x86_64.so.1",
+            elf_with_dynsym_clock_gettime(),
+        ));
+        let mut runtime = Runtime::new(program).unwrap();
+        let target = mcr_elf::DEFAULT_INTERPRETER_LOAD_BASE + 0x2010;
+        assert_ne!(
+            guest_bytes(runtime.memory(), target, NATIVE_CLOCK_GETTIME_PATCH.len()),
+            NATIVE_CLOCK_GETTIME_PATCH
+        );
+
+        runtime.enable_native_execution();
+
+        assert_eq!(
+            guest_bytes(runtime.memory(), target, NATIVE_CLOCK_GETTIME_PATCH.len()),
+            NATIVE_CLOCK_GETTIME_PATCH
+        );
+    }
+
+    #[test]
+    fn native_execve_patches_interpreter_clock_gettime_stub_from_dynsym() {
+        let _guard = native_execution_test_guard();
+        let mut tree = PathTree::new();
+        tree.create_dir("/bin").unwrap();
+        tree.create_dir("/lib").unwrap();
+        tree.create_file_with_content("/bin/old", test_program_bytes(0x401000), 0o755)
+            .unwrap();
+        tree.create_file_with_content(
+            "/bin/dynamic",
+            dynamic_program_bytes("/lib/ld-musl-x86_64.so.1"),
+            0o755,
+        )
+        .unwrap();
+        tree.create_file_with_content(
+            "/lib/ld-musl-x86_64.so.1",
+            elf_with_dynsym_clock_gettime(),
+            0o755,
+        )
+        .unwrap();
+        let mut runtime = runtime_from_program_and_tree(test_program("/bin/old", 0x401000), tree);
+        runtime.enable_native_execution();
+        runtime
+            .memory_mut()
+            .write(0x402100, b"/bin/dynamic\0")
+            .unwrap();
+
+        let exec = runtime.dispatch_syscall(context(Syscall::Execve, [0x402100, 0, 0, 0, 0, 0]));
+
+        assert_eq!(exec.result, SyscallReturn::Success(0));
+        let target = mcr_elf::DEFAULT_INTERPRETER_LOAD_BASE + 0x2010;
+        assert_eq!(
+            guest_bytes(runtime.memory(), target, NATIVE_CLOCK_GETTIME_PATCH.len()),
+            NATIVE_CLOCK_GETTIME_PATCH
+        );
     }
 
     #[test]
