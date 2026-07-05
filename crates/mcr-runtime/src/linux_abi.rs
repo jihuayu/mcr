@@ -186,9 +186,6 @@ pub(crate) fn encode_dirents(entries: &[DirectoryEntry]) -> Result<Vec<u8>, Linu
     Ok(bytes)
 }
 
-pub(crate) const SOCKADDR_IN_LEN: usize = LINUX_SOCKADDR_IN_LEN;
-pub(crate) const SOCKADDR_IN6_LEN: usize = LINUX_SOCKADDR_IN6_LEN;
-
 pub(crate) fn read_socket_address(
     memory: &impl GuestMemoryAccess,
     sockaddr: u64,

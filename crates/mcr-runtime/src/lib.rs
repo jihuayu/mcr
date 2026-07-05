@@ -85,9 +85,8 @@ use mcr_sys::{
     LINUX_EPOLLPRI, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAKE, LINUX_KERNEL_SIGSET_SIZE, LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT,
     LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT,
-    LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LINUX_SOCKADDR_IN_LEN,
-    LINUX_SOCKADDR_IN6_LEN, LinuxEpollEvent, LinuxErrno, LinuxIovec, LinuxPollfd,
-    LinuxSelectInterest as SelectInterest, LinuxSocketAddress, LinuxStat, LinuxStatx,
+    LINUX_POLLPRI, LINUX_POLLRDNORM, LINUX_POLLWRNORM, LinuxEpollEvent, LinuxErrno, LinuxIovec,
+    LinuxPollfd, LinuxSelectInterest as SelectInterest, LinuxSocketAddress, LinuxStat, LinuxStatx,
     LinuxStatxTimestamp, LinuxTimespec, LinuxUtsname, MemorySyscalls, NetworkSyscalls,
     NoopSyscallTracer, Pipe2SyscallArgs, PipeSyscallArgs, SendRecvFromSyscallArgs,
     SendRecvMsgSyscallArgs, ShutdownSyscallArgs, SockaddrSyscallArgs, SocketSyscallArgs,
@@ -96,9 +95,9 @@ use mcr_sys::{
     iovec_output_buffers, memory_errno, read_guest_c_bytes, read_guest_i64, read_guest_timespec,
     read_guest_u32, read_guest_u64, read_guest_vector, read_iovec_buffers, read_iovecs,
     read_msghdr, read_pollfd, read_required_timespec_duration, read_select_interests,
-    read_select_timeout, select_fd_set_contains, select_nfds, write_guest_timespec,
-    write_guest_u32, write_iovec_buffers, write_msghdr_flags, write_msghdr_namelen,
-    write_pollfd_revents, write_select_fd_set, write_zeroed,
+    read_select_timeout, select_nfds, write_guest_timespec, write_guest_u32, write_iovec_buffers,
+    write_msghdr_flags, write_msghdr_namelen, write_pollfd_revents, write_select_fd_set,
+    write_zeroed,
 };
 use mcr_task::{
     CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
@@ -111,6 +110,14 @@ use mcr_vfs::{
     FdReadiness, FdTable, FileKind, FileRef, FileTimes, LinuxFileAttr, LinuxFsKind, LinuxStatfs,
     OpenFlags, ProcSelfData, RegularFileCacheKey, SeekWhence, VfsError, VirtualFileSystem,
 };
+
+#[cfg(test)]
+use mcr_sys::select_fd_set_contains;
+
+#[cfg(test)]
+pub(crate) const SOCKADDR_IN_LEN: usize = mcr_sys::LINUX_SOCKADDR_IN_LEN;
+#[cfg(test)]
+pub(crate) const SOCKADDR_IN6_LEN: usize = mcr_sys::LINUX_SOCKADDR_IN6_LEN;
 use mcr_win::SocketEvents;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

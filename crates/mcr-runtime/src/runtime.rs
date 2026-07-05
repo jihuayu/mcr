@@ -460,7 +460,7 @@ where
         let mut guest_steps = 0u64;
         let mut last_dispatched_tid = None;
         loop {
-            if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks())? {
+            if let Some(status) = initial_process_exit_status(dispatcher.subsystems().tasks())? {
                 return Ok(status);
             }
             dispatcher.subsystems_mut().perf_record_scheduler_enter();
@@ -510,7 +510,7 @@ where
                 dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
                 last_dispatched_tid = Some(tid);
                 guest_steps = guest_steps.saturating_add(1);
-                if initial_process_exit_status(&dispatcher.subsystems().tasks())?.is_some() {
+                if initial_process_exit_status(dispatcher.subsystems().tasks())?.is_some() {
                     break;
                 }
             }
