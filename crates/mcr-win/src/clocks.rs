@@ -1,11 +1,7 @@
-#[cfg(not(windows))]
-use std::time::Instant;
-#[cfg(windows)]
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, SystemTime};
 
 use crate::error::HostResult;
-#[cfg(windows)]
 use crate::error::{HostError, HostOperation};
 
 /// Queries the host wall clock.
@@ -23,24 +19,6 @@ pub fn sleep_for(duration: Duration) -> HostResult<()> {
     sleep_for_platform(duration)
 }
 
-#[cfg(not(windows))]
-fn system_time_platform() -> HostResult<SystemTime> {
-    Ok(SystemTime::now())
-}
-
-#[cfg(not(windows))]
-fn monotonic_time_platform() -> HostResult<Duration> {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    Ok(START.get_or_init(Instant::now).elapsed())
-}
-
-#[cfg(not(windows))]
-fn sleep_for_platform(duration: Duration) -> HostResult<()> {
-    std::thread::sleep(duration);
-    Ok(())
-}
-
-#[cfg(windows)]
 fn system_time_platform() -> HostResult<SystemTime> {
     let mut file_time = FileTime {
         low_date_time: 0,
@@ -61,7 +39,6 @@ fn system_time_platform() -> HostResult<SystemTime> {
     Ok(UNIX_EPOCH + Duration::from_nanos(unix_ticks.saturating_mul(100)))
 }
 
-#[cfg(windows)]
 fn monotonic_time_platform() -> HostResult<Duration> {
     let mut frequency = 0_i64;
     let mut counter = 0_i64;
@@ -83,7 +60,6 @@ fn monotonic_time_platform() -> HostResult<Duration> {
     Ok(Duration::from_nanos(nanos.min(u64::MAX as u128) as u64))
 }
 
-#[cfg(windows)]
 fn sleep_for_platform(duration: Duration) -> HostResult<()> {
     // SAFETY: `Sleep` accepts any u32 millisecond duration.
     unsafe {
@@ -92,7 +68,6 @@ fn sleep_for_platform(duration: Duration) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn duration_to_millis(duration: Duration) -> u32 {
     if duration.is_zero() {
         return 0;
@@ -102,17 +77,14 @@ fn duration_to_millis(duration: Duration) -> u32 {
     millis.min(u128::from(u32::MAX)) as u32
 }
 
-#[cfg(windows)]
 const WINDOWS_TICKS_TO_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 
-#[cfg(windows)]
 #[repr(C)]
 struct FileTime {
     low_date_time: u32,
     high_date_time: u32,
 }
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetSystemTimePreciseAsFileTime(file_time: *mut FileTime);

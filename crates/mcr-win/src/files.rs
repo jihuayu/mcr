@@ -6,7 +6,6 @@ use crate::overlapped_io::{
     HostIoCompletion, HostIoDirection, HostIoFailure, HostIoFallback, HostIoFallbackReason,
     HostIoSubmission,
 };
-#[cfg(windows)]
 use crate::overlapped_io::{PendingHostIo, WindowsOverlapped, WindowsPendingHostIo};
 
 /// Host file access requested from the file adapter.
@@ -107,12 +106,8 @@ pub enum RenameMode {
 /// Owned host file handle.
 #[derive(Debug)]
 pub struct HostFile {
-    #[cfg(windows)]
     handle: crate::windows::Handle,
-    #[cfg(windows)]
     overlapped: bool,
-    #[cfg(not(windows))]
-    file: std::fs::File,
 }
 
 impl HostFile {
@@ -121,7 +116,6 @@ impl HostFile {
         open_platform(path.as_ref(), options)
     }
 
-    #[cfg(windows)]
     pub(crate) fn from_windows_handle(handle: crate::windows::Handle, overlapped: bool) -> Self {
         Self { handle, overlapped }
     }
@@ -181,88 +175,6 @@ impl HostFile {
     }
 }
 
-#[cfg(not(windows))]
-fn map_readonly_at_platform(
-    file: &HostFile,
-    offset: u64,
-    len: usize,
-) -> HostResult<HostFileMapping> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    if len == 0 {
-        return Err(HostError::invalid_input(HostOperation::MapFile));
-    }
-    let mut cloned = file
-        .file
-        .try_clone()
-        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
-    cloned
-        .seek(SeekFrom::Start(offset))
-        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
-    let mut bytes = vec![0; len];
-    let count = cloned
-        .read(&mut bytes)
-        .map_err(|error| HostError::from_io(HostOperation::MapFile, error))?;
-    bytes.truncate(count);
-    Ok(HostFileMapping::from_bytes(bytes))
-}
-
-#[cfg(not(windows))]
-fn submit_overlapped_at_platform(
-    file: &HostFile,
-    direction: HostIoDirection,
-    offset: u64,
-    mut buffer: Vec<u8>,
-) -> HostIoSubmission {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let mut cloned = match file.file.try_clone() {
-        Ok(cloned) => cloned,
-        Err(error) => {
-            return HostIoSubmission::Failed(HostIoFailure::new(
-                direction,
-                HostError::from_io(direction.operation(), error),
-                buffer,
-            ));
-        }
-    };
-    if let Err(error) = cloned.seek(SeekFrom::Start(offset)) {
-        return HostIoSubmission::Failed(HostIoFailure::new(
-            direction,
-            HostError::from_io(direction.operation(), error),
-            buffer,
-        ));
-    }
-
-    match direction {
-        HostIoDirection::Read => match cloned.read(&mut buffer) {
-            Ok(bytes_transferred) => HostIoSubmission::Completed(HostIoCompletion::new(
-                direction,
-                bytes_transferred,
-                buffer,
-            )),
-            Err(error) => HostIoSubmission::Failed(HostIoFailure::new(
-                direction,
-                HostError::from_io(direction.operation(), error),
-                buffer,
-            )),
-        },
-        HostIoDirection::Write => match cloned.write(&buffer) {
-            Ok(bytes_transferred) => HostIoSubmission::Completed(HostIoCompletion::new(
-                direction,
-                bytes_transferred,
-                buffer,
-            )),
-            Err(error) => HostIoSubmission::Failed(HostIoFailure::new(
-                direction,
-                HostError::from_io(direction.operation(), error),
-                buffer,
-            )),
-        },
-    }
-}
-
-#[cfg(windows)]
 fn map_readonly_at_platform(
     file: &HostFile,
     offset: u64,
@@ -271,7 +183,6 @@ fn map_readonly_at_platform(
     HostFileMapping::map_readonly_handle(file.handle, offset, len)
 }
 
-#[cfg(windows)]
 impl Drop for HostFile {
     fn drop(&mut self) {
         crate::windows::close_handle(self.handle);
@@ -307,112 +218,6 @@ pub fn create_symlink_file(link: impl AsRef<Path>, target: impl AsRef<Path>) -> 
     create_symlink_file_platform(link.as_ref(), target.as_ref())
 }
 
-#[cfg(not(windows))]
-fn open_platform(path: &Path, options: FileOptions) -> HostResult<HostFile> {
-    let mut open_options = std::fs::OpenOptions::new();
-    match options.access {
-        FileAccess::Read => {
-            open_options.read(true);
-        }
-        FileAccess::Write => {
-            open_options.write(true);
-        }
-        FileAccess::ReadWrite => {
-            open_options.read(true).write(true);
-        }
-    }
-
-    match options.creation {
-        FileCreation::OpenExisting => {}
-        FileCreation::CreateNew => {
-            open_options.create_new(true);
-        }
-        FileCreation::CreateAlways => {
-            open_options.create(true).truncate(true);
-        }
-        FileCreation::OpenAlways => {
-            open_options.create(true);
-        }
-        FileCreation::TruncateExisting => {
-            open_options.truncate(true);
-        }
-    }
-
-    let file = open_options
-        .open(path)
-        .map_err(|error| HostError::from_io(HostOperation::OpenFile, error))?;
-    Ok(HostFile { file })
-}
-
-#[cfg(not(windows))]
-fn read_platform(file: &HostFile, buf: &mut [u8]) -> HostResult<usize> {
-    use std::io::Read;
-
-    let mut file = &file.file;
-    file.read(buf)
-        .map_err(|error| HostError::from_io(HostOperation::ReadFile, error))
-}
-
-#[cfg(not(windows))]
-fn write_platform(file: &HostFile, buf: &[u8]) -> HostResult<usize> {
-    use std::io::Write;
-
-    let mut file = &file.file;
-    file.write(buf)
-        .map_err(|error| HostError::from_io(HostOperation::WriteFile, error))
-}
-
-#[cfg(not(windows))]
-fn flush_platform(file: &HostFile) -> HostResult<()> {
-    use std::io::Write;
-
-    let mut file = &file.file;
-    file.flush()
-        .map_err(|error| HostError::from_io(HostOperation::FlushFile, error))
-}
-
-#[cfg(not(windows))]
-fn delete_file_platform(path: &Path) -> HostResult<()> {
-    std::fs::remove_file(path).map_err(|error| HostError::from_io(HostOperation::DeleteFile, error))
-}
-
-#[cfg(not(windows))]
-fn rename_file_platform(from: &Path, to: &Path, mode: RenameMode) -> HostResult<()> {
-    if mode == RenameMode::FailIfExists && to.exists() {
-        return Err(HostError::new(
-            HostOperation::RenameFile,
-            crate::HostErrorKind::AlreadyExists,
-        ));
-    }
-
-    std::fs::rename(from, to).map_err(|error| HostError::from_io(HostOperation::RenameFile, error))
-}
-
-#[cfg(not(windows))]
-fn replace_file_platform(replaced: &Path, replacement: &Path) -> HostResult<()> {
-    let _ = std::fs::remove_file(replaced);
-    std::fs::rename(replacement, replaced)
-        .map_err(|error| HostError::from_io(HostOperation::ReplaceFile, error))
-}
-
-#[cfg(not(windows))]
-fn create_hard_link_platform(link: &Path, target: &Path) -> HostResult<()> {
-    std::fs::hard_link(target, link)
-        .map_err(|error| HostError::from_io(HostOperation::CreateHardLink, error))
-}
-
-#[cfg(all(not(windows), unix))]
-fn create_symlink_file_platform(link: &Path, target: &Path) -> HostResult<()> {
-    std::os::unix::fs::symlink(target, link)
-        .map_err(|error| HostError::from_io(HostOperation::CreateSymlink, error))
-}
-
-#[cfg(all(not(windows), not(unix)))]
-fn create_symlink_file_platform(_link: &Path, _target: &Path) -> HostResult<()> {
-    Err(HostError::unsupported(HostOperation::CreateSymlink))
-}
-
-#[cfg(windows)]
 fn open_platform(path: &Path, options: FileOptions) -> HostResult<HostFile> {
     let path = path_to_wide(path, HostOperation::OpenFile)?;
     // SAFETY: `path` is a null-terminated UTF-16 string and other pointers are intentionally null.
@@ -441,7 +246,6 @@ fn open_platform(path: &Path, options: FileOptions) -> HostResult<HostFile> {
     })
 }
 
-#[cfg(windows)]
 fn submit_overlapped_at_platform(
     file: &HostFile,
     direction: HostIoDirection,
@@ -545,7 +349,6 @@ fn submit_overlapped_at_platform(
     }
 }
 
-#[cfg(windows)]
 fn read_platform(file: &HostFile, buf: &mut [u8]) -> HostResult<usize> {
     let read_len = buf.len().min(u32::MAX as usize) as u32;
     let mut bytes_read = 0;
@@ -565,7 +368,6 @@ fn read_platform(file: &HostFile, buf: &mut [u8]) -> HostResult<usize> {
     Ok(bytes_read as usize)
 }
 
-#[cfg(windows)]
 fn write_platform(file: &HostFile, buf: &[u8]) -> HostResult<usize> {
     let write_len = buf.len().min(u32::MAX as usize) as u32;
     let mut bytes_written = 0;
@@ -585,7 +387,6 @@ fn write_platform(file: &HostFile, buf: &[u8]) -> HostResult<usize> {
     Ok(bytes_written as usize)
 }
 
-#[cfg(windows)]
 fn flush_platform(file: &HostFile) -> HostResult<()> {
     // SAFETY: The handle is owned by `HostFile`.
     let ok = unsafe { FlushFileBuffers(file.handle) };
@@ -595,7 +396,6 @@ fn flush_platform(file: &HostFile) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn delete_file_platform(path: &Path) -> HostResult<()> {
     let path = path_to_wide(path, HostOperation::DeleteFile)?;
     // SAFETY: `path` is a null-terminated UTF-16 string.
@@ -606,7 +406,6 @@ fn delete_file_platform(path: &Path) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn rename_file_platform(from: &Path, to: &Path, mode: RenameMode) -> HostResult<()> {
     let from = path_to_wide(from, HostOperation::RenameFile)?;
     let to = path_to_wide(to, HostOperation::RenameFile)?;
@@ -623,7 +422,6 @@ fn rename_file_platform(from: &Path, to: &Path, mode: RenameMode) -> HostResult<
     Ok(())
 }
 
-#[cfg(windows)]
 fn replace_file_platform(replaced: &Path, replacement: &Path) -> HostResult<()> {
     let replaced = path_to_wide(replaced, HostOperation::ReplaceFile)?;
     let replacement = path_to_wide(replacement, HostOperation::ReplaceFile)?;
@@ -644,7 +442,6 @@ fn replace_file_platform(replaced: &Path, replacement: &Path) -> HostResult<()> 
     Ok(())
 }
 
-#[cfg(windows)]
 fn create_hard_link_platform(link: &Path, target: &Path) -> HostResult<()> {
     let link = path_to_wide(link, HostOperation::CreateHardLink)?;
     let target = path_to_wide(target, HostOperation::CreateHardLink)?;
@@ -658,7 +455,6 @@ fn create_hard_link_platform(link: &Path, target: &Path) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn create_symlink_file_platform(link: &Path, target: &Path) -> HostResult<()> {
     let link = path_to_wide(link, HostOperation::CreateSymlink)?;
     let target = path_to_wide(target, HostOperation::CreateSymlink)?;
@@ -678,7 +474,6 @@ fn create_symlink_file_platform(link: &Path, target: &Path) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn path_to_wide(path: &Path, operation: HostOperation) -> HostResult<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -690,7 +485,6 @@ fn path_to_wide(path: &Path, operation: HostOperation) -> HostResult<Vec<u16>> {
     Ok(wide)
 }
 
-#[cfg(windows)]
 impl FileAccess {
     const fn to_windows(self) -> u32 {
         match self {
@@ -701,7 +495,6 @@ impl FileAccess {
     }
 }
 
-#[cfg(windows)]
 impl FileCreation {
     const fn to_windows(self) -> u32 {
         match self {
@@ -714,7 +507,6 @@ impl FileCreation {
     }
 }
 
-#[cfg(windows)]
 impl FileShare {
     const fn to_windows(self) -> u32 {
         let mut flags = 0;
@@ -731,44 +523,25 @@ impl FileShare {
     }
 }
 
-#[cfg(windows)]
 const GENERIC_READ: u32 = 0x8000_0000;
-#[cfg(windows)]
 const GENERIC_WRITE: u32 = 0x4000_0000;
-#[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
-#[cfg(windows)]
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-#[cfg(windows)]
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-#[cfg(windows)]
 const CREATE_NEW: u32 = 1;
-#[cfg(windows)]
 const CREATE_ALWAYS: u32 = 2;
-#[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
-#[cfg(windows)]
 const OPEN_ALWAYS: u32 = 4;
-#[cfg(windows)]
 const TRUNCATE_EXISTING: u32 = 5;
-#[cfg(windows)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-#[cfg(windows)]
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-#[cfg(windows)]
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-#[cfg(windows)]
 const SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: u32 = 0x2;
-#[cfg(windows)]
 const ERROR_IO_PENDING: u32 = 997;
-#[cfg(windows)]
 const ERROR_HANDLE_EOF: u32 = 38;
-#[cfg(windows)]
 const TRUE: crate::windows::Bool = 1;
-#[cfg(windows)]
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateFileW(

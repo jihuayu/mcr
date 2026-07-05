@@ -267,7 +267,6 @@ impl PendingHostIo {
 
     /// Drains a host-aborted operation after cancellation or close.
     pub fn drain_cancelled(self) -> HostIoResult {
-        #[cfg(windows)]
         if self.platform.is_some() {
             return self.wait_complete();
         }
@@ -308,32 +307,16 @@ impl PendingHostIo {
         self.buffer.take().unwrap_or_default()
     }
 
-    #[cfg(not(windows))]
-    fn request_cancel_platform(&self) {}
-
-    #[cfg(windows)]
     fn request_cancel_platform(&self) {
         if let Some(platform) = self.platform.as_ref() {
             platform.request_cancel();
         }
     }
 
-    #[cfg(not(windows))]
-    fn try_complete_platform(&mut self) -> PendingPoll {
-        PendingPoll::Ready(self.take_unsupported_completion())
-    }
-
-    #[cfg(windows)]
     fn try_complete_platform(&mut self) -> PendingPoll {
         self.complete_platform(crate::windows::FALSE)
     }
 
-    #[cfg(not(windows))]
-    fn wait_complete_platform(&mut self) -> PendingPoll {
-        PendingPoll::Ready(self.take_unsupported_completion())
-    }
-
-    #[cfg(windows)]
     fn wait_complete_platform(&mut self) -> PendingPoll {
         self.complete_platform(TRUE)
     }
@@ -346,7 +329,6 @@ impl PendingHostIo {
         ))
     }
 
-    #[cfg(windows)]
     fn complete_platform(&mut self, wait: crate::windows::Bool) -> PendingPoll {
         let Some(platform) = self.platform.as_mut() else {
             return PendingPoll::Ready(self.take_unsupported_completion());
@@ -401,7 +383,6 @@ impl From<HostIoResult> for HostIoSubmission {
 
 impl Drop for PendingHostIo {
     fn drop(&mut self) {
-        #[cfg(windows)]
         if let Some(mut platform) = self.platform.take() {
             platform.request_cancel();
             let mut bytes_transferred = 0;
@@ -423,21 +404,14 @@ enum PendingPoll {
     Ready(HostIoResult),
 }
 
-#[cfg(not(windows))]
-#[derive(Debug)]
-struct PendingHostIoPlatform;
-
-#[cfg(windows)]
 type PendingHostIoPlatform = WindowsPendingHostIo;
 
-#[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct WindowsPendingHostIo {
     handle: crate::windows::Handle,
     overlapped: Box<WindowsOverlapped>,
 }
 
-#[cfg(windows)]
 impl WindowsPendingHostIo {
     pub(crate) fn new(handle: crate::windows::Handle, overlapped: WindowsOverlapped) -> Self {
         Self {
@@ -463,7 +437,6 @@ impl WindowsPendingHostIo {
     }
 }
 
-#[cfg(windows)]
 impl Drop for WindowsPendingHostIo {
     fn drop(&mut self) {
         crate::windows::close_handle(self.overlapped.event);
@@ -471,7 +444,6 @@ impl Drop for WindowsPendingHostIo {
     }
 }
 
-#[cfg(windows)]
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct WindowsOverlapped {
@@ -482,7 +454,6 @@ pub(crate) struct WindowsOverlapped {
     event: crate::windows::Handle,
 }
 
-#[cfg(windows)]
 impl WindowsOverlapped {
     pub(crate) const fn new(offset: u64, event: crate::windows::Handle) -> Self {
         Self {
@@ -495,14 +466,10 @@ impl WindowsOverlapped {
     }
 }
 
-#[cfg(windows)]
 const TRUE: crate::windows::Bool = 1;
-#[cfg(windows)]
 const ERROR_IO_INCOMPLETE: u32 = 996;
-#[cfg(windows)]
 const ERROR_HANDLE_EOF: u32 = 38;
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetOverlappedResult(

@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-#[cfg(not(windows))]
-use crate::error::HostError;
 use crate::error::{HostOperation, HostResult};
 
 /// Completion packet returned by a Windows I/O completion port.
@@ -38,7 +36,6 @@ impl HostIoCompletionPacket {
 /// Host-owned Windows I/O completion port.
 #[derive(Debug)]
 pub struct HostIoCompletionPort {
-    #[cfg(windows)]
     handle: crate::windows::Handle,
 }
 
@@ -79,27 +76,16 @@ impl HostIoCompletionPort {
     }
 }
 
-#[cfg(windows)]
 impl Drop for HostIoCompletionPort {
     fn drop(&mut self) {
         crate::windows::close_handle(self.handle);
     }
 }
 
-#[cfg(windows)]
 unsafe impl Send for HostIoCompletionPort {}
 
-#[cfg(windows)]
 unsafe impl Sync for HostIoCompletionPort {}
 
-#[cfg(not(windows))]
-fn create_iocp_platform() -> HostResult<HostIoCompletionPort> {
-    Err(HostError::unsupported(
-        HostOperation::CreateIoCompletionPort,
-    ))
-}
-
-#[cfg(windows)]
 fn create_iocp_platform() -> HostResult<HostIoCompletionPort> {
     let handle = unsafe {
         // SAFETY: INVALID_HANDLE_VALUE creates a new completion port; existing port is null.
@@ -118,7 +104,6 @@ fn create_iocp_platform() -> HostResult<HostIoCompletionPort> {
     Ok(HostIoCompletionPort { handle })
 }
 
-#[cfg(windows)]
 fn associate_iocp_handle_platform(
     port: &HostIoCompletionPort,
     handle: usize,
@@ -141,28 +126,6 @@ fn associate_iocp_handle_platform(
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn associate_iocp_handle_platform(
-    _port: &HostIoCompletionPort,
-    _handle: usize,
-    _completion_key: usize,
-) -> HostResult<()> {
-    Err(HostError::unsupported(
-        HostOperation::CreateIoCompletionPort,
-    ))
-}
-
-#[cfg(not(windows))]
-fn post_iocp_platform(
-    _port: &HostIoCompletionPort,
-    _bytes_transferred: u32,
-    _completion_key: usize,
-    _overlapped: usize,
-) -> HostResult<()> {
-    Err(HostError::unsupported(HostOperation::PostIoCompletionPort))
-}
-
-#[cfg(windows)]
 fn post_iocp_platform(
     port: &HostIoCompletionPort,
     bytes_transferred: u32,
@@ -186,15 +149,6 @@ fn post_iocp_platform(
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn get_iocp_platform(
-    _port: &HostIoCompletionPort,
-    _timeout: Option<Duration>,
-) -> HostResult<Option<HostIoCompletionPacket>> {
-    Err(HostError::unsupported(HostOperation::GetIoCompletionPort))
-}
-
-#[cfg(windows)]
 fn get_iocp_platform(
     port: &HostIoCompletionPort,
     timeout: Option<Duration>,
@@ -239,7 +193,6 @@ fn get_iocp_platform(
     }))
 }
 
-#[cfg(windows)]
 fn timeout_millis(timeout: Option<Duration>) -> u32 {
     match timeout {
         Some(timeout) => timeout.as_millis().min(u128::from(INFINITE - 1)) as u32,
@@ -247,12 +200,9 @@ fn timeout_millis(timeout: Option<Duration>) -> u32 {
     }
 }
 
-#[cfg(windows)]
 const INFINITE: u32 = 0xffff_ffff;
-#[cfg(windows)]
 const WAIT_TIMEOUT: u32 = 258;
 
-#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateIoCompletionPort(
@@ -279,13 +229,8 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::HostIoCompletionPort;
-    #[cfg(not(windows))]
-    use crate::{HostErrorKind, HostOperation};
-
-    #[cfg(windows)]
     use std::time::Duration;
 
-    #[cfg(windows)]
     #[test]
     fn iocp_post_and_poll_round_trip() {
         let port = HostIoCompletionPort::new().unwrap();
@@ -298,14 +243,5 @@ mod tests {
         assert_eq!(packet.completion_key(), 11);
         assert_eq!(packet.overlapped(), 0x1234);
         assert_eq!(packet.error_code(), None);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn iocp_reports_unsupported_off_windows() {
-        let error = HostIoCompletionPort::new().unwrap_err();
-
-        assert_eq!(error.operation(), HostOperation::CreateIoCompletionPort);
-        assert_eq!(error.kind(), HostErrorKind::Unsupported);
     }
 }

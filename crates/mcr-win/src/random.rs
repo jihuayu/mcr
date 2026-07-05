@@ -9,17 +9,6 @@ pub fn fill_random(buf: &mut [u8]) -> HostResult<()> {
     fill_random_platform(buf)
 }
 
-#[cfg(not(windows))]
-fn fill_random_platform(buf: &mut [u8]) -> HostResult<()> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open("/dev/urandom")
-        .map_err(|error| HostError::from_io(HostOperation::FillRandom, error))?;
-    file.read_exact(buf)
-        .map_err(|error| HostError::from_io(HostOperation::FillRandom, error))
-}
-
-#[cfg(windows)]
 fn fill_random_platform(buf: &mut [u8]) -> HostResult<()> {
     let mut offset = 0;
     while offset < buf.len() {
@@ -46,10 +35,8 @@ fn fill_random_platform(buf: &mut [u8]) -> HostResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
 
-#[cfg(windows)]
 #[link(name = "bcrypt")]
 unsafe extern "system" {
     fn BCryptGenRandom(

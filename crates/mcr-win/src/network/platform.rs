@@ -1,6 +1,5 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::net::SocketAddr;
-#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,35 +13,22 @@ use super::model::{
     SocketPoll, SocketProtocol,
 };
 
-#[cfg(windows)]
 mod pending;
-#[cfg(not(windows))]
-mod stubs;
-#[cfg(windows)]
 mod windows;
-#[cfg(windows)]
 mod winsock;
 
-#[cfg(windows)]
 use self::pending::{WindowsPendingAcceptEx, WindowsPendingConnectEx, WindowsPendingSocketIo};
-#[cfg(not(windows))]
-use self::stubs::*;
-#[cfg(windows)]
 use self::windows::*;
-#[cfg(windows)]
 pub(super) use self::winsock::{Guid, WSAID_ACCEPTEX, WSAID_CONNECTEX};
-#[cfg(windows)]
 use self::winsock::{WSACleanup, closesocket};
 
 /// Pending `AcceptEx` operation.
 #[derive(Debug)]
 pub struct PendingHostAcceptEx {
-    #[cfg(windows)]
     platform: Option<WindowsPendingAcceptEx>,
 }
 
 impl PendingHostAcceptEx {
-    #[cfg(windows)]
     fn from_windows_pending(platform: WindowsPendingAcceptEx) -> Self {
         Self {
             platform: Some(platform),
@@ -51,7 +37,6 @@ impl PendingHostAcceptEx {
 
     #[must_use]
     pub fn overlapped_token(&self) -> usize {
-        #[cfg(windows)]
         if let Some(platform) = self.platform.as_ref() {
             return platform.overlapped_token();
         }
@@ -80,7 +65,6 @@ impl PendingHostAcceptEx {
         self.mark_completed_platform()
     }
 
-    #[cfg(windows)]
     fn mark_completed_platform(&mut self) -> Result<(HostSocket, SocketAddr), HostError> {
         let Some(platform) = self.platform.as_mut() else {
             return Err(HostError::invalid_input(HostOperation::AcceptSocket));
@@ -100,32 +84,21 @@ impl PendingHostAcceptEx {
         Ok((accepted, peer))
     }
 
-    #[cfg(not(windows))]
-    fn mark_completed_platform(&mut self) -> Result<(HostSocket, SocketAddr), HostError> {
-        Err(HostError::unsupported(HostOperation::AcceptSocket))
-    }
-
-    #[cfg(windows)]
     fn mark_completed_without_context_update(&mut self) {
         if let Some(platform) = self.platform.as_mut() {
             platform.completed = true;
         }
         self.platform.take();
     }
-
-    #[cfg(not(windows))]
-    fn mark_completed_without_context_update(&mut self) {}
 }
 
 /// Pending `ConnectEx` operation.
 #[derive(Debug)]
 pub struct PendingHostConnectEx {
-    #[cfg(windows)]
     platform: Option<WindowsPendingConnectEx>,
 }
 
 impl PendingHostConnectEx {
-    #[cfg(windows)]
     fn from_windows_pending(platform: WindowsPendingConnectEx) -> Self {
         Self {
             platform: Some(platform),
@@ -134,7 +107,6 @@ impl PendingHostConnectEx {
 
     #[must_use]
     pub fn overlapped_token(&self) -> usize {
-        #[cfg(windows)]
         if let Some(platform) = self.platform.as_ref() {
             return platform.overlapped_token();
         }
@@ -160,7 +132,6 @@ impl PendingHostConnectEx {
         ))
     }
 
-    #[cfg(windows)]
     fn mark_completed_platform(&mut self) -> Result<(), HostError> {
         let Some(platform) = self.platform.as_mut() else {
             return Err(HostError::invalid_input(HostOperation::ConnectSocket));
@@ -171,21 +142,12 @@ impl PendingHostConnectEx {
         Ok(())
     }
 
-    #[cfg(not(windows))]
-    fn mark_completed_platform(&mut self) -> Result<(), HostError> {
-        Err(HostError::unsupported(HostOperation::ConnectSocket))
-    }
-
-    #[cfg(windows)]
     fn mark_completed_without_context_update(&mut self) {
         if let Some(platform) = self.platform.as_mut() {
             platform.completed = true;
         }
         self.platform.take();
     }
-
-    #[cfg(not(windows))]
-    fn mark_completed_without_context_update(&mut self) {}
 }
 
 /// Pending overlapped host socket operation.
@@ -193,12 +155,10 @@ impl PendingHostConnectEx {
 pub struct PendingHostSocketIo {
     direction: HostSocketIoDirection,
     buffer: Option<Vec<u8>>,
-    #[cfg(windows)]
     platform: Option<WindowsPendingSocketIo>,
 }
 
 impl PendingHostSocketIo {
-    #[cfg(windows)]
     fn from_windows_pending(
         direction: HostSocketIoDirection,
         platform: WindowsPendingSocketIo,
@@ -223,7 +183,6 @@ impl PendingHostSocketIo {
 
     #[must_use]
     pub fn overlapped_token(&self) -> usize {
-        #[cfg(windows)]
         if let Some(platform) = self.platform.as_ref() {
             return platform.overlapped_token();
         }
@@ -268,16 +227,12 @@ impl PendingHostSocketIo {
         ))
     }
 
-    #[cfg(windows)]
     fn mark_completed_platform(&mut self) {
         if let Some(platform) = self.platform.as_mut() {
             platform.completed = true;
         }
         self.platform.take();
     }
-
-    #[cfg(not(windows))]
-    fn mark_completed_platform(&mut self) {}
 }
 
 /// Registered I/O capability reported by the host for a socket.
@@ -324,7 +279,6 @@ impl HostRioCapability {
 /// Winsock runtime lifetime guard.
 #[derive(Debug)]
 pub struct NetworkStack {
-    #[cfg(windows)]
     _private: (),
 }
 
@@ -366,7 +320,6 @@ impl NetworkStack {
     }
 }
 
-#[cfg(windows)]
 impl Drop for NetworkStack {
     fn drop(&mut self) {
         // SAFETY: This balances a successful `WSAStartup` in `start_platform`.
@@ -379,32 +332,25 @@ impl Drop for NetworkStack {
 /// Owned host socket.
 #[derive(Debug)]
 pub struct HostSocket {
-    #[cfg(windows)]
     inner: Arc<HostSocketInner>,
-    #[cfg(not(windows))]
-    _private: (),
 }
 
-#[cfg(windows)]
 #[derive(Debug)]
 struct HostSocketInner {
     raw: crate::windows::Socket,
 }
 
 impl HostSocket {
-    #[cfg(windows)]
     fn from_raw(raw: crate::windows::Socket) -> Self {
         Self {
             inner: Arc::new(HostSocketInner { raw }),
         }
     }
 
-    #[cfg(windows)]
     fn raw(&self) -> crate::windows::Socket {
         self.inner.raw
     }
 
-    #[cfg(windows)]
     fn clone_inner(&self) -> Arc<HostSocketInner> {
         Arc::clone(&self.inner)
     }
@@ -557,7 +503,6 @@ impl HostSocket {
     }
 }
 
-#[cfg(windows)]
 impl Drop for HostSocketInner {
     fn drop(&mut self) {
         // SAFETY: `raw` is an owned SOCKET created by `socket`.
