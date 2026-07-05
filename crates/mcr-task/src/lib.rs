@@ -1509,7 +1509,7 @@ impl GuestKernel {
             return SyscallOutcome::success(0);
         }
         if is_terminating_signal(args.sig) {
-            return self.exit_task(tid, signal_exit_status(args.sig));
+            return self.exit_group(pid, signal_exit_status(args.sig));
         }
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
@@ -1519,9 +1519,9 @@ impl GuestKernel {
             return TaskError::UnsupportedSignalTarget(args.tid).into_outcome();
         }
         let tid = args.tid as GuestTid;
-        if self.task(tid).is_none() {
+        let Some(task) = self.task(tid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
-        }
+        };
         if let Err(error) = validate_signal_or_probe(args.sig) {
             return error.into_outcome();
         }
@@ -1529,7 +1529,7 @@ impl GuestKernel {
             return SyscallOutcome::success(0);
         }
         if is_terminating_signal(args.sig) {
-            return self.exit_task(tid, signal_exit_status(args.sig));
+            return self.exit_group(task.pid, signal_exit_status(args.sig));
         }
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
@@ -2918,8 +2918,25 @@ mod tests {
     }
 
     #[test]
-    fn tgkill_sigabrt_exits_target_task() {
+    fn tgkill_sigabrt_exits_process() {
         let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let sibling = kernel.clone_current(
+            INITIAL_GUEST_TID,
+            CloneSyscallArgs::new(
+                LINUX_CLONE_VM
+                    | LINUX_CLONE_FS
+                    | LINUX_CLONE_FILES
+                    | LINUX_CLONE_SIGHAND
+                    | LINUX_CLONE_THREAD,
+                0,
+                0,
+                0,
+                0,
+            ),
+        );
+        let SyscallReturn::Success(sibling_tid) = sibling.result else {
+            panic!("thread clone should succeed: {sibling:?}");
+        };
 
         assert_eq!(
             dispatch_task_syscall(
@@ -2940,23 +2957,56 @@ mod tests {
             kernel.task(INITIAL_GUEST_TID).unwrap().state(),
             TaskState::Exited { status: 134 }
         );
+        assert_eq!(
+            kernel.task(sibling_tid as GuestTid).unwrap().state(),
+            TaskState::Exited { status: 134 }
+        );
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Exited { status: 134 }
+        );
     }
 
     #[test]
-    fn tkill_sigabrt_exits_target_task() {
+    fn tkill_sigabrt_exits_process() {
         let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+        let sibling = kernel.clone_current(
+            INITIAL_GUEST_TID,
+            CloneSyscallArgs::new(
+                LINUX_CLONE_VM
+                    | LINUX_CLONE_FS
+                    | LINUX_CLONE_FILES
+                    | LINUX_CLONE_SIGHAND
+                    | LINUX_CLONE_THREAD,
+                0,
+                0,
+                0,
+                0,
+            ),
+        );
+        let SyscallReturn::Success(sibling_tid) = sibling.result else {
+            panic!("thread clone should succeed: {sibling:?}");
+        };
 
         assert_eq!(
             dispatch_task_syscall(
                 &mut kernel,
                 Syscall::Tkill,
-                [INITIAL_GUEST_TID as u64, LINUX_SIGABRT as u64, 0, 0, 0, 0],
+                [sibling_tid, LINUX_SIGABRT as u64, 0, 0, 0, 0],
             ),
             SyscallReturn::Success(0)
         );
         assert_eq!(
             kernel.task(INITIAL_GUEST_TID).unwrap().state(),
             TaskState::Exited { status: 134 }
+        );
+        assert_eq!(
+            kernel.task(sibling_tid as GuestTid).unwrap().state(),
+            TaskState::Exited { status: 134 }
+        );
+        assert_eq!(
+            kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
+            ExitState::Exited { status: 134 }
         );
     }
 
