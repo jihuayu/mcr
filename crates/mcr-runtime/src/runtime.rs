@@ -82,12 +82,12 @@ impl Runtime {
 
     #[must_use]
     pub fn kernel(&self) -> &GuestKernel {
-        &self.dispatcher.subsystems().tasks
+        self.dispatcher.subsystems().tasks()
     }
 
     #[must_use]
     pub fn kernel_mut(&mut self) -> &mut GuestKernel {
-        &mut self.dispatcher.subsystems_mut().tasks
+        self.dispatcher.subsystems_mut().tasks_mut()
     }
 
     #[must_use]
@@ -143,7 +143,7 @@ impl Runtime {
     }
 
     pub fn into_kernel(self) -> GuestKernel {
-        self.dispatcher.into_parts().0.tasks
+        self.dispatcher.into_parts().0.into_tasks()
     }
 }
 
@@ -157,12 +157,12 @@ where
 {
     #[must_use]
     pub fn kernel(&self) -> &GuestKernel {
-        &self.dispatcher.subsystems().tasks
+        self.dispatcher.subsystems().tasks()
     }
 
     #[must_use]
     pub fn kernel_mut(&mut self) -> &mut GuestKernel {
-        &mut self.dispatcher.subsystems_mut().tasks
+        self.dispatcher.subsystems_mut().tasks_mut()
     }
 
     #[must_use]
@@ -229,7 +229,7 @@ where
 
     pub fn into_parts(self) -> (GuestKernel, T) {
         let (subsystems, tracer) = self.dispatcher.into_parts();
-        (subsystems.tasks, tracer)
+        (subsystems.into_tasks(), tracer)
     }
 }
 
@@ -460,7 +460,7 @@ where
         let mut guest_steps = 0u64;
         let mut last_dispatched_tid = None;
         loop {
-            if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks)? {
+            if let Some(status) = initial_process_exit_status(&dispatcher.subsystems().tasks())? {
                 return Ok(status);
             }
             dispatcher.subsystems_mut().perf_record_scheduler_enter();
@@ -473,11 +473,11 @@ where
                 last_dispatched_tid
                     .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
                     .map_or_else(
-                        || dispatcher.subsystems().tasks.runnable_tids(),
+                        || dispatcher.subsystems().tasks().runnable_tids(),
                         |tid| vec![tid],
                     )
             } else {
-                dispatcher.subsystems().tasks.runnable_tids()
+                dispatcher.subsystems().tasks().runnable_tids()
             };
             if runnable_tids.len() != 1 {
                 dispatcher
@@ -491,7 +491,7 @@ where
             for tid in runnable_tids {
                 let Some((pid, state)) = dispatcher
                     .subsystems()
-                    .tasks
+                    .tasks()
                     .task(tid)
                     .map(|task| (task.pid(), task.state()))
                 else {
@@ -510,7 +510,7 @@ where
                 dispatch_guest_task_with_dispatcher(dispatcher, tid)?;
                 last_dispatched_tid = Some(tid);
                 guest_steps = guest_steps.saturating_add(1);
-                if initial_process_exit_status(&dispatcher.subsystems().tasks)?.is_some() {
+                if initial_process_exit_status(&dispatcher.subsystems().tasks())?.is_some() {
                     break;
                 }
             }
@@ -551,7 +551,7 @@ where
 {
     let task = dispatcher
         .subsystems()
-        .tasks
+        .tasks()
         .task(INITIAL_GUEST_TID)
         .ok_or(GuestExecutionError::MissingInitialTask)?;
     if task.pid() != INITIAL_GUEST_PID {
@@ -632,7 +632,7 @@ where
 
     let fs_base = dispatcher
         .subsystems()
-        .tasks
+        .tasks()
         .task(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
@@ -677,7 +677,7 @@ where
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
             .subsystems_mut()
-            .tasks
+            .tasks_mut()
             .task_mut(tid)
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         if task.regs() == gpr {
@@ -696,7 +696,7 @@ where
     registers.apply_syscall_return(dispatch_result.encoded_rax, trap.site().next_rip);
     let task = dispatcher
         .subsystems_mut()
-        .tasks
+        .tasks_mut()
         .task_mut(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?;
     let final_regs = if task.regs() == gpr {
@@ -726,7 +726,7 @@ where
 
     let task = dispatcher
         .subsystems()
-        .tasks
+        .tasks()
         .task(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?;
     let pid = task.pid();
@@ -763,7 +763,7 @@ where
         all(target_os = "linux", target_arch = "x86_64"),
         all(windows, target_arch = "x86_64")
     ))]
-    if dispatcher.subsystems().native_execution {
+    if dispatcher.subsystems().native_execution_enabled() {
         return dispatch_native_guest_task_with_dispatcher(dispatcher, tid, pid, gpr, before_rip);
     }
 
@@ -776,7 +776,7 @@ where
     };
     let fs_base = dispatcher
         .subsystems()
-        .tasks
+        .tasks()
         .task(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
@@ -805,7 +805,7 @@ where
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
             .subsystems_mut()
-            .tasks
+            .tasks_mut()
             .task_mut(tid)
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         if task.regs() == gpr {
@@ -824,7 +824,7 @@ where
 
     let task = dispatcher
         .subsystems_mut()
-        .tasks
+        .tasks_mut()
         .task_mut(tid)
         .ok_or(GuestExecutionError::MissingInitialTask)?;
     let final_regs = if task.regs() == gpr {
@@ -884,7 +884,7 @@ where
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
             .subsystems_mut()
-            .tasks
+            .tasks_mut()
             .task_mut(tid)
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         if task.regs() == expected_task_regs {
@@ -904,7 +904,7 @@ where
     let updated_regs = gpr_from_registers(registers);
     let task = dispatcher
         .subsystems_mut()
-        .tasks
+        .tasks_mut()
         .task_mut(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?;
     let final_regs = if task.regs() == expected_task_regs {
@@ -947,7 +947,7 @@ where
         .unwrap_or_default();
     let fs_base = dispatcher
         .subsystems()
-        .tasks
+        .tasks()
         .task(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .tls()
@@ -1056,8 +1056,9 @@ where
         if is_fork_like_syscall_number(syscall_registers.rax) {
             let mut child_registers = registers;
             child_registers.apply_syscall_return(0, site.next_rip);
-            dispatcher.subsystems_mut().pending_fork_child_regs =
-                Some(gpr_from_registers(child_registers));
+            dispatcher
+                .subsystems_mut()
+                .set_pending_fork_child_regs(gpr_from_registers(child_registers));
         }
         let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
         if dispatch_result.result == SyscallReturn::Errno(LinuxErrno::EAGAIN)
@@ -1069,12 +1070,12 @@ where
         {
             dispatcher
                 .subsystems_mut()
-                .tasks
+                .tasks_mut()
                 .block_task_for_fd(tid, fd, write)
                 .map_err(|_| GuestExecutionError::MissingTask(tid))?;
             let task = dispatcher
                 .subsystems_mut()
-                .tasks
+                .tasks_mut()
                 .task_mut(tid)
                 .ok_or(GuestExecutionError::MissingTask(tid))?;
             let blocked_regs = gpr_from_registers(registers);
@@ -1091,7 +1092,7 @@ where
             let trap_regs = gpr_from_registers(registers);
             let task = dispatcher
                 .subsystems_mut()
-                .tasks
+                .tasks_mut()
                 .task_mut(tid)
                 .ok_or(GuestExecutionError::MissingTask(tid))?;
             if task.regs() == gpr {
@@ -1109,7 +1110,7 @@ where
 
         let task = dispatcher
             .subsystems_mut()
-            .tasks
+            .tasks_mut()
             .task_mut(tid)
             .ok_or(GuestExecutionError::MissingTask(tid))?;
         let blocked_after_syscall = matches!(
@@ -1164,7 +1165,7 @@ pub(crate) fn dispatch_native_libc_intrinsic_task<T>(
     let gpr = gpr_from_registers(registers);
     let task = dispatcher
         .subsystems_mut()
-        .tasks
+        .tasks_mut()
         .task_mut(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?;
     task.set_regs(gpr);

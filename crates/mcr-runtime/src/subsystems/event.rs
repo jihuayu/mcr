@@ -86,7 +86,7 @@ impl RuntimeSubsystems {
         }
 
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
-        match self.tasks.block_task_for_futex(tid, key) {
+        match self.process.tasks.block_task_for_futex(tid, key) {
             Ok(()) => SyscallOutcome::success(0).with_decoded_field("task_blocked", "futex"),
             Err(error) => error.into_outcome(),
         }
@@ -94,7 +94,7 @@ impl RuntimeSubsystems {
 
     pub(crate) fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
-        self.tasks.wake_futex_waiters(key, args.val) as u64
+        self.process.tasks.wake_futex_waiters(key, args.val) as u64
     }
 
     pub(crate) fn dispatch_poll(&mut self, request: &SyscallRequest) -> SyscallOutcome {
@@ -425,7 +425,7 @@ impl RuntimeSubsystems {
         if flags & !LINUX_EPOLL_CLOEXEC != 0 {
             return Err(LinuxErrno::EINVAL);
         }
-        let epoll_id = self.epolls.create()?;
+        let epoll_id = self.events.epolls.create()?;
         let mut open_flags = 0;
         if flags & LINUX_EPOLL_CLOEXEC != 0 {
             open_flags |= mcr_vfs::O_CLOEXEC;
@@ -437,7 +437,7 @@ impl RuntimeSubsystems {
         {
             Ok(fd) => Ok(fd as u64),
             Err(error) => {
-                self.epolls.close(epoll_id);
+                self.events.epolls.close(epoll_id);
                 Err(vfs_errno(error))
             }
         }
@@ -463,7 +463,7 @@ impl RuntimeSubsystems {
             LINUX_EPOLL_CTL_ADD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
                 validate_epoll_events(event.events)?;
-                let instance = self.epolls.instance_mut(epoll_id)?;
+                let instance = self.events.epolls.instance_mut(epoll_id)?;
                 if instance.watches.contains_key(&fd) {
                     return Err(LinuxErrno::EEXIST);
                 }
@@ -479,13 +479,13 @@ impl RuntimeSubsystems {
             LINUX_EPOLL_CTL_MOD => {
                 let event = read_epoll_event(self.files.memory(), event_addr)?;
                 validate_epoll_events(event.events)?;
-                let instance = self.epolls.instance_mut(epoll_id)?;
+                let instance = self.events.epolls.instance_mut(epoll_id)?;
                 let watch = instance.watches.get_mut(&fd).ok_or(LinuxErrno::ENOENT)?;
                 watch.events = event.events;
                 watch.data = event.data;
             }
             LINUX_EPOLL_CTL_DEL => {
-                let instance = self.epolls.instance_mut(epoll_id)?;
+                let instance = self.events.epolls.instance_mut(epoll_id)?;
                 if instance.watches.remove(&fd).is_none() {
                     return Err(LinuxErrno::ENOENT);
                 }
@@ -508,6 +508,7 @@ impl RuntimeSubsystems {
         }
         let epoll_id = self.files.vfs().epoll_id_for_fd(epfd).map_err(vfs_errno)?;
         let watches = self
+            .events
             .epolls
             .instance(epoll_id)?
             .watches

@@ -12,44 +12,97 @@ mod task;
 mod time;
 
 pub struct RuntimeSubsystems {
-    pub(crate) tasks: GuestKernel,
-    pub(crate) guest_task_worker_pool: Option<Arc<HostWorkerPoolExecutor>>,
+    pub(crate) process: ProcessSubsystemState,
     pub(crate) files: RuntimeFileSystem<GuestMemory>,
+    pub(crate) native: NativeExecutionState,
+    pub(crate) events: EventSubsystemState,
+    pub(crate) perf_summary: RuntimePerfSummary,
+}
+
+pub(crate) struct ProcessSubsystemState {
+    pub(crate) tasks: GuestKernel,
+    pub(crate) memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
+    pub(crate) pending_fork_exec: BTreeMap<mcr_sys::GuestPid, PendingForkExec>,
+    pub(crate) selected_memory_pid: mcr_sys::GuestPid,
+    pub(crate) fds: BTreeMap<mcr_sys::GuestPid, FdTable>,
+    pub(crate) selected_fds_pid: mcr_sys::GuestPid,
+}
+
+impl ProcessSubsystemState {
+    fn new(tasks: GuestKernel) -> Self {
+        Self {
+            tasks,
+            memory: BTreeMap::new(),
+            pending_fork_exec: BTreeMap::new(),
+            selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
+            fds: BTreeMap::new(),
+            selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
+        }
+    }
+}
+
+pub(crate) struct NativeExecutionState {
+    pub(crate) guest_task_worker_pool: Option<Arc<HostWorkerPoolExecutor>>,
     pub(crate) file_backed_mapping_cache: FileBackedMappingCache,
     pub(crate) libc_intrinsic_symbol_cache:
         BTreeMap<RegularFileCacheKey, Arc<[FileBackedLibcIntrinsicSymbol]>>,
-    pub(crate) process_memory: BTreeMap<mcr_sys::GuestPid, GuestMemory>,
-    pub(crate) pending_fork_exec: BTreeMap<mcr_sys::GuestPid, PendingForkExec>,
-    pub(crate) selected_memory_pid: mcr_sys::GuestPid,
-    pub(crate) process_fds: BTreeMap<mcr_sys::GuestPid, FdTable>,
-    pub(crate) selected_fds_pid: mcr_sys::GuestPid,
-    pub(crate) futexes: FutexRegistry,
-    pub(crate) epolls: EpollRegistry,
-    pub(crate) native_execution: bool,
-    pub(crate) native_fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
-    pub(crate) signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
-    pub(crate) native_patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
-    pub(crate) native_image_patch_keys: NativeImagePatchKeyMap,
-    pub(crate) native_image_patch_ranges: NativeImagePatchRangeMap,
-    pub(crate) native_image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
+    pub(crate) enabled: bool,
+    pub(crate) fp: BTreeMap<mcr_sys::GuestTid, mcr_win::HostFloatingPointState>,
+    pub(crate) patch_caches: BTreeMap<mcr_sys::GuestPid, NativePatchCache>,
+    pub(crate) image_patch_keys: NativeImagePatchKeyMap,
+    pub(crate) image_patch_ranges: NativeImagePatchRangeMap,
+    pub(crate) image_patch_metadata: BTreeMap<NativeImagePatchKey, NativePatchMetadataEntry>,
     pub(crate) libc_intrinsic_patches: BTreeMap<(mcr_sys::GuestPid, u64), GuestLibcIntrinsic>,
     pub(crate) pending_fork_child_regs: Option<GprState>,
-    pub(crate) perf_summary: RuntimePerfSummary,
+}
+
+impl NativeExecutionState {
+    fn new(
+        image_patch_keys: NativeImagePatchKeyMap,
+        image_patch_ranges: NativeImagePatchRangeMap,
+    ) -> Self {
+        Self {
+            guest_task_worker_pool: start_guest_task_worker_pool(),
+            file_backed_mapping_cache: FileBackedMappingCache::default(),
+            libc_intrinsic_symbol_cache: BTreeMap::new(),
+            enabled: false,
+            fp: BTreeMap::new(),
+            patch_caches: BTreeMap::new(),
+            image_patch_keys,
+            image_patch_ranges,
+            image_patch_metadata: BTreeMap::new(),
+            libc_intrinsic_patches: BTreeMap::new(),
+            pending_fork_child_regs: None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EventSubsystemState {
+    pub(crate) futexes: FutexRegistry,
+    pub(crate) epolls: EpollRegistry,
+    pub(crate) signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
 }
 
 impl fmt::Debug for RuntimeSubsystems {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeSubsystems")
-            .field("selected_memory_pid", &self.selected_memory_pid)
-            .field("selected_fds_pid", &self.selected_fds_pid)
-            .field("process_memory_len", &self.process_memory.len())
-            .field("process_fds_len", &self.process_fds.len())
-            .field("pending_fork_exec_len", &self.pending_fork_exec.len())
-            .field("native_execution", &self.native_execution)
-            .field("native_fp_len", &self.native_fp.len())
-            .field("signal_alt_stacks_len", &self.signal_alt_stacks.len())
-            .field("native_patch_caches_len", &self.native_patch_caches.len())
+            .field("selected_memory_pid", &self.process.selected_memory_pid)
+            .field("selected_fds_pid", &self.process.selected_fds_pid)
+            .field("process_memory_len", &self.process.memory.len())
+            .field("process_fds_len", &self.process.fds.len())
+            .field(
+                "pending_fork_exec_len",
+                &self.process.pending_fork_exec.len(),
+            )
+            .field("native_execution", &self.native.enabled)
+            .field("native_fp_len", &self.native.fp.len())
+            .field(
+                "signal_alt_stacks_len",
+                &self.events.signal_alt_stacks.len(),
+            )
+            .field("native_patch_caches_len", &self.native.patch_caches.len())
             .finish_non_exhaustive()
     }
 }
@@ -105,27 +158,10 @@ impl RuntimeSubsystems {
         let (native_image_patch_keys, native_image_patch_ranges) =
             native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
-            tasks,
-            guest_task_worker_pool: start_guest_task_worker_pool(),
+            process: ProcessSubsystemState::new(tasks),
             files: RuntimeFileSystem::new(vfs, memory),
-            file_backed_mapping_cache: FileBackedMappingCache::default(),
-            libc_intrinsic_symbol_cache: BTreeMap::new(),
-            process_memory: BTreeMap::new(),
-            pending_fork_exec: BTreeMap::new(),
-            selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
-            process_fds: BTreeMap::new(),
-            selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
-            futexes: FutexRegistry::default(),
-            epolls: EpollRegistry::default(),
-            native_execution: false,
-            native_fp: BTreeMap::new(),
-            signal_alt_stacks: BTreeMap::new(),
-            native_patch_caches: BTreeMap::new(),
-            native_image_patch_keys,
-            native_image_patch_ranges,
-            native_image_patch_metadata: BTreeMap::new(),
-            libc_intrinsic_patches: BTreeMap::new(),
-            pending_fork_child_regs: None,
+            native: NativeExecutionState::new(native_image_patch_keys, native_image_patch_ranges),
+            events: EventSubsystemState::default(),
             perf_summary: RuntimePerfSummary::default(),
         })
     }
@@ -147,27 +183,10 @@ impl RuntimeSubsystems {
         let (native_image_patch_keys, native_image_patch_ranges) =
             native_image_patch_maps(&tasks, mcr_task::INITIAL_GUEST_PID);
         Ok(Self {
-            tasks,
-            guest_task_worker_pool: start_guest_task_worker_pool(),
+            process: ProcessSubsystemState::new(tasks),
             files: RuntimeFileSystem::with_socket_transport(vfs, memory, transport),
-            file_backed_mapping_cache: FileBackedMappingCache::default(),
-            libc_intrinsic_symbol_cache: BTreeMap::new(),
-            process_memory: BTreeMap::new(),
-            pending_fork_exec: BTreeMap::new(),
-            selected_memory_pid: mcr_task::INITIAL_GUEST_PID,
-            process_fds: BTreeMap::new(),
-            selected_fds_pid: mcr_task::INITIAL_GUEST_PID,
-            futexes: FutexRegistry::default(),
-            epolls: EpollRegistry::default(),
-            native_execution: false,
-            native_fp: BTreeMap::new(),
-            signal_alt_stacks: BTreeMap::new(),
-            native_patch_caches: BTreeMap::new(),
-            native_image_patch_keys,
-            native_image_patch_ranges,
-            native_image_patch_metadata: BTreeMap::new(),
-            libc_intrinsic_patches: BTreeMap::new(),
-            pending_fork_child_regs: None,
+            native: NativeExecutionState::new(native_image_patch_keys, native_image_patch_ranges),
+            events: EventSubsystemState::default(),
             perf_summary: RuntimePerfSummary::default(),
         })
     }
@@ -179,25 +198,25 @@ impl RuntimeSubsystems {
                 .memory_mut()
                 .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
                 .expect("Windows native mmap base is page-aligned and within guest space");
-            for memory in self.process_memory.values_mut() {
+            for memory in self.process.memory.values_mut() {
                 memory
                     .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
                     .expect("Windows native mmap base is page-aligned and within guest space");
             }
         }
-        self.native_execution = true;
+        self.native.enabled = true;
     }
 
     #[cfg(test)]
     pub(crate) fn file_backed_mapping_cache_snapshot(&self) -> FileBackedMappingCacheSnapshot {
-        self.file_backed_mapping_cache.snapshot()
+        self.native.file_backed_mapping_cache.snapshot()
     }
 
     pub(crate) fn native_fp(
         &self,
         tid: mcr_sys::GuestTid,
     ) -> Option<&mcr_win::HostFloatingPointState> {
-        self.native_fp.get(&tid)
+        self.native.fp.get(&tid)
     }
 
     pub(crate) fn set_native_fp(
@@ -205,12 +224,21 @@ impl RuntimeSubsystems {
         tid: mcr_sys::GuestTid,
         state: mcr_win::HostFloatingPointState,
     ) {
-        self.native_fp.insert(tid, state);
+        self.native.fp.insert(tid, state);
+    }
+
+    pub(crate) fn set_pending_fork_child_regs(&mut self, regs: GprState) {
+        self.native.pending_fork_child_regs = Some(regs);
+    }
+
+    #[must_use]
+    pub(crate) const fn native_execution_enabled(&self) -> bool {
+        self.native.enabled
     }
 
     pub(crate) fn host_worker_pool_diagnostics(&self) -> [HostWorkerPoolDiagnostics; 2] {
-        let mut diagnostics = self.tasks.host_worker_pool_diagnostics();
-        if let Some(pool) = self.guest_task_worker_pool.as_ref() {
+        let mut diagnostics = self.process.tasks.host_worker_pool_diagnostics();
+        if let Some(pool) = self.native.guest_task_worker_pool.as_ref() {
             diagnostics[0] = pool.diagnostics();
         }
         diagnostics
@@ -227,12 +255,16 @@ impl RuntimeSubsystems {
 
     #[must_use]
     pub const fn tasks(&self) -> &GuestKernel {
-        &self.tasks
+        &self.process.tasks
     }
 
     #[must_use]
     pub const fn tasks_mut(&mut self) -> &mut GuestKernel {
-        &mut self.tasks
+        &mut self.process.tasks
+    }
+
+    pub(crate) fn into_tasks(self) -> GuestKernel {
+        self.process.tasks
     }
 
     #[must_use]
@@ -250,15 +282,15 @@ impl RuntimeSubsystems {
 
     #[must_use]
     pub fn memory_for_process(&self, pid: mcr_sys::GuestPid) -> Option<&GuestMemory> {
-        if pid == self.selected_memory_pid {
+        if pid == self.process.selected_memory_pid {
             Some(self.files.memory())
-        } else if let Some(memory) = self.process_memory.get(&pid) {
+        } else if let Some(memory) = self.process.memory.get(&pid) {
             Some(memory)
-        } else if let Some(pending) = self.pending_fork_exec.get(&pid) {
-            if pending.parent_pid == self.selected_memory_pid {
+        } else if let Some(pending) = self.process.pending_fork_exec.get(&pid) {
+            if pending.parent_pid == self.process.selected_memory_pid {
                 Some(self.files.memory())
             } else {
-                self.process_memory.get(&pending.parent_pid)
+                self.process.memory.get(&pending.parent_pid)
             }
         } else {
             None
@@ -267,16 +299,17 @@ impl RuntimeSubsystems {
 
     #[must_use]
     pub fn memory_for_process_mut(&mut self, pid: mcr_sys::GuestPid) -> Option<&mut GuestMemory> {
-        if pid == self.selected_memory_pid {
+        if pid == self.process.selected_memory_pid {
             Some(self.files.memory_mut())
         } else {
-            self.process_memory.get_mut(&pid)
+            self.process.memory.get_mut(&pid)
         }
     }
 
     #[must_use]
     pub fn current_image(&self) -> &mcr_elf::GuestMemoryImage {
-        self.tasks
+        self.process
+            .tasks
             .process(mcr_task::INITIAL_GUEST_PID)
             .expect("runtime always starts with an initial process")
             .image()

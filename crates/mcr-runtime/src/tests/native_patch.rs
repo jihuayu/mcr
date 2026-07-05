@@ -84,12 +84,14 @@ fn native_patch_cache_scans_only_new_executable_ranges() {
     runtime
         .dispatcher
         .subsystems_mut()
-        .native_image_patch_keys
+        .native
+        .image_patch_keys
         .clear();
     runtime
         .dispatcher
         .subsystems_mut()
-        .native_image_patch_ranges
+        .native
+        .image_patch_ranges
         .clear();
 
     runtime
@@ -101,7 +103,8 @@ fn native_patch_cache_scans_only_new_executable_ranges() {
         runtime
             .dispatcher
             .subsystems()
-            .native_patch_caches
+            .native
+            .patch_caches
             .get(&pid)
             .unwrap()
             .scanned_ranges
@@ -148,7 +151,8 @@ fn native_patch_cache_scans_only_new_executable_ranges() {
         runtime
             .dispatcher
             .subsystems()
-            .native_patch_caches
+            .native
+            .patch_caches
             .get(&pid)
             .unwrap()
             .scanned_ranges
@@ -415,21 +419,24 @@ fn native_patch_cache_applies_image_metadata_without_rescanning_image() {
     let key = runtime
         .dispatcher
         .subsystems()
-        .native_image_patch_keys
+        .native
+        .image_patch_keys
         .get(&pid)
         .cloned()
         .expect("test image should have native patch key");
     let ranges = runtime
         .dispatcher
         .subsystems()
-        .native_image_patch_ranges
+        .native
+        .image_patch_ranges
         .get(&pid)
         .cloned()
         .expect("test image should have native patch ranges");
     runtime
         .dispatcher
         .subsystems_mut()
-        .native_image_patch_metadata
+        .native
+        .image_patch_metadata
         .insert(
             key,
             NativePatchMetadataEntry {
@@ -467,9 +474,9 @@ fn native_patch_cache_applies_executable_range_metadata_at_current_base() {
     let key = native_executable_range_patch_key(runtime.memory(), start, end, protection).unwrap();
     {
         let subsystems = runtime.dispatcher.subsystems_mut();
-        subsystems.native_image_patch_keys.remove(&pid);
-        subsystems.native_image_patch_ranges.remove(&pid);
-        subsystems.native_image_patch_metadata.insert(
+        subsystems.native.image_patch_keys.remove(&pid);
+        subsystems.native.image_patch_ranges.remove(&pid);
+        subsystems.native.image_patch_metadata.insert(
             key,
             NativePatchMetadataEntry {
                 base: 0x500000,
@@ -510,7 +517,8 @@ fn native_patch_cache_survives_guest_brk_changes() {
     let scanned_ranges = runtime
         .dispatcher
         .subsystems()
-        .native_patch_caches
+        .native
+        .patch_caches
         .get(&pid)
         .unwrap()
         .scanned_ranges
@@ -529,7 +537,8 @@ fn native_patch_cache_survives_guest_brk_changes() {
         runtime
             .dispatcher
             .subsystems()
-            .native_patch_caches
+            .native
+            .patch_caches
             .get(&pid)
             .unwrap()
             .scanned_ranges,
@@ -626,7 +635,8 @@ fn native_patch_cache_defers_zero_fs_base_tls_rewrites() {
         runtime
             .dispatcher
             .subsystems()
-            .native_patch_caches
+            .native
+            .patch_caches
             .get(&pid)
             .unwrap()
             .fs_relative_patches

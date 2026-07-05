@@ -8,7 +8,7 @@ impl RuntimeSubsystems {
     ) -> Result<(), LinuxErrno> {
         self.select_memory_for_process(pid)?;
         self.select_fds_for_process(pid)?;
-        sync_proc_self(self.files.vfs_mut(), &self.tasks, pid);
+        sync_proc_self(self.files.vfs_mut(), &self.process.tasks, pid);
         Ok(())
     }
 
@@ -16,31 +16,37 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        if self.pending_fork_exec.contains_key(&pid) {
+        if self.process.pending_fork_exec.contains_key(&pid) {
             self.materialize_pending_fork_exec_child_memory(pid)
                 .map_err(|error| error.errno())?;
         }
-        if pid == self.selected_memory_pid {
-            if self.native_execution && !self.files.memory().uses_fixed_guest_host_addresses() {
+        if pid == self.process.selected_memory_pid {
+            if self.native.enabled && !self.files.memory().uses_fixed_guest_host_addresses() {
                 self.materialize_selected_memory_at_guest_addresses()?;
             }
             return Ok(());
         }
-        if self.native_execution {
+        if self.native.enabled {
             return self.select_native_memory_for_process(pid);
         }
-        if self.tasks.process(self.selected_memory_pid).is_some() {
+        if self
+            .process
+            .tasks
+            .process(self.process.selected_memory_pid)
+            .is_some()
+        {
             let selected = self
                 .files
                 .memory()
                 .try_clone_runtime()
                 .map_err(|error| error.errno())?;
-            self.process_memory
-                .insert(self.selected_memory_pid, selected);
+            self.process
+                .memory
+                .insert(self.process.selected_memory_pid, selected);
         }
-        let memory = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+        let memory = self.process.memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
         *self.files.memory_mut() = memory;
-        self.selected_memory_pid = pid;
+        self.process.selected_memory_pid = pid;
         Ok(())
     }
 
@@ -48,7 +54,7 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        if self.pending_fork_exec.contains_key(&pid) {
+        if self.process.pending_fork_exec.contains_key(&pid) {
             self.materialize_pending_fork_exec_child_memory(pid)
                 .map_err(|error| error.errno())?;
         }
@@ -63,8 +69,8 @@ impl RuntimeSubsystems {
     ) -> Result<(), LinuxErrno> {
         let remap_start = Instant::now();
         let result = (|| {
-            let selected_pid = self.selected_memory_pid;
-            let selected_snapshot = if self.tasks.process(selected_pid).is_some() {
+            let selected_pid = self.process.selected_memory_pid;
+            let selected_snapshot = if self.process.tasks.process(selected_pid).is_some() {
                 Some(
                     self.files
                         .memory()
@@ -74,24 +80,24 @@ impl RuntimeSubsystems {
             } else {
                 None
             };
-            let target_snapshot = self.process_memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+            let target_snapshot = self.process.memory.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
             self.drop_selected_memory_allocations();
             match target_snapshot.try_clone_runtime_at_guest_addresses() {
                 Ok(memory) => {
                     if let Some(snapshot) = selected_snapshot {
-                        self.process_memory.insert(selected_pid, snapshot);
+                        self.process.memory.insert(selected_pid, snapshot);
                     }
                     *self.files.memory_mut() = memory;
-                    self.selected_memory_pid = pid;
+                    self.process.selected_memory_pid = pid;
                     Ok(())
                 }
                 Err(error) => {
-                    self.process_memory.insert(pid, target_snapshot);
+                    self.process.memory.insert(pid, target_snapshot);
                     if let Some(snapshot) = selected_snapshot {
                         let restored = snapshot
                             .try_clone_runtime_at_guest_addresses()
                             .map_err(|restore_error| restore_error.errno())?;
-                        self.process_memory.insert(selected_pid, snapshot);
+                        self.process.memory.insert(selected_pid, snapshot);
                         *self.files.memory_mut() = restored;
                     }
                     Err(error.errno())
@@ -125,11 +131,12 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn has_pending_fork_exec_child(&self, pid: mcr_sys::GuestPid) -> bool {
-        self.pending_fork_exec.contains_key(&pid)
+        self.process.pending_fork_exec.contains_key(&pid)
     }
 
     pub(crate) fn has_pending_fork_exec_children(&self, parent_pid: mcr_sys::GuestPid) -> bool {
-        self.pending_fork_exec
+        self.process
+            .pending_fork_exec
             .values()
             .any(|pending| pending.parent_pid == parent_pid)
     }
@@ -137,9 +144,10 @@ impl RuntimeSubsystems {
     pub(crate) fn prioritize_pending_fork_exec_tids(&self, tids: &mut [mcr_sys::GuestTid]) {
         tids.sort_by_key(|tid| {
             let pending_child = self
+                .process
                 .tasks
                 .task(*tid)
-                .is_some_and(|task| self.pending_fork_exec.contains_key(&task.pid()));
+                .is_some_and(|task| self.process.pending_fork_exec.contains_key(&task.pid()));
             (!pending_child, *tid)
         });
     }
@@ -148,7 +156,7 @@ impl RuntimeSubsystems {
         &self,
         tid: mcr_sys::GuestTid,
     ) -> Option<mcr_sys::GuestTid> {
-        let task = self.tasks.task(tid)?;
+        let task = self.process.tasks.task(tid)?;
         if !matches!(task.state(), TaskState::Runnable) {
             return None;
         }
@@ -166,6 +174,7 @@ impl RuntimeSubsystems {
             return Ok(());
         }
         let child_pids = self
+            .process
             .pending_fork_exec
             .iter()
             .filter_map(|(child_pid, pending)| {
@@ -184,6 +193,7 @@ impl RuntimeSubsystems {
     ) -> Result<(), GuestMemoryError> {
         let materialize_start = Instant::now();
         let pending = self
+            .process
             .pending_fork_exec
             .get(&child_pid)
             .copied()
@@ -196,33 +206,37 @@ impl RuntimeSubsystems {
             .memory_for_process(pending.parent_pid)
             .ok_or(GuestMemoryError::NotMapped)?
             .try_clone_runtime()?;
-        self.pending_fork_exec.remove(&child_pid);
-        self.process_memory.insert(child_pid, memory);
-        if let Some(cache) = self.native_patch_caches.get(&pending.parent_pid).cloned() {
-            self.native_patch_caches.insert(child_pid, cache);
+        self.process.pending_fork_exec.remove(&child_pid);
+        self.process.memory.insert(child_pid, memory);
+        if let Some(cache) = self.native.patch_caches.get(&pending.parent_pid).cloned() {
+            self.native.patch_caches.insert(child_pid, cache);
         }
         if let Some(key) = self
-            .native_image_patch_keys
+            .native
+            .image_patch_keys
             .get(&pending.parent_pid)
             .cloned()
         {
-            self.native_image_patch_keys.insert(child_pid, key);
+            self.native.image_patch_keys.insert(child_pid, key);
         }
         if let Some(ranges) = self
-            .native_image_patch_ranges
+            .native
+            .image_patch_ranges
             .get(&pending.parent_pid)
             .cloned()
         {
-            self.native_image_patch_ranges.insert(child_pid, ranges);
+            self.native.image_patch_ranges.insert(child_pid, ranges);
         }
         let inherited_intrinsic_patches = self
+            .native
             .libc_intrinsic_patches
             .iter()
             .filter(|((pid, _), _)| *pid == pending.parent_pid)
             .map(|((_, address), intrinsic)| (*address, *intrinsic))
             .collect::<Vec<_>>();
         for (address, intrinsic) in inherited_intrinsic_patches {
-            self.libc_intrinsic_patches
+            self.native
+                .libc_intrinsic_patches
                 .insert((child_pid, address), intrinsic);
         }
         host_step_trace(format_args!(
@@ -237,10 +251,10 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        if pid != self.selected_memory_pid {
+        if pid != self.process.selected_memory_pid {
             return Err(LinuxErrno::ESRCH);
         }
-        if self.tasks.process(pid).is_none() {
+        if self.process.tasks.process(pid).is_none() {
             return Ok(());
         }
         Ok(())
@@ -250,16 +264,23 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        if pid == self.selected_fds_pid {
+        if pid == self.process.selected_fds_pid {
             return Ok(());
         }
-        if self.tasks.process(self.selected_fds_pid).is_some() {
+        if self
+            .process
+            .tasks
+            .process(self.process.selected_fds_pid)
+            .is_some()
+        {
             let selected = self.files.vfs().fds().clone();
-            self.process_fds.insert(self.selected_fds_pid, selected);
+            self.process
+                .fds
+                .insert(self.process.selected_fds_pid, selected);
         }
-        let fds = self.process_fds.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
+        let fds = self.process.fds.remove(&pid).ok_or(LinuxErrno::ESRCH)?;
         self.files.vfs_mut().replace_fds(fds);
-        self.selected_fds_pid = pid;
+        self.process.selected_fds_pid = pid;
         Ok(())
     }
 
@@ -267,27 +288,28 @@ impl RuntimeSubsystems {
         &mut self,
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
-        if pid != self.selected_fds_pid {
+        if pid != self.process.selected_fds_pid {
             return Err(LinuxErrno::ESRCH);
         }
-        if self.tasks.process(pid).is_none() {
+        if self.process.tasks.process(pid).is_none() {
             return Ok(());
         }
         Ok(())
     }
 
     pub(crate) fn drop_process_fds(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
-        if pid == self.selected_fds_pid {
+        if pid == self.process.selected_fds_pid {
             if pid != mcr_task::INITIAL_GUEST_PID {
                 let fds = self
-                    .process_fds
+                    .process
+                    .fds
                     .remove(&mcr_task::INITIAL_GUEST_PID)
                     .ok_or(LinuxErrno::ESRCH)?;
                 self.files.vfs_mut().replace_fds(fds);
-                self.selected_fds_pid = mcr_task::INITIAL_GUEST_PID;
+                self.process.selected_fds_pid = mcr_task::INITIAL_GUEST_PID;
             }
         } else {
-            self.process_fds.remove(&pid);
+            self.process.fds.remove(&pid);
         }
         Ok(())
     }
@@ -306,17 +328,18 @@ impl RuntimeSubsystems {
         parent_tid: mcr_sys::GuestTid,
         child_pid: mcr_sys::GuestPid,
     ) {
-        let Some(state) = self.native_fp.get(&parent_tid).copied() else {
+        let Some(state) = self.native.fp.get(&parent_tid).copied() else {
             return;
         };
         let child_tids = self
+            .process
             .tasks
             .tasks()
             .filter(|task| task.pid() == child_pid)
             .map(mcr_task::GuestTask::tid)
             .collect::<Vec<_>>();
         for child_tid in child_tids {
-            self.native_fp.insert(child_tid, state);
+            self.native.fp.insert(child_tid, state);
         }
     }
 
@@ -325,32 +348,34 @@ impl RuntimeSubsystems {
         parent_tid: mcr_sys::GuestTid,
         child_tid: mcr_sys::GuestTid,
     ) {
-        if let Some(state) = self.native_fp.get(&parent_tid).copied() {
-            self.native_fp.insert(child_tid, state);
+        if let Some(state) = self.native.fp.get(&parent_tid).copied() {
+            self.native.fp.insert(child_tid, state);
         }
     }
 
     pub(crate) fn drop_native_fp_for_tid(&mut self, tid: mcr_sys::GuestTid) {
-        self.native_fp.remove(&tid);
+        self.native.fp.remove(&tid);
     }
 
     pub(crate) fn drop_native_fp_for_process(&mut self, pid: mcr_sys::GuestPid) {
         let tids = self
+            .process
             .tasks
             .tasks()
             .filter(|task| task.pid() == pid)
             .map(mcr_task::GuestTask::tid)
             .collect::<Vec<_>>();
         for tid in tids {
-            self.native_fp.remove(&tid);
+            self.native.fp.remove(&tid);
         }
     }
 
     pub(crate) fn drop_native_patch_cache_for_process(&mut self, pid: mcr_sys::GuestPid) {
-        self.native_patch_caches.remove(&pid);
-        self.native_image_patch_keys.remove(&pid);
-        self.native_image_patch_ranges.remove(&pid);
-        self.libc_intrinsic_patches
+        self.native.patch_caches.remove(&pid);
+        self.native.image_patch_keys.remove(&pid);
+        self.native.image_patch_ranges.remove(&pid);
+        self.native
+            .libc_intrinsic_patches
             .retain(|(patch_pid, _), _| *patch_pid != pid);
     }
 
@@ -378,7 +403,7 @@ impl RuntimeSubsystems {
         }
         for epoll_id in epoll_ids {
             if self.epoll_fd_ref_count_excluding_current(pid, epoll_id) == 0 {
-                self.epolls.close(epoll_id);
+                self.events.epolls.close(epoll_id);
             }
         }
         Ok(())
@@ -428,8 +453,10 @@ impl RuntimeSubsystems {
                     _ => None,
                 };
                 if let Some(socket_id) = socket_id
-                    && self.socket_fd_ref_count_excluding_current(self.selected_fds_pid, socket_id)
-                        + self.files.vfs().socket_fd_count(socket_id.get())
+                    && self.socket_fd_ref_count_excluding_current(
+                        self.process.selected_fds_pid,
+                        socket_id,
+                    ) + self.files.vfs().socket_fd_count(socket_id.get())
                         == 0
                 {
                     self.files
@@ -444,11 +471,13 @@ impl RuntimeSubsystems {
                     _ => None,
                 };
                 if let Some(epoll_id) = epoll_id
-                    && self.epoll_fd_ref_count_excluding_current(self.selected_fds_pid, epoll_id)
-                        + self.files.vfs().epoll_fd_count(epoll_id)
+                    && self.epoll_fd_ref_count_excluding_current(
+                        self.process.selected_fds_pid,
+                        epoll_id,
+                    ) + self.files.vfs().epoll_fd_count(epoll_id)
                         == 0
                 {
-                    self.epolls.close(epoll_id);
+                    self.events.epolls.close(epoll_id);
                 }
             }
             _ => {}
@@ -457,10 +486,10 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn fd_table_for_process(&self, pid: mcr_sys::GuestPid) -> Option<&FdTable> {
-        if pid == self.selected_fds_pid {
+        if pid == self.process.selected_fds_pid {
             Some(self.files.vfs().fds())
         } else {
-            self.process_fds.get(&pid)
+            self.process.fds.get(&pid)
         }
     }
 
@@ -469,7 +498,7 @@ impl RuntimeSubsystems {
         excluded_pid: mcr_sys::GuestPid,
         socket_id: SocketId,
     ) -> usize {
-        let selected_count = if self.selected_fds_pid != excluded_pid {
+        let selected_count = if self.process.selected_fds_pid != excluded_pid {
             self.files
                 .vfs()
                 .socket_ids()
@@ -480,7 +509,8 @@ impl RuntimeSubsystems {
         };
         selected_count
             + self
-                .process_fds
+                .process
+                .fds
                 .iter()
                 .filter(|(pid, _)| **pid != excluded_pid)
                 .map(|(_, fds)| {
@@ -496,7 +526,7 @@ impl RuntimeSubsystems {
         excluded_pid: mcr_sys::GuestPid,
         epoll_id: u64,
     ) -> usize {
-        let selected_count = if self.selected_fds_pid != excluded_pid {
+        let selected_count = if self.process.selected_fds_pid != excluded_pid {
             self.files
                 .vfs()
                 .epoll_ids()
@@ -507,7 +537,8 @@ impl RuntimeSubsystems {
         };
         selected_count
             + self
-                .process_fds
+                .process
+                .fds
                 .iter()
                 .filter(|(pid, _)| **pid != excluded_pid)
                 .map(|(_, fds)| fds.epoll_ids().filter(|raw| *raw == epoll_id).count())
@@ -517,13 +548,13 @@ impl RuntimeSubsystems {
     pub(crate) fn drop_process_memory(&mut self, pid: mcr_sys::GuestPid) -> Result<(), LinuxErrno> {
         self.materialize_pending_fork_exec_children(pid)
             .map_err(|error| error.errno())?;
-        self.pending_fork_exec.remove(&pid);
-        if pid == self.selected_memory_pid {
+        self.process.pending_fork_exec.remove(&pid);
+        if pid == self.process.selected_memory_pid {
             if pid != mcr_task::INITIAL_GUEST_PID {
                 self.restore_initial_memory_after_selected_drop()?;
             }
         } else {
-            self.process_memory.remove(&pid);
+            self.process.memory.remove(&pid);
         }
         self.drop_native_patch_cache_for_process(pid);
         Ok(())
@@ -531,10 +562,11 @@ impl RuntimeSubsystems {
 
     pub(crate) fn restore_initial_memory_after_selected_drop(&mut self) -> Result<(), LinuxErrno> {
         let memory = self
-            .process_memory
+            .process
+            .memory
             .remove(&mcr_task::INITIAL_GUEST_PID)
             .ok_or(LinuxErrno::ESRCH)?;
-        if self.native_execution {
+        if self.native.enabled {
             self.drop_selected_memory_allocations();
             let memory = memory
                 .try_clone_runtime_at_guest_addresses()
@@ -543,7 +575,7 @@ impl RuntimeSubsystems {
         } else {
             *self.files.memory_mut() = memory;
         }
-        self.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
+        self.process.selected_memory_pid = mcr_task::INITIAL_GUEST_PID;
         Ok(())
     }
 }

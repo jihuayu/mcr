@@ -3,7 +3,11 @@ use super::*;
 
 impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
     fn supports_fast_task(&self, request: &SyscallRequest) -> bool {
-        if self.pending_fork_exec.contains_key(&request.context.pid) {
+        if self
+            .process
+            .pending_fork_exec
+            .contains_key(&request.context.pid)
+        {
             return false;
         }
         matches!(
@@ -13,7 +17,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
     }
 
     fn dispatch_fast_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {
-        let Some(task) = self.tasks.task(request.context.tid) else {
+        let Some(task) = self.process.tasks.task(request.context.tid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
         if task.pid() != request.context.pid {
@@ -339,6 +343,7 @@ impl RuntimeSubsystems {
             read_guest_u64(self.files.memory(), args.set)?
         };
         let current_mask = self
+            .process
             .tasks
             .process(pid)
             .ok_or(LinuxErrno::ESRCH)?
@@ -364,7 +369,10 @@ impl RuntimeSubsystems {
                 rip: request.context.rip,
             },
         ));
-        let outcome = self.tasks.dispatch_for_current_task(&kernel_request);
+        let outcome = self
+            .process
+            .tasks
+            .dispatch_for_current_task(&kernel_request);
         match outcome.result {
             SyscallReturn::Success(_) => {
                 self.store_selected_process_memory(pid)?;
@@ -388,6 +396,7 @@ impl RuntimeSubsystems {
         let ss = arg(request, 0);
         let old_ss = arg(request, 1);
         let current = self
+            .events
             .signal_alt_stacks
             .get(&tid)
             .copied()
@@ -406,9 +415,9 @@ impl RuntimeSubsystems {
 
         if let Some(requested) = requested {
             if requested.disabled() {
-                self.signal_alt_stacks.remove(&tid);
+                self.events.signal_alt_stacks.remove(&tid);
             } else {
-                self.signal_alt_stacks.insert(tid, requested);
+                self.events.signal_alt_stacks.insert(tid, requested);
             }
         }
 
@@ -420,7 +429,7 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        let outcome = self.tasks.dispatch_for_current_task(request);
+        let outcome = self.process.tasks.dispatch_for_current_task(request);
         if !matches!(outcome.result, SyscallReturn::Success(_)) {
             return outcome;
         }
@@ -463,19 +472,24 @@ impl RuntimeSubsystems {
     ) -> Result<(), LinuxErrno> {
         if !exit_group
             && let Some(clear_child_tid) = self
+                .process
                 .tasks
                 .task_mut(tid)
                 .and_then(GuestTask::take_clear_child_tid)
         {
             write_guest_u32(self.files.memory_mut(), clear_child_tid, 0)?;
             self.store_selected_process_memory(pid)?;
-            self.futexes.wake(clear_child_tid, u32::MAX);
-            self.tasks
+            self.events.futexes.wake(clear_child_tid, u32::MAX);
+            self.process
+                .tasks
                 .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
         }
 
         let process_exited = matches!(
-            self.tasks.process(pid).map(GuestProcess::exit_state),
+            self.process
+                .tasks
+                .process(pid)
+                .map(GuestProcess::exit_state),
             Some(ExitState::Exited { .. })
         );
         if exit_group || process_exited {
@@ -488,7 +502,7 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn resume_waiting_tasks(&mut self) -> Result<Vec<CompletedWait>, LinuxErrno> {
-        let completed = self.tasks.resume_waiting_tasks();
+        let completed = self.process.tasks.resume_waiting_tasks();
         for wait in &completed {
             self.write_wait_status(*wait)?;
             self.drop_native_fp_for_process(wait.waited().pid());
@@ -498,10 +512,10 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn resume_fd_waiters(&mut self) {
-        let selected_pid = self.selected_fds_pid;
+        let selected_pid = self.process.selected_fds_pid;
         let selected_fds = self.files.vfs().fds().clone();
-        let process_fds = self.process_fds.clone();
-        let resumed = self.tasks.resume_fd_waiters(|pid, fd, write| {
+        let process_fds = self.process.fds.clone();
+        let resumed = self.process.tasks.resume_fd_waiters(|pid, fd, write| {
             let fds = if pid == selected_pid {
                 Some(&selected_fds)
             } else {
@@ -514,7 +528,7 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn write_uname(&mut self, addr: u64) -> Result<(), LinuxErrno> {
-        let uts = self.tasks.uname_value();
+        let uts = self.process.tasks.uname_value();
         write_guest_uname(self.files.memory_mut(), addr, &uts)
     }
 
@@ -573,25 +587,27 @@ impl RuntimeSubsystems {
             _ => None,
         };
         self.perf_record_fork_like(request.syscall, clone_args);
-        let pending_child_regs = self.pending_fork_child_regs.take();
-        let outcome = if self.native_execution {
+        let pending_child_regs = self.native.pending_fork_child_regs.take();
+        let outcome = if self.native.enabled {
             match pending_child_regs {
                 Some(child_regs) => {
                     self.dispatch_native_fork_like_task(request, clone_args, child_regs)
                 }
-                None if request.syscall == mcr_sys::Syscall::Clone3 => self.tasks.clone_current(
-                    request.context.tid,
-                    clone_args.expect("clone3 args decoded"),
-                ),
-                None => self.tasks.dispatch_for_current_task(request),
+                None if request.syscall == mcr_sys::Syscall::Clone3 => {
+                    self.process.tasks.clone_current(
+                        request.context.tid,
+                        clone_args.expect("clone3 args decoded"),
+                    )
+                }
+                None => self.process.tasks.dispatch_for_current_task(request),
             }
         } else if request.syscall == mcr_sys::Syscall::Clone3 {
-            self.tasks.clone_current(
+            self.process.tasks.clone_current(
                 request.context.tid,
                 clone_args.expect("clone3 args decoded"),
             )
         } else {
-            self.tasks.dispatch_for_current_task(request)
+            self.process.tasks.dispatch_for_current_task(request)
         };
         if !matches!(outcome.result, SyscallReturn::Success(_)) {
             return outcome;
@@ -608,14 +624,15 @@ impl RuntimeSubsystems {
         let Some(child_pid) = fork_child_pid(&outcome.decoded) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        self.pending_fork_exec.insert(
+        self.process.pending_fork_exec.insert(
             child_pid,
             PendingForkExec {
                 parent_pid: pid,
                 created_at: Instant::now(),
             },
         );
-        self.process_fds
+        self.process
+            .fds
             .insert(child_pid, self.files.vfs().fds().clone());
         self.fork_native_fp(request.context.tid, child_pid);
         outcome.with_decoded_field("fork_memory", "deferred_exec")
@@ -629,13 +646,15 @@ impl RuntimeSubsystems {
     ) -> SyscallOutcome {
         match request.syscall {
             mcr_sys::Syscall::Fork => self
+                .process
                 .tasks
                 .fork_current_with_child_regs(request.context.tid, child_regs),
             mcr_sys::Syscall::Vfork => self
+                .process
                 .tasks
                 .vfork_current_with_child_regs(request.context.tid, child_regs),
             mcr_sys::Syscall::Clone | mcr_sys::Syscall::Clone3 => {
-                self.tasks.clone_current_with_child_regs(
+                self.process.tasks.clone_current_with_child_regs(
                     request.context.tid,
                     clone_args.expect("clone args decoded"),
                     child_regs,
@@ -677,7 +696,11 @@ impl RuntimeSubsystems {
     }
 
     pub(crate) fn execve(&mut self, request: &SyscallRequest) -> Result<bool, LinuxErrno> {
-        if self.pending_fork_exec.contains_key(&request.context.pid) {
+        if self
+            .process
+            .pending_fork_exec
+            .contains_key(&request.context.pid)
+        {
             return self.execve_pending_fork_exec_child(request).map(|()| true);
         }
         self.materialize_pending_fork_exec_children(request.context.pid)
@@ -687,7 +710,8 @@ impl RuntimeSubsystems {
         let argv = self.files.read_guest_vector(arg(request, 1))?;
         let envp = self.files.read_guest_vector(arg(request, 2))?;
         let program = self.files.load_guest_program(filename, argv, envp)?;
-        self.tasks
+        self.process
+            .tasks
             .exec_task(request.context.tid, program)
             .map_err(|error| error.linux_errno())?;
         let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
@@ -711,15 +735,20 @@ impl RuntimeSubsystems {
                 + self.files.vfs().epoll_fd_count(epoll_id)
                 == 0
             {
-                self.epolls.close(epoll_id);
+                self.events.epolls.close(epoll_id);
             }
         }
-        sync_proc_self(self.files.vfs_mut(), &self.tasks, request.context.pid);
-        self.native_fp.remove(&request.context.tid);
-        self.signal_alt_stacks.remove(&request.context.tid);
+        sync_proc_self(
+            self.files.vfs_mut(),
+            &self.process.tasks,
+            request.context.pid,
+        );
+        self.native.fp.remove(&request.context.tid);
+        self.events.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(request.context.pid)?;
-        self.native_patch_caches.remove(&request.context.pid);
-        self.libc_intrinsic_patches
+        self.native.patch_caches.remove(&request.context.pid);
+        self.native
+            .libc_intrinsic_patches
             .retain(|(pid, _), _| *pid != request.context.pid);
         self.store_selected_process_fds(request.context.pid)?;
         self.store_selected_process_memory(request.context.pid)?;
@@ -732,13 +761,14 @@ impl RuntimeSubsystems {
     ) -> Result<(), LinuxErrno> {
         let child_pid = request.context.pid;
         let pending = self
+            .process
             .pending_fork_exec
             .get(&child_pid)
             .copied()
             .ok_or(LinuxErrno::ESRCH)?;
         let parent_pid = pending.parent_pid;
         self.select_fds_for_process(child_pid)?;
-        sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
+        sync_proc_self(self.files.vfs_mut(), &self.process.tasks, child_pid);
 
         let args = (|| {
             let memory = self
@@ -765,12 +795,12 @@ impl RuntimeSubsystems {
                 return Err(errno);
             }
         };
-        if let Err(error) = self.tasks.exec_task(request.context.tid, program) {
+        if let Err(error) = self.process.tasks.exec_task(request.context.tid, program) {
             self.materialize_pending_fork_exec_child_memory(child_pid)
                 .map_err(|error| error.errno())?;
             return Err(error.linux_errno());
         }
-        self.pending_fork_exec.remove(&child_pid);
+        self.process.pending_fork_exec.remove(&child_pid);
         self.perf_record_clone_to_exec(pending.created_at.elapsed());
         let closed_fd_ids = self.files.vfs_mut().fds_mut().close_on_exec();
         for socket_id in closed_fd_ids
@@ -793,15 +823,16 @@ impl RuntimeSubsystems {
                 + self.files.vfs().epoll_fd_count(epoll_id)
                 == 0
             {
-                self.epolls.close(epoll_id);
+                self.events.epolls.close(epoll_id);
             }
         }
-        sync_proc_self(self.files.vfs_mut(), &self.tasks, child_pid);
-        self.native_fp.remove(&request.context.tid);
-        self.signal_alt_stacks.remove(&request.context.tid);
+        sync_proc_self(self.files.vfs_mut(), &self.process.tasks, child_pid);
+        self.native.fp.remove(&request.context.tid);
+        self.events.signal_alt_stacks.remove(&request.context.tid);
         self.replace_memory_from_image(child_pid)?;
-        self.native_patch_caches.remove(&child_pid);
-        self.libc_intrinsic_patches
+        self.native.patch_caches.remove(&child_pid);
+        self.native
+            .libc_intrinsic_patches
             .retain(|(pid, _), _| *pid != child_pid);
         self.store_selected_process_fds(child_pid)
     }
@@ -811,19 +842,20 @@ impl RuntimeSubsystems {
         pid: mcr_sys::GuestPid,
     ) -> Result<(), LinuxErrno> {
         let image = self
+            .process
             .tasks
             .process(pid)
             .ok_or(LinuxErrno::ESRCH)?
             .image()
             .memory()
             .clone();
-        if pid == self.selected_memory_pid {
+        if pid == self.process.selected_memory_pid {
             self.drop_selected_memory_allocations();
             let memory = self.memory_from_process_image(&image)?;
             *self.files.memory_mut() = memory;
         } else {
             let memory = self.memory_from_process_image(&image)?;
-            self.process_memory.insert(pid, memory);
+            self.process.memory.insert(pid, memory);
         }
         self.set_native_image_patch_key(pid, &image);
         Ok(())
@@ -835,11 +867,11 @@ impl RuntimeSubsystems {
         image: &mcr_elf::GuestMemoryImage,
     ) {
         if let Some((key, ranges)) = native_image_patch_key_and_ranges(image) {
-            self.native_image_patch_keys.insert(pid, key);
-            self.native_image_patch_ranges.insert(pid, ranges);
+            self.native.image_patch_keys.insert(pid, key);
+            self.native.image_patch_ranges.insert(pid, ranges);
         } else {
-            self.native_image_patch_keys.remove(&pid);
-            self.native_image_patch_ranges.remove(&pid);
+            self.native.image_patch_keys.remove(&pid);
+            self.native.image_patch_ranges.remove(&pid);
         }
     }
 
@@ -858,7 +890,7 @@ impl RuntimeSubsystems {
     ) -> Result<(), LinuxErrno> {
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
-            if self.native_execution {
+            if self.native.enabled {
                 memory
                     .set_mmap_base(WINDOWS_NATIVE_MMAP_BASE)
                     .map_err(|error| error.errno())?;

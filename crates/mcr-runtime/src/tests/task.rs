@@ -435,6 +435,7 @@ fn fork_exec_defers_memory_clone_until_child_execve() {
         runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -442,7 +443,8 @@ fn fork_exec_defers_memory_clone_until_child_execve() {
         !runtime
             .dispatcher
             .subsystems()
-            .process_memory
+            .process
+            .memory
             .contains_key(&2)
     );
 
@@ -458,6 +460,7 @@ fn fork_exec_defers_memory_clone_until_child_execve() {
         !runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -465,7 +468,8 @@ fn fork_exec_defers_memory_clone_until_child_execve() {
         runtime
             .dispatcher
             .subsystems()
-            .process_memory
+            .process
+            .memory
             .contains_key(&2)
     );
     let mut parent_bytes = [0; 6];
@@ -515,6 +519,7 @@ fn clone3_vfork_defers_memory_clone_until_child_execve() {
         runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -522,7 +527,8 @@ fn clone3_vfork_defers_memory_clone_until_child_execve() {
         !runtime
             .dispatcher
             .subsystems()
-            .process_memory
+            .process
+            .memory
             .contains_key(&2)
     );
 
@@ -552,6 +558,7 @@ fn clone3_vfork_defers_memory_clone_until_child_execve() {
         !runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -568,6 +575,7 @@ fn parent_memory_mutation_materializes_deferred_fork_child_first() {
         runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -578,6 +586,7 @@ fn parent_memory_mutation_materializes_deferred_fork_child_first() {
         !runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -613,6 +622,7 @@ fn unsafe_share_until_exec_keeps_child_pending_after_parent_memory_write() {
         runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -620,7 +630,8 @@ fn unsafe_share_until_exec_keeps_child_pending_after_parent_memory_write() {
         !runtime
             .dispatcher
             .subsystems()
-            .process_memory
+            .process
+            .memory
             .contains_key(&2)
     );
 
@@ -671,6 +682,7 @@ fn deferred_fork_exec_failure_preserves_child_memory() {
         !runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );
@@ -744,6 +756,7 @@ fn pending_fork_child_can_exec_from_read_only_parent_memory() {
         !runtime
             .dispatcher
             .subsystems()
+            .process
             .pending_fork_exec
             .contains_key(&2)
     );

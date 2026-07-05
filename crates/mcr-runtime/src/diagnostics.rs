@@ -26,9 +26,9 @@ impl RuntimeDiagnostics {
         events: &[SyscallTraceEvent],
     ) -> Self {
         let mut diagnostics = Self::capture_with_native_execution(
-            &subsystems.tasks,
+            subsystems.tasks(),
             events,
-            subsystems.native_execution,
+            subsystems.native_execution_enabled(),
         );
         diagnostics.worker_pools = subsystems.host_worker_pool_diagnostics().to_vec();
         diagnostics

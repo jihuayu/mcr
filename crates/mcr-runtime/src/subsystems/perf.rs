@@ -23,7 +23,8 @@ impl RuntimeSubsystems {
             self.perf_summary
                 .last_dispatched
                 .is_some_and(|(last_tid, _)| {
-                    self.tasks
+                    self.process
+                        .tasks
                         .task(last_tid)
                         .is_some_and(|task| matches!(task.state(), TaskState::Runnable))
                 });

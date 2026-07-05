@@ -12,7 +12,8 @@ impl RuntimeSubsystems {
             .memory_for_process_mut(pid)
             .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
         memory.patch_code_fixed([(address, [0xcc, 0x90])])?;
-        self.libc_intrinsic_patches
+        self.native
+            .libc_intrinsic_patches
             .insert((pid, address), intrinsic);
         Ok(())
     }
@@ -22,7 +23,10 @@ impl RuntimeSubsystems {
         pid: mcr_sys::GuestPid,
         address: u64,
     ) -> Option<GuestLibcIntrinsic> {
-        self.libc_intrinsic_patches.get(&(pid, address)).copied()
+        self.native
+            .libc_intrinsic_patches
+            .get(&(pid, address))
+            .copied()
     }
 
     pub(crate) fn cached_native_patch_metadata(
@@ -30,7 +34,7 @@ impl RuntimeSubsystems {
         key: &NativeImagePatchKey,
         base: u64,
     ) -> Option<NativePatchMetadata> {
-        if let Some(entry) = self.native_image_patch_metadata.get(key)
+        if let Some(entry) = self.native.image_patch_metadata.get(key)
             && let Some(metadata) = rebase_native_patch_metadata(&entry.metadata, entry.base, base)
         {
             return Some(metadata);
@@ -38,7 +42,7 @@ impl RuntimeSubsystems {
         let metadata = load_persistent_native_patch_metadata(key, base)
             .ok()
             .flatten()?;
-        self.native_image_patch_metadata.insert(
+        self.native.image_patch_metadata.insert(
             key.clone(),
             NativePatchMetadataEntry {
                 base,
@@ -54,12 +58,12 @@ impl RuntimeSubsystems {
         fs_base: u64,
     ) -> Result<(), GuestExecutionError> {
         let patch_start = Instant::now();
-        let mut cache = self.native_patch_caches.remove(&pid).unwrap_or_default();
+        let mut cache = self.native.patch_caches.remove(&pid).unwrap_or_default();
         let mut store_image_metadata = None;
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
             cache.image_metadata_checked = true;
-            if let Some(key) = self.native_image_patch_keys.get(&pid).cloned() {
-                let image_ranges = self.native_image_patch_ranges.get(&pid).cloned();
+            if let Some(key) = self.native.image_patch_keys.get(&pid).cloned() {
+                let image_ranges = self.native.image_patch_ranges.get(&pid).cloned();
                 let metadata = image_ranges
                     .as_ref()
                     .and_then(|ranges| self.cached_native_patch_metadata(&key, ranges.base));
@@ -108,7 +112,7 @@ impl RuntimeSubsystems {
 
         let scanned_ranges = cache.scanned_ranges.clone();
         let scanned_metadata;
-        let guest_task_worker_pool = self.guest_task_worker_pool.clone();
+        let guest_task_worker_pool = self.native.guest_task_worker_pool.clone();
         host_step_trace(format_args!(
             "runtime native-patch-cache start pid={pid} fs_base=0x{fs_base:016x} cached_ranges={}",
             scanned_ranges.len()
@@ -196,7 +200,7 @@ impl RuntimeSubsystems {
         if let Some((key, base, ranges)) = store_image_metadata {
             let image_metadata = metadata_for_ranges(&scanned_metadata, &ranges);
             if !image_metadata.scanned_ranges.is_empty() {
-                self.native_image_patch_metadata.insert(
+                self.native.image_patch_metadata.insert(
                     key.clone(),
                     NativePatchMetadataEntry {
                         base,
@@ -209,7 +213,7 @@ impl RuntimeSubsystems {
         for (key, base, range) in store_range_metadata {
             let range_metadata = metadata_for_ranges(&scanned_metadata, &[range]);
             if !range_metadata.scanned_ranges.is_empty() {
-                self.native_image_patch_metadata.insert(
+                self.native.image_patch_metadata.insert(
                     key.clone(),
                     NativePatchMetadataEntry {
                         base,
@@ -233,12 +237,12 @@ impl RuntimeSubsystems {
             cache.scanned_ranges.len(),
             host_step_elapsed_ms(patch_start)
         ));
-        self.native_patch_caches.insert(pid, cache);
+        self.native.patch_caches.insert(pid, cache);
         Ok(())
     }
 
     pub(crate) fn invalidate_native_patch_cache(&mut self, pid: mcr_sys::GuestPid) {
-        if let Some(cache) = self.native_patch_caches.get_mut(&pid) {
+        if let Some(cache) = self.native.patch_caches.get_mut(&pid) {
             cache.invalidate();
         }
     }
@@ -253,7 +257,7 @@ impl RuntimeSubsystems {
             self.invalidate_native_patch_cache(pid);
             return;
         };
-        if let Some(cache) = self.native_patch_caches.get_mut(&pid) {
+        if let Some(cache) = self.native.patch_caches.get_mut(&pid) {
             cache.invalidate_range(start, end);
         }
     }

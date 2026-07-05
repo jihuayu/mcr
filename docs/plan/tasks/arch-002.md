@@ -1,7 +1,7 @@
 ---
 id: arch-002
 scope: architecture
-status: pending
+status: done
 depends-on: [arch-001]
 ---
 

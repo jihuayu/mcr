@@ -135,7 +135,7 @@ impl RuntimeSubsystems {
         fd: Fd,
         offset: i64,
     ) -> Result<(), LinuxErrno> {
-        if !self.native_execution || prot & mcr_sys::LINUX_PROT_EXEC == 0 || offset < 0 {
+        if !self.native.enabled || prot & mcr_sys::LINUX_PROT_EXEC == 0 || offset < 0 {
             return Ok(());
         }
         let len = usize::try_from(length).map_err(|_| LinuxErrno::ENOMEM)?;
@@ -178,14 +178,16 @@ impl RuntimeSubsystems {
         else {
             return Ok(Arc::from([]));
         };
-        if let Some(symbols) = self.libc_intrinsic_symbol_cache.get(&key) {
+        if let Some(symbols) = self.native.libc_intrinsic_symbol_cache.get(&key) {
             return Ok(Arc::clone(symbols));
         }
         let symbols: Arc<[FileBackedLibcIntrinsicSymbol]> =
             Arc::from(parse_file_backed_libc_intrinsic_symbols(bytes).into_boxed_slice());
-        self.libc_intrinsic_symbol_cache
+        self.native
+            .libc_intrinsic_symbol_cache
             .retain(|cached, _| cached.generation() == key.generation());
-        self.libc_intrinsic_symbol_cache
+        self.native
+            .libc_intrinsic_symbol_cache
             .insert(key, Arc::clone(&symbols));
         Ok(symbols)
     }
@@ -217,12 +219,12 @@ impl RuntimeSubsystems {
     ) -> Result<Arc<[u8]>, LinuxErrno> {
         let cache_key = self.file_backed_mmap_cache_key(fd, offset, len, prot, flags)?;
         if let Some(key) = cache_key {
-            if let Some(bytes) = self.file_backed_mapping_cache.lookup(key) {
+            if let Some(bytes) = self.native.file_backed_mapping_cache.lookup(key) {
                 return Ok(bytes);
             }
-            self.file_backed_mapping_cache.record_miss();
+            self.native.file_backed_mapping_cache.record_miss();
             let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
-            return Ok(self.file_backed_mapping_cache.insert(key, bytes));
+            return Ok(self.native.file_backed_mapping_cache.insert(key, bytes));
         }
 
         let bytes = self.read_file_backed_mmap_bytes(fd, offset, len)?;
