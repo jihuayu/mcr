@@ -298,6 +298,21 @@ fn task_time_resource_fake_syscalls_handle_limits_prctl_cpu_and_fallbacks() {
         runtime
             .dispatch_syscall(context(Syscall::Membarrier, [0, 0, 0, 0, 0, 0]))
             .result,
+        SyscallReturn::Success(
+            LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        )
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Membarrier, [8, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Membarrier, [16, 0, 0, 0, 0, 0]))
+            .result,
         SyscallReturn::Success(0)
     );
     assert_eq!(

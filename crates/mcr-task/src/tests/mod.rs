@@ -854,6 +854,32 @@ fn rt_sigtimedwait_blocks_and_tkill_wakes_matching_waiter() {
 }
 
 #[test]
+fn tkill_interrupts_futex_waiter_with_eintr() {
+    let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+    kernel
+        .block_task_for_futex(
+            INITIAL_GUEST_TID,
+            FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true),
+        )
+        .unwrap();
+
+    assert_eq!(
+        dispatch_task_syscall(
+            &mut kernel,
+            Syscall::Tkill,
+            [INITIAL_GUEST_TID as u64, LINUX_SIGCHLD as u64, 0, 0, 0, 0],
+        ),
+        SyscallReturn::Success(0)
+    );
+    let task = kernel.task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(
+        SyscallReturn::decode_rax(task.regs().rax()),
+        SyscallReturn::Errno(LinuxErrno::EINTR)
+    );
+}
+
+#[test]
 fn kill_queues_blocked_sigterm_for_sigtimedwait_instead_of_exiting() {
     let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
     let signal_mask = 1u64 << (LINUX_SIGTERM - 1);

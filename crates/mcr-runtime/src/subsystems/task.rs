@@ -324,6 +324,14 @@ impl RuntimeSubsystems {
             return Err(LinuxErrno::EINVAL);
         }
         if command == LINUX_MEMBARRIER_CMD_QUERY {
+            return Ok(LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED);
+        }
+        if matches!(
+            command,
+            LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                | LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+        ) {
             return Ok(0);
         }
         Err(LinuxErrno::ENOSYS)

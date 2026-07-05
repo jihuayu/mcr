@@ -1,7 +1,7 @@
 use mcr_sys::{
     GuestPid, GuestTid, KillSyscallArgs, LINUX_KERNEL_SIGSET_SIZE, LINUX_ROBUST_LIST_HEAD_SIZE,
     LinuxErrno, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs, SetRobustListSyscallArgs,
-    SetTidAddressSyscallArgs, SyscallOutcome, TgkillSyscallArgs, TkillSyscallArgs,
+    SetTidAddressSyscallArgs, SyscallOutcome, SyscallReturn, TgkillSyscallArgs, TkillSyscallArgs,
 };
 
 use super::{GuestKernel, current_syscall_return_rip};
@@ -125,6 +125,9 @@ impl GuestKernel {
             return;
         };
         self.wake_signal_waiters(pid);
+        if !self.signal_blocked(pid, signal) {
+            self.interrupt_futex_waiter(tid);
+        }
     }
 
     fn take_pending_signal_for_task(
@@ -199,6 +202,27 @@ impl GuestKernel {
             }
         }
         woken
+    }
+
+    fn signal_blocked(&self, pid: GuestPid, signal: u32) -> bool {
+        self.process(pid)
+            .is_some_and(|process| signal_matches_mask(signal, process.signals.blocked()))
+    }
+
+    fn interrupt_futex_waiter(&mut self, tid: GuestTid) -> bool {
+        if !matches!(
+            self.task(tid).map(|task| task.state),
+            Some(TaskState::WaitingForFutex { .. })
+        ) {
+            return false;
+        }
+        if let Some(task) = self.task_mut(tid) {
+            task.regs = task.regs.with_syscall_return(
+                task.regs.rip(),
+                SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64(),
+            );
+        }
+        self.set_task_state(tid, TaskState::Runnable).is_some()
     }
 
     pub fn kill_current(&mut self, args: KillSyscallArgs) -> SyscallOutcome {

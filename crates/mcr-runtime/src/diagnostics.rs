@@ -10,6 +10,7 @@ pub struct RuntimeDiagnostics {
     tasks: Vec<DiagnosticTask>,
     worker_pools: Vec<HostWorkerPoolDiagnostics>,
     last_syscall: Option<DiagnosticSyscall>,
+    recent_syscalls: Vec<DiagnosticSyscall>,
     in_flight_syscall: Option<DiagnosticSyscall>,
     native_execution_enabled: bool,
     perf: RuntimePerfDiagnostics,
@@ -63,6 +64,12 @@ impl RuntimeDiagnostics {
                 .collect(),
             worker_pools: kernel.host_worker_pool_diagnostics().to_vec(),
             last_syscall: events.iter().rev().find_map(DiagnosticSyscall::from_event),
+            recent_syscalls: events
+                .iter()
+                .rev()
+                .filter_map(DiagnosticSyscall::from_event)
+                .take(8)
+                .collect(),
             in_flight_syscall: in_flight_syscall(events),
             native_execution_enabled,
             perf: RuntimePerfDiagnostics::default(),
@@ -92,6 +99,11 @@ impl RuntimeDiagnostics {
     #[must_use]
     pub const fn last_syscall(&self) -> Option<&DiagnosticSyscall> {
         self.last_syscall.as_ref()
+    }
+
+    #[must_use]
+    pub fn recent_syscalls(&self) -> &[DiagnosticSyscall] {
+        &self.recent_syscalls
     }
 
     #[must_use]
@@ -163,6 +175,8 @@ pub struct RuntimeStallDiagnostic {
     fd_wait_tasks: usize,
     child_wait_tasks: usize,
     futex_wait_tasks: usize,
+    task_states: Vec<DiagnosticTask>,
+    recent_syscalls: Vec<DiagnosticSyscall>,
 }
 
 impl RuntimeStallDiagnostic {
@@ -255,6 +269,8 @@ impl RuntimeStallDiagnostic {
             fd_wait_tasks,
             child_wait_tasks,
             futex_wait_tasks,
+            task_states: diagnostics.tasks().to_vec(),
+            recent_syscalls: recent_completed_syscalls(diagnostics, 8),
         }
     }
 
@@ -326,7 +342,86 @@ impl fmt::Display for RuntimeStallDiagnostic {
             formatter,
             "; tasks runnable={} fd_wait={} child_wait={} futex_wait={}",
             self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks, self.futex_wait_tasks
-        )
+        )?;
+        write_task_state_summary(formatter, &self.task_states)?;
+        write_recent_syscalls(formatter, &self.recent_syscalls)
+    }
+}
+
+fn recent_completed_syscalls(
+    diagnostics: &RuntimeDiagnostics,
+    limit: usize,
+) -> Vec<DiagnosticSyscall> {
+    diagnostics
+        .recent_syscalls()
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+fn write_task_state_summary(
+    formatter: &mut fmt::Formatter<'_>,
+    tasks: &[DiagnosticTask],
+) -> fmt::Result {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    write!(formatter, "; task_states=[")?;
+    for (index, task) in tasks.iter().take(6).enumerate() {
+        if index > 0 {
+            write!(formatter, ", ")?;
+        }
+        write!(
+            formatter,
+            "pid={} tid={} rip=0x{:x} {}",
+            task.pid(),
+            task.tid(),
+            task.rip(),
+            diagnostic_task_state_display(task.state())
+        )?;
+    }
+    if tasks.len() > 6 {
+        write!(formatter, ", ...")?;
+    }
+    write!(formatter, "]")
+}
+
+fn write_recent_syscalls(
+    formatter: &mut fmt::Formatter<'_>,
+    syscalls: &[DiagnosticSyscall],
+) -> fmt::Result {
+    if syscalls.is_empty() {
+        return Ok(());
+    }
+    write!(formatter, "; recent_syscalls=[")?;
+    for (index, syscall) in syscalls.iter().enumerate() {
+        if index > 0 {
+            write!(formatter, ", ")?;
+        }
+        write!(
+            formatter,
+            "{}({}) args={} result={:?}",
+            syscall.name(),
+            syscall.number(),
+            syscall_args_display(syscall.args()),
+            syscall.result()
+        )?;
+    }
+    write!(formatter, "]")
+}
+
+fn diagnostic_task_state_display(state: DiagnosticTaskState) -> String {
+    match state {
+        DiagnosticTaskState::Runnable => "runnable".to_owned(),
+        DiagnosticTaskState::WaitingForChild => "child_wait".to_owned(),
+        DiagnosticTaskState::WaitingForFd { fd, write } => {
+            format!("fd_wait(fd={fd}, write={write})")
+        }
+        DiagnosticTaskState::WaitingForFutex { uaddr } => {
+            format!("futex_wait(uaddr=0x{uaddr:x})")
+        }
+        DiagnosticTaskState::Exited { status } => format!("exited(status={status})"),
     }
 }
 
