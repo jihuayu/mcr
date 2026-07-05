@@ -114,6 +114,7 @@ pub enum Syscall {
     Fcntl,
     Flock,
     Ftruncate,
+    Fallocate,
     Getdents,
     Getcwd,
     Chdir,
@@ -250,6 +251,7 @@ impl Syscall {
     pub const FCNTL: SyscallNumber = SyscallNumber::new(72);
     pub const FLOCK: SyscallNumber = SyscallNumber::new(73);
     pub const FTRUNCATE: SyscallNumber = SyscallNumber::new(77);
+    pub const FALLOCATE: SyscallNumber = SyscallNumber::new(285);
     pub const GETDENTS: SyscallNumber = SyscallNumber::new(78);
     pub const GETCWD: SyscallNumber = SyscallNumber::new(79);
     pub const CHDIR: SyscallNumber = SyscallNumber::new(80);
@@ -366,6 +368,7 @@ impl Syscall {
             74 => Self::Fsync,
             75 => Self::Fdatasync,
             77 => Self::Ftruncate,
+            285 => Self::Fallocate,
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
@@ -527,6 +530,7 @@ impl Syscall {
             Self::Fcntl => Self::FCNTL,
             Self::Flock => Self::FLOCK,
             Self::Ftruncate => Self::FTRUNCATE,
+            Self::Fallocate => Self::FALLOCATE,
             Self::Getdents => Self::GETDENTS,
             Self::Getcwd => Self::GETCWD,
             Self::Chdir => Self::CHDIR,
@@ -667,6 +671,7 @@ impl Syscall {
             Self::Fcntl => "fcntl",
             Self::Flock => "flock",
             Self::Ftruncate => "ftruncate",
+            Self::Fallocate => "fallocate",
             Self::Getdents => "getdents",
             Self::Getcwd => "getcwd",
             Self::Chdir => "chdir",
@@ -776,6 +781,7 @@ mod tests {
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
             (Syscall::FCHDIR, Syscall::Fchdir, "fchdir"),
             (Syscall::FLOCK, Syscall::Flock, "flock"),
+            (Syscall::FALLOCATE, Syscall::Fallocate, "fallocate"),
             (Syscall::PRCTL, Syscall::Prctl, "prctl"),
             (Syscall::TKILL, Syscall::Tkill, "tkill"),
             (

@@ -165,6 +165,7 @@ const LINUX_STATFS_SIZE: usize = 120;
 const LINUX_EXT_SUPER_MAGIC: u64 = 0xef53;
 const LINUX_TMPFS_MAGIC: u64 = 0x0102_1994;
 const LINUX_STATFS_BLOCK_SIZE: u64 = 4096;
+const LINUX_FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -1215,6 +1216,7 @@ where
             mcr_sys::Syscall::Link => self.sys_link(request),
             mcr_sys::Syscall::Linkat => self.sys_linkat(request),
             mcr_sys::Syscall::Ftruncate => self.sys_ftruncate(request),
+            mcr_sys::Syscall::Fallocate => self.sys_fallocate(request),
             mcr_sys::Syscall::Chmod => self.sys_chmod(request),
             mcr_sys::Syscall::Chown => self.sys_chown(request),
             mcr_sys::Syscall::Utimensat => self.sys_utimensat(request),
@@ -2232,6 +2234,30 @@ where
         self.vfs
             .ftruncate(arg_i32(request, 0), length as u64)
             .map_err(vfs_errno)?;
+        Ok(0)
+    }
+
+    fn sys_fallocate(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let fd = arg_i32(request, 0);
+        let mode = arg_u32(request, 1);
+        let offset = arg(request, 2) as i64;
+        let len = arg(request, 3) as i64;
+        if offset < 0 || len <= 0 {
+            return Err(LinuxErrno::EINVAL);
+        }
+        if mode & !LINUX_FALLOC_FL_KEEP_SIZE != 0 {
+            return Err(LinuxErrno::EOPNOTSUPP);
+        }
+        if mode & LINUX_FALLOC_FL_KEEP_SIZE != 0 {
+            self.vfs.fstat(fd).map_err(vfs_errno)?;
+            return Ok(0);
+        }
+        let end = (offset as u64)
+            .checked_add(len as u64)
+            .ok_or(LinuxErrno::EINVAL)?;
+        if end > self.vfs.fstat(fd).map_err(vfs_errno)?.size {
+            self.vfs.ftruncate(fd, end).map_err(vfs_errno)?;
+        }
         Ok(0)
     }
 
@@ -14360,6 +14386,20 @@ mod tests {
             SyscallReturn::Success(0)
         );
         assert_eq!(runtime.vfs().fstat(3).unwrap().size, 7);
+        assert_eq!(
+            dispatch(&mut runtime, Syscall::Fallocate, [3, 0, 7, 11, 0, 0]),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(runtime.vfs().fstat(3).unwrap().size, 18);
+        assert_eq!(
+            dispatch(
+                &mut runtime,
+                Syscall::Fallocate,
+                [3, u64::from(LINUX_FALLOC_FL_KEEP_SIZE), 18, 8, 0, 0],
+            ),
+            SyscallReturn::Success(0)
+        );
+        assert_eq!(runtime.vfs().fstat(3).unwrap().size, 18);
         assert_eq!(
             dispatch(
                 &mut runtime,
