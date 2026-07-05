@@ -1301,6 +1301,7 @@ mod tests {
                     bytes: vec![0x48, 0x8b, 0x40, 0x28],
                     decoded: "code=Mov_r64_rm64 mnemonic=Mov len=4 operands=[reg=RAX,mem(seg=DS,base=RAX,index=None,scale=1,disp=0x28)]"
                         .to_string(),
+                    fs_relative_memory_operand: false,
                 })),
                 stack_words: vec![mcr_jit::NativeFaultStackWord {
                     address: 0x1001_ffb58,

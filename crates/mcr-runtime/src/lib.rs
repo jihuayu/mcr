@@ -5184,7 +5184,7 @@ fn native_fault_stack_words(memory: &GuestMemory, rsp: u64) -> Vec<NativeFaultSt
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn native_fault_is_unrewritten_fs_relative(instruction: &NativeFaultInstruction) -> bool {
-    fs_relative_original(&instruction.bytes).is_some()
+    instruction.fs_relative_memory_operand
 }
 
 fn read_guest_block(
@@ -17216,6 +17216,24 @@ mod tests {
         assert_eq!(guest_bytes(runtime.memory(), 0x401009, 2), [0xcc, 0x90]);
         let instruction = native_fault_instruction(runtime.memory(), 0x401000)
             .expect("fs-relative fault instruction decodes");
+        assert!(native_fault_is_unrewritten_fs_relative(&instruction));
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn native_fault_detection_handles_prefixed_fs_relative_instruction() {
+        let _guard = native_execution_test_guard();
+        let fs_load = [
+            0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+        ];
+        let mut code = fs_load.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let runtime =
+            Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+
+        let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+            .expect("prefixed fs-relative fault instruction decodes");
+
         assert!(native_fault_is_unrewritten_fs_relative(&instruction));
     }
 

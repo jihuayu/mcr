@@ -266,6 +266,7 @@ pub struct NativeFaultInstruction {
     pub rip: u64,
     pub bytes: Vec<u8>,
     pub decoded: String,
+    pub fs_relative_memory_operand: bool,
 }
 
 impl fmt::Display for NativeFaultInstruction {
@@ -295,6 +296,7 @@ pub fn decode_native_fault_instruction(bytes: &[u8], rip: u64) -> Option<NativeF
         rip,
         bytes: bytes[..len].to_vec(),
         decoded: describe_instruction(&instruction),
+        fs_relative_memory_operand: instruction_has_fs_memory_operand(&instruction),
     })
 }
 
@@ -310,6 +312,13 @@ fn describe_instruction(instruction: &Instruction) -> String {
         instruction.len(),
         operands
     )
+}
+
+fn instruction_has_fs_memory_operand(instruction: &Instruction) -> bool {
+    (0..instruction.op_count()).any(|operand| {
+        instruction.op_kind(operand) == OpKind::Memory
+            && instruction.memory_segment() == Register::FS
+    })
 }
 
 fn describe_operand(instruction: &Instruction, operand: u32) -> String {
@@ -2347,6 +2356,33 @@ mod tests {
             "{}",
             instruction.decoded
         );
+        assert!(!instruction.fs_relative_memory_operand);
+    }
+
+    #[test]
+    fn native_fault_instruction_marks_prefixed_fs_memory_operand() {
+        let instruction = decode_native_fault_instruction(
+            &[
+                0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+            ],
+            0x6f7494,
+        )
+        .expect("prefixed fs-relative fault instruction should decode");
+
+        assert_eq!(
+            instruction.bytes,
+            [
+                0x66, 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0
+            ]
+        );
+        assert!(
+            instruction
+                .decoded
+                .contains("mem(seg=FS,base=None,index=None,scale=1,disp=0x0)"),
+            "{}",
+            instruction.decoded
+        );
+        assert!(instruction.fs_relative_memory_operand);
     }
 
     #[test]
