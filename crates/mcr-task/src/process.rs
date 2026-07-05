@@ -106,6 +106,10 @@ impl SignalState {
             _ => Err(TaskError::InvalidSignalMaskHow(how)),
         }
     }
+
+    pub fn set_blocked(&mut self, mask: u64) {
+        self.blocked = mask;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

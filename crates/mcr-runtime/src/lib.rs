@@ -12,6 +12,7 @@ mod native_patch;
 mod perf;
 pub mod run_rootfs;
 mod runtime;
+mod signal_frame;
 mod subsystems;
 mod tracing;
 
@@ -61,6 +62,7 @@ pub(crate) use runtime::{
     dispatch_guest_task_with_dispatcher, dispatch_native_libc_intrinsic_task,
 };
 pub(crate) use runtime::{guest_execution_errno, run_guest_until_exit_with_diagnostic_step_limit};
+pub(crate) use signal_frame::*;
 pub(crate) use subsystems::EPOLL_EVENT_SIZE;
 pub use subsystems::RuntimeSubsystems;
 pub use tracing::RuntimeDiagnosticsTracer;

@@ -4,6 +4,7 @@ mod filesystem;
 mod native_patch;
 mod network;
 mod runtime;
+mod signal_frame;
 mod support;
 mod task;
 mod time;

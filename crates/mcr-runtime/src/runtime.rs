@@ -808,15 +808,21 @@ where
             memory,
         )?
     };
-    let dispatch_result = dispatcher.dispatch(GuestContext::new(
-        pid,
-        tid,
-        trap.registers().syscall_registers(),
-    ));
     let syscall_registers = trap.registers().syscall_registers();
     dispatcher
         .subsystems_mut()
         .perf_record_syscall(syscall_registers.syscall());
+    if syscall_registers.syscall() == mcr_sys::Syscall::RtSigreturn {
+        return dispatch_rt_sigreturn_guest_task(
+            dispatcher,
+            tid,
+            pid,
+            before_rip,
+            gpr,
+            trap.registers(),
+        );
+    }
+    let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
         let task = dispatcher
@@ -887,6 +893,16 @@ where
     dispatcher
         .subsystems_mut()
         .perf_record_syscall(syscall_registers.syscall());
+    if syscall_registers.syscall() == mcr_sys::Syscall::RtSigreturn {
+        return dispatch_rt_sigreturn_guest_task(
+            dispatcher,
+            tid,
+            pid,
+            before_rip,
+            expected_task_regs,
+            trap.registers(),
+        );
+    }
     let dispatch_result = dispatcher.dispatch(GuestContext::new(pid, tid, syscall_registers));
     if is_nonreturning_exit_syscall(syscall_registers, &dispatch_result) {
         let trap_regs = gpr_from_registers(trap.registers());
@@ -929,6 +945,148 @@ where
         task.state(),
     ))
 }
+
+pub(crate) fn dispatch_rt_sigreturn_guest_task<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    expected_task_regs: GprState,
+    registers: GuestRegisters,
+) -> Result<GuestExecutionStep, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    let restored = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        restore_rt_signal_frame(memory, registers)
+            .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
+    };
+    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
+        process.signals_mut().set_blocked(restored.signal_mask);
+    }
+    let updated_regs = gpr_from_registers(restored.registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks_mut()
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == expected_task_regs {
+        task.set_regs(updated_regs);
+        updated_regs
+    } else {
+        task.regs()
+    };
+    Ok(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    ))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn try_deliver_native_guest_fault_signal<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    expected_task_regs: GprState,
+    native_registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    fault_address: u64,
+) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    let Some((action, signal_mask)) =
+        dispatcher
+            .subsystems()
+            .tasks()
+            .process(pid)
+            .and_then(|process| {
+                process
+                    .signals()
+                    .action(LINUX_SIGSEGV)
+                    .map(|action| (action, process.signals().blocked()))
+            })
+    else {
+        return Ok(None);
+    };
+    if action.action() == LINUX_SIG_DFL
+        || action.action() == LINUX_SIG_IGN
+        || action.flags() & LINUX_SA_RESTORER == 0
+        || action.restorer() == 0
+    {
+        return Ok(None);
+    }
+
+    let alt_stack = dispatcher
+        .subsystems()
+        .events
+        .signal_alt_stacks
+        .get(&tid)
+        .copied();
+    let mut guest_registers = guest_registers_from_host(native_registers);
+    guest_registers.fs_base = fs_base;
+    let handler_registers = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        setup_rt_signal_frame(
+            memory,
+            guest_registers,
+            action,
+            LINUX_SIGSEGV,
+            signal_mask,
+            fault_address,
+            alt_stack,
+        )
+        .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
+    };
+
+    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
+        let mut blocked = signal_mask | action.mask();
+        if action.flags() & LINUX_SA_NODEFER == 0 {
+            blocked |= signal_mask_for(LINUX_SIGSEGV);
+        }
+        process.signals_mut().set_blocked(blocked);
+    }
+    dispatcher.subsystems_mut().set_native_fp(
+        tid,
+        mcr_win::HostFloatingPointState {
+            xmm: native_registers.xmm,
+            mxcsr: native_registers.mxcsr,
+        },
+    );
+    let gpr = gpr_from_registers(handler_registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks_mut()
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == expected_task_regs {
+        task.set_regs(gpr);
+        gpr
+    } else {
+        task.regs()
+    };
+    Ok(Some(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    )))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const WINDOWS_EXCEPTION_ACCESS_VIOLATION: u32 = 0xc000_0005;
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -1064,6 +1222,28 @@ where
                     dispatcher, tid, pid, before_rip, gpr, registers,
                 );
             }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let mcr_win::NativeExecutionError::GuestFault {
+                signal, address, ..
+            } = &error
+                && *signal as u32 == WINDOWS_EXCEPTION_ACCESS_VIOLATION
+                && let Some(step) = try_deliver_native_guest_fault_signal(
+                    dispatcher,
+                    tid,
+                    pid,
+                    before_rip,
+                    gpr,
+                    native_registers,
+                    fs_base,
+                    *address,
+                )?
+            {
+                host_step_trace(format_args!(
+                    "runtime native-signal-deliver pid={pid} tid={tid} signal={LINUX_SIGSEGV} rip=0x{:016x}",
+                    native_registers.rip
+                ));
+                return Ok(step);
+            }
             return Err(native_execution_error(
                 error,
                 native_registers,
@@ -1097,6 +1277,11 @@ where
         dispatcher
             .subsystems_mut()
             .perf_record_syscall(syscall_registers.syscall());
+        if syscall_registers.syscall() == mcr_sys::Syscall::RtSigreturn {
+            return dispatch_rt_sigreturn_guest_task(
+                dispatcher, tid, pid, before_rip, gpr, registers,
+            );
+        }
         if is_fork_like_syscall_number(syscall_registers.rax) {
             let mut child_registers = registers;
             child_registers.apply_syscall_return(0, site.next_rip);
