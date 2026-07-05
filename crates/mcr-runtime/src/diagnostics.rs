@@ -1,6 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
+const RUNTIME_RECENT_SYSCALL_LIMIT: usize = 32;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDiagnostics {
     executable_path: Vec<u8>,
@@ -68,7 +70,7 @@ impl RuntimeDiagnostics {
                 .iter()
                 .rev()
                 .filter_map(DiagnosticSyscall::from_event)
-                .take(8)
+                .take(RUNTIME_RECENT_SYSCALL_LIMIT)
                 .collect(),
             in_flight_syscall: in_flight_syscall(events),
             native_execution_enabled,
