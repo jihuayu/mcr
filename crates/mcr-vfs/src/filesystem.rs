@@ -527,7 +527,7 @@ impl VirtualFileSystem {
     }
 
     pub fn dup(&mut self, oldfd: Fd) -> VfsResult<Fd> {
-        self.fds.dup(oldfd, FIRST_USER_FD, false)
+        self.fds.dup(oldfd, FIRST_ALLOC_FD, false)
     }
 
     pub fn dup2(&mut self, oldfd: Fd, newfd: Fd) -> VfsResult<Fd> {

@@ -168,6 +168,41 @@ fn fd_allocation_reuses_lowest_closed_descriptor() {
 }
 
 #[test]
+fn fd_allocation_reuses_closed_standard_stream_descriptors() {
+    let mut table = FdTable::with_stdio();
+    table.close(0).unwrap();
+
+    let reopened = table.insert(regular_file(10), false).unwrap();
+
+    assert_eq!(reopened, 0);
+}
+
+#[test]
+fn open_reuses_closed_standard_stream_descriptor() {
+    let mut vfs = VirtualFileSystem::new("/host/root");
+    vfs.close(0).unwrap();
+
+    let fd = vfs
+        .openat(AT_FDCWD, "/dev/null", OpenFlags::new(O_RDONLY), 0)
+        .unwrap();
+
+    assert_eq!(fd, 0);
+}
+
+#[test]
+fn dup_reuses_closed_standard_stream_descriptor() {
+    let mut vfs = sample_vfs();
+    let file = vfs
+        .openat(AT_FDCWD, "/tmp/file", OpenFlags::new(O_RDONLY), 0)
+        .unwrap();
+    vfs.close(0).unwrap();
+
+    let dup = vfs.dup(file).unwrap();
+
+    assert_eq!(dup, 0);
+}
+
+#[test]
 fn fd_lookup_and_close_report_bad_fd() {
     let mut table = FdTable::with_stdio();
 

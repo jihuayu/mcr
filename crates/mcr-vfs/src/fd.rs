@@ -363,7 +363,7 @@ impl FdTable {
     }
 
     pub fn insert(&mut self, file: FileRef, cloexec: bool) -> VfsResult<Fd> {
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         self.insert_exact(fd, file, cloexec)?;
         Ok(fd)
     }
@@ -374,7 +374,7 @@ impl FdTable {
         flags: OpenFlags,
         path: Option<GuestPath>,
     ) -> VfsResult<Fd> {
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         self.insert_entry(fd, file, flags.cloexec(), flags, path)
     }
 
@@ -383,7 +383,7 @@ impl FdTable {
             return Err(VfsError::InvalidPath);
         }
 
-        let read_fd = self.next_fd_from(FIRST_USER_FD)?;
+        let read_fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         let write_fd = self.next_fd_from(read_fd.checked_add(1).ok_or(VfsError::BadFd)?)?;
         let pipe_id = self.allocate_pipe_id()?;
         let pipe_inode = Arc::new(Inode::new(
@@ -427,7 +427,7 @@ impl FdTable {
             socket_inode_id(socket_id)?,
             InodeBackend::Socket(SocketNode::new(socket_id)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Socket),
@@ -447,7 +447,7 @@ impl FdTable {
             epoll_inode_id(epoll_id)?,
             InodeBackend::Epoll(EpollNode::new(epoll_id)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Epoll),
@@ -470,7 +470,7 @@ impl FdTable {
             eventfd_inode_id(eventfd_id)?,
             InodeBackend::Eventfd(EventfdNode::new(eventfd_id, initial)),
         ));
-        let fd = self.next_fd_from(FIRST_USER_FD)?;
+        let fd = self.next_fd_from(FIRST_ALLOC_FD)?;
         self.insert_entry(
             fd,
             FileRef::new(inode, FileKind::Eventfd),
