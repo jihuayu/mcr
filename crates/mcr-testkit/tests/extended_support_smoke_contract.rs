@@ -56,8 +56,14 @@ base=/tmp/mcr-mysql-smoke
 rm -rf "$base"
 mkdir -p "$base"
 trap 'rm -rf "$base"' EXIT
-printf 'CREATE DATABASE mcr_smoke;\n' | /usr/bin/mariadbd --no-defaults --user=root --datadir="$base" --bootstrap --skip-grant-tables --innodb-use-native-aio=0 >/dev/null
-test -d "$base/mcr_smoke"
+/usr/bin/mariadbd --no-defaults --user=root --datadir="$base" --bootstrap --skip-grant-tables --innodb-use-native-aio=0 >/dev/null <<'SQL'
+CREATE DATABASE mcr_smoke;
+USE mcr_smoke;
+CREATE TABLE smoke_items (id INT PRIMARY KEY, n INT);
+INSERT INTO smoke_items VALUES (1, 7);
+SQL
+test -f "$base/mcr_smoke/smoke_items.frm"
+test -f "$base/mcr_smoke/smoke_items.ibd"
 echo mysql-ok
 "#;
 
