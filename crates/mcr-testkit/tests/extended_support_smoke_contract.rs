@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mcr_testkit::{FixtureRoot, Result, SmokeCommand};
@@ -32,7 +32,7 @@ EOF
 "#;
 
 const NODEJS_RUN_SCRIPT: &str = r#"set -eu
-/usr/bin/node --jitless -e "require('fs').writeSync(1, 'node-ok\n')"
+/usr/bin/node --allow-natives-syntax -e "function f(x){return x+1}; for(let i=0;i<10000;i++) f(i); %PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f); const y=f(41); if(y!==42) process.exit(2); require('fs').writeSync(1, 'node-ok\n')"
 "#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
@@ -178,7 +178,7 @@ impl ExtendedSupportSmokeContext {
 
         Ok(Some(Self {
             mcr: resolve_mcr_bin(mcr, &fixtures),
-            rootfs: rootfs_path,
+            rootfs: command_rootfs_path(&rootfs_path),
         }))
     }
 
@@ -190,6 +190,15 @@ impl ExtendedSupportSmokeContext {
             .arg("-c")
             .arg(contract.script)
     }
+}
+
+fn command_rootfs_path(rootfs_path: &Path) -> PathBuf {
+    let Ok(cwd) = env::current_dir() else {
+        return rootfs_path.to_path_buf();
+    };
+    rootfs_path
+        .strip_prefix(cwd)
+        .map_or_else(|_| rootfs_path.to_path_buf(), Path::to_path_buf)
 }
 
 fn resolve_mcr_bin(mcr: OsString, fixtures: &FixtureRoot) -> OsString {

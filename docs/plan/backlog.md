@@ -65,20 +65,17 @@ loading, program loading, native entry/return, native patch scanning, and
 fork-exec memory materialization when a workload stalls inside a single
 host/native window instead of returning a guest step-limit diagnostic.
 
-2026-07-06 Node/V8 diagnosis: forced Maglev/Turbofan optimized JavaScript can
-compile and run under native execution, including a synchronous
-`--trace-opt --no-concurrent-recompilation` probe. The remaining default V8
-blockers are Linux userspace-kernel semantics around asynchronous signal
-delivery, fatal default actions, interruptible futex waits, `clear_child_tid`
-thread join wakeups, and concurrent compiler-thread shutdown. The follow-up is
-split into `task-004`, `task-005`, `jit-002`, and `workload-002` so the runtime
-fixes land before the Node contract is promoted from `--jitless` to default
-JIT.
+2026-07-06 Node/V8 follow-up: `task-004`, `task-005`, `jit-002`, and
+`workload-002` restored the default V8 JIT contract. The extended-support smoke
+now warms JavaScript, requests optimization through V8 native syntax, verifies
+the optimized result, and exits with concurrent compiler-thread shutdown
+working. The default optimized probe prints the expected result; V8 diagnostic
+flags such as `--trace-opt` remain broader follow-up coverage.
 
 | Command | Current result | Required follow-up |
 |---|---|---|
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | After the FS/TLS fallback checkpoint, the latest bounded local rerun still exceeded a 90s process timeout without output. | Rerun with host-step and native-fault diagnostics to classify the current native-window blocker now that high-address FS/TLS fallback is no longer the known missing boundary. |
-| `mcr run-rootfs node-rootfs /bin/sh -c "<run JavaScript with default Node/V8 JIT>"` | The restored extended smoke stays on `node --jitless`. A forced synchronous Maglev/Turbofan probe can compile and execute optimized JS, but normal default Node/V8 can still fail on V8 `hlt` fatal paths or finish JS output and then stall with no runnable guest tasks while compiler/helper threads wait on futex join cleanup. | Keep the smoke on `--jitless` until `task-004` signal delivery, `task-005` futex/thread-exit semantics, and `jit-002` dynamic executable/fault handling land; close `workload-002` before promoting default V8 JIT to the extended-support matrix. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "<run JavaScript with default Node/V8 JIT>"` | The extended-support smoke is now promoted to default V8 JIT and verifies optimized JavaScript with `node-ok`. A bounded default concurrent probe also prints `opt-concurrent=42`. | Keep broader Node package-manager and large application workloads on the workload backlog; the default JIT smoke is restored. |
 | `mcr run-rootfs jdk-rootfs /bin/sh -c "<javac then java>"` | JDK compile-and-run is repeatably green locally when the smoke pins the compile/run step to interpreted mode with `javac -J-Xint` and `java -Xint`. Unpinned `javac -version` is now covered after nanosleep stopped blocking the whole guest scheduler. | Keep broader unpinned Java compilation workloads on the workload backlog, but the extended-support javac version and compile-and-run smoke is restored. |
 | `mcr run-rootfs mysql-rootfs /bin/sh -c "<bootstrap mariadbd and run query matrix>"` | MariaDB bootstrap mode now initializes InnoDB, creates customer/item/order tables, bulk-inserts 128 rows, and verifies ordinary lookup, forced-index aggregate, JOIN aggregate, and range aggregate query results through `SELECT ... INTO OUTFILE`. Full install-db plus background daemon/client query remains broader than the restored smoke; the latest bounded install-db probe still did not complete. | Keep full local server startup plus client query coverage on the workload backlog; the extended-support bootstrap query matrix is restored. |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | The FS/TLS fallback now handles the prior `mov rax, fs:[0]` native fault and advances execution to `guest block terminated with x86 exception before syscall at guest rip 0x000000007006681e`. | Classify the new x86 exception terminator and decide whether it is an unsupported instruction, signal/exception semantic gap, or workload-specific runtime blocker. |

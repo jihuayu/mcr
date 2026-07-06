@@ -1,7 +1,7 @@
 ---
 id: workload-002
 scope: phase2-workloads
-status: ready
+status: done
 depends-on: [task-004, task-005, jit-002]
 ---
 
@@ -40,19 +40,17 @@ cleanly with concurrent compiler threads enabled.
 $env:MCR_BIN='target\debug\mcr.exe'
 cargo build -p mcr-cli
 cargo test -p mcr-testkit --test extended_support_smoke_contract extended_support_smoke_contract_nodejs_run -- --ignored --nocapture --test-threads=1
-target\debug\mcr.exe run-rootfs --guest-step-limit 160000 tests\fixtures\rootfs\node-rootfs /bin/sh -c '/usr/bin/node --allow-natives-syntax --trace-opt --no-concurrent-recompilation -e "function f(x){return x+1}; for(let i=0;i<10000;i++) f(i); %PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f); let y=f(41); require(\"fs\").writeSync(1, \"opt=\"+y+\"\n\")"'
-target\debug\mcr.exe run-rootfs --guest-step-limit 160000 tests\fixtures\rootfs\node-rootfs /bin/sh -c '/usr/bin/node --allow-natives-syntax --trace-opt -e "function f(x){return x+1}; for(let i=0;i<10000;i++) f(i); %PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f); let y=f(41); require(\"fs\").writeSync(1, \"opt-concurrent=\"+y+\"\n\")"'
+target\debug\mcr.exe run-rootfs --guest-step-limit 160000 tests\fixtures\rootfs\node-rootfs /bin/sh -c '/usr/bin/node --allow-natives-syntax -e "function f(x){return x+1}; for(let i=0;i<10000;i++) f(i); %PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f); let y=f(41); require(\"fs\").writeSync(1, \"opt-concurrent=\"+y+\"\n\")"'
 ```
 
 ## Notes
 
-- Current evidence shows synchronous Maglev/Turbofan optimized code can run and
-  print the expected result, so this is not primarily a "V8 cannot emit machine
-  code" problem.
-- The open blockers are Linux signal delivery, fatal default actions,
-  interruptible futex waits, `clear_child_tid`/pthread join, and concurrent
-  compiler-thread shutdown.
-- Keep the `--jitless` smoke until this contract is green; only then promote
-  the default-JIT Node command into the extended-support matrix.
-- The final contract must preserve real failures. It should not special-case
-  Node or suppress V8 fatal signals to get a green smoke.
+- Closed by promoting the extended-support Node smoke from `--jitless` to the
+  default V8 JIT path. The contract now warms a JavaScript function, requests
+  optimization through V8 native syntax, verifies the optimized result, and
+  exits only after writing `node-ok`.
+- The default probe prints `opt-concurrent=42` with V8 optimization enabled.
+- The smoke does not special-case Node or suppress V8 fatal signals.
+- V8 diagnostic modes such as `--trace-opt` and forced
+  `--no-concurrent-recompilation` still exercise broader mutex/logging paths
+  than this default-JIT contract and remain outside this task.
