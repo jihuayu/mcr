@@ -60,6 +60,7 @@ pub enum Syscall {
     Pwrite64,
     Readv,
     Writev,
+    Pwritev2,
     Access,
     Pipe,
     Select,
@@ -306,6 +307,7 @@ impl Syscall {
     pub const RENAMEAT2: SyscallNumber = SyscallNumber::new(316);
     pub const GETRANDOM: SyscallNumber = SyscallNumber::new(318);
     pub const MEMBARRIER: SyscallNumber = SyscallNumber::new(324);
+    pub const PWRITEV2: SyscallNumber = SyscallNumber::new(328);
     pub const STATX: SyscallNumber = SyscallNumber::new(332);
     pub const RSEQ: SyscallNumber = SyscallNumber::new(334);
     pub const CLONE3: SyscallNumber = SyscallNumber::new(435);
@@ -447,6 +449,7 @@ impl Syscall {
             316 => Self::Renameat2,
             318 => Self::Getrandom,
             324 => Self::Membarrier,
+            328 => Self::Pwritev2,
             332 => Self::Statx,
             334 => Self::Rseq,
             435 => Self::Clone3,
@@ -486,6 +489,7 @@ impl Syscall {
             Self::Pwrite64 => Self::PWRITE64,
             Self::Readv => Self::READV,
             Self::Writev => Self::WRITEV,
+            Self::Pwritev2 => Self::PWRITEV2,
             Self::Access => Self::ACCESS,
             Self::Pipe => Self::PIPE,
             Self::Select => Self::SELECT,
@@ -630,6 +634,7 @@ impl Syscall {
             Self::Pwrite64 => "pwrite64",
             Self::Readv => "readv",
             Self::Writev => "writev",
+            Self::Pwritev2 => "pwritev2",
             Self::Access => "access",
             Self::Pipe => "pipe",
             Self::Select => "select",
@@ -819,6 +824,7 @@ mod tests {
             (Syscall::PRLIMIT64, Syscall::Prlimit64, "prlimit64"),
             (Syscall::GETCPU, Syscall::Getcpu, "getcpu"),
             (Syscall::MEMBARRIER, Syscall::Membarrier, "membarrier"),
+            (Syscall::PWRITEV2, Syscall::Pwritev2, "pwritev2"),
             (Syscall::RSEQ, Syscall::Rseq, "rseq"),
             (Syscall::CLONE3, Syscall::Clone3, "clone3"),
             (Syscall::CLOSE_RANGE, Syscall::CloseRange, "close_range"),

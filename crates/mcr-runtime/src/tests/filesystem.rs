@@ -75,6 +75,63 @@ fn dispatcher_routes_pwrite64_without_changing_fd_offset() {
 }
 
 #[test]
+fn pwritev2_writes_iovecs_at_offset_and_accepts_noappend_flag() {
+    let mut runtime = runtime_with_sample_vfs();
+    runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+    runtime.memory_mut().write(0x2100, b"YY");
+    runtime.memory_mut().write(0x2200, b"ZZ");
+    runtime.memory_mut().write(0x2300, b"!");
+    runtime.memory_mut().write_iovec(0x2000, 0x2100, 2);
+    runtime.memory_mut().write_iovec(0x2010, 0x2200, 2);
+    let fd = dispatch(
+        &mut runtime,
+        Syscall::Openat,
+        [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+    );
+    assert_eq!(fd, SyscallReturn::Success(3));
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Lseek, [3, 5, 0, 0, 0, 0]),
+        SyscallReturn::Success(5)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Pwritev2, [3, 0x2000, 2, 1, 0, 0x20]),
+        SyscallReturn::Success(4)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Write, [3, 0x2300, 1, 0, 0, 0]),
+        SyscallReturn::Success(1)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Lseek, [3, 0, 0, 0, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Read, [3, 0x3000, 6, 0, 0, 0]),
+        SyscallReturn::Success(6)
+    );
+    assert_eq!(runtime.memory().read(0x3000, 6), b"hYYZZ!");
+}
+
+#[test]
+fn pwritev2_rejects_unsupported_flags() {
+    let mut runtime = runtime_with_sample_vfs();
+    runtime.memory_mut().write_cstr(0x1000, "/tmp/file");
+    runtime.memory_mut().write_iovec(0x2000, 0x2100, 1);
+    assert_eq!(
+        dispatch(
+            &mut runtime,
+            Syscall::Openat,
+            [AT_FDCWD as u64, 0x1000, u64::from(O_RDWR), 0, 0, 0],
+        ),
+        SyscallReturn::Success(3)
+    );
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Pwritev2, [3, 0x2000, 1, 0, 0, 0x40]),
+        SyscallReturn::Errno(LinuxErrno::EOPNOTSUPP)
+    );
+}
+
+#[test]
 fn openat2_degrades_simple_open_how_to_openat() {
     let mut runtime = runtime_with_sample_vfs();
     runtime.memory_mut().write_cstr(0x1000, "/tmp/file");

@@ -72,6 +72,7 @@ where
             mcr_sys::Syscall::Pwrite64 => self.sys_pwrite64(request),
             mcr_sys::Syscall::Readv => self.sys_readv(request),
             mcr_sys::Syscall::Writev => self.sys_writev(request),
+            mcr_sys::Syscall::Pwritev2 => self.sys_pwritev2(request),
             mcr_sys::Syscall::Close => self.sys_close(request),
             mcr_sys::Syscall::Lseek => self.sys_lseek(request),
             mcr_sys::Syscall::Stat => self.sys_stat(request),
@@ -980,6 +981,64 @@ where
         Ok(total)
     }
 
+    fn sys_pwritev2(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
+        let flags = arg(request, 5);
+        if flags & !LINUX_RWF_PWRITEV2_SUPPORTED != 0 {
+            return Err(LinuxErrno::EOPNOTSUPP);
+        }
+
+        let offset = pwritev2_offset(arg(request, 3), arg(request, 4))?;
+        if offset == PWRITEV2_USE_FILE_OFFSET {
+            return self.sys_writev(request);
+        }
+
+        let fd = arg_i32(request, 0);
+        let iov = self.read_iovecs(arg(request, 1), usize_arg(request, 2)?)?;
+        let bytes_written = self.pwrite_iovecs(fd, offset, &iov)?;
+        if flags & LINUX_RWF_SYNC_FLAGS != 0 {
+            self.vfs.sync_fd(fd).map_err(vfs_errno)?;
+        }
+        Ok(bytes_written)
+    }
+
+    fn pwrite_iovecs(
+        &mut self,
+        fd: Fd,
+        offset: u64,
+        iov: &[LinuxIovec],
+    ) -> Result<u64, LinuxErrno> {
+        let mut total = 0u64;
+        let mut next_offset = offset;
+        for item in iov {
+            let len = usize::try_from(item.iov_len).map_err(|_| LinuxErrno::EINVAL)?;
+            let count = if let Some(buffer) = self
+                .memory
+                .borrowed_bytes(item.iov_base, len)
+                .map_err(memory_errno)?
+            {
+                self.vfs
+                    .pwrite(fd, next_offset, buffer)
+                    .map_err(vfs_errno)?
+            } else {
+                let mut buffer = vec![0; len];
+                self.memory
+                    .read_bytes(item.iov_base, &mut buffer)
+                    .map_err(memory_errno)?;
+                self.vfs
+                    .pwrite(fd, next_offset, &buffer)
+                    .map_err(vfs_errno)?
+            };
+            total = total.checked_add(count as u64).ok_or(LinuxErrno::EINVAL)?;
+            next_offset = next_offset
+                .checked_add(count as u64)
+                .ok_or(LinuxErrno::EINVAL)?;
+            if count < len {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     fn sys_close(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let fd = arg_i32(request, 0);
         let file = self.vfs.close_with_file(fd).map_err(vfs_errno)?;
@@ -1542,4 +1601,22 @@ where
             .write_bytes(addr, &encode_linux_statfs(statfs))
             .map_err(memory_errno)
     }
+}
+
+const LINUX_RWF_DSYNC: u64 = 0x2;
+const LINUX_RWF_SYNC: u64 = 0x4;
+const LINUX_RWF_NOAPPEND: u64 = 0x20;
+const LINUX_RWF_SYNC_FLAGS: u64 = LINUX_RWF_DSYNC | LINUX_RWF_SYNC;
+const LINUX_RWF_PWRITEV2_SUPPORTED: u64 = LINUX_RWF_DSYNC | LINUX_RWF_SYNC | LINUX_RWF_NOAPPEND;
+const PWRITEV2_USE_FILE_OFFSET: u64 = u64::MAX;
+
+fn pwritev2_offset(pos_l: u64, pos_h: u64) -> Result<u64, LinuxErrno> {
+    let offset = ((pos_h & u64::from(u32::MAX)) << 32) | (pos_l & u64::from(u32::MAX));
+    if offset == PWRITEV2_USE_FILE_OFFSET {
+        return Ok(offset);
+    }
+    if offset > i64::MAX as u64 {
+        return Err(LinuxErrno::EINVAL);
+    }
+    Ok(offset)
 }
