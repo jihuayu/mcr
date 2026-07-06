@@ -432,6 +432,7 @@ fn diagnostic_task_state_display(state: DiagnosticTaskState) -> String {
         DiagnosticTaskState::WaitingForFutex { uaddr } => {
             format!("futex_wait(uaddr=0x{uaddr:x})")
         }
+        DiagnosticTaskState::WaitingForSleep => "sleep_wait".to_owned(),
         DiagnosticTaskState::Exited { status } => format!("exited(status={status})"),
     }
 }
@@ -662,6 +663,7 @@ pub enum DiagnosticTaskState {
     WaitingForChild,
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { uaddr: u64 },
+    WaitingForSleep,
     Exited { status: i32 },
 }
 
@@ -675,6 +677,7 @@ impl DiagnosticTaskState {
             | TaskState::WaitingForSignalSet { .. } => Self::WaitingForChild,
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
             TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
+            TaskState::WaitingForSleep => Self::WaitingForSleep,
             TaskState::Exited { status } => Self::Exited { status },
         }
     }

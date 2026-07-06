@@ -24,7 +24,7 @@ impl TimeSyscalls for RuntimeSubsystems {
                 outcome(self.gettimeofday(arg(request, 0), arg(request, 1)))
             }
             mcr_sys::Syscall::Nanosleep => {
-                outcome(self.nanosleep(arg(request, 0), arg(request, 1)))
+                outcome(self.nanosleep(request.context.tid, arg(request, 0), arg(request, 1)))
             }
             mcr_sys::Syscall::Getrandom => {
                 outcome(self.getrandom(arg(request, 0), arg(request, 1), arg(request, 2)))
@@ -100,13 +100,29 @@ impl RuntimeSubsystems {
         Ok(0)
     }
 
-    pub(crate) fn nanosleep(&mut self, req_addr: u64, _rem_addr: u64) -> Result<u64, LinuxErrno> {
+    pub(crate) fn nanosleep(
+        &mut self,
+        tid: mcr_sys::GuestTid,
+        req_addr: u64,
+        _rem_addr: u64,
+    ) -> Result<u64, LinuxErrno> {
         if req_addr == 0 {
             return Err(LinuxErrno::EFAULT);
         }
 
         let duration = read_required_timespec_duration(self.files.memory(), req_addr)?;
-        mcr_win::sleep_for(duration).map_err(time_errno)?;
+        if duration.is_zero() {
+            return Ok(0);
+        }
+
+        self.process
+            .tasks
+            .block_task_for_sleep(tid)
+            .map_err(|error| error.linux_errno())?;
+        let deadline = Instant::now()
+            .checked_add(duration)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        self.events.sleep_timeouts.insert(tid, deadline);
         Ok(0)
     }
 
@@ -134,5 +150,54 @@ impl RuntimeSubsystems {
             .write_bytes(buf_addr, &bytes)
             .map_err(memory_errno)?;
         Ok(buflen as u64)
+    }
+}
+
+impl RuntimeSubsystems {
+    pub(crate) fn resume_expired_sleep_timeouts(&mut self) -> usize {
+        let now = Instant::now();
+        let expired = self
+            .events
+            .sleep_timeouts
+            .iter()
+            .filter_map(|(tid, deadline)| (*deadline <= now).then_some(*tid))
+            .collect::<Vec<_>>();
+        let mut resumed = 0;
+        for tid in expired {
+            self.events.sleep_timeouts.remove(&tid);
+            if self.process.tasks.resume_sleep_waiter(tid) {
+                resumed += 1;
+            }
+        }
+        self.prune_sleep_timeouts();
+        resumed
+    }
+
+    pub(crate) fn expire_next_sleep_timeout(&mut self) -> bool {
+        self.prune_sleep_timeouts();
+        let Some(deadline) = self.events.sleep_timeouts.values().min().copied() else {
+            return false;
+        };
+        let expired = self
+            .events
+            .sleep_timeouts
+            .iter()
+            .filter_map(|(tid, candidate)| (*candidate <= deadline).then_some(*tid))
+            .collect::<Vec<_>>();
+        for tid in expired {
+            self.events.sleep_timeouts.remove(&tid);
+            self.process.tasks.resume_sleep_waiter(tid);
+        }
+        self.prune_sleep_timeouts();
+        true
+    }
+
+    fn prune_sleep_timeouts(&mut self) {
+        self.events.sleep_timeouts.retain(|tid, _| {
+            matches!(
+                self.process.tasks.task(*tid).map(|task| task.state()),
+                Some(TaskState::WaitingForSleep)
+            )
+        });
     }
 }

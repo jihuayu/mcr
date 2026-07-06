@@ -151,6 +151,7 @@ impl GuestKernel {
                 self.futex_wait_tids.entry(key).or_default().insert(tid);
             }
             TaskState::WaitingForVfork { .. }
+            | TaskState::WaitingForSleep
             | TaskState::WaitingForSignalSet { .. }
             | TaskState::Exited { .. } => {}
         }
@@ -178,6 +179,7 @@ impl GuestKernel {
                 }
             }
             TaskState::WaitingForVfork { .. }
+            | TaskState::WaitingForSleep
             | TaskState::WaitingForSignalSet { .. }
             | TaskState::Exited { .. } => {}
         }

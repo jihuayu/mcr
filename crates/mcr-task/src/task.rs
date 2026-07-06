@@ -34,6 +34,7 @@ pub enum TaskState {
     WaitingForSignalSet { mask: u64 },
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { key: FutexWaitKey },
+    WaitingForSleep,
     Exited { status: i32 },
 }
 

@@ -470,6 +470,7 @@ where
                 .map_err(|errno| GuestRunError::WaitResume { errno })?;
             dispatcher.subsystems_mut().resume_fd_waiters();
             dispatcher.subsystems_mut().resume_expired_futex_timeouts();
+            dispatcher.subsystems_mut().resume_expired_sleep_timeouts();
             let mut runnable_tids = if sticky_scheduler {
                 last_dispatched_tid
                     .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
@@ -487,6 +488,9 @@ where
             }
             if runnable_tids.is_empty() {
                 if dispatcher.subsystems_mut().expire_next_futex_timeout() {
+                    continue;
+                }
+                if dispatcher.subsystems_mut().expire_next_sleep_timeout() {
                     continue;
                 }
                 dispatcher.subsystems_mut().perf_record_no_runnable();
@@ -1359,6 +1363,7 @@ where
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForSignalSet { .. }
                 | TaskState::WaitingForFutex { .. }
+                | TaskState::WaitingForSleep
         );
         let final_regs = if task.regs() == gpr || blocked_after_syscall {
             let updated_regs = gpr_from_registers(registers);

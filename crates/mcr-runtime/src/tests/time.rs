@@ -81,6 +81,23 @@ fn nanosleep_accepts_zero_duration_and_ignores_rem_on_success() {
 }
 
 #[test]
+fn nanosleep_blocks_only_current_guest_task_for_nonzero_duration() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    write_timespec(runtime.memory_mut(), 0x402000, 0, 1);
+
+    let result = runtime.dispatch_syscall(context(
+        Syscall::Nanosleep,
+        [0x402000, 0x7000_0000, 0, 0, 0, 0],
+    ));
+
+    assert_eq!(result.result, SyscallReturn::Success(0));
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForSleep
+    );
+}
+
+#[test]
 fn getrandom_rejects_unknown_flags_and_null_non_empty_buffer() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
 

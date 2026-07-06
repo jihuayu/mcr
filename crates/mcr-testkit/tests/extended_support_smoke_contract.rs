@@ -46,6 +46,7 @@ public class Hello {
     }
 }
 EOF
+/usr/lib/jvm/java-21-openjdk/bin/javac -version >/dev/null
 /usr/lib/jvm/java-21-openjdk/bin/javac -J-Xint "$base/Hello.java"
 /usr/lib/jvm/java-21-openjdk/bin/java -Xint -cp "$base" Hello
 "#;

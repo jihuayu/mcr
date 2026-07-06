@@ -230,8 +230,9 @@ through the host shell.
 
 The ignored extended support matrix uses `MCR_BIN` plus the matching
 materialized package rootfs fixture. It covers GCC compile-and-run, Node.js
-JavaScript execution, JDK compile-and-run, MariaDB bootstrap database creation,
-and Redis server execution. Run it explicitly with:
+JavaScript execution, unpinned `javac -version` plus JDK compile-and-run,
+MariaDB bootstrap database creation, and Redis server execution. Run it
+explicitly with:
 
 ```powershell
 MCR_BIN=mcr cargo test -p mcr-testkit --test extended_support_smoke_contract -- --ignored --nocapture

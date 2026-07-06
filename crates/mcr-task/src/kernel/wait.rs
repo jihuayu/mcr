@@ -134,6 +134,22 @@ impl GuestKernel {
             .ok_or(TaskError::UnknownTid(tid))
     }
 
+    pub fn block_task_for_sleep(&mut self, tid: GuestTid) -> Result<(), TaskError> {
+        self.set_task_state(tid, TaskState::WaitingForSleep)
+            .map(|_| ())
+            .ok_or(TaskError::UnknownTid(tid))
+    }
+
+    pub fn resume_sleep_waiter(&mut self, tid: GuestTid) -> bool {
+        if !matches!(
+            self.task(tid).map(|task| task.state),
+            Some(TaskState::WaitingForSleep)
+        ) {
+            return false;
+        }
+        self.set_task_state(tid, TaskState::Runnable).is_some()
+    }
+
     pub fn wake_futex_waiters(&mut self, key: FutexWaitKey, limit: u32) -> usize {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         if limit == 0 {
