@@ -165,6 +165,44 @@ fn native_patch_scan_and_syscall_write_plan_live_in_jit() {
     );
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn native_patch_scan_classifies_v8_fs_tls_forms_as_traps() {
+    let bytes = [
+        0x64, 0x4c, 0x89, 0x14, 0x25, 0xe0, 0xff, 0xff, 0xff, // mov fs:[-0x20],r10
+        0x64, 0x48, 0x83, 0x3c, 0x25, 0xe0, 0xff, 0xff, 0xff,
+        0x00, // cmp qword ptr fs:[-0x20],0
+        0x64, 0x48, 0xc7, 0x04, 0x25, 0xe0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+        0x00, // mov qword ptr fs:[-0x20],0
+        0x64, 0x0f, 0xb6, 0x04, 0x25, 0x58, 0xfe, 0xff, 0xff, // movzx eax,byte ptr fs:[-0x1a8]
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, // mov rax,fs:[0x28]
+        0x0f, 0x05, // syscall
+    ];
+
+    let patches = scan_executable_native_patch_range(
+        0x401000,
+        0x401000 + bytes.len() as u64,
+        bytes.to_vec(),
+        0,
+    );
+
+    assert_eq!(patches.fs_relative_patches.len(), 1);
+    assert_eq!(patches.fs_relative_patches[0].address, 0x401029);
+    assert_eq!(
+        patches
+            .fs_relative_traps
+            .iter()
+            .map(|site| (site.address, site.trap.original_bytes().to_vec()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x401000, bytes[0..9].to_vec()),
+            (0x401009, bytes[9..19].to_vec()),
+            (0x401013, bytes[19..32].to_vec()),
+            (0x401020, bytes[32..41].to_vec()),
+        ]
+    );
+}
+
 #[test]
 fn native_patch_metadata_cache_round_trips_inside_jit() {
     let dir = unique_native_patch_dir("cache-roundtrip");
@@ -178,6 +216,8 @@ fn native_patch_metadata_cache_round_trips_inside_jit() {
         syscall_patches: vec![ExecutableSyscallPatch { address: 0x401123 }],
         #[cfg(all(windows, target_arch = "x86_64"))]
         fs_relative_patches: BTreeMap::new(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_traps: BTreeMap::new(),
     };
 
     store_persistent_native_patch_metadata_in_dir(&key, &metadata, 0x400000, &dir).unwrap();

@@ -4,7 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{GuestBlock, LinearInstructionScanner, syscall_instruction_sites};
+use crate::syscall_instruction_sites;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+use iced_x86::{Decoder, DecoderOptions, Register};
 
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -25,6 +28,8 @@ pub struct ExecutableNativePatches {
     pub syscall_patches: Vec<ExecutableSyscallPatch>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub fs_relative_patches: Vec<FsRelativePatchSite>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub fs_relative_traps: Vec<FsRelativeTrapSite>,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -39,6 +44,40 @@ pub struct FsRelativePatchSite {
     pub address: u64,
     pub patch: FsRelativePatch,
     pub materialized: bool,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsRelativeTrap {
+    pub original: [u8; 15],
+    pub len: u8,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl FsRelativeTrap {
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > 15 {
+            return None;
+        }
+        let mut original = [0; 15];
+        original[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            original,
+            len: bytes.len() as u8,
+        })
+    }
+
+    #[must_use]
+    pub fn original_bytes(&self) -> &[u8] {
+        &self.original[..usize::from(self.len)]
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub struct FsRelativeTrapSite {
+    pub address: u64,
+    pub trap: FsRelativeTrap,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -69,6 +108,8 @@ pub struct NativePatchMetadata {
     pub syscall_patches: Vec<ExecutableSyscallPatch>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub fs_relative_patches: BTreeMap<u64, FsRelativePatch>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub fs_relative_traps: BTreeMap<u64, FsRelativeTrap>,
 }
 
 #[cfg(any(
@@ -116,6 +157,8 @@ pub struct NativePatchCache {
     pub image_metadata_eligible: bool,
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub fs_relative_patches: BTreeMap<u64, FsRelativePatch>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub fs_relative_traps: BTreeMap<u64, FsRelativeTrap>,
 }
 
 #[cfg(any(
@@ -128,6 +171,8 @@ impl NativePatchCache {
         self.image_metadata_eligible = false;
         #[cfg(all(windows, target_arch = "x86_64"))]
         self.fs_relative_patches.clear();
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        self.fs_relative_traps.clear();
     }
 
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
@@ -144,6 +189,9 @@ impl NativePatchCache {
         });
         #[cfg(all(windows, target_arch = "x86_64"))]
         self.fs_relative_patches
+            .retain(|address, _| !(*address >= start && *address < end));
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        self.fs_relative_traps
             .retain(|address, _| !(*address >= start && *address < end));
     }
 
@@ -163,6 +211,9 @@ impl NativePatchCache {
                     entry.insert(*patch);
                     added_fs_patch = true;
                 }
+            }
+            for (address, trap) in &metadata.fs_relative_traps {
+                self.fs_relative_traps.entry(*address).or_insert(*trap);
             }
             added_fs_patch
         }
@@ -184,6 +235,8 @@ impl Default for NativePatchCache {
             image_metadata_eligible: true,
             #[cfg(all(windows, target_arch = "x86_64"))]
             fs_relative_patches: BTreeMap::new(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            fs_relative_traps: BTreeMap::new(),
         }
     }
 }
@@ -203,10 +256,11 @@ const NATIVE_PATCH_CACHE_MAGIC: &[u8; 8] = b"MCRNPC01";
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
-/// Persistent native patch cache v2 stores:
+/// Persistent native patch cache v3 stores:
 /// magic, version, image key, scanned ranges, syscall patch addresses, and
-/// FS-relative originals as little-endian offsets from the runtime base.
-const NATIVE_PATCH_CACHE_VERSION: u32 = 2;
+/// FS-relative materialized originals plus trap originals as little-endian
+/// offsets from the runtime base.
+const NATIVE_PATCH_CACHE_VERSION: u32 = 3;
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
@@ -446,9 +500,16 @@ pub fn encode_native_patch_metadata(
             push_cache_u64(&mut bytes, cache_relative_offset(*address, base)?);
             bytes.extend_from_slice(&patch.original);
         }
+        push_cache_u32(&mut bytes, metadata.fs_relative_traps.len() as u32);
+        for (address, trap) in &metadata.fs_relative_traps {
+            push_cache_u64(&mut bytes, cache_relative_offset(*address, base)?);
+            push_cache_u32(&mut bytes, u32::from(trap.len));
+            bytes.extend_from_slice(&trap.original);
+        }
     }
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
+        push_cache_u32(&mut bytes, 0);
         push_cache_u32(&mut bytes, 0);
     }
     Ok(bytes)
@@ -507,6 +568,34 @@ pub fn decode_native_patch_metadata(
         #[cfg(not(all(windows, target_arch = "x86_64")))]
         {
             let _ = (address, original);
+        }
+    }
+    let fs_trap_count = reader.read_u32()?;
+    for _ in 0..fs_trap_count {
+        let address = cache_absolute_address(reader.read_u64()?, base)?;
+        let len = reader.read_u32()?;
+        let original = reader.read_array::<15>()?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let len = u8::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native patch cache FS trap length overflows u8",
+                )
+            })?;
+            if len == 0 || usize::from(len) > original.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native patch cache has invalid FS trap length",
+                ));
+            }
+            metadata
+                .fs_relative_traps
+                .insert(address, FsRelativeTrap { original, len });
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            let _ = (address, len, original);
         }
     }
     reader.expect_eof()?;
@@ -634,6 +723,12 @@ pub fn native_patch_metadata_from_patches(
             .iter()
             .map(|site| (site.address, site.patch))
             .collect(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_traps: patches
+            .fs_relative_traps
+            .iter()
+            .map(|site| (site.address, site.trap))
+            .collect(),
     }
 }
 pub fn scan_executable_native_patch_range(
@@ -653,9 +748,11 @@ pub fn scan_executable_native_patch_range(
             .push(ExecutableSyscallPatch { address: site.rip });
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
-    patches
-        .fs_relative_patches
-        .extend(fs_relative_patch_sites(&bytes, start, previous_fs_base));
+    {
+        let fs_sites = fs_relative_sites(&bytes, start, previous_fs_base);
+        patches.fs_relative_patches.extend(fs_sites.patches);
+        patches.fs_relative_traps.extend(fs_sites.traps);
+    }
     patches
 }
 
@@ -667,6 +764,8 @@ pub fn merge_executable_native_patches(
     target.syscall_patches.extend(range.syscall_patches);
     #[cfg(all(windows, target_arch = "x86_64"))]
     target.fs_relative_patches.extend(range.fs_relative_patches);
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    target.fs_relative_traps.extend(range.fs_relative_traps);
 }
 
 pub fn executable_syscall_patch_writes(
@@ -697,6 +796,14 @@ pub fn metadata_for_ranges(
             .iter()
             .filter_map(|(address, patch)| {
                 address_in_ranges(*address, ranges).then_some((*address, *patch))
+            })
+            .collect(),
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_traps: metadata
+            .fs_relative_traps
+            .iter()
+            .filter_map(|(address, trap)| {
+                address_in_ranges(*address, ranges).then_some((*address, *trap))
             })
             .collect(),
     }
@@ -735,6 +842,17 @@ pub fn rebase_native_patch_metadata(
                 Some((
                     rebase_native_patch_address(*address, source_base, target_base)?,
                     *patch,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        fs_relative_traps: metadata
+            .fs_relative_traps
+            .iter()
+            .map(|(address, trap)| {
+                Some((
+                    rebase_native_patch_address(*address, source_base, target_base)?,
+                    *trap,
                 ))
             })
             .collect::<Option<BTreeMap<_, _>>>()?,
@@ -805,10 +923,45 @@ pub fn fs_relative_patch_sites(
     range_start: u64,
     previous_fs_base: u64,
 ) -> Vec<FsRelativePatchSite> {
+    fs_relative_sites(bytes, range_start, previous_fs_base).patches
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn fs_relative_trap_sites(
+    bytes: &[u8],
+    range_start: u64,
+    previous_fs_base: u64,
+) -> Vec<FsRelativeTrapSite> {
+    fs_relative_sites(bytes, range_start, previous_fs_base).traps
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+struct FsRelativeSites {
+    patches: Vec<FsRelativePatchSite>,
+    traps: Vec<FsRelativeTrapSite>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn fs_relative_sites(
+    bytes: &[u8],
+    range_start: u64,
+    previous_fs_base: u64,
+) -> FsRelativeSites {
     let mut patches = Vec::new();
-    for instruction in LinearInstructionScanner::new().scan(GuestBlock::new(bytes, range_start)) {
+    let mut traps = Vec::new();
+    let mut decoder = Decoder::with_ip(
+        crate::X86_64_BITNESS,
+        bytes,
+        range_start,
+        DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            continue;
+        }
         let Some(offset) = instruction
-            .rip
+            .ip()
             .checked_sub(range_start)
             .and_then(|offset| usize::try_from(offset).ok())
         else {
@@ -816,7 +969,7 @@ pub fn fs_relative_patch_sites(
         };
         if let Some(original) = fs_relative_original(&bytes[offset..]) {
             patches.push(FsRelativePatchSite {
-                address: instruction.rip,
+                address: instruction.ip(),
                 patch: FsRelativePatch { original },
                 materialized: false,
             });
@@ -825,14 +978,22 @@ pub fn fs_relative_patch_sites(
                 fs_relative_original_from_replacement(&bytes[offset..], previous_fs_base)
         {
             patches.push(FsRelativePatchSite {
-                address: instruction.rip,
+                address: instruction.ip(),
                 patch: FsRelativePatch { original },
                 materialized: true,
+            });
+        } else if instruction.memory_segment() == Register::FS
+            && let Some(original) = bytes.get(offset..offset + instruction.len())
+            && let Some(trap) = FsRelativeTrap::new(original)
+        {
+            traps.push(FsRelativeTrapSite {
+                address: instruction.ip(),
+                trap,
             });
         }
     }
 
-    patches
+    FsRelativeSites { patches, traps }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -848,6 +1009,16 @@ pub fn fs_relative_original(bytes: &[u8]) -> Option<[u8; 9]> {
     }
 
     Some(bytes[..9].try_into().expect("slice length checked"))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn fs_relative_instruction_bytes(bytes: &[u8]) -> bool {
+    let mut decoder = Decoder::with_ip(crate::X86_64_BITNESS, bytes, 0, DecoderOptions::NONE);
+    if !decoder.can_decode() {
+        return false;
+    }
+    let instruction = decoder.decode();
+    !instruction.is_invalid() && instruction.memory_segment() == Register::FS
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
