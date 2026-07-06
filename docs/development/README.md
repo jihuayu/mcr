@@ -192,7 +192,7 @@ Smoke commands become required as soon as their owning task lands:
 | `mcr run-rootfs gcc-rootfs /bin/sh -c "<write C source, gcc, run binary>"` | Extended support matrix |
 | `mcr run-rootfs node-rootfs /bin/sh -c "<run JavaScript with node>"` | Extended support matrix |
 | `mcr run-rootfs jdk-rootfs /bin/sh -c "<compile Java source with javac, run class with java>"` | Extended support matrix |
-| `mcr run-rootfs mysql-rootfs /bin/sh -c "<bootstrap mariadbd and create database>"` | Extended support matrix |
+| `mcr run-rootfs mysql-rootfs /bin/sh -c "<bootstrap mariadbd, create table, insert row>"` | Extended support matrix |
 | `mcr run-rootfs redis-rootfs /bin/sh -c "redis-server --test-memory 1"` | Extended support matrix |
 
 Phase 2 shell and network contracts are opt-in. Normal `cargo test -p
@@ -231,7 +231,8 @@ through the host shell.
 The ignored extended support matrix uses `MCR_BIN` plus the matching
 materialized package rootfs fixture. It covers GCC compile-and-run, Node.js
 JavaScript execution, unpinned `javac -version` plus JDK compile-and-run,
-MariaDB bootstrap database creation, and Redis server execution. Run it
+MariaDB bootstrap database/table creation with an inserted row, and Redis
+server execution. Run it
 explicitly with:
 
 ```powershell
