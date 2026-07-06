@@ -48,6 +48,7 @@ pub struct GuestTask {
     pub(crate) state: TaskState,
     pub(crate) robust_list: Option<GuestAddress>,
     pub(crate) clear_child_tid: Option<GuestAddress>,
+    pub(crate) signal_mask: u64,
     pub(crate) pending_signals: BTreeSet<u32>,
     pub(crate) pending_signal_delivery: Option<u32>,
 }
@@ -62,6 +63,7 @@ impl GuestTask {
             state: TaskState::Runnable,
             robust_list: None,
             clear_child_tid: None,
+            signal_mask: 0,
             pending_signals: BTreeSet::new(),
             pending_signal_delivery: None,
         }
@@ -104,6 +106,15 @@ impl GuestTask {
     #[must_use]
     pub const fn clear_child_tid(&self) -> Option<GuestAddress> {
         self.clear_child_tid
+    }
+
+    #[must_use]
+    pub const fn signal_mask(&self) -> u64 {
+        self.signal_mask
+    }
+
+    pub fn set_signal_mask(&mut self, signal_mask: u64) {
+        self.signal_mask = signal_mask;
     }
 
     pub fn take_clear_child_tid(&mut self) -> Option<GuestAddress> {

@@ -50,7 +50,55 @@ pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
+pub const LINUX_SIGHUP: u32 = 1;
+pub const LINUX_SIGINT: u32 = 2;
+pub const LINUX_SIGQUIT: u32 = 3;
+pub const LINUX_SIGILL: u32 = 4;
+pub const LINUX_SIGTRAP: u32 = 5;
+pub const LINUX_SIGABRT: u32 = 6;
+pub const LINUX_SIGBUS: u32 = 7;
+pub const LINUX_SIGFPE: u32 = 8;
 pub const LINUX_SIGKILL: u32 = 9;
+pub const LINUX_SIGUSR1: u32 = 10;
+pub const LINUX_SIGSEGV: u32 = 11;
+pub const LINUX_SIGUSR2: u32 = 12;
+pub const LINUX_SIGPIPE: u32 = 13;
+pub const LINUX_SIGALRM: u32 = 14;
 pub const LINUX_SIGSTOP: u32 = 19;
 pub const LINUX_SIGTERM: u32 = 15;
 pub const LINUX_SIGNAL_COUNT: u32 = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxDefaultSignalAction {
+    Ignore,
+    Terminate,
+}
+
+#[must_use]
+pub const fn default_signal_action(signal: u32) -> LinuxDefaultSignalAction {
+    match signal {
+        LINUX_SIGHUP
+        | LINUX_SIGINT
+        | LINUX_SIGQUIT
+        | LINUX_SIGILL
+        | LINUX_SIGTRAP
+        | LINUX_SIGABRT
+        | LINUX_SIGBUS
+        | LINUX_SIGFPE
+        | LINUX_SIGKILL
+        | LINUX_SIGUSR1
+        | LINUX_SIGSEGV
+        | LINUX_SIGUSR2
+        | LINUX_SIGPIPE
+        | LINUX_SIGALRM
+        | LINUX_SIGTERM
+        | 24..=27
+        | 30..=31 => LinuxDefaultSignalAction::Terminate,
+        _ => LinuxDefaultSignalAction::Ignore,
+    }
+}
+
+#[must_use]
+pub const fn signal_exit_status(signal: u32) -> i32 {
+    128 + (signal as i32)
+}

@@ -1,11 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use mcr_sys::{
-    GuestAddress, GuestPid, GuestTid, LINUX_SIG_BLOCK, LINUX_SIG_SETMASK, LINUX_SIG_UNBLOCK,
-    Wait4SyscallArgs,
-};
+use mcr_sys::{GuestAddress, GuestPid, GuestTid, Wait4SyscallArgs};
 
-use crate::{GuestFdTable, GuestImageState, TaskError};
+use crate::{GuestFdTable, GuestImageState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitState {
@@ -71,7 +68,6 @@ impl GuestSignalAction {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SignalState {
     actions: BTreeMap<u32, GuestSignalAction>,
-    blocked: u64,
 }
 
 impl SignalState {
@@ -80,35 +76,8 @@ impl SignalState {
         self.actions.get(&signal).copied()
     }
 
-    #[must_use]
-    pub const fn blocked(&self) -> u64 {
-        self.blocked
-    }
-
     pub(crate) fn set_action(&mut self, signal: u32, action: GuestSignalAction) {
         self.actions.insert(signal, action);
-    }
-
-    pub(crate) fn apply_mask(&mut self, how: u32, mask: u64) -> Result<(), TaskError> {
-        match how {
-            LINUX_SIG_BLOCK => {
-                self.blocked |= mask;
-                Ok(())
-            }
-            LINUX_SIG_UNBLOCK => {
-                self.blocked &= !mask;
-                Ok(())
-            }
-            LINUX_SIG_SETMASK => {
-                self.blocked = mask;
-                Ok(())
-            }
-            _ => Err(TaskError::InvalidSignalMaskHow(how)),
-        }
-    }
-
-    pub fn set_blocked(&mut self, mask: u64) {
-        self.blocked = mask;
     }
 }
 

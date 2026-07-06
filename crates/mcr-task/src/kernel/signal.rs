@@ -7,7 +7,7 @@ use mcr_sys::{
 
 use super::{GuestKernel, current_syscall_return_rip};
 use crate::{
-    ExitState, GuestSignalAction, LINUX_SIGKILL, LINUX_SIGNAL_COUNT, LINUX_SIGSTOP, LINUX_SIGTERM,
+    ExitState, GuestSignalAction, GuestTask, LINUX_SIGKILL, LINUX_SIGNAL_COUNT, LINUX_SIGSTOP,
     TaskError, TaskState,
 };
 
@@ -125,9 +125,9 @@ impl GuestKernel {
         signal_mask: Option<u64>,
         sigsetsize: u64,
     ) -> SyscallOutcome {
-        let Some(pid) = self.task(tid).map(|task| task.pid) else {
+        if self.task(tid).is_none() {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
-        };
+        }
         if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
             return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
         }
@@ -135,10 +135,10 @@ impl GuestKernel {
             return TaskError::InvalidSignalMaskHow(how).into_outcome();
         }
         if let Some(mask) = signal_mask {
-            let Some(process) = self.process_mut(pid) else {
+            let Some(task) = self.task_mut(tid) else {
                 return SyscallOutcome::errno(LinuxErrno::ESRCH);
             };
-            if let Err(error) = process.signals.apply_mask(how, mask) {
+            if let Err(error) = apply_task_signal_mask(task, how, mask) {
                 return error.into_outcome();
             }
         }
@@ -163,9 +163,28 @@ impl GuestKernel {
             return;
         };
         self.wake_signal_waiters(pid);
-        if !self.signal_blocked(pid, signal) {
+        if !self.signal_blocked(tid, signal) {
             self.interrupt_futex_waiter(tid);
         }
+    }
+
+    pub fn take_pending_signal_for_return_to_user(&mut self, tid: GuestTid) -> Option<u32> {
+        if let Some(signal) = self
+            .task_mut(tid)
+            .and_then(GuestTask::take_pending_signal_delivery)
+        {
+            return Some(signal);
+        }
+        let (pid, allowed_mask) = self.task(tid).map(|task| (task.pid, !task.signal_mask()))?;
+        self.take_pending_signal_for_task(tid, pid, allowed_mask)
+    }
+
+    pub fn set_task_signal_mask(&mut self, tid: GuestTid, signal_mask: u64) -> bool {
+        let Some(task) = self.task_mut(tid) else {
+            return false;
+        };
+        task.set_signal_mask(sanitize_signal_mask(signal_mask));
+        true
     }
 
     fn take_pending_signal_for_task(
@@ -281,9 +300,9 @@ impl GuestKernel {
         woken
     }
 
-    fn signal_blocked(&self, pid: GuestPid, signal: u32) -> bool {
-        self.process(pid)
-            .is_some_and(|process| signal_matches_mask(signal, process.signals.blocked()))
+    fn signal_blocked(&self, tid: GuestTid, signal: u32) -> bool {
+        self.task(tid)
+            .is_some_and(|task| signal_matches_mask(signal, task.signal_mask()))
     }
 
     fn interrupt_futex_waiter(&mut self, tid: GuestTid) -> bool {
@@ -316,9 +335,6 @@ impl GuestKernel {
         if args.sig == 0 {
             return SyscallOutcome::success(0);
         }
-        if self.should_terminate_for_process_signal(pid, args.sig) {
-            return self.exit_group(pid, signal_exit_status(args.sig));
-        }
         self.queue_process_signal(pid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
     }
@@ -328,7 +344,7 @@ impl GuestKernel {
             return TaskError::UnsupportedSignalTarget(args.tid).into_outcome();
         }
         let tid = args.tid as GuestTid;
-        let Some(task) = self.task(tid) else {
+        let Some(_task) = self.task(tid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
         if let Err(error) = validate_signal_or_probe(args.sig) {
@@ -336,9 +352,6 @@ impl GuestKernel {
         }
         if args.sig == 0 {
             return SyscallOutcome::success(0);
-        }
-        if self.should_terminate_for_process_signal(task.pid, args.sig) {
-            return self.exit_group(task.pid, signal_exit_status(args.sig));
         }
         self.queue_task_signal(tid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
@@ -362,25 +375,8 @@ impl GuestKernel {
         if args.sig == 0 {
             return SyscallOutcome::success(0);
         }
-        if self.should_terminate_for_process_signal(pid, args.sig) {
-            return self.exit_group(pid, signal_exit_status(args.sig));
-        }
         self.queue_task_signal(tid, args.sig);
         SyscallOutcome::success(0).with_decoded_field("queued_signal", args.sig.to_string())
-    }
-
-    fn should_terminate_for_process_signal(&self, pid: GuestPid, signal: u32) -> bool {
-        if !is_terminating_signal(signal) {
-            return false;
-        }
-        if signal == LINUX_SIGKILL {
-            return true;
-        }
-        let Some(process) = self.process(pid) else {
-            return true;
-        };
-        !signal_matches_mask(signal, process.signals.blocked())
-            && process.signals.action(signal).is_none()
     }
 
     pub fn set_tid_address_current(
@@ -448,10 +444,34 @@ fn signal_matches_mask(signal: u32, signal_mask: u64) -> bool {
     signal > 0 && signal <= LINUX_SIGNAL_COUNT && signal_mask & (1u64 << (signal - 1)) != 0
 }
 
-const fn is_terminating_signal(signal: u32) -> bool {
-    matches!(signal, LINUX_SIGKILL | LINUX_SIGTERM)
+fn apply_task_signal_mask(
+    task: &mut GuestTask,
+    how: u32,
+    signal_mask: u64,
+) -> Result<(), TaskError> {
+    let mask = sanitize_signal_mask(signal_mask);
+    match how {
+        mcr_sys::LINUX_SIG_BLOCK => {
+            task.signal_mask |= mask;
+            task.signal_mask = sanitize_signal_mask(task.signal_mask);
+            Ok(())
+        }
+        mcr_sys::LINUX_SIG_UNBLOCK => {
+            task.signal_mask &= !mask;
+            Ok(())
+        }
+        mcr_sys::LINUX_SIG_SETMASK => {
+            task.signal_mask = mask;
+            Ok(())
+        }
+        _ => Err(TaskError::InvalidSignalMaskHow(how)),
+    }
 }
 
-const fn signal_exit_status(signal: u32) -> i32 {
-    128 + (signal as i32)
+const fn sanitize_signal_mask(mask: u64) -> u64 {
+    mask & !unblockable_signal_mask()
+}
+
+const fn unblockable_signal_mask() -> u64 {
+    (1u64 << (LINUX_SIGKILL - 1)) | (1u64 << (LINUX_SIGSTOP - 1))
 }

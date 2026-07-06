@@ -141,10 +141,9 @@ fn rt_sigprocmask_applies_empty_guest_set() {
     assert_eq!(
         runtime
             .kernel()
-            .process(INITIAL_GUEST_PID)
+            .task(INITIAL_GUEST_TID)
             .unwrap()
-            .signals()
-            .blocked(),
+            .signal_mask(),
         0
     );
     assert_eq!(u64_from_guest(runtime.memory(), old_mask_addr), 0b1010);
@@ -358,6 +357,103 @@ fn rt_sigsuspend_delivers_child_signal_handler() {
 
     assert_eq!(signal.after_rip(), 0x411000);
     assert_eq!(signal.task_state(), TaskState::Runnable);
+}
+
+#[test]
+fn queued_tkill_signal_delivers_handler_before_guest_execution() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let action_addr = 0x402100;
+    write_guest_sigaction(
+        runtime.memory_mut(),
+        action_addr,
+        0x411000,
+        LINUX_SA_RESTORER,
+        0x422000,
+        0,
+    );
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigaction,
+                [
+                    mcr_task::LINUX_SIGTERM as u64,
+                    action_addr,
+                    0,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::Tkill,
+                [
+                    INITIAL_GUEST_TID as u64,
+                    mcr_task::LINUX_SIGTERM as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+
+    let signal = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, INITIAL_GUEST_TID)
+        .expect("queued signal is delivered before guest code resumes");
+
+    assert_eq!(signal.after_rip(), 0x411000);
+    assert_eq!(signal.task_state(), TaskState::Runnable);
+    assert_eq!(
+        runtime
+            .kernel()
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .signal_mask()
+            & (1u64 << (mcr_task::LINUX_SIGTERM - 1)),
+        1u64 << (mcr_task::LINUX_SIGTERM - 1)
+    );
+}
+
+#[test]
+fn queued_sigterm_default_terminates_before_guest_execution() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::Tkill,
+                [
+                    INITIAL_GUEST_TID as u64,
+                    mcr_task::LINUX_SIGTERM as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+
+    let signal = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, INITIAL_GUEST_TID)
+        .expect("default fatal signal terminates before guest code resumes");
+
+    assert_eq!(signal.task_state(), TaskState::Exited { status: 143 });
+    assert_eq!(
+        runtime
+            .kernel()
+            .process(INITIAL_GUEST_PID)
+            .unwrap()
+            .exit_state(),
+        ExitState::Exited { status: 143 }
+    );
 }
 
 #[cfg(any(

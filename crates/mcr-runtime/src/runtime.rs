@@ -966,32 +966,33 @@ where
     let signal = dispatcher
         .subsystems_mut()
         .tasks_mut()
-        .task_mut(tid)
-        .and_then(GuestTask::take_pending_signal_delivery);
+        .take_pending_signal_for_return_to_user(tid);
     let Some(signal) = signal else {
         return Ok(None);
     };
 
-    let Some((action, signal_mask)) =
-        dispatcher
-            .subsystems()
-            .tasks()
-            .process(pid)
-            .and_then(|process| {
-                process
-                    .signals()
-                    .action(signal)
-                    .map(|action| (action, process.signals().blocked()))
-            })
-    else {
-        return Ok(None);
+    let action = dispatcher
+        .subsystems()
+        .tasks()
+        .process(pid)
+        .and_then(|process| process.signals().action(signal));
+    let signal_mask = dispatcher
+        .subsystems()
+        .tasks()
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .signal_mask();
+    let Some(action) = action else {
+        return deliver_default_signal_action(dispatcher, tid, pid, before_rip, signal);
     };
-    if action.action() == LINUX_SIG_DFL
-        || action.action() == LINUX_SIG_IGN
+    if action.action() == LINUX_SIG_DFL {
+        return deliver_default_signal_action(dispatcher, tid, pid, before_rip, signal);
+    }
+    if action.action() == LINUX_SIG_IGN
         || action.flags() & LINUX_SA_RESTORER == 0
         || action.restorer() == 0
     {
-        return Ok(None);
+        return signal_noop_step(dispatcher, tid, before_rip);
     }
 
     let fs_base = dispatcher
@@ -1024,12 +1025,15 @@ where
         .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
     };
 
-    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
+    {
         let mut blocked = signal_mask | action.mask();
         if action.flags() & LINUX_SA_NODEFER == 0 {
             blocked |= signal_mask_for(signal);
         }
-        process.signals_mut().set_blocked(blocked);
+        dispatcher
+            .subsystems_mut()
+            .tasks_mut()
+            .set_task_signal_mask(tid, blocked);
     }
     let gpr = gpr_from_registers(handler_registers);
     let task = dispatcher
@@ -1048,6 +1052,57 @@ where
         before_rip,
         final_regs.rip(),
         final_regs.rax(),
+        task.state(),
+    )))
+}
+
+fn deliver_default_signal_action<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    signal: u32,
+) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    match default_signal_action(signal) {
+        LinuxDefaultSignalAction::Ignore => signal_noop_step(dispatcher, tid, before_rip),
+        LinuxDefaultSignalAction::Terminate => {
+            let status = signal_exit_status(signal);
+            {
+                let subsystems = dispatcher.subsystems_mut();
+                let outcome = subsystems.tasks_mut().exit_group(pid, status);
+                if let SyscallReturn::Errno(errno) = outcome.result {
+                    return Err(GuestExecutionError::Memory(memory_error_from_errno(errno)));
+                }
+                subsystems
+                    .finish_task_exit(pid, tid, true)
+                    .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?;
+            }
+            signal_noop_step(dispatcher, tid, before_rip)
+        }
+    }
+}
+
+fn signal_noop_step<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    before_rip: u64,
+) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    let task = dispatcher
+        .subsystems()
+        .tasks()
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    Ok(Some(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        task.regs().rip(),
+        task.regs().rax(),
         task.state(),
     )))
 }
@@ -1071,9 +1126,10 @@ where
         restore_rt_signal_frame(memory, registers)
             .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
     };
-    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
-        process.signals_mut().set_blocked(restored.signal_mask);
-    }
+    dispatcher
+        .subsystems_mut()
+        .tasks_mut()
+        .set_task_signal_mask(tid, restored.signal_mask);
     let updated_regs = gpr_from_registers(restored.registers);
     let task = dispatcher
         .subsystems_mut()
@@ -1109,20 +1165,20 @@ pub(crate) fn try_deliver_native_guest_fault_signal<T>(
 where
     T: SyscallTracer,
 {
-    let Some((action, signal_mask)) =
-        dispatcher
-            .subsystems()
-            .tasks()
-            .process(pid)
-            .and_then(|process| {
-                process
-                    .signals()
-                    .action(LINUX_SIGSEGV)
-                    .map(|action| (action, process.signals().blocked()))
-            })
+    let Some(action) = dispatcher
+        .subsystems()
+        .tasks()
+        .process(pid)
+        .and_then(|process| process.signals().action(LINUX_SIGSEGV))
     else {
         return Ok(None);
     };
+    let signal_mask = dispatcher
+        .subsystems()
+        .tasks()
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .signal_mask();
     if action.action() == LINUX_SIG_DFL
         || action.action() == LINUX_SIG_IGN
         || action.flags() & LINUX_SA_RESTORER == 0
@@ -1156,12 +1212,15 @@ where
         .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
     };
 
-    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
+    {
         let mut blocked = signal_mask | action.mask();
         if action.flags() & LINUX_SA_NODEFER == 0 {
             blocked |= signal_mask_for(LINUX_SIGSEGV);
         }
-        process.signals_mut().set_blocked(blocked);
+        dispatcher
+            .subsystems_mut()
+            .tasks_mut()
+            .set_task_signal_mask(tid, blocked);
     }
     dispatcher.subsystems_mut().set_native_fp(
         tid,

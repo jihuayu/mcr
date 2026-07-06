@@ -107,7 +107,8 @@ use mcr_task::{
     CompletedWait, ExitState, FutexWaitKey, GprState, GuestExecutable, GuestKernel, GuestProcess,
     GuestProgram, GuestTask, HostWorkerPoolConfig, HostWorkerPoolDiagnostics,
     HostWorkerPoolExecutor, HostWorkerPoolJob, HostWorkerPoolRole, INITIAL_GUEST_PID,
-    INITIAL_GUEST_TID, TaskError, TaskState,
+    INITIAL_GUEST_TID, LinuxDefaultSignalAction, TaskError, TaskState, default_signal_action,
+    signal_exit_status,
 };
 use mcr_vfs::{
     AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, DirectoryEntry, Fd,

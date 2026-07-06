@@ -457,10 +457,9 @@ impl RuntimeSubsystems {
         let current_mask = self
             .process
             .tasks
-            .process(pid)
+            .task(request.context.tid)
             .ok_or(LinuxErrno::ESRCH)?
-            .signals()
-            .blocked();
+            .signal_mask();
         if args.oldset != 0 {
             self.files
                 .memory_mut()

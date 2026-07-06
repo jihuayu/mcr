@@ -700,11 +700,7 @@ fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
         SyscallReturn::Success(0)
     );
     assert_eq!(
-        kernel
-            .process(INITIAL_GUEST_PID)
-            .unwrap()
-            .signals()
-            .blocked(),
+        kernel.task(INITIAL_GUEST_TID).unwrap().signal_mask(),
         0b1010
     );
 
@@ -724,11 +720,7 @@ fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
         SyscallReturn::Success(0)
     );
     assert_eq!(
-        kernel
-            .process(INITIAL_GUEST_PID)
-            .unwrap()
-            .signals()
-            .blocked(),
+        kernel.task(INITIAL_GUEST_TID).unwrap().signal_mask(),
         0b1111
     );
 
@@ -748,11 +740,7 @@ fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
         SyscallReturn::Success(0)
     );
     assert_eq!(
-        kernel
-            .process(INITIAL_GUEST_PID)
-            .unwrap()
-            .signals()
-            .blocked(),
+        kernel.task(INITIAL_GUEST_TID).unwrap().signal_mask(),
         0b1100
     );
 
@@ -767,14 +755,7 @@ fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
             .result,
         SyscallReturn::Success(0)
     );
-    assert_eq!(
-        kernel
-            .process(INITIAL_GUEST_PID)
-            .unwrap()
-            .signals()
-            .blocked(),
-        0
-    );
+    assert_eq!(kernel.task(INITIAL_GUEST_TID).unwrap().signal_mask(), 0);
 
     assert_eq!(
         dispatch_task_syscall(
@@ -1020,7 +1001,7 @@ fn kill_queues_blocked_sigterm_for_sigtimedwait_instead_of_exiting() {
 }
 
 #[test]
-fn kill_probe_checks_process_and_sigterm_exits_group() {
+fn kill_probe_checks_process_and_sigterm_queues_for_return_to_user() {
     let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
 
     assert_eq!(
@@ -1050,17 +1031,20 @@ fn kill_probe_checks_process_and_sigterm_exits_group() {
         SyscallReturn::Success(0)
     );
     assert_eq!(
-        kernel.task(INITIAL_GUEST_TID).unwrap().state(),
-        TaskState::Exited { status: 143 }
-    );
-    assert_eq!(
         kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
-        ExitState::Exited { status: 143 }
+        ExitState::Running
+    );
+    assert!(
+        kernel
+            .process(INITIAL_GUEST_PID)
+            .unwrap()
+            .pending_signals()
+            .contains(&LINUX_SIGTERM)
     );
 }
 
 #[test]
-fn tgkill_sigkill_exits_target_task() {
+fn tgkill_sigkill_queues_for_return_to_user() {
     let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
 
     assert_eq!(
@@ -1080,11 +1064,18 @@ fn tgkill_sigkill_exits_target_task() {
     );
     assert_eq!(
         kernel.task(INITIAL_GUEST_TID).unwrap().state(),
-        TaskState::Exited { status: 137 }
+        TaskState::Runnable
     );
     assert_eq!(
         kernel.process(INITIAL_GUEST_PID).unwrap().exit_state(),
-        ExitState::Exited { status: 137 }
+        ExitState::Running
+    );
+    assert!(
+        kernel
+            .task(INITIAL_GUEST_TID)
+            .unwrap()
+            .pending_signals
+            .contains(&LINUX_SIGKILL)
     );
 }
 
@@ -1186,7 +1177,7 @@ fn fork_child_inherits_signal_action_and_mask() {
         child_signals.action(LINUX_SIGTERM).unwrap().action(),
         0x7000
     );
-    assert_eq!(child_signals.blocked(), 0x55);
+    assert_eq!(kernel.task(2).unwrap().signal_mask(), 0x55);
 }
 
 fn dispatch_task_syscall(

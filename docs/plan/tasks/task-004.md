@@ -1,7 +1,7 @@
 ---
 id: task-004
 scope: task
-status: ready
+status: done
 depends-on: [task-003, workload-001]
 ---
 
