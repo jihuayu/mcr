@@ -942,11 +942,7 @@ struct FsRelativeSites {
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn fs_relative_sites(
-    bytes: &[u8],
-    range_start: u64,
-    previous_fs_base: u64,
-) -> FsRelativeSites {
+fn fs_relative_sites(bytes: &[u8], range_start: u64, previous_fs_base: u64) -> FsRelativeSites {
     let mut patches = Vec::new();
     let mut traps = Vec::new();
     let mut decoder = Decoder::with_ip(

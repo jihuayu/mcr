@@ -308,7 +308,7 @@ mod windows_x86_64 {
         popfq
 
         mov rax, [r15 + 56]
-        sub rax, 8
+        lea rax, [rax - 8]
         mov rsp, rax
         mov rax, [r15 + 128]
         mov [rsp], rax
@@ -553,5 +553,31 @@ mod tests {
         execute_x86_64_until_trap(&mut registers, 0).expect("int3 should trap");
 
         assert_eq!(registers.rip, code_addr);
+    }
+
+    #[test]
+    fn windows_enter_guest_preserves_status_flags_for_branches() {
+        let mut code =
+            HostMemory::allocate(4096, MemoryProtection::ExecuteReadWrite).expect("code memory");
+        code.as_mut_slice()[..7].copy_from_slice(&[
+            0x74, 0x03, // je taken
+            0xcc, // not-taken trap
+            0xeb, 0x02, // jmp after taken trap
+            0xcc, // taken trap
+            0xc3,
+        ]);
+        let stack = HostMemory::allocate(4096, MemoryProtection::ReadWrite).expect("stack memory");
+        let code_addr = code.as_ptr() as u64;
+        let stack_top = stack.as_ptr() as u64 + stack.len() as u64;
+        let mut registers = HostCpuRegisters {
+            rip: code_addr,
+            rsp: stack_top,
+            rflags: 0x246,
+            ..HostCpuRegisters::default()
+        };
+
+        execute_x86_64_until_trap(&mut registers, 0).expect("int3 should trap");
+
+        assert_eq!(registers.rip, code_addr + 5);
     }
 }

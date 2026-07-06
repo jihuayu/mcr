@@ -1488,15 +1488,17 @@ where
             }
             let instruction =
                 mcr_jit::decode_native_fault_instruction(trap.original_bytes(), registers.rip);
-            return Err(GuestExecutionError::Execution(ExecutionError::NativeFault {
-                signal: 0,
-                rip: registers.rip,
-                address: registers.rip,
-                fs_base,
-                registers,
-                instruction: instruction.map(Box::new),
-                stack_words,
-            }));
+            return Err(GuestExecutionError::Execution(
+                ExecutionError::NativeFault {
+                    signal: 0,
+                    rip: registers.rip,
+                    address: registers.rip,
+                    fs_base,
+                    registers,
+                    instruction: instruction.map(Box::new),
+                    stack_words,
+                },
+            ));
         }
         if let Some(intrinsic) = dispatcher
             .subsystems()

@@ -90,7 +90,10 @@ impl NextJsFsTlsContext {
         }
 
         let app_root = rootfs_path.join(NEXT_APP_ROOT);
-        if !app_root.join("node_modules/next/dist/server/config.js").exists() {
+        if !app_root
+            .join("node_modules/next/dist/server/config.js")
+            .exists()
+        {
             eprintln!(
                 "skipping nextjs FS/TLS contract: prepare Next.js app at {}",
                 app_root.display()
