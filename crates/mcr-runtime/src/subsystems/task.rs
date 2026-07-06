@@ -52,6 +52,8 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::RtSigsuspend => self.dispatch_rt_sigsuspend(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
+            mcr_sys::Syscall::SchedGetparam => self.dispatch_sched_getparam(request),
+            mcr_sys::Syscall::SchedGetscheduler => self.dispatch_sched_getscheduler(request),
             mcr_sys::Syscall::SchedGetaffinity => self.dispatch_sched_getaffinity(request),
             mcr_sys::Syscall::Getrlimit => self.dispatch_getrlimit(request),
             mcr_sys::Syscall::Getrusage => self.dispatch_getrusage(request),
@@ -126,6 +128,39 @@ fn write_guest_sigaction(
 impl RuntimeSubsystems {
     pub(crate) fn dispatch_sched_yield(&mut self) -> SyscallOutcome {
         std::thread::yield_now();
+        SyscallOutcome::success(0)
+    }
+
+    pub(crate) fn dispatch_sched_getparam(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.sched_getparam(request) {
+            Ok(()) => SyscallOutcome::success(0),
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
+    pub(crate) fn sched_getparam(&mut self, request: &SyscallRequest) -> Result<(), LinuxErrno> {
+        let requested_pid = arg(request, 0);
+        let param = arg(request, 1);
+        if param == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        if !self.sched_target_exists(request.context.pid, requested_pid) {
+            return Err(LinuxErrno::ESRCH);
+        }
+
+        self.select_memory_for_process(request.context.pid)?;
+        write_guest_u32(self.files.memory_mut(), param, 0)?;
+        self.store_selected_process_memory(request.context.pid)
+    }
+
+    pub(crate) fn dispatch_sched_getscheduler(
+        &mut self,
+        request: &SyscallRequest,
+    ) -> SyscallOutcome {
+        let requested_pid = arg(request, 0);
+        if !self.sched_target_exists(request.context.pid, requested_pid) {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        }
         SyscallOutcome::success(0)
     }
 
@@ -649,6 +684,22 @@ impl RuntimeSubsystems {
             .write_bytes(mask_addr, &mask)
             .map_err(memory_errno)?;
         self.store_selected_process_memory(request.context.pid)
+    }
+
+    fn sched_target_exists(&self, current_pid: mcr_sys::GuestPid, requested_pid: u64) -> bool {
+        if requested_pid == 0 {
+            return true;
+        }
+        let Ok(id) = mcr_sys::GuestTid::try_from(requested_pid) else {
+            return false;
+        };
+        self.process.tasks.task(id).is_some()
+            || self
+                .process
+                .tasks
+                .process(mcr_sys::GuestPid::from(id))
+                .is_some()
+            || u32::from(current_pid) == id
     }
 
     pub(crate) fn dispatch_kernel_task(&mut self, request: &SyscallRequest) -> SyscallOutcome {

@@ -770,6 +770,31 @@ fn sched_getaffinity_reports_single_guest_cpu_mask() {
 }
 
 #[test]
+fn sched_getparam_and_getscheduler_report_default_policy() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &0xffff_ffffu32.to_le_bytes())
+        .unwrap();
+
+    let param =
+        runtime.dispatch_syscall(context(Syscall::SchedGetparam, [0, 0x402000, 0, 0, 0, 0]));
+    let scheduler = runtime.dispatch_syscall(context(
+        Syscall::SchedGetscheduler,
+        [u64::from(INITIAL_GUEST_TID), 0, 0, 0, 0, 0],
+    ));
+    let missing =
+        runtime.dispatch_syscall(context(Syscall::SchedGetscheduler, [99, 0, 0, 0, 0, 0]));
+
+    assert_eq!(param.result, SyscallReturn::Success(0));
+    let mut priority = [0xff; 4];
+    runtime.memory().read(0x402000, &mut priority).unwrap();
+    assert_eq!(priority, 0u32.to_le_bytes());
+    assert_eq!(scheduler.result, SyscallReturn::Success(0));
+    assert_eq!(missing.result, SyscallReturn::Errno(LinuxErrno::ESRCH));
+}
+
+#[test]
 fn runtime_dispatches_fork_child_exit_and_wait4() {
     let mut runtime = Runtime::new(test_program("/bin/parent", 0x401000)).unwrap();
 

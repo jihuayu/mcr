@@ -88,6 +88,8 @@ pub enum Syscall {
     Sigaltstack,
     Statfs,
     Fstatfs,
+    SchedGetparam,
+    SchedGetscheduler,
     Nanosleep,
     Dup,
     Dup2,
@@ -229,6 +231,8 @@ impl Syscall {
     pub const SIGALTSTACK: SyscallNumber = SyscallNumber::new(131);
     pub const STATFS: SyscallNumber = SyscallNumber::new(137);
     pub const FSTATFS: SyscallNumber = SyscallNumber::new(138);
+    pub const SCHED_GETPARAM: SyscallNumber = SyscallNumber::new(143);
+    pub const SCHED_GETSCHEDULER: SyscallNumber = SyscallNumber::new(145);
     pub const NANOSLEEP: SyscallNumber = SyscallNumber::new(35);
     pub const DUP: SyscallNumber = SyscallNumber::new(32);
     pub const DUP2: SyscallNumber = SyscallNumber::new(33);
@@ -415,6 +419,8 @@ impl Syscall {
             131 => Self::Sigaltstack,
             137 => Self::Statfs,
             138 => Self::Fstatfs,
+            143 => Self::SchedGetparam,
+            145 => Self::SchedGetscheduler,
             157 => Self::Prctl,
             158 => Self::ArchPrctl,
             186 => Self::Gettid,
@@ -517,6 +523,8 @@ impl Syscall {
             Self::Sigaltstack => Self::SIGALTSTACK,
             Self::Statfs => Self::STATFS,
             Self::Fstatfs => Self::FSTATFS,
+            Self::SchedGetparam => Self::SCHED_GETPARAM,
+            Self::SchedGetscheduler => Self::SCHED_GETSCHEDULER,
             Self::Nanosleep => Self::NANOSLEEP,
             Self::Dup => Self::DUP,
             Self::Dup2 => Self::DUP2,
@@ -662,6 +670,8 @@ impl Syscall {
             Self::Sigaltstack => "sigaltstack",
             Self::Statfs => "statfs",
             Self::Fstatfs => "fstatfs",
+            Self::SchedGetparam => "sched_getparam",
+            Self::SchedGetscheduler => "sched_getscheduler",
             Self::Nanosleep => "nanosleep",
             Self::Dup => "dup",
             Self::Dup2 => "dup2",
@@ -810,6 +820,16 @@ mod tests {
             (Syscall::SIGALTSTACK, Syscall::Sigaltstack, "sigaltstack"),
             (Syscall::STATFS, Syscall::Statfs, "statfs"),
             (Syscall::FSTATFS, Syscall::Fstatfs, "fstatfs"),
+            (
+                Syscall::SCHED_GETPARAM,
+                Syscall::SchedGetparam,
+                "sched_getparam",
+            ),
+            (
+                Syscall::SCHED_GETSCHEDULER,
+                Syscall::SchedGetscheduler,
+                "sched_getscheduler",
+            ),
             (Syscall::FCHDIR, Syscall::Fchdir, "fchdir"),
             (Syscall::FLOCK, Syscall::Flock, "flock"),
             (Syscall::FALLOCATE, Syscall::Fallocate, "fallocate"),
