@@ -1127,7 +1127,7 @@ fn epoll_pwait_reuses_epoll_wait_without_sigmask() {
             .result,
         SyscallReturn::Success(0)
     );
-    let empty = runtime.dispatch_syscall(context(Syscall::EpollPwait, [5, 0x402200, 4, 0, 0, 0]));
+    let empty = runtime.dispatch_syscall(context(Syscall::EpollPwait, [5, 0x402200, 4, 0, 0, 8]));
     assert_eq!(empty.result, SyscallReturn::Success(0));
 
     runtime.memory_mut().write(0x402400, b"x").unwrap();
@@ -1191,7 +1191,7 @@ fn epoll_pwait2_reuses_epoll_wait_without_sigmask() {
     write_timespec(runtime.memory_mut(), 0x402300, 0, 0);
     let empty = runtime.dispatch_syscall(context(
         Syscall::EpollPwait2,
-        [5, 0x402200, 4, 0x402300, 0, 0],
+        [5, 0x402200, 4, 0x402300, 0, 8],
     ));
     assert_eq!(empty.result, SyscallReturn::Success(0));
 

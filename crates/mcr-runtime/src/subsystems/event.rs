@@ -581,7 +581,7 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        if arg(request, 4) != 0 || arg(request, 5) != 0 {
+        if arg(request, 4) != 0 {
             return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         let maxevents = match usize_arg(request, 2) {
@@ -610,7 +610,7 @@ impl RuntimeSubsystems {
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
         }
-        if arg(request, 4) != 0 || arg(request, 5) != 0 {
+        if arg(request, 4) != 0 {
             return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         let maxevents = match usize_arg(request, 2) {
