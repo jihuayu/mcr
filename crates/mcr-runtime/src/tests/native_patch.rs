@@ -897,6 +897,38 @@ fn native_fs_fault_emulates_register_relative_mov_load() {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[test]
+fn native_fs_fault_emulates_extended_register_relative_mov32_load() {
+    let _guard = native_execution_test_guard();
+    let code = [0x64, 0x44, 0x8b, 0x28, 0x0f, 0x05];
+    let mut runtime =
+        Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402030, &0x89ab_cdefu32.to_le_bytes())
+        .unwrap();
+    let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+        .expect("fs-relative extended register fault instruction decodes");
+
+    let registers = emulate_fs_relative_native_fault(
+        runtime.memory_mut(),
+        mcr_win::HostCpuRegisters {
+            rax: 0x30,
+            r13: u64::MAX,
+            rip: 0x401000,
+            ..mcr_win::HostCpuRegisters::default()
+        },
+        0x402000,
+        &instruction,
+    )
+    .unwrap()
+    .expect("instruction is emulated");
+
+    assert_eq!(registers.r13, 0x89ab_cdef);
+    assert_eq!(registers.rip, 0x401004);
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
 fn native_fs_fault_emulates_absolute_mov64_load() {
     let _guard = native_execution_test_guard();
     let code = [0x64, 0x48, 0x8b, 0x0c, 0x25, 0, 0, 0, 0, 0x0f, 0x05];
@@ -1050,6 +1082,39 @@ fn native_fs_fault_emulates_absolute_mov64_immediate_store() {
     let mut stored = [0xff; 8];
     runtime.memory().read(0x4021e0, &mut stored).unwrap();
     assert_eq!(stored, 0u64.to_le_bytes());
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn native_fs_fault_emulates_register_relative_mov32_immediate_store() {
+    let _guard = native_execution_test_guard();
+    let code = [0x64, 0xc7, 0x00, 0, 0, 0, 0, 0x0f, 0x05];
+    let mut runtime =
+        Runtime::new(test_program_with_entry_code("/bin/app", 0x401000, &code)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402030, &0xffff_ffffu32.to_le_bytes())
+        .unwrap();
+    let instruction = native_fault_instruction(runtime.memory(), 0x401000)
+        .expect("fs-relative register immediate store fault instruction decodes");
+
+    let registers = emulate_fs_relative_native_fault(
+        runtime.memory_mut(),
+        mcr_win::HostCpuRegisters {
+            rax: 0x30,
+            rip: 0x401000,
+            ..mcr_win::HostCpuRegisters::default()
+        },
+        0x402000,
+        &instruction,
+    )
+    .unwrap()
+    .expect("instruction is emulated");
+
+    assert_eq!(registers.rip, 0x401007);
+    let mut stored = [0xff; 4];
+    runtime.memory().read(0x402030, &mut stored).unwrap();
+    assert_eq!(stored, 0u32.to_le_bytes());
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
