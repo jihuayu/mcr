@@ -757,6 +757,26 @@ fn rt_sigprocmask_updates_mask_and_rejects_invalid_how_or_sigset_size() {
     );
 
     assert_eq!(
+        kernel
+            .rt_sigprocmask_current_mask(
+                INITIAL_GUEST_TID,
+                LINUX_SIG_SETMASK,
+                Some(0),
+                LINUX_KERNEL_SIGSET_SIZE,
+            )
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        kernel
+            .process(INITIAL_GUEST_PID)
+            .unwrap()
+            .signals()
+            .blocked(),
+        0
+    );
+
+    assert_eq!(
         dispatch_task_syscall(
             &mut kernel,
             Syscall::RtSigprocmask,

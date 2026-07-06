@@ -118,6 +118,7 @@ impl GuestKernel {
         child_task.tid = child_tid;
         child_task.state = TaskState::Runnable;
         child_task.pending_signals.clear();
+        child_task.pending_signal_delivery = None;
 
         self.processes.insert(
             child_pid,
@@ -277,6 +278,7 @@ impl GuestKernel {
         child_task.regs = child_regs;
         child_task.state = TaskState::Runnable;
         child_task.pending_signals.clear();
+        child_task.pending_signal_delivery = None;
         child_task.robust_list = None;
         child_task.clear_child_tid =
             (args.has_clone_child_cleartid() && args.child_tid != 0).then_some(args.child_tid);

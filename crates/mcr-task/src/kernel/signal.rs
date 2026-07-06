@@ -110,24 +110,42 @@ impl GuestKernel {
         tid: GuestTid,
         args: RtSigprocmaskSyscallArgs,
     ) -> SyscallOutcome {
+        self.rt_sigprocmask_current_mask(
+            tid,
+            args.how,
+            (args.set != 0).then_some(args.set),
+            args.sigsetsize,
+        )
+    }
+
+    pub fn rt_sigprocmask_current_mask(
+        &mut self,
+        tid: GuestTid,
+        how: u32,
+        signal_mask: Option<u64>,
+        sigsetsize: u64,
+    ) -> SyscallOutcome {
         let Some(pid) = self.task(tid).map(|task| task.pid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        if args.sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
-            return TaskError::InvalidSigsetSize(args.sigsetsize).into_outcome();
+        if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
         }
-        if !args.supported_how() {
-            return TaskError::InvalidSignalMaskHow(args.how).into_outcome();
+        if !RtSigprocmaskSyscallArgs::new(how, 0, 0, sigsetsize).supported_how() {
+            return TaskError::InvalidSignalMaskHow(how).into_outcome();
         }
-        if args.set != 0 {
+        if let Some(mask) = signal_mask {
             let Some(process) = self.process_mut(pid) else {
                 return SyscallOutcome::errno(LinuxErrno::ESRCH);
             };
-            if let Err(error) = process.signals.apply_mask(args.how, args.set) {
+            if let Err(error) = process.signals.apply_mask(how, mask) {
                 return error.into_outcome();
             }
         }
-        SyscallOutcome::success(0).with_decoded_field("signal_mask", format!("{:#x}", args.set))
+        let decoded_mask = signal_mask
+            .map(|mask| format!("{mask:#x}"))
+            .unwrap_or_else(|| "unchanged".to_owned());
+        SyscallOutcome::success(0).with_decoded_field("signal_mask", decoded_mask)
     }
 
     fn queue_process_signal(&mut self, pid: GuestPid, signal: u32) {
@@ -209,10 +227,10 @@ impl GuestKernel {
         let Some(pid) = self.task(tid).map(|task| task.pid) else {
             return SyscallOutcome::errno(LinuxErrno::ESRCH);
         };
-        if self
-            .take_pending_signal_for_task(tid, pid, signal_mask)
-            .is_some()
-        {
+        if let Some(signal) = self.take_pending_signal_for_task(tid, pid, signal_mask) {
+            if let Some(task) = self.task_mut(tid) {
+                task.pending_signal_delivery = Some(signal);
+            }
             return SyscallOutcome::errno(LinuxErrno::EINTR)
                 .with_decoded_field("signal_wait", "interrupted");
         }
@@ -252,6 +270,7 @@ impl GuestKernel {
                 let result = if returns_signal {
                     u64::from(signal)
                 } else {
+                    task.pending_signal_delivery = Some(signal);
                     SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64()
                 };
                 task.regs = task.regs.with_syscall_return(task.regs.rip(), result);

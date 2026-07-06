@@ -467,24 +467,12 @@ impl RuntimeSubsystems {
                 .write_bytes(args.oldset, &current_mask.to_le_bytes())
                 .map_err(memory_errno)?;
         }
-        let kernel_request = SyscallRequest::from_guest_context(GuestContext::new(
-            request.context.pid,
+        let outcome = self.process.tasks.rt_sigprocmask_current_mask(
             request.context.tid,
-            mcr_sys::SyscallRegisters {
-                rax: request.number.raw(),
-                rdi: u64::from(args.how),
-                rsi: set,
-                rdx: 0,
-                r10: args.sigsetsize,
-                r8: 0,
-                r9: 0,
-                rip: request.context.rip,
-            },
-        ));
-        let outcome = self
-            .process
-            .tasks
-            .dispatch_for_current_task(&kernel_request);
+            args.how,
+            (args.set != 0).then_some(set),
+            args.sigsetsize,
+        );
         match outcome.result {
             SyscallReturn::Success(_) => {
                 self.store_selected_process_memory(pid)?;

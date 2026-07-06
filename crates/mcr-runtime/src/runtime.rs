@@ -785,6 +785,9 @@ where
     {
         return Ok(step);
     }
+    if let Some(step) = try_deliver_pending_guest_signal(dispatcher, tid, pid, before_rip, gpr)? {
+        return Ok(step);
+    }
     #[cfg(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(windows, target_arch = "x86_64")
@@ -948,6 +951,105 @@ where
         final_regs.rax(),
         task.state(),
     ))
+}
+
+pub(crate) fn try_deliver_pending_guest_signal<T>(
+    dispatcher: &mut SyscallDispatcher<RuntimeSubsystems, T>,
+    tid: mcr_sys::GuestTid,
+    pid: mcr_sys::GuestPid,
+    before_rip: u64,
+    expected_task_regs: GprState,
+) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
+where
+    T: SyscallTracer,
+{
+    let signal = dispatcher
+        .subsystems_mut()
+        .tasks_mut()
+        .task_mut(tid)
+        .and_then(GuestTask::take_pending_signal_delivery);
+    let Some(signal) = signal else {
+        return Ok(None);
+    };
+
+    let Some((action, signal_mask)) =
+        dispatcher
+            .subsystems()
+            .tasks()
+            .process(pid)
+            .and_then(|process| {
+                process
+                    .signals()
+                    .action(signal)
+                    .map(|action| (action, process.signals().blocked()))
+            })
+    else {
+        return Ok(None);
+    };
+    if action.action() == LINUX_SIG_DFL
+        || action.action() == LINUX_SIG_IGN
+        || action.flags() & LINUX_SA_RESTORER == 0
+        || action.restorer() == 0
+    {
+        return Ok(None);
+    }
+
+    let fs_base = dispatcher
+        .subsystems()
+        .tasks()
+        .task(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?
+        .tls()
+        .fs_base();
+    let alt_stack = dispatcher
+        .subsystems()
+        .events
+        .signal_alt_stacks
+        .get(&tid)
+        .copied();
+    let handler_registers = {
+        let memory = dispatcher
+            .subsystems_mut()
+            .memory_for_process_mut(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+        setup_rt_signal_frame(
+            memory,
+            registers_from_gpr_with_fs_base(expected_task_regs, fs_base),
+            action,
+            signal,
+            signal_mask,
+            0,
+            alt_stack,
+        )
+        .map_err(|errno| GuestExecutionError::Memory(memory_error_from_errno(errno)))?
+    };
+
+    if let Some(process) = dispatcher.subsystems_mut().tasks_mut().process_mut(pid) {
+        let mut blocked = signal_mask | action.mask();
+        if action.flags() & LINUX_SA_NODEFER == 0 {
+            blocked |= signal_mask_for(signal);
+        }
+        process.signals_mut().set_blocked(blocked);
+    }
+    let gpr = gpr_from_registers(handler_registers);
+    let task = dispatcher
+        .subsystems_mut()
+        .tasks_mut()
+        .task_mut(tid)
+        .ok_or(GuestExecutionError::MissingTask(tid))?;
+    let final_regs = if task.regs() == expected_task_regs {
+        task.set_regs(gpr);
+        gpr
+    } else {
+        task.regs()
+    };
+    Ok(Some(GuestExecutionStep::new(
+        tid,
+        before_rip,
+        final_regs.rip(),
+        final_regs.rax(),
+        task.state(),
+    )))
 }
 
 pub(crate) fn dispatch_rt_sigreturn_guest_task<T>(

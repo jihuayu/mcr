@@ -91,6 +91,66 @@ fn rt_sigaction_copies_guest_action_and_returns_old_action() {
 }
 
 #[test]
+fn rt_sigprocmask_applies_empty_guest_set() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let block_mask_addr = 0x402000;
+    let empty_mask_addr = 0x402020;
+    let old_mask_addr = 0x402040;
+    runtime
+        .memory_mut()
+        .write(block_mask_addr, &0b1010u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(empty_mask_addr, &0u64.to_le_bytes())
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigprocmask,
+                [
+                    mcr_sys::LINUX_SIG_SETMASK as u64,
+                    block_mask_addr,
+                    0,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigprocmask,
+                [
+                    mcr_sys::LINUX_SIG_SETMASK as u64,
+                    empty_mask_addr,
+                    old_mask_addr,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+
+    assert_eq!(
+        runtime
+            .kernel()
+            .process(INITIAL_GUEST_PID)
+            .unwrap()
+            .signals()
+            .blocked(),
+        0
+    );
+    assert_eq!(u64_from_guest(runtime.memory(), old_mask_addr), 0b1010);
+}
+
+#[test]
 fn rt_sigtimedwait_returns_eagain_after_validating_inputs() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     runtime
@@ -212,6 +272,92 @@ fn rt_sigsuspend_reads_temporary_mask_and_blocks_for_unmasked_signal() {
         runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
         TaskState::WaitingForSignalSuspend { mask: signal_mask }
     );
+}
+
+#[test]
+fn rt_sigsuspend_wakes_when_child_exits() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let signal_mask = 1u64 << (LINUX_SIGCHLD - 1);
+    runtime
+        .memory_mut()
+        .write(0x402000, &(!signal_mask).to_le_bytes())
+        .unwrap();
+
+    let fork = runtime.dispatch_syscall(context(Syscall::Fork, [0; 6]));
+    assert_eq!(fork.result, SyscallReturn::Success(2));
+    let wait = runtime.dispatch_syscall(context(Syscall::RtSigsuspend, [0x402000, 8, 0, 0, 0, 0]));
+    assert_eq!(wait.result, SyscallReturn::Success(0));
+
+    let child_exit =
+        runtime.dispatch_syscall(context_for(2, 2, Syscall::ExitGroup, [0, 0, 0, 0, 0, 0]));
+
+    assert_eq!(child_exit.result, SyscallReturn::Success(0));
+    let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(
+        SyscallReturn::decode_rax(task.regs().rax()),
+        SyscallReturn::Errno(LinuxErrno::EINTR)
+    );
+}
+
+#[test]
+fn rt_sigsuspend_delivers_child_signal_handler() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let action_addr = 0x402100;
+    let signal_mask = 1u64 << (LINUX_SIGCHLD - 1);
+    runtime
+        .memory_mut()
+        .write(0x402000, &(!signal_mask).to_le_bytes())
+        .unwrap();
+    write_guest_sigaction(
+        runtime.memory_mut(),
+        action_addr,
+        0x411000,
+        LINUX_SA_RESTORER,
+        0x422000,
+        0,
+    );
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::RtSigaction,
+                [
+                    LINUX_SIGCHLD,
+                    action_addr,
+                    0,
+                    mcr_sys::LINUX_KERNEL_SIGSET_SIZE,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Fork, [0; 6]))
+            .result,
+        SyscallReturn::Success(2)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::RtSigsuspend, [0x402000, 8, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context_for(2, 2, Syscall::ExitGroup, [0, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(0)
+    );
+
+    let signal = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, INITIAL_GUEST_TID)
+        .expect("signal handler is delivered before parent resumes");
+
+    assert_eq!(signal.after_rip(), 0x411000);
+    assert_eq!(signal.task_state(), TaskState::Runnable);
 }
 
 #[cfg(any(
@@ -1024,6 +1170,64 @@ fn native_fork_keeps_parent_and_child_memory_isolated() {
     runtime.memory().read(0x402000, &mut parent_bytes).unwrap();
 
     assert_eq!(&parent_bytes, b"parent");
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn native_rt_sigsuspend_wakes_when_child_exits() {
+    let _guard = native_execution_test_guard();
+    let mut runtime = Runtime::new(test_program_with_entry_code(
+        "/bin/app",
+        0x401000,
+        &[
+            0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax,fork
+            0x0f, 0x05, // syscall
+            0x85, 0xc0, // test eax,eax
+            0x74, 0x1f, // je child
+            0x48, 0xbf, 0x00, 0x20, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rdi,0x402000
+            0xbe, 0x08, 0x00, 0x00, 0x00, // mov esi,8
+            0xb8, 0x82, 0x00, 0x00, 0x00, // mov eax,rt_sigsuspend
+            0x0f, 0x05, // syscall
+            0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax,exit_group
+            0x31, 0xff, // xor edi,edi
+            0x0f, 0x05, // syscall
+            0xb8, 0xe7, 0x00, 0x00, 0x00, // child: mov eax,exit_group
+            0x31, 0xff, // xor edi,edi
+            0x0f, 0x05, // syscall
+        ],
+    ))
+    .unwrap();
+    runtime.enable_native_execution();
+    let signal_mask = 1u64 << (LINUX_SIGCHLD - 1);
+    runtime
+        .memory_mut()
+        .write(0x402000, &(!signal_mask).to_le_bytes())
+        .unwrap();
+
+    let fork = runtime
+        .dispatch_guest_execution()
+        .expect("parent native fork syscall executes");
+    assert_eq!(fork.encoded_rax(), 2);
+    let wait = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, INITIAL_GUEST_TID)
+        .expect("parent reaches rt_sigsuspend");
+    assert_eq!(
+        wait.task_state(),
+        TaskState::WaitingForSignalSuspend { mask: signal_mask }
+    );
+
+    let child = dispatch_guest_task_with_dispatcher(&mut runtime.dispatcher, 2)
+        .expect("child native branch exits");
+
+    assert_eq!(child.task_state(), TaskState::Exited { status: 0 });
+    let parent = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(parent.state(), TaskState::Runnable);
+    assert_eq!(
+        SyscallReturn::decode_rax(parent.regs().rax()),
+        SyscallReturn::Errno(LinuxErrno::EINTR)
+    );
 }
 
 #[test]

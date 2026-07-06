@@ -176,6 +176,7 @@ pub struct RuntimeStallDiagnostic {
     runnable_tasks: usize,
     fd_wait_tasks: usize,
     child_wait_tasks: usize,
+    signal_wait_tasks: usize,
     futex_wait_tasks: usize,
     task_states: Vec<DiagnosticTask>,
     recent_syscalls: Vec<DiagnosticSyscall>,
@@ -206,6 +207,11 @@ impl RuntimeStallDiagnostic {
             .tasks()
             .iter()
             .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForChild))
+            .count();
+        let signal_wait_tasks = diagnostics
+            .tasks()
+            .iter()
+            .filter(|task| matches!(task.state(), DiagnosticTaskState::WaitingForSignal { .. }))
             .count();
         let futex_wait_tasks = diagnostics
             .tasks()
@@ -240,6 +246,11 @@ impl RuntimeStallDiagnostic {
                 RuntimeStallKind::Scheduling,
                 format!("{child_wait_tasks} task(s) waiting for child process completion"),
             )
+        } else if signal_wait_tasks > 0 {
+            (
+                RuntimeStallKind::Scheduling,
+                format!("{signal_wait_tasks} task(s) waiting for signal delivery"),
+            )
         } else if futex_wait_tasks > 0 {
             (
                 RuntimeStallKind::GuestWaitFutex,
@@ -270,6 +281,7 @@ impl RuntimeStallDiagnostic {
             runnable_tasks,
             fd_wait_tasks,
             child_wait_tasks,
+            signal_wait_tasks,
             futex_wait_tasks,
             task_states: diagnostics.tasks().to_vec(),
             recent_syscalls: recent_completed_syscalls(diagnostics, 32),
@@ -312,6 +324,11 @@ impl RuntimeStallDiagnostic {
     }
 
     #[must_use]
+    pub const fn signal_wait_tasks(&self) -> usize {
+        self.signal_wait_tasks
+    }
+
+    #[must_use]
     pub const fn futex_wait_tasks(&self) -> usize {
         self.futex_wait_tasks
     }
@@ -342,8 +359,12 @@ impl fmt::Display for RuntimeStallDiagnostic {
         }
         write!(
             formatter,
-            "; tasks runnable={} fd_wait={} child_wait={} futex_wait={}",
-            self.runnable_tasks, self.fd_wait_tasks, self.child_wait_tasks, self.futex_wait_tasks
+            "; tasks runnable={} fd_wait={} child_wait={} signal_wait={} futex_wait={}",
+            self.runnable_tasks,
+            self.fd_wait_tasks,
+            self.child_wait_tasks,
+            self.signal_wait_tasks,
+            self.futex_wait_tasks
         )?;
         write_task_state_summary(formatter, &self.task_states)?;
         write_recent_syscalls(formatter, &self.recent_syscalls)
@@ -426,6 +447,9 @@ fn diagnostic_task_state_display(state: DiagnosticTaskState) -> String {
     match state {
         DiagnosticTaskState::Runnable => "runnable".to_owned(),
         DiagnosticTaskState::WaitingForChild => "child_wait".to_owned(),
+        DiagnosticTaskState::WaitingForSignal { mask, suspend } => {
+            format!("signal_wait(mask=0x{mask:x}, suspend={suspend})")
+        }
         DiagnosticTaskState::WaitingForFd { fd, write } => {
             format!("fd_wait(fd={fd}, write={write})")
         }
@@ -661,6 +685,7 @@ impl DiagnosticTask {
 pub enum DiagnosticTaskState {
     Runnable,
     WaitingForChild,
+    WaitingForSignal { mask: u64, suspend: bool },
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { uaddr: u64 },
     WaitingForSleep,
@@ -672,10 +697,17 @@ impl DiagnosticTaskState {
     pub const fn from_task_state(state: TaskState) -> Self {
         match state {
             TaskState::Runnable => Self::Runnable,
-            TaskState::WaitingForChild { .. }
-            | TaskState::WaitingForVfork { .. }
-            | TaskState::WaitingForSignalSuspend { .. }
-            | TaskState::WaitingForSignalSet { .. } => Self::WaitingForChild,
+            TaskState::WaitingForChild { .. } | TaskState::WaitingForVfork { .. } => {
+                Self::WaitingForChild
+            }
+            TaskState::WaitingForSignalSuspend { mask } => Self::WaitingForSignal {
+                mask,
+                suspend: true,
+            },
+            TaskState::WaitingForSignalSet { mask } => Self::WaitingForSignal {
+                mask,
+                suspend: false,
+            },
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
             TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },
             TaskState::WaitingForSleep => Self::WaitingForSleep,

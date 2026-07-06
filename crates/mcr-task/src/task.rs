@@ -49,6 +49,7 @@ pub struct GuestTask {
     pub(crate) robust_list: Option<GuestAddress>,
     pub(crate) clear_child_tid: Option<GuestAddress>,
     pub(crate) pending_signals: BTreeSet<u32>,
+    pub(crate) pending_signal_delivery: Option<u32>,
 }
 
 impl GuestTask {
@@ -62,6 +63,7 @@ impl GuestTask {
             robust_list: None,
             clear_child_tid: None,
             pending_signals: BTreeSet::new(),
+            pending_signal_delivery: None,
         }
     }
 
@@ -106,5 +108,9 @@ impl GuestTask {
 
     pub fn take_clear_child_tid(&mut self) -> Option<GuestAddress> {
         self.clear_child_tid.take()
+    }
+
+    pub fn take_pending_signal_delivery(&mut self) -> Option<u32> {
+        self.pending_signal_delivery.take()
     }
 }
