@@ -72,10 +72,18 @@ the optimized result, and exits with concurrent compiler-thread shutdown
 working. The default optimized probe prints the expected result; V8 diagnostic
 flags such as `--trace-opt` remain broader follow-up coverage.
 
+2026-07-06 Next.js probe follow-up: `require("next/dist/server/config")`
+reaches V8's executable-memory write-scope cleanup path and shows the next
+boundary is complete FS/TLS coverage, not missing Node packages. `jit-003`
+tracks the required change: classify every FS-relative memory operand before
+native execution, materialize only safe forms, and force the rest through an
+explicit trap/interpreter path instead of depending on host faults.
+
 | Command | Current result | Required follow-up |
 |---|---|---|
 | `mcr run-rootfs go-rootfs /bin/sh -c "go version"` | After the FS/TLS fallback checkpoint, the latest bounded local rerun still exceeded a 90s process timeout without output. | Rerun with host-step and native-fault diagnostics to classify the current native-window blocker now that high-address FS/TLS fallback is no longer the known missing boundary. |
 | `mcr run-rootfs node-rootfs /bin/sh -c "<run JavaScript with default Node/V8 JIT>"` | The extended-support smoke is now promoted to default V8 JIT and verifies optimized JavaScript with `node-ok`. A bounded default concurrent probe also prints `opt-concurrent=42`. | Keep broader Node package-manager and large application workloads on the workload backlog; the default JIT smoke is restored. |
+| `mcr run-rootfs node-rootfs /bin/sh -c "cd /tmp/mcr-next-smoke && node probe-config-require.js"` | A focused Next.js config-loader probe fails in V8/Abseil mutex cleanup after FS-relative TLS slot handling reaches the executable-memory write-scope path. | Complete `jit-003` FS/TLS classification and explicit trap/interpreter routing, then promote this focused probe before attempting a full `next build` contract. |
 | `mcr run-rootfs jdk-rootfs /bin/sh -c "<javac then java>"` | JDK compile-and-run is repeatably green locally when the smoke pins the compile/run step to interpreted mode with `javac -J-Xint` and `java -Xint`. Unpinned `javac -version` is now covered after nanosleep stopped blocking the whole guest scheduler. | Keep broader unpinned Java compilation workloads on the workload backlog, but the extended-support javac version and compile-and-run smoke is restored. |
 | `mcr run-rootfs mysql-rootfs /bin/sh -c "<bootstrap mariadbd and run query matrix>"` | MariaDB bootstrap mode now initializes InnoDB, creates customer/item/order tables, bulk-inserts 128 rows, and verifies ordinary lookup, forced-index aggregate, JOIN aggregate, and range aggregate query results through `SELECT ... INTO OUTFILE`. Full install-db plus background daemon/client query remains broader than the restored smoke; the latest bounded install-db probe still did not complete. | Keep full local server startup plus client query coverage on the workload backlog; the extended-support bootstrap query matrix is restored. |
 | `mcr run-rootfs rust-rootfs /bin/sh -c "cargo --version"` | The FS/TLS fallback now handles the prior `mov rax, fs:[0]` native fault and advances execution to `guest block terminated with x86 exception before syscall at guest rip 0x000000007006681e`. | Classify the new x86 exception terminator and decide whether it is an unsupported instruction, signal/exception semantic gap, or workload-specific runtime blocker. |

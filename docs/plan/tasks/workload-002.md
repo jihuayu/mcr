@@ -54,3 +54,6 @@ target\debug\mcr.exe run-rootfs --guest-step-limit 160000 tests\fixtures\rootfs\
 - V8 diagnostic modes such as `--trace-opt` and forced
   `--no-concurrent-recompilation` still exercise broader mutex/logging paths
   than this default-JIT contract and remain outside this task.
+- Focused Next.js package probes such as `require("next/dist/server/config")`
+  exercise a deeper FS/TLS write-scope cleanup path and are tracked by
+  `jit-003`.
