@@ -14,6 +14,23 @@ ELF file
   -> return Linux ABI result to guest registers
 ```
 
+## Runtime Layering
+
+The runtime is a userspace Linux kernel model, not a set of direct Windows API
+shortcuts. The implementation is split across four layers:
+
+| Layer | Responsibility |
+|---|---|
+| Host | Windows threads, memory protection, timers, files, sockets, and exception hooks as infrastructure only. |
+| MCR runtime | Guest scheduler, syscall dispatch, signal delivery, futexes, VFS, memory, native patching, and diagnostics. |
+| Guest kernel model | Linux process/thread state, address spaces, fd tables, signal dispositions, pending signals, and wait queues. |
+| Guest application | Linux ELF code such as BusyBox, Node/V8, JDK, MySQL, Redis, and build tools. |
+
+Linux-visible semantics must be owned by the runtime and guest-kernel model.
+Windows thread, signal, and handle behavior may back an implementation detail,
+but must not leak into guest-visible IDs, signal results, futex wakeups, fd
+numbers, or errno values.
+
 ## ELF Loader
 
 The loader owns:
@@ -98,9 +115,12 @@ struct GuestProcess {
     mm: MmSpace,
     files: Arc<FdTable>,
     fs: FsContext,
-    signals: SignalState,
+    signal_dispositions: Arc<SignalDispositions>,
+    signal_mask_process_defaults: SignalState,
+    process_pending_signals: SignalQueue,
     children: BTreeSet<GuestPid>,
     exit_state: ExitState,
+    exit_group_state: Option<ExitStatus>,
 }
 
 struct GuestTask {
@@ -108,10 +128,14 @@ struct GuestTask {
     pid: GuestPid,
     regs: GprState,
     tls: TlsState,
+    signal_mask: SigSet,
+    thread_pending_signals: SignalQueue,
     state: TaskState,
     host_thread: Option<HostThreadId>,
     robust_list: Option<u64>,
     clear_child_tid: Option<u64>,
+    waiting_on: Option<WaitObject>,
+    interrupt_pending: bool,
 }
 ```
 
@@ -123,7 +147,10 @@ Required semantics:
 - `fork+exec` is optimized as a common shell path;
 - full copy-on-write `fork` without immediate exec is explicitly not required for Phase 2 unless needed by a smoke workload;
 - `wait4` observes guest child exit state;
-- signals can be skeletal but must support common install, mask, interrupt, and termination paths.
+- signal dispositions are process-shared, while signal masks and thread-pending signals are per task;
+- `exit` terminates the current task, while `exit_group` terminates every task in the guest process;
+- `set_tid_address` and `CLONE_CHILD_CLEARTID` write zero to `clear_child_tid` and wake the matching futex when a thread exits;
+- robust-list cleanup must remain a first-class task-exit hook even when the first implementation supports only the subset needed by current workloads.
 
 ## Guest TLS And `arch_prctl`
 
@@ -140,17 +167,124 @@ Required Phase 2 behavior:
 
 Rust `thread_local!`, host thread-local APIs, and host TLS slots may be used only as implementation details. They must not become guest-visible TLS semantics.
 
+## Signal Delivery And Return-To-User
+
+Signal handling is the primary compatibility boundary for language runtimes such
+as Node/V8. The runtime must not treat `kill`, `tkill`, or `tgkill` as direct
+host process actions. They enqueue Linux signals into process-level or
+thread-level pending queues, then the runtime delivers them at Linux return
+points.
+
+Required signal model:
+
+- signal dispositions from `rt_sigaction` are shared by the guest process;
+- each task owns its signal mask, alternate signal stack state, and
+  thread-pending signal queue;
+- process-pending signals from `kill(pid, sig)` may be delivered to any
+  unmasked task in the process;
+- thread-pending signals from `tkill`, `tgkill`, `pthread_kill`, or native
+  guest faults may be delivered only to the target task;
+- standard signals coalesce while pending; real-time signal queuing is deferred
+  until a workload requires it;
+- fatal default actions such as `SIGABRT`, `SIGSEGV`, `SIGILL`, `SIGBUS`, and
+  `SIGFPE` terminate the guest process unless a guest handler overrides them;
+- stop/continue job-control signals may stay explicitly unsupported until pty
+  and job-control support enter scope.
+
+All paths that can enter guest code must call a single return-to-user delivery
+hook before native execution or interpreted execution resumes:
+
+- normal syscall return;
+- syscall return after blocking wait wakeup;
+- scheduler task switch to a runnable task;
+- `rt_sigprocmask` changes that unblock pending signals;
+- `rt_sigreturn` after restoring the saved context;
+- first user entry of a newly cloned task.
+
+The delivery hook selects a deliverable signal by checking thread-pending
+signals before process-pending signals and by skipping signals blocked by the
+task mask. When a handler is installed, the runtime builds an `rt_sigframe` on
+the guest stack or signal alt stack, writes `siginfo_t` and `ucontext_t`, sets
+`rdi/rsi/rdx` to Linux handler arguments, updates the task mask using the
+action mask and `SA_NODEFER`, and jumps to the guest handler. `rt_sigreturn`
+restores the saved registers and mask from the frame.
+
+Blocking syscalls that Linux can interrupt must be represented as
+interruptible waits. When a deliverable signal arrives, the runtime removes the
+task from the wait queue, marks it runnable, returns `EINTR` or arranges a
+restart according to the installed action and `SA_RESTART`, then lets the
+return-to-user hook deliver the signal frame.
+
 ## Futex And Synchronization
 
-Phase 2 supports process-private futex behavior only.
+Phase 2 supports process-private futex behavior first. The long-term futex
+table must still have a shape that can represent process-shared futexes later.
 
 Required behavior:
 
 - `FUTEX_WAIT` checks the guest memory value before sleeping;
 - `FUTEX_WAKE` wakes up to the requested number of waiters;
-- timeout and interrupt paths produce Linux-compatible results;
-- implementation maps to `WaitOnAddress` and `WakeByAddress*` only while all guest tasks share one host process;
-- process-shared futex is deferred and must not be accidentally advertised.
+- timeout and interrupt paths produce Linux-compatible results such as
+  `ETIMEDOUT`, `EAGAIN`, and `EINTR`;
+- private futex keys include the guest address-space identity plus the guest
+  address, so same-process threads synchronize on `(mm_id, uaddr)`;
+- shared futex keys will need mapping identity plus offset; until implemented,
+  process-shared futex behavior must fail intentionally rather than sharing on
+  host virtual addresses;
+- thread exit performs `clear_child_tid` zeroing and wakes the matching futex
+  as part of the task-exit path used by pthread join;
+- implementation may use `WaitOnAddress` and `WakeByAddress*` only while all
+  guest tasks share one host process and the runtime still owns the Linux
+  keying and wake semantics.
+
+## Scheduler And Wait Loop
+
+The scheduler owns guest task state transitions. A lack of runnable tasks is
+not automatically a runtime crash.
+
+Required scheduler behavior:
+
+- if all tasks are dead, return the guest process exit status;
+- if the process is in `exit_group`, wake all tasks that can be woken so they
+  can run task-exit cleanup and release futex waiters;
+- if tasks are blocked on interruptible waits and the runtime has timers,
+  fd-readiness, futex, signal, or child-exit wake sources, wait for or poll the
+  next source;
+- if blocked tasks have no possible wake source, report a deadlock or stalled
+  wait diagnostic rather than a native execution fault;
+- diagnostics for stalls must include runnable count, futex waiters, fd waiters,
+  child waiters, signal waiters, task states, last syscall, and recent syscalls.
+
+`no runnable guest tasks remain` should be reserved for diagnostics where the
+runtime has proven there are no runnable tasks and no event source that can make
+forward progress. It must not be emitted while the process is still completing
+valid Linux thread-exit or signal-delivery work.
+
+## Dynamic Executable Pages And Native Faults
+
+V8 and other JIT runtimes generate executable code after process startup. MCR
+must track those pages with the same Linux ABI discipline used for file-backed
+ELF mappings.
+
+Required behavior:
+
+- `mmap` or `mprotect` that grants `PROT_EXEC` invalidates native patch metadata
+  for the affected range and increments an executable-generation marker;
+- writes to executable or RWX pages must conservatively invalidate the affected
+  translated/native patch range before it can run again;
+- native entry checks the executable-generation metadata and scans newly
+  executable ranges for syscall traps and supported intrinsic patches;
+- Windows `FlushInstructionCache` is required after host-side code patching or
+  guest writes that can affect host-executed instructions;
+- host SEH/VEH exceptions from guest-owned addresses map to Linux signals such
+  as `SIGSEGV`, `SIGBUS`, `SIGILL`, and `SIGFPE`, enqueue thread-pending
+  `siginfo`, and return through the normal signal-delivery hook.
+
+Node/V8 JIT stability depends more on signal/futex/thread lifecycle semantics
+than on the raw ability to execute generated machine code. A JIT-generated code
+page may execute successfully while the process still fails during concurrent
+compiler-thread shutdown or fatal-signal delivery; those are task/signal/futex
+bugs, not proof that dynamic executable tracking is complete.
 
 ## VFS And File Descriptor Model
 
