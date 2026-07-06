@@ -155,6 +155,11 @@ Required semantics:
 ## Guest TLS And `arch_prctl`
 
 Guest thread-local storage is Linux ABI state, not host Rust TLS.
+On Linux x86-64, FS-relative memory operands are the normal TLS access path for
+libc, libstdc++, V8, and language runtimes. Every guest task therefore owns an
+FS base, and every instruction with an FS segment override must resolve through
+that task's guest FS base. Host segment registers, host thread-local storage,
+and Windows TEB/PEB state are implementation details only.
 
 Required Phase 2 behavior:
 
@@ -162,10 +167,43 @@ Required Phase 2 behavior:
 - preserve FS base across syscall dispatch and task scheduling;
 - reset FS base on `execve` according to the newly loaded image and dynamic linker path;
 - copy or initialize FS base intentionally for the supported `fork`/`vfork`/`clone` paths;
-- make same-ISA native execution and any re-emitted guest code observe guest FS-relative memory accesses;
+- classify every executable instruction whose memory operand uses the FS
+  segment before same-ISA native execution can run that range;
+- materialize only FS-relative forms whose replacement is proven correct for
+  the current FS base and instruction length constraints;
+- force every unmaterialized FS-relative site through a trap, marker, or
+  interpreted execution path before the host CPU can execute it;
+- make same-ISA native execution and any re-emitted guest code observe guest
+  FS-relative memory accesses for loads, register stores, immediate stores,
+  comparisons, tests, and arithmetic/logical memory operations;
 - return explicit Linux errors for unsupported `arch_prctl` operations.
 
-Rust `thread_local!`, host thread-local APIs, and host TLS slots may be used only as implementation details. They must not become guest-visible TLS semantics.
+The native-patch pipeline may keep fast fixed-width absolute rewrites for common
+forms such as `mov r64, fs:[disp32]`, but that optimization is not the semantic
+boundary. The semantic boundary is: no unclassified or unhandled FS-relative
+guest instruction may fall through to host native execution. Relying on a host
+fault is not sufficient because an invalid guest TLS access may be a valid host
+FS/GS address, or may read host TLS data before MCR can intervene. Native fault
+fallback remains a diagnostic and recovery path for unexpected gaps, not the
+primary FS/TLS interception mechanism.
+
+The interpreter and any re-emitted block must compute FS-relative effective
+addresses as `task.fs_base + signed_displacement`, then apply normal guest
+memory permissions and Linux fault mapping. If a Windows host adapter can safely
+install a zero or sentinel host FS/GS base for the native-execution window
+without breaking the host thread runtime, it may do so as a hardening measure;
+correctness must not depend on that guard.
+
+Node/V8 is the gating workload for this boundary. V8 uses TLS slots to remember
+per-thread executable-code write scopes and the JIT page mutex currently held by
+that thread. A stale, host-routed, or partially emulated FS slot can make V8
+attempt to unlock a mutex that the guest thread does not hold. The runtime must
+preserve the full lock -> TLS slot nonzero -> unlock -> TLS slot clear lifecycle
+before larger Node package workloads can be considered stable.
+
+Rust `thread_local!`, host thread-local APIs, and host TLS slots may be used
+only as implementation details. They must not become guest-visible TLS
+semantics.
 
 ## Signal Delivery And Return-To-User
 
@@ -273,7 +311,8 @@ Required behavior:
 - writes to executable or RWX pages must conservatively invalidate the affected
   translated/native patch range before it can run again;
 - native entry checks the executable-generation metadata and scans newly
-  executable ranges for syscall traps and supported intrinsic patches;
+  executable ranges for syscall traps, supported intrinsic patches, and the
+  complete FS/TLS classification described above;
 - Windows `FlushInstructionCache` is required after host-side code patching or
   guest writes that can affect host-executed instructions;
 - host SEH/VEH exceptions from guest-owned addresses map to Linux signals such

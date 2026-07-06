@@ -391,15 +391,26 @@ the `0f 05` byte pair and skips the decoder entirely for candidate-free ranges;
 when candidates exist, decoding stops after the last candidate so large package
 binary tails are not walked after the final possible `syscall`.
 
-Windows FS-relative TLS patching records candidates separately from materializing
-rewrites. When the guest FS base is zero, newly discovered candidates stay in the
-cache but are not rewritten back to their original bytes, avoiding no-op patch
-work for large binaries. When the FS base is unchanged and only new executable
-ranges appear, only the new candidates are materialized; a real FS-base change
-still rewrites the full candidate set to preserve guest TLS semantics. Batched
-code patching groups fixed-width rewrites by host allocation so large syscall or
-TLS patch sets do not repeatedly toggle the same executable mapping's
-protection for each candidate.
+Windows FS-relative TLS handling has two layers:
+
+1. A correctness classifier decodes executable ranges and records every
+   instruction whose memory operand uses the FS segment. This includes loads,
+   register stores, immediate stores, comparisons, tests, and read-modify-write
+   arithmetic/logical operations. An unclassified FS-relative instruction must
+   be treated as a bug in the scanner, not as a valid native fast path.
+2. An optimization layer materializes only the subset that can be rewritten
+   safely for the current guest FS base. Fixed-width absolute rewrites remain
+   useful for short common forms, but unsupported forms must be routed through a
+   trap or interpreted marker before host native execution reaches them.
+
+The patch cache records FS candidates separately from materializing rewrites.
+When the guest FS base is zero, newly discovered candidates stay in the cache
+but no no-op rewrite is emitted. When the FS base is unchanged and only new
+executable ranges appear, only the new materializable candidates are patched; a
+real FS-base change still revisits the full candidate set so guest TLS semantics
+remain intact. Batched code patching groups fixed-width rewrites by host
+allocation so large syscall or TLS patch sets do not repeatedly toggle the same
+executable mapping's protection for each candidate.
 
 Native fault diagnostics include the faulting instruction bytes, a decoded
 instruction summary, the guest FS base, registers, and stack words. These
@@ -409,12 +420,15 @@ such as FS-relative TLS instructions whose guest FS base cannot be encoded by
 the current fixed-width absolute rewrite.
 
 When Windows native execution faults on an original FS-relative instruction that
-could not be rewritten into the fixed-width absolute form, the runtime now uses
-a narrow interpreted fallback. It preserves native floating-point state, seeds
-the same-ISA execution core with the guest FS base, executes the current block
-until the next syscall through the JIT memory operand path, and then resumes the
-normal syscall return flow. This keeps high-address TLS loads correct without
-turning unsupported native execution faults into a broad interpreter escape.
+could not be rewritten into the fixed-width absolute form, the runtime uses a
+narrow interpreted fallback. It preserves native floating-point state, seeds the
+same-ISA execution core with the guest FS base, executes the current block until
+the next syscall through the JIT memory operand path, and then resumes the normal
+syscall return flow. This fallback is not complete FS/TLS coverage: some
+incorrect host-routed TLS operations can read or write mapped host addresses and
+never fault. The long-term invariant is that non-materialized FS sites are
+explicitly trapped or interpreted before native execution, while fault fallback
+remains a last-resort diagnostic.
 
 ## Measurement Gates
 
