@@ -59,6 +59,13 @@ impl RuntimeSubsystems {
     ) -> Result<(), GuestExecutionError> {
         let patch_start = Instant::now();
         let mut cache = self.native.patch_caches.remove(&pid).unwrap_or_default();
+        let executable_write_generation = self
+            .memory_for_process(pid)
+            .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?
+            .executable_write_generation();
+        if cache.executable_write_generation != executable_write_generation {
+            cache.invalidate();
+        }
         let mut store_image_metadata = None;
         let mut fs_relative_materialized_this_call = false;
         if !cache.image_metadata_checked && cache.image_metadata_eligible {
@@ -254,6 +261,7 @@ impl RuntimeSubsystems {
             .map(|vma| (vma.start(), vma.end()))
             .collect::<Vec<_>>();
         cache.fs_base = materialized_fs_base;
+        cache.executable_write_generation = executable_write_generation;
         cache.scanned_ranges = scanned_now;
         host_step_trace(format_args!(
             "runtime native-patch-cache done pid={pid} ranges={} elapsed_ms={}",

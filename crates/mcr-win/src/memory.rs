@@ -161,6 +161,22 @@ impl HostMemory {
         protect_platform(self, offset, len, protection)
     }
 
+    /// Flushes the host instruction cache for a byte range inside the allocation.
+    pub fn flush_instruction_cache_range(&self, offset: usize, len: usize) -> HostResult<()> {
+        let Some(end) = offset.checked_add(len) else {
+            return Err(HostError::invalid_input(
+                HostOperation::FlushInstructionCache,
+            ));
+        };
+        if len == 0 || end > self.len {
+            return Err(HostError::invalid_input(
+                HostOperation::FlushInstructionCache,
+            ));
+        }
+
+        flush_instruction_cache_platform(self, offset, len)
+    }
+
     /// Copies a range from the allocation into `destination`.
     pub fn copy_to_slice(&self, offset: usize, destination: &mut [u8]) -> HostResult<()> {
         let Some(end) = offset.checked_add(destination.len()) else {
@@ -413,6 +429,27 @@ fn protect_platform(
     Ok(())
 }
 
+fn flush_instruction_cache_platform(
+    memory: &HostMemory,
+    offset: usize,
+    len: usize,
+) -> HostResult<()> {
+    let process = unsafe {
+        // SAFETY: `GetCurrentProcess` has no preconditions and returns a pseudo-handle.
+        GetCurrentProcess()
+    };
+    let ok = unsafe {
+        // SAFETY: The checked range is inside the allocation owned by `memory`.
+        FlushInstructionCache(process, memory.ptr.as_ptr().add(offset).cast(), len)
+    };
+    if ok == crate::windows::FALSE {
+        return Err(crate::error::last_windows_error(
+            HostOperation::FlushInstructionCache,
+        ));
+    }
+    Ok(())
+}
+
 impl MemoryProtection {
     const fn to_windows(self) -> u32 {
         match self {
@@ -485,6 +522,12 @@ unsafe extern "system" {
         address: *mut std::ffi::c_void,
         size: usize,
         free_type: u32,
+    ) -> crate::windows::Bool;
+    fn GetCurrentProcess() -> crate::windows::Handle;
+    fn FlushInstructionCache(
+        process: crate::windows::Handle,
+        base_address: *const std::ffi::c_void,
+        size: usize,
     ) -> crate::windows::Bool;
 }
 

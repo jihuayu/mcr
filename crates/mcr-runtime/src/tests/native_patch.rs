@@ -159,6 +159,19 @@ fn native_patch_cache_scans_only_new_executable_ranges() {
             .iter()
             .any(|(start, end)| *start <= 0x600000 && 0x600000 < *end)
     );
+
+    runtime.memory_mut().write(0x600000, &[0x0f, 0x05]).unwrap();
+    runtime
+        .dispatcher
+        .subsystems_mut()
+        .ensure_native_patch_cache(pid, 0)
+        .unwrap();
+
+    assert_eq!(
+        guest_bytes(runtime.memory(), 0x600000, 2),
+        [0xcc, 0x90],
+        "guest writes to executable pages must invalidate native patch metadata"
+    );
 }
 
 #[test]

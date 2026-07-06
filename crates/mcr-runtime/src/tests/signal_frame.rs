@@ -75,3 +75,48 @@ fn windows_native_access_and_privileged_faults_deliver_sigsegv() {
     ));
     assert!(!crate::runtime::native_fault_delivers_sigsegv(0xc000_001d));
 }
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn windows_native_privileged_fault_default_sigsegv_exits_guest_process() {
+    let _guard = native_execution_test_guard();
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let task = runtime.kernel().task(INITIAL_GUEST_TID).unwrap();
+    let gpr = task.regs();
+    let native_registers = mcr_win::HostCpuRegisters {
+        rip: 0x401000,
+        rsp: gpr.rsp(),
+        ..mcr_win::HostCpuRegisters::default()
+    };
+
+    let step = crate::runtime::try_deliver_native_guest_fault_signal(
+        &mut runtime.dispatcher,
+        INITIAL_GUEST_TID,
+        INITIAL_GUEST_PID,
+        0x401000,
+        gpr,
+        native_registers,
+        0,
+        crate::runtime::WINDOWS_EXCEPTION_PRIVILEGED_INSTRUCTION,
+        0x401000,
+    )
+    .unwrap()
+    .expect("default native SIGSEGV should be delivered as a fatal guest signal");
+
+    assert_eq!(
+        step.task_state(),
+        mcr_task::TaskState::Exited {
+            status: mcr_task::signal_exit_status(LINUX_SIGSEGV)
+        }
+    );
+    assert_eq!(
+        runtime
+            .kernel()
+            .process(INITIAL_GUEST_PID)
+            .unwrap()
+            .exit_state(),
+        ExitState::Exited {
+            status: mcr_task::signal_exit_status(LINUX_SIGSEGV)
+        }
+    );
+}

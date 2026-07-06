@@ -267,6 +267,7 @@ pub struct GuestMemory {
     mmap_base: u64,
     address_space_end: u64,
     host_address_mode: HostAddressMode,
+    executable_write_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +305,7 @@ impl GuestMemory {
             mmap_base,
             address_space_end,
             host_address_mode: HostAddressMode::Flexible,
+            executable_write_generation: 0,
         })
     }
 
@@ -365,6 +367,7 @@ impl GuestMemory {
             mmap_base: self.mmap_base,
             address_space_end: self.address_space_end,
             host_address_mode: self.host_address_mode,
+            executable_write_generation: self.executable_write_generation,
         }
     }
 
@@ -411,6 +414,7 @@ impl GuestMemory {
             mmap_base: self.mmap_base,
             address_space_end: self.address_space_end,
             host_address_mode: HostAddressMode::Flexible,
+            executable_write_generation: self.executable_write_generation,
         })
     }
 
@@ -478,6 +482,11 @@ impl GuestMemory {
 
     pub fn vmas(&self) -> impl Iterator<Item = &GuestVma> {
         self.vmas.values()
+    }
+
+    #[must_use]
+    pub const fn executable_write_generation(&self) -> u64 {
+        self.executable_write_generation
     }
 
     #[must_use]
@@ -632,6 +641,9 @@ impl GuestMemory {
             return Ok(None);
         }
 
+        if self.range_overlaps_executable(address, end) {
+            self.record_executable_write();
+        }
         self.ensure_guest_page_range_unique(address, end)?;
         let vma = self
             .vma_containing(address)
@@ -748,6 +760,10 @@ impl GuestMemory {
             .get(&vma.allocation_id)
             .expect("VMA references live allocation");
         apply_allocation_protections(&allocation.memory, &ranges)?;
+        allocation
+            .memory
+            .flush_instruction_cache_range(allocation_offset, bytes.len())
+            .map_err(GuestMemoryError::Host)?;
         Ok(old)
     }
 
@@ -824,7 +840,7 @@ impl GuestMemory {
                 .memory
                 .protect(MemoryProtection::ReadWrite)
                 .map_err(GuestMemoryError::Host)?;
-            for patch in patches {
+            for patch in &patches {
                 let patch_end = patch
                     .allocation_offset
                     .checked_add(N)
@@ -838,9 +854,27 @@ impl GuestMemory {
                 .get(&allocation_id)
                 .expect("VMA references live allocation");
             apply_allocation_protections(&allocation.memory, &ranges)?;
+            for patch in patches {
+                allocation
+                    .memory
+                    .flush_instruction_cache_range(patch.allocation_offset, N)
+                    .map_err(GuestMemoryError::Host)?;
+            }
         }
 
         Ok(())
+    }
+
+    fn record_executable_write(&mut self) {
+        self.executable_write_generation = self.executable_write_generation.wrapping_add(1);
+    }
+
+    fn range_overlaps_executable(&self, start: u64, end: u64) -> bool {
+        start < end
+            && self
+                .vmas
+                .values()
+                .any(|vma| vma.protection.execute && vma.start < end && start < vma.end)
     }
 
     fn ensure_guest_page_range_unique(
@@ -1570,6 +1604,7 @@ impl GuestMemory {
         let end = checked_raw_range(address, bytes.len() as u64)?;
         let mut cursor = address;
         let mut copied = 0usize;
+        let mut touched_executable = false;
         while cursor < end {
             let vma = self
                 .vma_containing(cursor)
@@ -1587,8 +1622,22 @@ impl GuestMemory {
             self.allocation_memory_mut(vma.allocation_id)?
                 .as_mut_slice()[allocation_offset..allocation_offset + chunk_len]
                 .copy_from_slice(&bytes[copied..copied + chunk_len]);
+            if vma.protection.execute {
+                let allocation = self
+                    .allocations
+                    .get(&vma.allocation_id)
+                    .expect("VMA references live allocation");
+                allocation
+                    .memory
+                    .flush_instruction_cache_range(allocation_offset, chunk_len)
+                    .map_err(GuestMemoryError::Host)?;
+                touched_executable = true;
+            }
             cursor += chunk_len as u64;
             copied += chunk_len;
+        }
+        if touched_executable {
+            self.record_executable_write();
         }
         Ok(())
     }

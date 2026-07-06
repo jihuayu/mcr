@@ -1160,31 +1160,44 @@ pub(crate) fn try_deliver_native_guest_fault_signal<T>(
     expected_task_regs: GprState,
     native_registers: mcr_win::HostCpuRegisters,
     fs_base: u64,
+    native_signal: u32,
     fault_address: u64,
 ) -> Result<Option<GuestExecutionStep>, GuestExecutionError>
 where
     T: SyscallTracer,
 {
-    let Some(action) = dispatcher
+    let action = dispatcher
         .subsystems()
         .tasks()
         .process(pid)
-        .and_then(|process| process.signals().action(LINUX_SIGSEGV))
-    else {
-        return Ok(None);
-    };
+        .and_then(|process| process.signals().action(LINUX_SIGSEGV));
     let signal_mask = dispatcher
         .subsystems()
         .tasks()
         .task(tid)
         .ok_or(GuestExecutionError::MissingTask(tid))?
         .signal_mask();
-    if action.action() == LINUX_SIG_DFL
-        || action.action() == LINUX_SIG_IGN
+    let default_native_fault_is_guest_fatal =
+        native_signal == WINDOWS_EXCEPTION_PRIVILEGED_INSTRUCTION;
+    let Some(action) = action else {
+        return if default_native_fault_is_guest_fatal {
+            deliver_default_signal_action(dispatcher, tid, pid, before_rip, LINUX_SIGSEGV)
+        } else {
+            Ok(None)
+        };
+    };
+    if action.action() == LINUX_SIG_DFL {
+        return if default_native_fault_is_guest_fatal {
+            deliver_default_signal_action(dispatcher, tid, pid, before_rip, LINUX_SIGSEGV)
+        } else {
+            Ok(None)
+        };
+    }
+    if action.action() == LINUX_SIG_IGN
         || action.flags() & LINUX_SA_RESTORER == 0
         || action.restorer() == 0
     {
-        return Ok(None);
+        return signal_noop_step(dispatcher, tid, before_rip);
     }
 
     let alt_stack = dispatcher
@@ -1411,6 +1424,7 @@ where
                     gpr,
                     native_registers,
                     fs_base,
+                    *signal as u32,
                     *address,
                 )?
             {

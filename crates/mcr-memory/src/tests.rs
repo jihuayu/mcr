@@ -175,6 +175,37 @@ fn borrowed_slices_require_one_contiguous_vma_and_matching_protection() {
 }
 
 #[test]
+fn executable_write_generation_tracks_guest_writes_to_executable_pages() {
+    let mut memory = memory();
+    let rw_addr = memory
+        .mmap(anonymous(
+            0,
+            GUEST_PAGE_SIZE,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            0,
+        ))
+        .unwrap();
+    let rwx_addr = memory
+        .mmap(anonymous(
+            0,
+            GUEST_PAGE_SIZE,
+            LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+            0,
+        ))
+        .unwrap();
+
+    assert_eq!(memory.executable_write_generation(), 0);
+    memory.write(rw_addr, b"data").unwrap();
+    assert_eq!(memory.executable_write_generation(), 0);
+    memory.write(rwx_addr, b"code").unwrap();
+    assert_eq!(memory.executable_write_generation(), 1);
+
+    let slice = memory.slice_mut(rwx_addr + 8, 1).unwrap().unwrap();
+    slice[0] = 0xcc;
+    assert_eq!(memory.executable_write_generation(), 2);
+}
+
+#[test]
 fn read_c_string_scans_vma_bounded_chunks_across_mappings() {
     let mut memory = memory();
     let addr = memory

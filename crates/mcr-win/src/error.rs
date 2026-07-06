@@ -10,6 +10,7 @@ pub type HostResult<T> = Result<T, HostError>;
 pub enum HostOperation {
     AllocateMemory,
     ProtectMemory,
+    FlushInstructionCache,
     FreeMemory,
     OpenFile,
     ReadFile,
@@ -52,6 +53,7 @@ impl fmt::Display for HostOperation {
         let operation = match self {
             Self::AllocateMemory => "allocate memory",
             Self::ProtectMemory => "protect memory",
+            Self::FlushInstructionCache => "flush instruction cache",
             Self::FreeMemory => "free memory",
             Self::OpenFile => "open file",
             Self::ReadFile => "read file",

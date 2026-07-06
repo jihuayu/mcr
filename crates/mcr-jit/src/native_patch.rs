@@ -111,6 +111,7 @@ pub type NativeImagePatchRangeMap = BTreeMap<mcr_sys::GuestPid, NativeImagePatch
 pub struct NativePatchCache {
     pub fs_base: u64,
     pub scanned_ranges: Vec<(u64, u64)>,
+    pub executable_write_generation: u64,
     pub image_metadata_checked: bool,
     pub image_metadata_eligible: bool,
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -178,6 +179,7 @@ impl Default for NativePatchCache {
         Self {
             fs_base: 0,
             scanned_ranges: Vec::new(),
+            executable_write_generation: 0,
             image_metadata_checked: false,
             image_metadata_eligible: true,
             #[cfg(all(windows, target_arch = "x86_64"))]

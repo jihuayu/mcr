@@ -1,7 +1,7 @@
 ---
 id: workload-002
 scope: phase2-workloads
-status: pending
+status: ready
 depends-on: [task-004, task-005, jit-002]
 ---
 
