@@ -1,7 +1,8 @@
 use mcr_sys::{
     GuestPid, GuestTid, KillSyscallArgs, LINUX_KERNEL_SIGSET_SIZE, LINUX_ROBUST_LIST_HEAD_SIZE,
-    LinuxErrno, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs, SetRobustListSyscallArgs,
-    SetTidAddressSyscallArgs, SyscallOutcome, SyscallReturn, TgkillSyscallArgs, TkillSyscallArgs,
+    LINUX_SIGCHLD, LinuxErrno, RtSigactionSyscallArgs, RtSigprocmaskSyscallArgs,
+    SetRobustListSyscallArgs, SetTidAddressSyscallArgs, SyscallOutcome, SyscallReturn,
+    TgkillSyscallArgs, TkillSyscallArgs,
 };
 
 use super::{GuestKernel, current_syscall_return_rip};
@@ -26,10 +27,14 @@ impl GuestKernel {
             .filter(|candidate| candidate.pid == pid)
             .all(|candidate| matches!(candidate.state, TaskState::Exited { .. }));
         if all_exited {
+            let parent = self.processes.get(&pid).and_then(|process| process.parent);
             if let Some(process) = self.processes.get_mut(&pid) {
                 process.exit_state = ExitState::Exited { status };
             }
             self.resume_vfork_parent(pid);
+            if let Some(parent) = parent {
+                self.queue_process_signal(parent, LINUX_SIGCHLD as u32);
+            }
         }
 
         SyscallOutcome::success(0)
@@ -50,10 +55,14 @@ impl GuestKernel {
         for tid in tids {
             self.set_task_state(tid, TaskState::Exited { status });
         }
+        let parent = self.processes.get(&pid).and_then(|process| process.parent);
         if let Some(process) = self.processes.get_mut(&pid) {
             process.exit_state = ExitState::Exited { status };
         }
         self.resume_vfork_parent(pid);
+        if let Some(parent) = parent {
+            self.queue_process_signal(parent, LINUX_SIGCHLD as u32);
+        }
 
         SyscallOutcome::success(0)
             .with_decoded_field("guest_pid", pid.to_string())
@@ -188,26 +197,64 @@ impl GuestKernel {
             .with_decoded_field("signal_wait", "no_pending_signal")
     }
 
+    pub fn rt_sigsuspend_current(
+        &mut self,
+        tid: GuestTid,
+        signal_mask: u64,
+        sigsetsize: u64,
+    ) -> SyscallOutcome {
+        if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+            return TaskError::InvalidSigsetSize(sigsetsize).into_outcome();
+        }
+        let Some(pid) = self.task(tid).map(|task| task.pid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        if self
+            .take_pending_signal_for_task(tid, pid, signal_mask)
+            .is_some()
+        {
+            return SyscallOutcome::errno(LinuxErrno::EINTR)
+                .with_decoded_field("signal_wait", "interrupted");
+        }
+
+        let return_rip = current_syscall_return_rip(self, tid);
+        let Some(task) = self.task_mut(tid) else {
+            return SyscallOutcome::errno(LinuxErrno::ESRCH);
+        };
+        task.regs = task.regs.with_syscall_return(return_rip, task.regs.rax());
+        self.set_task_state(
+            tid,
+            TaskState::WaitingForSignalSuspend { mask: signal_mask },
+        );
+        SyscallOutcome::success(0).with_decoded_field("task_blocked", "rt_sigsuspend")
+    }
+
     pub fn wake_signal_waiters(&mut self, pid: GuestPid) -> usize {
         let waiters = self
             .tasks
             .values()
             .filter_map(|task| match task.state {
                 TaskState::WaitingForSignalSet { mask } if task.pid == pid => {
-                    Some((task.tid, mask))
+                    Some((task.tid, mask, true))
+                }
+                TaskState::WaitingForSignalSuspend { mask } if task.pid == pid => {
+                    Some((task.tid, mask, false))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
         let mut woken = 0usize;
-        for (tid, mask) in waiters {
+        for (tid, mask, returns_signal) in waiters {
             let Some(signal) = self.take_pending_signal_for_task(tid, pid, mask) else {
                 continue;
             };
             if let Some(task) = self.task_mut(tid) {
-                task.regs = task
-                    .regs
-                    .with_syscall_return(task.regs.rip(), u64::from(signal));
+                let result = if returns_signal {
+                    u64::from(signal)
+                } else {
+                    SyscallReturn::Errno(LinuxErrno::EINTR).encode_u64()
+                };
+                task.regs = task.regs.with_syscall_return(task.regs.rip(), result);
                 self.set_task_state(tid, TaskState::Runnable);
                 woken += 1;
             }

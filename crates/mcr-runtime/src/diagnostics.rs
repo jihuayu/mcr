@@ -674,6 +674,7 @@ impl DiagnosticTaskState {
             TaskState::Runnable => Self::Runnable,
             TaskState::WaitingForChild { .. }
             | TaskState::WaitingForVfork { .. }
+            | TaskState::WaitingForSignalSuspend { .. }
             | TaskState::WaitingForSignalSet { .. } => Self::WaitingForChild,
             TaskState::WaitingForFd { fd, write } => Self::WaitingForFd { fd, write },
             TaskState::WaitingForFutex { key } => Self::WaitingForFutex { uaddr: key.uaddr() },

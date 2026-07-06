@@ -152,6 +152,7 @@ impl GuestKernel {
             }
             TaskState::WaitingForVfork { .. }
             | TaskState::WaitingForSleep
+            | TaskState::WaitingForSignalSuspend { .. }
             | TaskState::WaitingForSignalSet { .. }
             | TaskState::Exited { .. } => {}
         }
@@ -180,6 +181,7 @@ impl GuestKernel {
             }
             TaskState::WaitingForVfork { .. }
             | TaskState::WaitingForSleep
+            | TaskState::WaitingForSignalSuspend { .. }
             | TaskState::WaitingForSignalSet { .. }
             | TaskState::Exited { .. } => {}
         }

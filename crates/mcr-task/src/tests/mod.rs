@@ -884,6 +884,35 @@ fn rt_sigtimedwait_blocks_and_tkill_wakes_matching_waiter() {
 }
 
 #[test]
+fn rt_sigsuspend_blocks_and_child_sigchld_wakes_with_eintr() {
+    let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
+    let signal_mask = 1u64 << (LINUX_SIGCHLD - 1);
+    let child_pid = kernel.fork_child(INITIAL_GUEST_TID).unwrap();
+
+    assert_eq!(
+        kernel
+            .rt_sigsuspend_current(INITIAL_GUEST_TID, signal_mask, LINUX_KERNEL_SIGSET_SIZE)
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        kernel.task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForSignalSuspend { mask: signal_mask }
+    );
+
+    assert_eq!(
+        kernel.exit_group(child_pid, 0).result,
+        SyscallReturn::Success(0)
+    );
+    let task = kernel.task(INITIAL_GUEST_TID).unwrap();
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(
+        SyscallReturn::decode_rax(task.regs().rax()),
+        SyscallReturn::Errno(LinuxErrno::EINTR)
+    );
+}
+
+#[test]
 fn tkill_interrupts_futex_waiter_with_eintr() {
     let mut kernel = GuestKernel::new(test_program("/bin/app", 0x401000)).unwrap();
     kernel

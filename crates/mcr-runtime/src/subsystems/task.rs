@@ -49,6 +49,7 @@ impl mcr_sys::TaskSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::RtSigaction => self.dispatch_rt_sigaction(request),
             mcr_sys::Syscall::RtSigprocmask => self.dispatch_rt_sigprocmask(request),
             mcr_sys::Syscall::RtSigtimedwait => self.dispatch_rt_sigtimedwait(request),
+            mcr_sys::Syscall::RtSigsuspend => self.dispatch_rt_sigsuspend(request),
             mcr_sys::Syscall::Sigaltstack => self.dispatch_sigaltstack(request),
             mcr_sys::Syscall::SchedYield => self.dispatch_sched_yield(),
             mcr_sys::Syscall::SchedGetaffinity => self.dispatch_sched_getaffinity(request),
@@ -500,6 +501,13 @@ impl RuntimeSubsystems {
         }
     }
 
+    pub(crate) fn dispatch_rt_sigsuspend(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        match self.rt_sigsuspend(request) {
+            Ok(outcome) => outcome,
+            Err(errno) => SyscallOutcome::errno(errno),
+        }
+    }
+
     pub(crate) fn rt_sigtimedwait(
         &mut self,
         request: &SyscallRequest,
@@ -549,6 +557,24 @@ impl RuntimeSubsystems {
             mcr_win::sleep_for(duration).map_err(time_errno)?;
         }
         Ok(outcome)
+    }
+
+    pub(crate) fn rt_sigsuspend(
+        &mut self,
+        request: &SyscallRequest,
+    ) -> Result<SyscallOutcome, LinuxErrno> {
+        let pid = request.context.pid;
+        self.select_memory_for_process(pid)?;
+        let mask_addr = arg(request, 0);
+        if mask_addr == 0 {
+            return Err(LinuxErrno::EFAULT);
+        }
+        let temporary_mask = read_guest_u64(self.files.memory(), mask_addr)?;
+        Ok(self.process.tasks.rt_sigsuspend_current(
+            request.context.tid,
+            !temporary_mask,
+            arg(request, 1),
+        ))
     }
 
     pub(crate) fn dispatch_sigaltstack(&mut self, request: &SyscallRequest) -> SyscallOutcome {

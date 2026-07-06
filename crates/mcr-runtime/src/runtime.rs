@@ -1362,6 +1362,7 @@ where
             TaskState::WaitingForChild { .. }
                 | TaskState::WaitingForVfork { .. }
                 | TaskState::WaitingForSignalSet { .. }
+                | TaskState::WaitingForSignalSuspend { .. }
                 | TaskState::WaitingForFutex { .. }
                 | TaskState::WaitingForSleep
         );

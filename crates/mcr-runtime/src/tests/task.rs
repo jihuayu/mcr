@@ -192,6 +192,28 @@ fn rt_sigtimedwait_blocks_when_timeout_is_null() {
     );
 }
 
+#[test]
+fn rt_sigsuspend_reads_temporary_mask_and_blocks_for_unmasked_signal() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    let signal = LINUX_SIGCHLD as u32;
+    let signal_mask = 1u64 << (signal - 1);
+    runtime
+        .memory_mut()
+        .write(0x402000, &(!signal_mask).to_le_bytes())
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::RtSigsuspend, [0x402000, 8, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForSignalSuspend { mask: signal_mask }
+    );
+}
+
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")

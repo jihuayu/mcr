@@ -32,6 +32,7 @@ pub enum TaskState {
     WaitingForChild { args: Wait4SyscallArgs },
     WaitingForVfork { child_pid: GuestPid },
     WaitingForSignalSet { mask: u64 },
+    WaitingForSignalSuspend { mask: u64 },
     WaitingForFd { fd: i32, write: bool },
     WaitingForFutex { key: FutexWaitKey },
     WaitingForSleep,
