@@ -32,7 +32,7 @@ EOF
 "#;
 
 const NODEJS_RUN_SCRIPT: &str = r#"set -eu
-/usr/bin/node -e "require('fs').writeSync(1, 'node-ok\n')"
+/usr/bin/node --jitless -e "require('fs').writeSync(1, 'node-ok\n')"
 "#;
 
 const JDK_RUN_SCRIPT: &str = r#"set -eu
