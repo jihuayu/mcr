@@ -191,6 +191,14 @@ pub(crate) fn apply_native_patch_metadata(
     apply_executable_syscall_patches(memory, &metadata.syscall_patches)?;
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
+        apply_fs_relative_trap_entries(
+            memory,
+            metadata.fs_relative_traps.len(),
+            metadata
+                .fs_relative_traps
+                .iter()
+                .map(|(&address, &trap)| (address, trap)),
+        )?;
         if should_materialize_fs_relative_patches(metadata.fs_relative_patches.len()) {
             apply_fs_relative_patch_entries(
                 memory,
@@ -237,6 +245,24 @@ pub(crate) fn apply_fs_relative_patch_entries(
         "runtime fs-relative-patch apply done patches={} elapsed_ms={}",
         patch_count,
         host_step_elapsed_ms(patch_start)
+    ));
+    Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn apply_fs_relative_trap_entries(
+    memory: &mut GuestMemory,
+    trap_count: usize,
+    traps: impl IntoIterator<Item = (u64, FsRelativeTrap)>,
+) -> Result<(), GuestExecutionError> {
+    let trap_start = Instant::now();
+    host_step_trace(format_args!(
+        "runtime fs-relative-trap apply start traps={trap_count}"
+    ));
+    memory.patch_code_fixed(traps.into_iter().map(|(address, _)| (address, [0xcc])))?;
+    host_step_trace(format_args!(
+        "runtime fs-relative-trap apply done traps={trap_count} elapsed_ms={}",
+        host_step_elapsed_ms(trap_start)
     ));
     Ok(())
 }
@@ -348,6 +374,7 @@ pub(crate) fn native_fault_is_unrewritten_fs_relative(
     instruction: &NativeFaultInstruction,
 ) -> bool {
     fs_relative_original(&instruction.bytes).is_some()
+        || fs_relative_instruction_bytes(&instruction.bytes)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -384,11 +411,31 @@ pub(crate) fn emulate_fs_relative_native_fault(
     {
         return Ok(Some(registers));
     }
+    if let Some(registers) =
+        emulate_fs_absolute_mov_immediate_store(memory, registers, fs_base, instruction)?
+    {
+        return Ok(Some(registers));
+    }
     if let Some(registers) = emulate_fs_absolute_cmp_imm8(memory, registers, fs_base, instruction)?
     {
         return Ok(Some(registers));
     }
     emulate_fs_absolute_sub(memory, registers, fs_base, instruction)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn emulate_fs_relative_trap(
+    memory: &mut GuestMemory,
+    registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    rip: u64,
+    trap: FsRelativeTrap,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let Some(instruction) = mcr_jit::decode_native_fault_instruction(trap.original_bytes(), rip)
+    else {
+        return Ok(None);
+    };
+    emulate_fs_relative_native_fault(memory, registers, fs_base, &instruction)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -580,6 +627,74 @@ fn emulate_fs_absolute_mov_store(
     let reg = ((modrm >> 3) & 0x07) | if rex & 0x04 != 0 { 8 } else { 0 };
     let value = host_register64(&registers, reg)?.to_le_bytes();
     memory.write(addr, &value[..value_len])?;
+    registers.rip = registers
+        .rip
+        .checked_add(instruction.bytes.len() as u64)
+        .ok_or(GuestExecutionError::Memory(
+            GuestMemoryError::InvalidAddress,
+        ))?;
+    Ok(Some(registers))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn emulate_fs_absolute_mov_immediate_store(
+    memory: &mut GuestMemory,
+    mut registers: mcr_win::HostCpuRegisters,
+    fs_base: u64,
+    instruction: &NativeFaultInstruction,
+) -> Result<Option<mcr_win::HostCpuRegisters>, GuestExecutionError> {
+    let bytes = instruction.bytes.as_slice();
+    let Some(fs_index) = fs_segment_prefix_index(bytes) else {
+        return Ok(None);
+    };
+    let mut index = fs_index + 1;
+    let rex = if bytes
+        .get(index)
+        .is_some_and(|byte| (0x40..=0x4f).contains(byte))
+    {
+        let rex = bytes[index];
+        index += 1;
+        rex
+    } else {
+        0
+    };
+    if bytes.get(index).copied() != Some(0xc7) {
+        return Ok(None);
+    }
+    let Some(&modrm) = bytes.get(index + 1) else {
+        return Ok(None);
+    };
+    let Some(&sib) = bytes.get(index + 2) else {
+        return Ok(None);
+    };
+    if modrm & 0xf8 != 0x00 || modrm & 0x07 != 0x04 || sib != 0x25 {
+        return Ok(None);
+    }
+    let displacement_start = index + 3;
+    let displacement_end = displacement_start + 4;
+    let Some(displacement_bytes) = bytes.get(displacement_start..displacement_end) else {
+        return Ok(None);
+    };
+    let immediate_end = displacement_end + 4;
+    let Some(immediate_bytes) = bytes.get(displacement_end..immediate_end) else {
+        return Ok(None);
+    };
+    let displacement = i32::from_le_bytes(
+        displacement_bytes
+            .try_into()
+            .expect("displacement length checked"),
+    );
+    let immediate = i32::from_le_bytes(
+        immediate_bytes
+            .try_into()
+            .expect("immediate length checked"),
+    );
+    let addr = fs_base.wrapping_add(displacement as i64 as u64);
+    if rex & 0x08 != 0 {
+        memory.write(addr, &(immediate as i64 as u64).to_le_bytes())?;
+    } else {
+        memory.write(addr, &immediate.to_le_bytes())?;
+    }
     registers.rip = registers
         .rip
         .checked_add(instruction.bytes.len() as u64)

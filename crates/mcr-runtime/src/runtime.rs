@@ -1451,6 +1451,53 @@ where
         );
 
         let mut registers = guest_registers_from_host(native_registers);
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(trap) = dispatcher.subsystems().fs_relative_trap(pid, registers.rip) {
+            let memory = dispatcher
+                .subsystems_mut()
+                .memory_for_process_mut(pid)
+                .ok_or(GuestExecutionError::Memory(GuestMemoryError::NotMapped))?;
+            if let Some(emulated_registers) =
+                emulate_fs_relative_trap(memory, native_registers, fs_base, registers.rip, trap)?
+            {
+                host_step_trace(format_args!(
+                    "runtime native-fs-trap-emulate pid={pid} tid={tid} rip=0x{:016x} next=0x{:016x}",
+                    native_registers.rip, emulated_registers.rip
+                ));
+                dispatcher.subsystems_mut().set_native_fp(
+                    tid,
+                    mcr_win::HostFloatingPointState {
+                        xmm: emulated_registers.xmm,
+                        mxcsr: emulated_registers.mxcsr,
+                    },
+                );
+                let gpr = gpr_from_registers(guest_registers_from_host(emulated_registers));
+                let task = dispatcher
+                    .subsystems_mut()
+                    .tasks_mut()
+                    .task_mut(tid)
+                    .ok_or(GuestExecutionError::MissingTask(tid))?;
+                task.set_regs(gpr);
+                return Ok(GuestExecutionStep::new(
+                    tid,
+                    before_rip,
+                    gpr.rip(),
+                    gpr.rax(),
+                    task.state(),
+                ));
+            }
+            let instruction =
+                mcr_jit::decode_native_fault_instruction(trap.original_bytes(), registers.rip);
+            return Err(GuestExecutionError::Execution(ExecutionError::NativeFault {
+                signal: 0,
+                rip: registers.rip,
+                address: registers.rip,
+                fs_base,
+                registers,
+                instruction: instruction.map(Box::new),
+                stack_words,
+            }));
+        }
         if let Some(intrinsic) = dispatcher
             .subsystems()
             .libc_intrinsic_patch(pid, registers.rip)

@@ -29,6 +29,20 @@ impl RuntimeSubsystems {
             .copied()
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn fs_relative_trap(
+        &self,
+        pid: mcr_sys::GuestPid,
+        address: u64,
+    ) -> Option<FsRelativeTrap> {
+        self.native
+            .patch_caches
+            .get(&pid)?
+            .fs_relative_traps
+            .get(&address)
+            .copied()
+    }
+
     pub(crate) fn cached_native_patch_metadata(
         &mut self,
         key: &NativeImagePatchKey,
@@ -145,6 +159,7 @@ impl RuntimeSubsystems {
                 let cached_fs_patch_count = cache.fs_relative_patches.len();
                 let mut new_unmaterialized_fs_patch_addresses = Vec::new();
                 let mut new_materialized_fs_patch_addresses = Vec::new();
+                let mut new_fs_trap_addresses = Vec::new();
                 for site in patches.fs_relative_patches {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
                         cache.fs_relative_patches.entry(site.address)
@@ -157,6 +172,24 @@ impl RuntimeSubsystems {
                         }
                     }
                 }
+                for site in patches.fs_relative_traps {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        cache.fs_relative_traps.entry(site.address)
+                    {
+                        entry.insert(site.trap);
+                        new_fs_trap_addresses.push(site.address);
+                    }
+                }
+                apply_fs_relative_trap_entries(
+                    memory,
+                    new_fs_trap_addresses.len(),
+                    new_fs_trap_addresses.iter().filter_map(|address| {
+                        cache
+                            .fs_relative_traps
+                            .get(address)
+                            .map(|&trap| (*address, trap))
+                    }),
+                )?;
                 if should_materialize_fs_relative_patches(cache.fs_relative_patches.len()) {
                     match fs_relative_patch_work(
                         cache.fs_base,
