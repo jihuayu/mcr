@@ -149,6 +149,59 @@ fn win_host_transport_acceptex_completes_nonblocking_accept() {
 
 #[cfg(windows)]
 #[test]
+fn win_host_transport_poll_reports_listener_readiness_without_acceptex() {
+    let mut table =
+        GuestSocketTable::with_transport(WinHostSocketTransport::new().expect("host transport"));
+    let listener = table
+        .create_socket_from_spec(
+            SocketSpec::with_flags(
+                SocketDomain::Inet,
+                SocketType::Stream,
+                SocketProtocol::Tcp,
+                SocketCreationFlags {
+                    nonblocking: true,
+                    cloexec: false,
+                },
+            )
+            .expect("tcp spec"),
+        )
+        .expect("listener socket");
+    table
+        .set_option(listener, SocketOptionName::ReuseAddr, 1)
+        .expect("reuse addr");
+    table
+        .bind(listener, SocketAddress::inet([127, 0, 0, 1], 0))
+        .expect("bind listener");
+    let local = table
+        .local_address(listener)
+        .expect("listener local")
+        .expect("bound address");
+    table.listen(listener, 1).expect("listen");
+
+    let stack = NetworkStack::start().expect("network stack");
+    let client = stack
+        .open_socket(
+            AddressFamily::Inet,
+            SocketKind::Stream,
+            HostSocketProtocol::Tcp,
+        )
+        .expect("client socket");
+    client
+        .connect(SocketAddr::from(local))
+        .expect("client connect");
+
+    let readiness = table
+        .poll(listener, SocketEvents::read(), Some(Duration::from_secs(1)))
+        .expect("poll listener");
+    assert!(readiness.readable);
+
+    let client_addr = SocketAddress::from(client.local_addr().expect("client local"));
+    let (_, peer) = table.accept(listener).expect("accepted socket");
+    assert_eq!(peer, client_addr);
+}
+
+#[cfg(windows)]
+#[test]
 fn win_host_transport_iocp_recv_completion_feeds_readiness() {
     let stack = NetworkStack::start().expect("network stack");
     let listener = stack
