@@ -3,7 +3,7 @@ use super::*;
 pub(crate) fn anonymous_attr(file: &FileRef) -> LinuxFileAttr {
     match file.kind() {
         FileKind::Stdio(StdioKind::Stdin | StdioKind::Stdout | StdioKind::Stderr) => {
-            LinuxFileAttr::new(0, S_IFREG | 0o666, 0)
+            LinuxFileAttr::fifo(file.inode().id())
         }
         FileKind::PipeRead | FileKind::PipeWrite => LinuxFileAttr::fifo(file.inode().id()),
         FileKind::Socket => LinuxFileAttr::socket(file.inode().id()),

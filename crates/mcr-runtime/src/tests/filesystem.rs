@@ -1148,6 +1148,25 @@ fn fd_management_syscalls_wire_to_vfs_and_guest_memory() {
 }
 
 #[test]
+fn ioctl_fionbio_toggles_nonblocking_status_flags() {
+    let mut runtime = runtime_with_sample_vfs();
+    runtime.memory_mut().write(0x2000, &1u32.to_le_bytes());
+    runtime.memory_mut().write(0x2004, &0u32.to_le_bytes());
+
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Ioctl, [1, FIONBIO, 0x2000, 0, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_ne!(runtime.vfs().fds().status_flags(1).unwrap() & O_NONBLOCK, 0);
+
+    assert_eq!(
+        dispatch(&mut runtime, Syscall::Ioctl, [1, FIONBIO, 0x2004, 0, 0, 0]),
+        SyscallReturn::Success(0)
+    );
+    assert_eq!(runtime.vfs().fds().status_flags(1).unwrap() & O_NONBLOCK, 0);
+}
+
+#[test]
 fn errno_cases_match_linux_shapes() {
     let mut runtime = runtime_with_sample_vfs();
     runtime.memory_mut().write_cstr(0x1000, "/missing");

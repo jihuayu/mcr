@@ -52,6 +52,7 @@ pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 pub const FIONREAD: u64 = 0x541b;
+pub const FIONBIO: u64 = 0x5421;
 pub const TCGETS: u64 = 0x5401;
 pub const TCSETS: u64 = 0x5402;
 pub const TCSETSW: u64 = 0x5403;

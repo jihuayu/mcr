@@ -442,6 +442,17 @@ impl VirtualFileSystem {
 
     pub fn fstat(&self, fd: Fd) -> VfsResult<LinuxFileAttr> {
         let entry = self.fds.get(fd)?;
+        if matches!(
+            entry.file().kind(),
+            FileKind::Stdio(_)
+                | FileKind::PipeRead
+                | FileKind::PipeWrite
+                | FileKind::Socket
+                | FileKind::Epoll
+                | FileKind::Eventfd
+        ) {
+            return Ok(anonymous_attr(entry.file()));
+        }
         if let Some(node) = self.tree.lookup_inode(entry.inode_id()) {
             return Ok(self.cached_metadata(node));
         }

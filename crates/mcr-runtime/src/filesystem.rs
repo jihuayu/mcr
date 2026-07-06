@@ -1293,6 +1293,22 @@ where
 
     fn sys_ioctl(&mut self, request: &SyscallRequest) -> Result<u64, LinuxErrno> {
         let args = IoctlSyscallArgs::new(arg_i32(request, 0), arg(request, 1), arg(request, 2));
+        if args.request == mcr_vfs::FIONBIO {
+            let nonblocking = read_guest_u32(&self.memory, args.argp)? != 0;
+            let flags = self
+                .vfs
+                .fcntl(args.fd, mcr_vfs::F_GETFL, 0)
+                .map_err(vfs_errno)? as u32;
+            let next = if nonblocking {
+                flags | mcr_vfs::O_NONBLOCK
+            } else {
+                flags & !mcr_vfs::O_NONBLOCK
+            };
+            self.vfs
+                .fcntl(args.fd, mcr_vfs::F_SETFL, u64::from(next))
+                .map_err(vfs_errno)?;
+            return Ok(0);
+        }
         match self.vfs.ioctl(args.fd, args.request).map_err(vfs_errno)? {
             mcr_vfs::IoctlReply::None => Ok(0),
             mcr_vfs::IoctlReply::U32(value) => {

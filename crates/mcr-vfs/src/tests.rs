@@ -102,6 +102,15 @@ fn fd_table_initializes_stdio_descriptors() {
 }
 
 #[test]
+fn stdio_descriptors_stat_as_fifos_for_libuv_handle_detection() {
+    let vfs = sample_vfs();
+
+    assert_eq!(vfs.fstat(0).unwrap().mode & S_IFMT, S_IFIFO);
+    assert_eq!(vfs.fstat(1).unwrap().mode & S_IFMT, S_IFIFO);
+    assert_eq!(vfs.fstat(2).unwrap().mode & S_IFMT, S_IFIFO);
+}
+
+#[test]
 fn stdio_writes_are_captured_and_can_be_taken() {
     let mut vfs = sample_vfs();
 

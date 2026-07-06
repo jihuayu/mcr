@@ -33,7 +33,7 @@ pub(crate) use mcr_sys::{
 pub(crate) use mcr_task::{ARCH_SET_FS, ExitState, INITIAL_GUEST_PID, INITIAL_GUEST_TID};
 pub(crate) use mcr_testkit::elf::{Elf64Builder, Elf64ProgramHeader, PF_R, PF_W, PF_X};
 pub(crate) use mcr_vfs::{
-    AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
+    AT_FDCWD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, FIONBIO, FIONREAD, FdTable, O_CLOEXEC, O_CREAT,
     O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PathTree, RENAME_NOREPLACE, Rootfs,
     TIOCGWINSZ, VirtualFileSystem,
 };

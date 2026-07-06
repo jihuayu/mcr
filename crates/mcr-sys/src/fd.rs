@@ -20,6 +20,7 @@ pub const LINUX_IOCTL_TIOCGPGRP: u64 = 0x540f;
 pub const LINUX_IOCTL_TIOCSPGRP: u64 = 0x5410;
 pub const LINUX_IOCTL_TIOCGWINSZ: u64 = 0x5413;
 pub const LINUX_IOCTL_FIONREAD: u64 = 0x541b;
+pub const LINUX_IOCTL_FIONBIO: u64 = 0x5421;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PipeSyscallArgs {
@@ -122,9 +123,9 @@ mod tests {
     use super::{
         Dup2SyscallArgs, Dup3SyscallArgs, DupSyscallArgs, FcntlSyscallArgs, IoctlSyscallArgs,
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_GETPIPE_SZ,
-        LINUX_F_SETFD, LINUX_F_SETFL, LINUX_F_SETPIPE_SZ, LINUX_FD_CLOEXEC, LINUX_IOCTL_FIONREAD,
-        LINUX_IOCTL_TCGETS, LINUX_IOCTL_TIOCGWINSZ, LINUX_O_CLOEXEC, LINUX_O_NONBLOCK,
-        Pipe2SyscallArgs, PipeSyscallArgs,
+        LINUX_F_SETFD, LINUX_F_SETFL, LINUX_F_SETPIPE_SZ, LINUX_FD_CLOEXEC, LINUX_IOCTL_FIONBIO,
+        LINUX_IOCTL_FIONREAD, LINUX_IOCTL_TCGETS, LINUX_IOCTL_TIOCGWINSZ, LINUX_O_CLOEXEC,
+        LINUX_O_NONBLOCK, Pipe2SyscallArgs, PipeSyscallArgs,
     };
 
     #[test]
@@ -145,6 +146,7 @@ mod tests {
         assert_eq!(LINUX_IOCTL_TCGETS, 0x5401);
         assert_eq!(LINUX_IOCTL_TIOCGWINSZ, 0x5413);
         assert_eq!(LINUX_IOCTL_FIONREAD, 0x541b);
+        assert_eq!(LINUX_IOCTL_FIONBIO, 0x5421);
     }
 
     #[test]
