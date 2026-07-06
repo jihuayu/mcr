@@ -443,6 +443,18 @@ impl GuestSocketTable {
             .state
             .local_address()
             .unwrap_or_else(|| SocketAddress::unspecified_for_domain(spec.domain));
+        match {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Accept)?;
+            entry.handle.accept().map_err(SocketError::from_host)
+        } {
+            Ok((handle, peer)) => {
+                self.readiness_cache.clear_socket(id);
+                return self.register_accepted_socket(spec, handle, local, peer);
+            }
+            Err(error) if error.linux_errno() == LinuxErrno::OperationWouldBlock => {}
+            Err(error) => return Err(error),
+        }
+
         let fast_path = {
             let entry = self.ensure_host_entry_mut(id, SocketOperation::Accept)?;
             let token = entry.readiness_token;
@@ -453,23 +465,16 @@ impl GuestSocketTable {
         };
         match fast_path {
             SocketAcceptFastPath::Accepted { handle, peer } => {
-                return self.register_accepted_socket(spec, handle, local, peer);
+                self.readiness_cache.clear_socket(id);
+                self.register_accepted_socket(spec, handle, local, peer)
             }
-            SocketAcceptFastPath::Pending => {
-                return Err(SocketError::would_block(
+            SocketAcceptFastPath::Pending | SocketAcceptFastPath::Unsupported => {
+                Err(SocketError::would_block(
                     SocketOperation::Accept,
-                    "AcceptEx operation is pending",
-                ));
+                    "no pending socket connection is available",
+                ))
             }
-            SocketAcceptFastPath::Unsupported => {}
         }
-
-        let (handle, peer) = self
-            .ensure_host_entry_mut(id, SocketOperation::Accept)?
-            .handle
-            .accept()
-            .map_err(SocketError::from_host)?;
-        self.register_accepted_socket(spec, handle, local, peer)
     }
 
     pub fn shutdown(&mut self, id: SocketId, how: ShutdownHow) -> Result<(), SocketError> {
@@ -561,11 +566,14 @@ impl GuestSocketTable {
             }
         }
 
-        let entry = self.host_entry_mut(id, SocketOperation::Recv)?;
-        entry
-            .handle
-            .recv(buffer)
-            .map_err(|error| self.record_host_error(id, error))
+        let received = {
+            let entry = self.host_entry_mut(id, SocketOperation::Recv)?;
+            entry.handle.recv(buffer)
+        };
+        if received.is_ok() {
+            self.readiness_cache.clear_socket(id);
+        }
+        received.map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn recv_connected_vectored(
@@ -585,11 +593,14 @@ impl GuestSocketTable {
             }
         }
 
-        let entry = self.host_entry_mut(id, SocketOperation::RecvMsg)?;
-        entry
-            .handle
-            .recv_vectored(buffers)
-            .map_err(|error| self.record_host_error(id, error))
+        let received = {
+            let entry = self.host_entry_mut(id, SocketOperation::RecvMsg)?;
+            entry.handle.recv_vectored(buffers)
+        };
+        if received.is_ok() {
+            self.readiness_cache.clear_socket(id);
+        }
+        received.map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn send_to(
@@ -661,11 +672,14 @@ impl GuestSocketTable {
             }
         }
 
-        let entry = self.ensure_host_entry_mut(id, SocketOperation::Recv)?;
-        entry
-            .handle
-            .recv_from(buffer)
-            .map_err(|error| self.record_host_error(id, error))
+        let received = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::Recv)?;
+            entry.handle.recv_from(buffer)
+        };
+        if received.is_ok() {
+            self.readiness_cache.clear_socket(id);
+        }
+        received.map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn recv_from_vectored(
@@ -685,11 +699,14 @@ impl GuestSocketTable {
             }
         }
 
-        let entry = self.ensure_host_entry_mut(id, SocketOperation::RecvMsg)?;
-        entry
-            .handle
-            .recv_from_vectored(buffers)
-            .map_err(|error| self.record_host_error(id, error))
+        let received = {
+            let entry = self.ensure_host_entry_mut(id, SocketOperation::RecvMsg)?;
+            entry.handle.recv_from_vectored(buffers)
+        };
+        if received.is_ok() {
+            self.readiness_cache.clear_socket(id);
+        }
+        received.map_err(|error| self.record_host_error(id, error))
     }
 
     pub fn poll(

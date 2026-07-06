@@ -99,6 +99,7 @@ impl HostSocketTransport for WinHostSocketTransport {
             pending_accept: None,
             accepted_fast_path: None,
             accept_error: None,
+            listening: false,
             pending_recv: None,
             recv_ready: VecDeque::new(),
             recv_eof: false,
@@ -119,6 +120,7 @@ struct WinHostSocketHandle {
     pending_accept: Option<PendingHostAcceptEx>,
     accepted_fast_path: Option<(HostSocket, SocketAddress)>,
     accept_error: Option<HostIoError>,
+    listening: bool,
     pending_recv: Option<PendingHostSocketIo>,
     recv_ready: VecDeque<u8>,
     recv_eof: bool,
@@ -133,13 +135,15 @@ const WIN_IOCP_RECV_BUFFER_SIZE: usize = 16 * 1024;
 
 impl WinHostSocketHandle {
     fn can_use_iocp_recv(&self) -> bool {
-        self.completion_port.is_some()
+        !self.listening
+            && self.completion_port.is_some()
             && self.spec.socket_type == SocketType::Stream
             && self.spec.effective_protocol() == SocketProtocol::Tcp
     }
 
     fn can_use_iocp_send(&self) -> bool {
         self.completion_port.is_some()
+            && !self.listening
             && !self.spec.flags.nonblocking
             && self.pending_accept.is_none()
             && self.pending_connect.is_none()
@@ -353,7 +357,9 @@ impl HostSocketHandle for WinHostSocketHandle {
         let backlog = i32::try_from(backlog).map_err(|_| {
             HostIoError::new(LinuxErrno::InvalidArgument, "listen backlog too large")
         })?;
-        self.socket.listen(backlog).map_err(HostIoError::from)
+        self.socket.listen(backlog).map_err(HostIoError::from)?;
+        self.listening = true;
+        Ok(())
     }
 
     fn accept_fast_path(
@@ -374,6 +380,7 @@ impl HostSocketHandle for WinHostSocketHandle {
                     pending_accept: None,
                     accepted_fast_path: None,
                     accept_error: None,
+                    listening: false,
                     pending_recv: None,
                     recv_ready: VecDeque::new(),
                     recv_eof: false,
@@ -418,6 +425,7 @@ impl HostSocketHandle for WinHostSocketHandle {
                 pending_accept: None,
                 accepted_fast_path: None,
                 accept_error: None,
+                listening: false,
                 pending_recv: None,
                 recv_ready: VecDeque::new(),
                 recv_eof: false,

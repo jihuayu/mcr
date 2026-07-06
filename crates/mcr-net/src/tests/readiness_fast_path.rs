@@ -110,7 +110,7 @@ fn acceptex_unsupported_uses_plain_accept_fallback() {
 }
 
 #[test]
-fn acceptex_pending_completion_feeds_readiness_then_accepts_without_plain_fallback() {
+fn acceptex_pending_completion_feeds_readiness_after_plain_accept_would_block() {
     let accept_calls = Rc::new(Cell::new(0));
     let poll_calls = Rc::new(Cell::new(0));
     let peer = SocketAddress::inet([127, 0, 0, 1], 49152);
@@ -136,7 +136,7 @@ fn acceptex_pending_completion_feeds_readiness_then_accepts_without_plain_fallba
             .linux_errno(),
         LinuxErrno::OperationWouldBlock
     );
-    assert_eq!(accept_calls.get(), 0);
+    assert_eq!(accept_calls.get(), 1);
 
     let readiness = table
         .poll(listener, SocketEvents::read(), Some(Duration::ZERO))
@@ -146,10 +146,16 @@ fn acceptex_pending_completion_feeds_readiness_then_accepts_without_plain_fallba
 
     let (accepted, accepted_peer) = table.accept(listener).expect("completed AcceptEx");
     assert_eq!(accepted_peer, peer);
-    assert_eq!(accept_calls.get(), 0);
+    assert_eq!(accept_calls.get(), 2);
     assert_eq!(
         table.socket(accepted).expect("accepted").state(),
         SocketState::Connected { local, peer }
+    );
+    assert_eq!(
+        table
+            .poll(listener, SocketEvents::read(), Some(Duration::ZERO))
+            .expect("listener readiness after accepted connection"),
+        SocketEvents::default()
     );
 }
 
