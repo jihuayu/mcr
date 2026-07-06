@@ -22,6 +22,8 @@ pub const LINUX_FUTEX_WAIT: u32 = 0;
 pub const LINUX_FUTEX_WAKE: u32 = 1;
 pub const LINUX_FUTEX_REQUEUE: u32 = 3;
 pub const LINUX_FUTEX_CMP_REQUEUE: u32 = 4;
+pub const LINUX_FUTEX_WAIT_BITSET: u32 = 9;
+pub const LINUX_FUTEX_WAKE_BITSET: u32 = 10;
 pub const LINUX_FUTEX_CMD_MASK: u32 = 0x7f;
 pub const LINUX_FUTEX_PRIVATE_FLAG: u32 = 0x80;
 pub const LINUX_FUTEX_CLOCK_REALTIME: u32 = 0x100;
@@ -357,6 +359,20 @@ mod tests {
         assert!(wait.is_private());
         assert!(!wait.has_unsupported_flags());
         assert_eq!(wait.val, 7);
+
+        let wait_bitset = FutexSyscallArgs::new(
+            0x1000,
+            LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME,
+            7,
+            0,
+            0,
+            u32::MAX,
+        );
+        assert_eq!(wait_bitset.command(), LINUX_FUTEX_WAIT_BITSET);
+        assert!(wait_bitset.is_private());
+        assert!(!wait_bitset.has_unsupported_flags());
+        assert_eq!(LINUX_FUTEX_WAKE_BITSET, 10);
+
         assert_eq!(SetTidAddressSyscallArgs::new(0x3000).tidptr, 0x3000);
         assert_eq!(
             SetRobustListSyscallArgs::new(0x4000, LINUX_ROBUST_LIST_HEAD_SIZE).len,

@@ -140,6 +140,65 @@ fn futex_wait_blocks_guest_task_and_wake_resumes_it() {
 }
 
 #[test]
+fn futex_wait_bitset_with_realtime_flag_blocks_and_wake_bitset_resumes_it() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(0x402000, &7u32.to_le_bytes())
+        .unwrap();
+    let flags = LINUX_CLONE_VM
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SIGHAND
+        | LINUX_CLONE_THREAD
+        | LINUX_CLONE_SYSVSEM;
+
+    let clone = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+    assert_eq!(clone.result, SyscallReturn::Success(2));
+
+    let wait = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            0x402000,
+            u64::from(
+                LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME,
+            ),
+            7,
+            0,
+            0,
+            u64::from(u32::MAX),
+        ],
+    ));
+    assert_eq!(wait.result, SyscallReturn::Success(0));
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForFutex {
+            key: FutexWaitKey::new(INITIAL_GUEST_PID, 0x402000, true)
+        }
+    );
+
+    let wake = runtime.dispatch_syscall(context_for(
+        INITIAL_GUEST_PID,
+        2,
+        Syscall::Futex,
+        [
+            0x402000,
+            u64::from(LINUX_FUTEX_WAKE_BITSET | LINUX_FUTEX_PRIVATE_FLAG),
+            1,
+            0,
+            0,
+            u64::from(u32::MAX),
+        ],
+    ));
+
+    assert_eq!(wake.result, SyscallReturn::Success(1));
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::Runnable
+    );
+}
+
+#[test]
 fn futex_requeue_wakes_and_moves_waiters_to_target_key() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     runtime

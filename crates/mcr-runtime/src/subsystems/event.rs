@@ -64,16 +64,31 @@ impl RuntimeSubsystems {
         tid: mcr_sys::GuestTid,
         args: FutexSyscallArgs,
     ) -> SyscallOutcome {
-        if args.op & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG) != 0 {
+        if args.has_unsupported_flags() {
             return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         if args.uaddr % 4 != 0 {
             return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
+        if args.op & LINUX_FUTEX_CLOCK_REALTIME != 0 && args.command() != LINUX_FUTEX_WAIT_BITSET {
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
+        }
 
         match args.command() {
             LINUX_FUTEX_WAIT => self.futex_wait(pid, tid, args),
+            LINUX_FUTEX_WAIT_BITSET => {
+                if args.val3 == 0 {
+                    return SyscallOutcome::errno(LinuxErrno::EINVAL);
+                }
+                self.futex_wait(pid, tid, args)
+            }
             LINUX_FUTEX_WAKE => SyscallOutcome::success(self.futex_wake(pid, args)),
+            LINUX_FUTEX_WAKE_BITSET => {
+                if args.val3 == 0 {
+                    return SyscallOutcome::errno(LinuxErrno::EINVAL);
+                }
+                SyscallOutcome::success(self.futex_wake(pid, args))
+            }
             LINUX_FUTEX_REQUEUE => self.futex_requeue(pid, args, false),
             LINUX_FUTEX_CMP_REQUEUE => self.futex_requeue(pid, args, true),
             _ => SyscallOutcome::errno(LinuxErrno::EINVAL),
@@ -121,6 +136,9 @@ impl RuntimeSubsystems {
     pub(crate) fn futex_wake(&mut self, pid: mcr_sys::GuestPid, args: FutexSyscallArgs) -> u64 {
         let key = FutexWaitKey::new(pid, args.uaddr, args.is_private());
         let woken = self.process.tasks.wake_futex_waiters(key, args.val) as u64;
+        if woken != 0 {
+            self.request_scheduler_yield();
+        }
         self.prune_futex_timeouts();
         woken
     }

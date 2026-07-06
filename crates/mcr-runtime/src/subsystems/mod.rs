@@ -84,6 +84,7 @@ pub(crate) struct EventSubsystemState {
     pub(crate) sleep_timeouts: BTreeMap<mcr_sys::GuestTid, Instant>,
     pub(crate) epolls: EpollRegistry,
     pub(crate) signal_alt_stacks: BTreeMap<mcr_sys::GuestTid, GuestSignalAltStack>,
+    pub(crate) scheduler_yield_budget: u8,
 }
 
 impl fmt::Debug for RuntimeSubsystems {
@@ -244,6 +245,19 @@ impl RuntimeSubsystems {
             diagnostics[0] = pool.diagnostics();
         }
         diagnostics
+    }
+
+    pub(crate) fn request_scheduler_yield(&mut self) {
+        self.events.scheduler_yield_budget =
+            self.events.scheduler_yield_budget.saturating_add(4).min(8);
+    }
+
+    pub(crate) fn take_scheduler_yield_request(&mut self) -> bool {
+        if self.events.scheduler_yield_budget == 0 {
+            return false;
+        }
+        self.events.scheduler_yield_budget -= 1;
+        true
     }
 
     pub(crate) fn default_vfs() -> VirtualFileSystem {

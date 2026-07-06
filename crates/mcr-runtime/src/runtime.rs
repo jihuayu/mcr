@@ -471,20 +471,22 @@ where
             dispatcher.subsystems_mut().resume_fd_waiters();
             dispatcher.subsystems_mut().resume_expired_futex_timeouts();
             dispatcher.subsystems_mut().resume_expired_sleep_timeouts();
-            let mut runnable_tids = if sticky_scheduler {
-                last_dispatched_tid
-                    .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid))
-                    .map_or_else(
-                        || dispatcher.subsystems().tasks().runnable_tids(),
-                        |tid| vec![tid],
-                    )
-            } else {
-                dispatcher.subsystems().tasks().runnable_tids()
-            };
+            let scheduler_yield_requested =
+                dispatcher.subsystems_mut().take_scheduler_yield_request();
+            let mut runnable_tids = dispatcher.subsystems().tasks().runnable_tids();
             if runnable_tids.len() != 1 {
                 dispatcher
                     .subsystems()
                     .prioritize_pending_fork_exec_tids(&mut runnable_tids);
+            }
+            if sticky_scheduler {
+                let sticky_candidate = last_dispatched_tid
+                    .and_then(|tid| dispatcher.subsystems().sticky_scheduler_candidate(tid));
+                runnable_tids = apply_sticky_scheduler_order(
+                    runnable_tids,
+                    sticky_candidate,
+                    scheduler_yield_requested,
+                );
             }
             if runnable_tids.is_empty() {
                 if dispatcher.subsystems_mut().expire_next_futex_timeout() {
@@ -537,6 +539,66 @@ pub(crate) fn sticky_scheduler_enabled() -> bool {
         value.to_ascii_lowercase().as_str(),
         "0" | "false" | "off" | "no"
     )
+}
+
+fn apply_sticky_scheduler_order(
+    mut runnable_tids: Vec<mcr_sys::GuestTid>,
+    sticky_candidate: Option<mcr_sys::GuestTid>,
+    yield_requested: bool,
+) -> Vec<mcr_sys::GuestTid> {
+    let Some(tid) = sticky_candidate else {
+        return runnable_tids;
+    };
+    let Some(index) = runnable_tids.iter().position(|candidate| *candidate == tid) else {
+        return runnable_tids;
+    };
+    if runnable_tids.len() == 1 {
+        return runnable_tids;
+    }
+    if !yield_requested {
+        return vec![tid];
+    }
+
+    let tid = runnable_tids.remove(index);
+    runnable_tids.push(tid);
+    runnable_tids
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::apply_sticky_scheduler_order;
+
+    #[test]
+    fn sticky_scheduler_keeps_single_runnable_candidate() {
+        assert_eq!(
+            apply_sticky_scheduler_order(vec![7], Some(7), false),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn sticky_scheduler_keeps_candidate_without_yield_request() {
+        assert_eq!(
+            apply_sticky_scheduler_order(vec![1, 2, 3], Some(1), false),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn sticky_scheduler_yields_to_other_runnable_tasks_after_wake() {
+        assert_eq!(
+            apply_sticky_scheduler_order(vec![1, 2, 3], Some(1), true),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn sticky_scheduler_ignores_non_runnable_candidate() {
+        assert_eq!(
+            apply_sticky_scheduler_order(vec![2, 3], Some(1), true),
+            vec![2, 3]
+        );
+    }
 }
 
 pub(crate) fn initial_process_exit_status(
