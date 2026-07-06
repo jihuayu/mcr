@@ -232,7 +232,9 @@ The ignored extended support matrix uses `MCR_BIN` plus the matching
 materialized package rootfs fixture. It covers GCC compile-and-run, Node.js
 JavaScript execution on the `--jitless` path, unpinned `javac -version` plus JDK
 compile-and-run, MariaDB bootstrap ordinary/index/JOIN/range queries, and Redis
-server execution. Run it
+server execution. Default Node/V8 JIT promotion is tracked by `workload-002`
+after signal delivery, interruptible futex/thread exit, and dynamic
+executable-page handling are complete. Run it
 explicitly with:
 
 ```powershell
