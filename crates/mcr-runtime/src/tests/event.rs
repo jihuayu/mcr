@@ -1094,6 +1094,67 @@ fn epoll_wait_reports_closed_watch_as_hup_error() {
 }
 
 #[test]
+fn epoll_pwait_reuses_epoll_wait_without_sigmask() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::Pipe2, [0x402000, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    let read_fd = i32_from_memory(runtime.memory(), 0x402000);
+    let write_fd = i32_from_memory(runtime.memory(), 0x402004);
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]))
+            .result,
+        SyscallReturn::Success(5)
+    );
+    write_epoll_event_for_test(runtime.memory_mut(), 0x402100, LINUX_EPOLLIN, 0x71);
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::EpollCtl,
+                [
+                    5,
+                    u64::from(LINUX_EPOLL_CTL_ADD),
+                    read_fd as u64,
+                    0x402100,
+                    0,
+                    0,
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    let empty = runtime.dispatch_syscall(context(Syscall::EpollPwait, [5, 0x402200, 4, 0, 0, 0]));
+    assert_eq!(empty.result, SyscallReturn::Success(0));
+
+    runtime.memory_mut().write(0x402400, b"x").unwrap();
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context(
+                Syscall::Write,
+                [write_fd as u64, 0x402400, 1, 0, 0, 0]
+            ))
+            .result,
+        SyscallReturn::Success(1)
+    );
+    let ready = runtime.dispatch_syscall(context(Syscall::EpollPwait, [5, 0x402200, 4, 0, 0, 0]));
+    assert_eq!(ready.result, SyscallReturn::Success(1));
+    assert_eq!(
+        epoll_event_from_memory(runtime.memory(), 0x402200),
+        (LINUX_EPOLLIN, 0x71)
+    );
+
+    let sigmask = runtime.dispatch_syscall(context(
+        Syscall::EpollPwait,
+        [5, 0x402200, 4, 0, 0x402500, 8],
+    ));
+    assert_eq!(sigmask.result, SyscallReturn::Errno(LinuxErrno::EINVAL));
+}
+
+#[test]
 fn epoll_pwait2_reuses_epoll_wait_without_sigmask() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
     assert_eq!(

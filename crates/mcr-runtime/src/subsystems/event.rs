@@ -18,6 +18,7 @@ impl EventSyscalls for RuntimeSubsystems {
             mcr_sys::Syscall::EpollCreate1 => self.dispatch_epoll_create1(request),
             mcr_sys::Syscall::EpollCtl => self.dispatch_epoll_ctl(request),
             mcr_sys::Syscall::EpollWait => self.dispatch_epoll_wait(request),
+            mcr_sys::Syscall::EpollPwait => self.dispatch_epoll_pwait(request),
             mcr_sys::Syscall::EpollPwait2 => self.dispatch_epoll_pwait2(request),
             _ => SyscallOutcome::unsupported(),
         }
@@ -553,6 +554,35 @@ impl RuntimeSubsystems {
         let pid = request.context.pid;
         if let Err(errno) = self.select_process_context(pid) {
             return SyscallOutcome::errno(errno);
+        }
+        let maxevents = match usize_arg(request, 2) {
+            Ok(maxevents) => maxevents,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let timeout = match poll_timeout(arg(request, 3)) {
+            Ok(timeout) => timeout,
+            Err(errno) => return SyscallOutcome::errno(errno),
+        };
+        let outcome =
+            outcome(self.epoll_wait(arg_i32(request, 0), arg(request, 1), maxevents, timeout));
+        if matches!(outcome.result, SyscallReturn::Success(_)) {
+            if let Err(errno) = self.store_selected_process_fds(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+            if let Err(errno) = self.store_selected_process_memory(pid) {
+                return SyscallOutcome::errno(errno);
+            }
+        }
+        outcome
+    }
+
+    pub(crate) fn dispatch_epoll_pwait(&mut self, request: &SyscallRequest) -> SyscallOutcome {
+        let pid = request.context.pid;
+        if let Err(errno) = self.select_process_context(pid) {
+            return SyscallOutcome::errno(errno);
+        }
+        if arg(request, 4) != 0 || arg(request, 5) != 0 {
+            return SyscallOutcome::errno(LinuxErrno::EINVAL);
         }
         let maxevents = match usize_arg(request, 2) {
             Ok(maxevents) => maxevents,

@@ -194,6 +194,7 @@ pub const SYSCALL_DISPATCH_TABLE: &[SyscallDescriptor] = &[
     SyscallDescriptor::new(Syscall::EpollWait, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::EpollCtl, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Tgkill, SyscallSubsystem::Task),
+    SyscallDescriptor::new(Syscall::EpollPwait, SyscallSubsystem::Event),
     SyscallDescriptor::new(Syscall::Openat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Mkdirat, SyscallSubsystem::File),
     SyscallDescriptor::new(Syscall::Newfstatat, SyscallSubsystem::File),
@@ -1019,6 +1020,14 @@ pub fn decode_syscall_fields(syscall: Syscall, args: SyscallArgs) -> Vec<TraceFi
             decimal_field("maxevents", arg(2)),
             signed_field("timeout", arg(3)),
         ],
+        Syscall::EpollPwait => vec![
+            decimal_field("epfd", arg(0)),
+            hex_field("events", arg(1)),
+            decimal_field("maxevents", arg(2)),
+            signed_field("timeout", arg(3)),
+            hex_field("sigmask", arg(4)),
+            decimal_field("sigsetsize", arg(5)),
+        ],
         Syscall::EpollPwait2 => vec![
             decimal_field("epfd", arg(0)),
             hex_field("events", arg(1)),
@@ -1135,6 +1144,8 @@ mod tests {
             (Syscall::Getsid, SyscallSubsystem::Task),
             (Syscall::Statfs, SyscallSubsystem::File),
             (Syscall::Fstatfs, SyscallSubsystem::File),
+            (Syscall::SchedGetparam, SyscallSubsystem::Task),
+            (Syscall::SchedGetscheduler, SyscallSubsystem::Task),
             (Syscall::Prctl, SyscallSubsystem::Task),
             (Syscall::ClockGetres, SyscallSubsystem::Time),
             (Syscall::SchedGetaffinity, SyscallSubsystem::Task),
@@ -1146,6 +1157,7 @@ mod tests {
             (Syscall::CloseRange, SyscallSubsystem::File),
             (Syscall::Openat2, SyscallSubsystem::File),
             (Syscall::Faccessat2, SyscallSubsystem::File),
+            (Syscall::EpollPwait, SyscallSubsystem::Event),
             (Syscall::EpollPwait2, SyscallSubsystem::Event),
         ] {
             assert_eq!(

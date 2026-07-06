@@ -469,7 +469,10 @@ fn syscall_args_display(args: [u64; 6]) -> String {
 }
 
 fn readiness_syscall_name(name: &str) -> bool {
-    matches!(name, "poll" | "ppoll" | "epoll_wait" | "epoll_pwait2")
+    matches!(
+        name,
+        "poll" | "ppoll" | "epoll_wait" | "epoll_pwait" | "epoll_pwait2"
+    )
 }
 
 fn in_flight_syscall(events: &[SyscallTraceEvent]) -> Option<DiagnosticSyscall> {

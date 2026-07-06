@@ -148,6 +148,7 @@ pub enum Syscall {
     EpollWait,
     EpollCtl,
     Tgkill,
+    EpollPwait,
     Openat,
     Mkdirat,
     Newfstatat,
@@ -291,6 +292,7 @@ impl Syscall {
     pub const EPOLL_WAIT: SyscallNumber = SyscallNumber::new(232);
     pub const EPOLL_CTL: SyscallNumber = SyscallNumber::new(233);
     pub const TGKILL: SyscallNumber = SyscallNumber::new(234);
+    pub const EPOLL_PWAIT: SyscallNumber = SyscallNumber::new(281);
     pub const OPENAT: SyscallNumber = SyscallNumber::new(257);
     pub const MKDIRAT: SyscallNumber = SyscallNumber::new(258);
     pub const NEWFSTATAT: SyscallNumber = SyscallNumber::new(262);
@@ -435,6 +437,7 @@ impl Syscall {
             232 => Self::EpollWait,
             233 => Self::EpollCtl,
             234 => Self::Tgkill,
+            281 => Self::EpollPwait,
             257 => Self::Openat,
             258 => Self::Mkdirat,
             262 => Self::Newfstatat,
@@ -583,6 +586,7 @@ impl Syscall {
             Self::EpollWait => Self::EPOLL_WAIT,
             Self::EpollCtl => Self::EPOLL_CTL,
             Self::Tgkill => Self::TGKILL,
+            Self::EpollPwait => Self::EPOLL_PWAIT,
             Self::Openat => Self::OPENAT,
             Self::Mkdirat => Self::MKDIRAT,
             Self::Newfstatat => Self::NEWFSTATAT,
@@ -730,6 +734,7 @@ impl Syscall {
             Self::EpollWait => "epoll_wait",
             Self::EpollCtl => "epoll_ctl",
             Self::Tgkill => "tgkill",
+            Self::EpollPwait => "epoll_pwait",
             Self::Openat => "openat",
             Self::Mkdirat => "mkdirat",
             Self::Newfstatat => "newfstatat",
@@ -841,6 +846,7 @@ mod tests {
                 "sched_getaffinity",
             ),
             (Syscall::CLOCK_GETRES, Syscall::ClockGetres, "clock_getres"),
+            (Syscall::EPOLL_PWAIT, Syscall::EpollPwait, "epoll_pwait"),
             (Syscall::PRLIMIT64, Syscall::Prlimit64, "prlimit64"),
             (Syscall::GETCPU, Syscall::Getcpu, "getcpu"),
             (Syscall::MEMBARRIER, Syscall::Membarrier, "membarrier"),
