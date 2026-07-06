@@ -103,6 +103,10 @@ impl GuestTask {
         self.robust_list
     }
 
+    pub fn take_robust_list(&mut self) -> Option<GuestAddress> {
+        self.robust_list.take()
+    }
+
     #[must_use]
     pub const fn clear_child_tid(&self) -> Option<GuestAddress> {
         self.clear_child_tid

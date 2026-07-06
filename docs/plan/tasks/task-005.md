@@ -1,7 +1,7 @@
 ---
 id: task-005
 scope: task
-status: ready
+status: done
 depends-on: [task-004]
 ---
 

@@ -581,6 +581,137 @@ fn thread_clone_writes_tid_pointers_and_exit_keeps_process_alive() {
 }
 
 #[test]
+fn thread_exit_clear_child_tid_wakes_join_futex_waiter() {
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime.memory_mut().write(0x402000, &[0; 8]).unwrap();
+    let flags = LINUX_CLONE_VM
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SIGHAND
+        | LINUX_CLONE_THREAD
+        | LINUX_CLONE_SYSVSEM
+        | LINUX_CLONE_CHILD_CLEARTID
+        | LINUX_CLONE_CHILD_SETTID;
+
+    let clone = runtime.dispatch_syscall(context(
+        Syscall::Clone,
+        [flags, 0x7000_0000, 0, 0x402000, 0, 0],
+    ));
+    assert_eq!(clone.result, SyscallReturn::Success(2));
+    assert_eq!(u32_from_guest(runtime.memory(), 0x402000), 2);
+
+    let wait = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [0x402000, u64::from(LINUX_FUTEX_WAIT), 2, 0, 0, 0],
+    ));
+    assert_eq!(wait.result, SyscallReturn::Success(0));
+    assert!(matches!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::WaitingForFutex { .. }
+    ));
+
+    let exit = runtime.dispatch_syscall(context_for(
+        INITIAL_GUEST_PID,
+        2,
+        Syscall::Exit,
+        [0, 0, 0, 0, 0, 0],
+    ));
+
+    assert_eq!(exit.result, SyscallReturn::Success(0));
+    assert_eq!(u32_from_guest(runtime.memory(), 0x402000), 0);
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::Runnable
+    );
+}
+
+#[test]
+fn thread_exit_wakes_robust_list_futex_waiter() {
+    const ROBUST_HEAD: u64 = 0x402000;
+    const ROBUST_NODE: u64 = 0x402030;
+    const ROBUST_FUTEX: u64 = 0x402040;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+
+    let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
+    runtime
+        .memory_mut()
+        .write(ROBUST_HEAD, &ROBUST_NODE.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(ROBUST_HEAD + 8, &16i64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(ROBUST_HEAD + 16, &0u64.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(ROBUST_NODE, &ROBUST_HEAD.to_le_bytes())
+        .unwrap();
+    runtime
+        .memory_mut()
+        .write(ROBUST_FUTEX, &2u32.to_le_bytes())
+        .unwrap();
+    let flags = LINUX_CLONE_VM
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SIGHAND
+        | LINUX_CLONE_THREAD
+        | LINUX_CLONE_SYSVSEM;
+
+    let clone = runtime.dispatch_syscall(context(Syscall::Clone, [flags, 0, 0, 0, 0, 0]));
+    assert_eq!(clone.result, SyscallReturn::Success(2));
+    assert_eq!(
+        runtime
+            .dispatch_syscall(context_for(
+                INITIAL_GUEST_PID,
+                2,
+                Syscall::SetRobustList,
+                [
+                    ROBUST_HEAD,
+                    mcr_sys::LINUX_ROBUST_LIST_HEAD_SIZE,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ))
+            .result,
+        SyscallReturn::Success(0)
+    );
+    let wait = runtime.dispatch_syscall(context(
+        Syscall::Futex,
+        [
+            ROBUST_FUTEX,
+            u64::from(LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG),
+            2,
+            0,
+            0,
+            0,
+        ],
+    ));
+    assert_eq!(wait.result, SyscallReturn::Success(0));
+
+    let exit = runtime.dispatch_syscall(context_for(
+        INITIAL_GUEST_PID,
+        2,
+        Syscall::Exit,
+        [0, 0, 0, 0, 0, 0],
+    ));
+
+    assert_eq!(exit.result, SyscallReturn::Success(0));
+    assert_eq!(
+        u32_from_guest(runtime.memory(), ROBUST_FUTEX),
+        FUTEX_OWNER_DIED
+    );
+    assert_eq!(
+        runtime.kernel().task(INITIAL_GUEST_TID).unwrap().state(),
+        TaskState::Runnable
+    );
+}
+
+#[test]
 fn set_tid_address_returns_current_guest_tid() {
     let mut runtime = Runtime::new(test_program("/bin/app", 0x401000)).unwrap();
 

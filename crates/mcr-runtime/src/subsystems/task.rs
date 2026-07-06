@@ -698,6 +698,15 @@ impl RuntimeSubsystems {
         exit_group: bool,
     ) -> Result<(), LinuxErrno> {
         if !exit_group
+            && let Some(robust_list) = self
+                .process
+                .tasks
+                .task_mut(tid)
+                .and_then(GuestTask::take_robust_list)
+        {
+            self.wake_robust_list(pid, tid, robust_list);
+        }
+        if !exit_group
             && let Some(clear_child_tid) = self
                 .process
                 .tasks
@@ -710,6 +719,9 @@ impl RuntimeSubsystems {
             self.process
                 .tasks
                 .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, true), u32::MAX);
+            self.process
+                .tasks
+                .wake_futex_waiters(FutexWaitKey::new(pid, clear_child_tid, false), u32::MAX);
         }
 
         let process_exited = matches!(
@@ -726,6 +738,71 @@ impl RuntimeSubsystems {
             self.drop_native_fp_for_tid(tid);
             Ok(())
         }
+    }
+
+    fn wake_robust_list(&mut self, pid: mcr_sys::GuestPid, tid: mcr_sys::GuestTid, head: u64) {
+        const ROBUST_LIST_NEXT_OFFSET: u64 = 0;
+        const ROBUST_LIST_HEAD_FUTEX_OFFSET: u64 = 8;
+        const ROBUST_LIST_HEAD_PENDING_OFFSET: u64 = 16;
+        const ROBUST_LIST_MAX_ENTRIES: usize = 2048;
+
+        let Ok(mut current) = read_guest_u64(self.files.memory(), head + ROBUST_LIST_NEXT_OFFSET)
+        else {
+            return;
+        };
+        let Ok(futex_offset) =
+            read_guest_i64(self.files.memory(), head + ROBUST_LIST_HEAD_FUTEX_OFFSET)
+        else {
+            return;
+        };
+        let pending = read_guest_u64(self.files.memory(), head + ROBUST_LIST_HEAD_PENDING_OFFSET)
+            .unwrap_or(0);
+
+        for _ in 0..ROBUST_LIST_MAX_ENTRIES {
+            if current == 0 || current == head {
+                break;
+            }
+            let next = read_guest_u64(self.files.memory(), current + ROBUST_LIST_NEXT_OFFSET)
+                .unwrap_or(head);
+            self.wake_robust_futex(pid, tid, current, futex_offset);
+            current = next;
+        }
+        if pending != 0 && pending != head {
+            self.wake_robust_futex(pid, tid, pending, futex_offset);
+        }
+        let _ = self.store_selected_process_memory(pid);
+    }
+
+    fn wake_robust_futex(
+        &mut self,
+        pid: mcr_sys::GuestPid,
+        tid: mcr_sys::GuestTid,
+        list_entry: u64,
+        futex_offset: i64,
+    ) {
+        const LINUX_FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+        const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+        let Some(futex_addr) = list_entry.checked_add_signed(futex_offset) else {
+            return;
+        };
+        let Ok(value) = read_guest_u32(self.files.memory(), futex_addr) else {
+            return;
+        };
+        if value & LINUX_FUTEX_TID_MASK != tid {
+            return;
+        }
+        let owner_died_value = (value & !LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED;
+        if write_guest_u32(self.files.memory_mut(), futex_addr, owner_died_value).is_err() {
+            return;
+        }
+        self.events.futexes.wake(futex_addr, u32::MAX);
+        self.process
+            .tasks
+            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, true), u32::MAX);
+        self.process
+            .tasks
+            .wake_futex_waiters(FutexWaitKey::new(pid, futex_addr, false), u32::MAX);
     }
 
     pub(crate) fn resume_waiting_tasks(&mut self) -> Result<Vec<CompletedWait>, LinuxErrno> {
