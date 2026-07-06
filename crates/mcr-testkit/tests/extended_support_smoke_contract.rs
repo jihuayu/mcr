@@ -56,12 +56,50 @@ base=/tmp/mcr-mysql-smoke
 rm -rf "$base"
 mkdir -p "$base"
 trap 'rm -rf "$base"' EXIT
-/usr/bin/mariadbd --no-defaults --user=root --datadir="$base" --bootstrap --skip-grant-tables --innodb-use-native-aio=0 >/dev/null <<'SQL'
+sql="$base/bootstrap.sql"
+cat > "$sql" <<SQL
 CREATE DATABASE mcr_smoke;
 USE mcr_smoke;
-CREATE TABLE smoke_items (id INT PRIMARY KEY, n INT);
-INSERT INTO smoke_items VALUES (1, 7);
+CREATE TABLE smoke_customers (id INT PRIMARY KEY, name VARCHAR(16));
+CREATE TABLE smoke_items (id INT PRIMARY KEY, bucket INT, n INT, INDEX idx_bucket (bucket));
+CREATE TABLE smoke_orders (id INT PRIMARY KEY, customer_id INT, item_id INT, amount INT, INDEX idx_customer (customer_id));
+INSERT INTO smoke_customers VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma'), (4, 'delta');
 SQL
+item=1
+printf 'INSERT INTO smoke_items VALUES ' >> "$sql"
+while [ "$item" -le 128 ]; do
+    bucket=$((item % 16))
+    amount=$((item * 3))
+    if [ "$item" -gt 1 ]; then
+        printf ', ' >> "$sql"
+    fi
+    printf '(%s, %s, %s)' "$item" "$bucket" "$amount" >> "$sql"
+    item=$((item + 1))
+done
+printf ';\n' >> "$sql"
+item=1
+printf 'INSERT INTO smoke_orders VALUES ' >> "$sql"
+while [ "$item" -le 128 ]; do
+    customer=$(((item % 4) + 1))
+    amount=$((item * 3))
+    if [ "$item" -gt 1 ]; then
+        printf ', ' >> "$sql"
+    fi
+    printf '(%s, %s, %s, %s)' "$item" "$customer" "$item" "$amount" >> "$sql"
+    item=$((item + 1))
+done
+printf ';\n' >> "$sql"
+cat >> "$sql" <<SQL
+SELECT CONCAT('plain=', n) INTO OUTFILE '$base/plain.out' FROM smoke_items WHERE id = 42;
+SELECT CONCAT('index=', COUNT(*), ',', SUM(n)) INTO OUTFILE '$base/index.out' FROM smoke_items FORCE INDEX(idx_bucket) WHERE bucket = 7;
+SELECT CONCAT('join=', c.name, ',', SUM(o.amount)) INTO OUTFILE '$base/join.out' FROM smoke_customers c JOIN smoke_orders o ON o.customer_id = c.id WHERE c.id = 3 GROUP BY c.name;
+SELECT CONCAT('range=', COUNT(*), ',', SUM(n)) INTO OUTFILE '$base/range.out' FROM smoke_items WHERE id BETWEEN 1 AND 128;
+SQL
+/usr/bin/mariadbd --no-defaults --user=root --datadir="$base" --bootstrap --skip-grant-tables --innodb-use-native-aio=0 >/dev/null < "$sql"
+test "$(cat "$base/plain.out")" = "plain=126"
+test "$(cat "$base/index.out")" = "index=8,1512"
+test "$(cat "$base/join.out")" = "join=gamma,6144"
+test "$(cat "$base/range.out")" = "range=128,24768"
 test -f "$base/mcr_smoke/smoke_items.frm"
 test -f "$base/mcr_smoke/smoke_items.ibd"
 echo mysql-ok
@@ -91,7 +129,7 @@ const JDK_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
     stdout: b"jdk-ok\n",
 };
 const MYSQL_RUN: ExtendedSupportSmokeContract = ExtendedSupportSmokeContract {
-    name: "mysql bootstrap database",
+    name: "mysql bootstrap query matrix",
     rootfs: "mysql-rootfs",
     script: MYSQL_RUN_SCRIPT,
     stdout: b"mysql-ok\n",
