@@ -2,11 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mcr_elf::{GuestMemoryImage, GuestVmaKind as ElfGuestVmaKind};
 use mcr_sys::{
-    BrkSyscallArgs, LINUX_MAP_HUGETLB, LINUX_MAP_PRIVATE, LINUX_MAP_SHARED, LINUX_MAP_SYNC,
-    LINUX_MAP_TYPE_MASK, LINUX_MAP_VALID_MASK, LINUX_PROT_EXEC, LINUX_PROT_READ,
-    LINUX_PROT_VALID_MASK, LINUX_PROT_WRITE, GuestAddress, LinuxErrno, MemorySyscalls,
-    MmapSyscallArgs, MprotectSyscallArgs, MunmapSyscallArgs, Syscall, SyscallOutcome,
-    SyscallRequest,
+    BrkSyscallArgs, GuestAddress, LINUX_MAP_HUGETLB, LINUX_MAP_PRIVATE, LINUX_MAP_SHARED,
+    LINUX_MAP_SYNC, LINUX_MAP_TYPE_MASK, LINUX_MAP_VALID_MASK, LINUX_PROT_EXEC, LINUX_PROT_READ,
+    LINUX_PROT_VALID_MASK, LINUX_PROT_WRITE, LinuxErrno, MemorySyscalls, MmapSyscallArgs,
+    MprotectSyscallArgs, MunmapSyscallArgs, Syscall, SyscallOutcome, SyscallRequest,
 };
 use mcr_win::{HostError, HostErrorCode, HostErrorKind, HostMemory, MemoryProtection};
 
